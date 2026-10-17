@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -12,7 +13,9 @@ use volucer_core::php;
 use volucer_core::sites::Sites;
 use volucer_fcgi::cgi::Routing;
 use volucer_http::{HttpLimits, RunningHttp, RunningStatus};
-use volucer_server::{Contention, Dispatcher, FastCgiListener, Limits, ServerError};
+use volucer_server::{
+    Consumers, Contention, Dispatcher, FastCgiListener, Limits, ServerError, WorkerPool,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -962,6 +965,25 @@ fn serve(
     // scraper and an orchestrator and by nothing else.
     let status = start_status(&config, &dispatcher)?;
 
+    // The consumer side of the queues, when the deployment consumes anything. **Started before the
+    // listeners**, so a consumer pool that cannot boot its processes is a startup failure rather than a
+    // queue that fills up while the server serves 200s: the pool's own constructor boots every worker and
+    // completes its handshake, which is the same guarantee a backend gets and for the same reason.
+    //
+    // `None` in three cases, and they are three different answers: no `[jobs]` table at all, a `[jobs]`
+    // table with nothing in `consume` (a producer-only node, which is a documented deployment), and a
+    // `[jobs]` table whose `pool` is absent. The last is refused by `Config::validate` when `consume` is
+    // non-empty, so it cannot arrive here as a silent no-consumer — that is the failure that would look
+    // like a working server.
+    let consumers = start_consumers(&config, &dispatcher)?;
+    if let Some(consumers) = &consumers {
+        println!(
+            "  consumers:        {} consumer(s) on {:?}",
+            consumers.len(),
+            consumers.pipelines()
+        );
+    }
+
     let http = match &http_address {
         Some(address) => {
             let running = RunningHttp::start_with_tls(
@@ -1063,6 +1085,25 @@ fn serve(
         front_controller_flag.map(str::to_string),
     );
 
+    // The poller, on its own thread: the pool is synchronous by construction, and the shutdown flag this
+    // checks between jobs is the same flag the signal handler sets, so Ctrl-C stops the reserving before
+    // the listeners go and a job already handed to a consumer is waited for rather than abandoned.
+    //
+    // Joined below and never detached, because the thread holds the pool: leaving it running past `serve`
+    // would leave it holding a slot and reading a pipe while the process tried to reap the consumers.
+    let poller = match &consumers {
+        Some(consumers) => {
+            let running = Arc::clone(consumers);
+            let stop = running.stopper();
+            Some((
+                stop,
+                std::thread::spawn(move || running.run()),
+                Arc::clone(consumers),
+            ))
+        }
+        None => None,
+    };
+
     // The FastCGI listener owns this thread while the HTTP listener runs on its
     // own, so both are served concurrently. With no FastCGI listener there is
     // nothing to drive, so the process waits on the shared shutdown flag instead.
@@ -1102,6 +1143,31 @@ fn serve(
     // diagnostic should depend on.
     for contention in reporting.contention() {
         println!("{}", contention_line(&contention));
+    }
+
+    // The consumers go last, after the listeners and after the last scrape. Stopping them earlier would
+    // make the final metrics scrape — the one an operator reads to find out what the run did — report a
+    // pool of zero consumers for a reason that has nothing to do with the deployment.
+    //
+    // The stop is requested, then the thread is joined, and the join is the graceful part: the flag is
+    // checked *between* jobs, so a consumer already working finishes and its answer is settled before the
+    // pool below drops. Killing the thread instead would leave a reserved job to wait out its lease, which
+    // is the exact cost the lease exists to bound.
+    if let Some((stop, poller, consumers)) = poller {
+        stop.store(true, Ordering::Relaxed);
+        if poller.join().is_err() {
+            // The poller thread panicked. Nothing to do about it here — the process is stopping, and the
+            // panic has already been reported by the default hook — but it is *reported* rather than
+            // silently joined, because a poller that died mid-job is the difference between "the queue
+            // drained" and "the queue stopped being read".
+            tracing::error!("the job poller panicked");
+        }
+        let (acked, requeued, rejected) = consumers.counts();
+        println!("jobs: {acked} acknowledged, {requeued} requeued, {rejected} rejected");
+        // Dropped explicitly so the consumer processes are reaped *here*, in the shutdown report, rather
+        // than by `Arc`'s last strong count somewhere below — the same reason the dispatcher is kept in a
+        // `reporting` handle above.
+        drop(consumers);
     }
 
     println!("stopped");
@@ -1291,6 +1357,45 @@ fn start_status(
         println!("  metrics:          {}", listener.local_addr());
     }
     Ok(running)
+}
+
+/// Start the consumer side of the queues, when the configuration has any.
+///
+/// Three cases answer `None`, and they are three different things: no `[jobs]` table, a table with nothing
+/// in `consume` (a producer-only node — a documented deployment, not a mistake), and a table whose `pool`
+/// is absent. The last is refused by `Config::validate` whenever `consume` is non-empty, so it cannot
+/// become a server that silently consumes nothing.
+///
+/// The pool is booted here, which is the point of doing this at startup: a consumer command that does not
+/// exist, or that cannot complete its handshake, is reported before a port is bound rather than as a queue
+/// that fills up while every request is answered 200.
+fn start_consumers(
+    config: &Config,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<Option<Arc<Consumers>>, ServerError> {
+    let (Some(jobs), Some(plane)) = (&config.jobs, dispatcher.queues()) else {
+        return Ok(None);
+    };
+    let Some(pool_config) = &jobs.pool else {
+        return Ok(None);
+    };
+    // `consume` is checked against `pipelines` by `Config::validate`, and `pool` is required whenever
+    // `consume` is non-empty — so by here a pool config means there is something to consume. The empty
+    // check is what turns that into a statement rather than an assumption: without it, a configuration
+    // that named a pool and consumed nothing would boot a set of consumer processes that poll nothing.
+    let consumers = Consumers::new(
+        &plane,
+        WorkerPool::start_consumers("jobs", pool_config)?,
+        Duration::from_secs(pool_config.job_lease_seconds),
+        pool_config.prefetch,
+    );
+    if consumers.is_empty() {
+        tracing::info!(
+            workers = consumers.len(),
+            "a jobs pool is configured but no pipeline is consumed, so it will not poll"
+        );
+    }
+    Ok(Some(Arc::new(consumers)))
 }
 
 /// Wait until the shutdown flag is set.

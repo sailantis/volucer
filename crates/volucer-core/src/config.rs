@@ -374,6 +374,36 @@ pub struct JobsPoolConfig {
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
 
+    /// Whether the per-frame `crc32c` is verified.
+    ///
+    /// The same negotiation a backend offers, and here for the same reason it exists there: a
+    /// consumer's channel is the same channel, so a deployment that accepted the trade for its
+    /// request workers has already accepted it for its consumers. Defaulting to the *same*
+    /// [`ChecksumMode`] is what keeps that one decision rather than two.
+    #[serde(default)]
+    pub checksum: ChecksumMode,
+
+    /// How the server and a consumer are connected.
+    ///
+    /// Likewise inherited rather than re-decided: the socket transport exists because PHP's pipe
+    /// reads are slow on Windows, and a consumer process reads its pipe exactly as a request worker
+    /// does. Leaving it out would have made the default — a socket on Windows — *unavailable* to
+    /// consumers, so the one platform that needs it would be the one that could not have it.
+    #[serde(default)]
+    pub transport: WorkerTransport,
+
+    /// Working directory for the consumer process.
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+
+    /// Extra environment variables for the consumer process.
+    ///
+    /// Worth having on a consumer and not only on a backend: a consumer is the process that talks to
+    /// the application's *queue*, so a deployment that runs its consumers against a different database
+    /// or broker than its web nodes is the ordinary case rather than an exotic one.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
     /// Recycle a consumer after this many **jobs**.
     ///
     /// `0` means never, the same rule [`WorkerConfig::max_requests`] documents at length. Named `max_jobs`
@@ -5202,6 +5232,50 @@ max_requests = 100
         assert!(err.to_string().contains("services"), "{err}");
     }
 
+    /// The three keys a consumer pool inherits from a backend are the ones a *process* needs, and each is
+    /// there because omitting it would be a silent misconfiguration rather than a missing feature.
+    ///
+    /// `transport` is the one worth the test. Its default is platform-dependent — a socket on Windows —
+    /// and a consumer pool that could not express it would be a pool that read its pipe the slow way on the
+    /// one platform where that was measured to cost 21×. `checksum` is the same trade the deployment
+    /// already accepted for its request workers, and `env` is how a consumer is pointed at a different
+    /// database than its web nodes.
+    #[test]
+    fn a_jobs_pool_carries_the_three_keys_a_process_needs() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "memory"
+[jobs.pool]
+command = "php consumer.php"
+checksum = "optional"
+transport = "pipe"
+env = { QUEUE_DATABASE = "jobs" }
+working_dir = "."
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        config.validate().expect("every key here is valid");
+        let pool = config.jobs.as_ref().and_then(|jobs| jobs.pool.as_ref());
+        let pool = pool.expect("the pool table was read");
+        assert!(
+            matches!(pool.checksum, ChecksumMode::Optional),
+            "the checksum policy is inherited rather than re-decided: {:?}",
+            pool.checksum
+        );
+        assert!(
+            matches!(pool.transport, WorkerTransport::Pipe),
+            "and so is the transport, which is the only way a deployment can pick one for its consumers"
+        );
+        assert_eq!(
+            pool.env.get("QUEUE_DATABASE").map(String::as_str),
+            Some("jobs"),
+            "a consumer pointed at a different database than its web nodes is the ordinary case"
+        );
+    }
+
     /// The driver name matches the serde tag, so `config.describe` and the file cannot disagree.
     #[test]
     fn a_pipeline_driver_name_matches_its_tag() {
@@ -5726,6 +5800,14 @@ driver = "memory"
         assert!(
             text.contains("a restart loses") || text.contains("restart loses"),
             "{} no longer says that the memory queue loses everything on a restart",
+            path.display()
+        );
+        // And the sentence that keeps a deployment from pointing `[jobs.pool] command` at its request
+        // worker, which the protocol refuses by name but only *after* the consumer has started.
+        assert!(
+            text.contains("where a request worker resets per-request state"),
+            "{} no longer distinguishes a consumer's process from a request worker's: both are \
+             `php <file>`, and the difference is the one thing a reader has to know here",
             path.display()
         );
     }

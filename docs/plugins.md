@@ -757,6 +757,50 @@ the contract*). So:
   **not** copied — `max_requests` already means this and means it explicitly (see the field's own
   comment at `crates/volucer-core/src/config.rs:1795`).
 
+**And it is done, as steps 5a–5c below.** What building it settled, in the order the code found it:
+
+- **The two exchanges are two frame types, not one with a flag.** `JOB` (17) and `ACK` (18), because
+  the thing a worker has to know *before* it touches any state is whether its own state is reset
+  between units of work. A request worker resets; a consumer does not, and that is the entire point
+  of the feature for an application. A magic URI on `REQUEST` would have made that question one each
+  implementation answers for itself, and one of them would get it wrong. **A worker pointed at the
+  wrong mode now refuses by name** rather than serving the frame as the other kind — in both
+  directions, because a `REQUEST` on a consumer has nowhere to go either.
+- **`ACK` had to carry the recycling signals, and the design did not predict it.** A job has no `END`
+  frame, so `peak_memory_bytes`, `keep_alive` and `duration_us` have nowhere else to live — and
+  without them `[jobs.pool] memory_limit_mb` and `max_jobs` would be configuration settings that
+  parse, validate, and are read by nothing. That is worse than not offering them, because an operator
+  has no way to find out. The frame is `Ack { outcome, peak_memory_bytes, keep_alive, duration_us }`
+  with the outcome flattened in, so the JSON stays `{"outcome":"ack",…}` rather than growing an
+  envelope that carries the type twice.
+- **Three outcomes, not RoadRunner's five.** `NoError`, `Error`, `ACK`, `NACK` and `REQUEUE` are three
+  decisions written two ways. `Ack` settles the reservation; `Requeue` negatively acknowledges it;
+  `Reject` **acknowledges it without recording a failure**, because a job an application has decided
+  against is not a job that is waiting, and nacking it would bring it back for ever.
+- **The reservation is not the job id.** `ACK` correlates by the frame's `request_id`, which is the
+  mechanism every other exchange here uses — so a worker whose lease expired cannot acknowledge the
+  job that has since been handed to somebody else. The server checks a reservation the worker never
+  saw.
+- **One poller thread, and it reserves only once it has a slot.** One thread per pipeline would be
+  several threads competing for the same slots, and the failure of that shape is not slowness: a
+  thread that reserved and *then* waited for a slot holds a reservation while it waits, so the lease
+  runs down on a job nobody is running. Reserving after the slot is taken is what makes the lease mean
+  the time a consumer spends *working*.
+- **`attempts` starts at 0 and is incremented only on the way out of a reserve**, never on a nack. A
+  worker killed mid-job never runs its nack, so a count including failures would miss exactly the
+  crashes worth counting.
+- **No retry policy, no backoff, no dead-lettering** — the fifth thing this section said, and the one
+  the code kept. The server's contribution is that `attempts` is *observable*; deciding what to do at
+  attempt four stays the application's, and `example/consumer.php` shows the three lines it takes.
+- **A throwing handler requeues.** A consumer that crashed must not lose the job, and an application
+  that wants a crashing job *dropped* catches its own exception and returns a string — the visible,
+  deliberate act. The loop that the opposite default guards against is bounded by the count above.
+- **A consumer's `echo` is captured and forwarded as a `LOG`, not left alone.** Rule 1 of the protocol
+  applies to a consumer exactly as it does to a request worker: an unbuffered write to stdout lands
+  inside a frame. What differs is only where the bytes go — a job has no response body, so they go to
+  the server's log rather than to a client.
+
+
 **PHP integration is the point of the feature for this organisation.** `sailantis/azera-queue`
 already defines `Backend\Contract\ReservableQueueInterface`, a `Worker\Worker`, a
 `Dispatch\Dispatcher` and a failed-job provider. A `VolucerQueue` backend implementing that
@@ -1080,7 +1124,7 @@ progress on something earlier look bigger.
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |
-| 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | Biggest item; the consumer-side exchange is the interesting part |
+| 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **5a–5c done** (engine, producer, consumer); the `redis` driver is still open. Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | Reuses the in-flight request, so it does not touch the one-request invariant |
@@ -1158,6 +1202,38 @@ Sizing, as revised by building it: S was right for the trait and the memory driv
 methods cost more than S because of the third answer — every verb now has to decide which kind of
 failure it is reporting, and `update_lease` returning `false` is a second "no" that means the opposite
 of contention.
+
+**Step 5 is done for the memory driver — engine, producer and consumer — and it was three commits'
+worth of one design question.** `crates/volucer-jobs/` (the `Driver` trait and `MemoryDriver`), the
+`jobs` namespace and `[jobs]`/`[jobs.pipelines]` (the producer half), then `JOB`/`ACK`, the `job`
+exchange, `[jobs.pool]` and `crates/volucer-server/src/jobs.rs` (the consumer half, whose full list of
+consequences is in §6.4 above rather than repeated here). The `redis` driver is the one part of step 5
+still open.
+
+The thing this step should be remembered for is not any of those items but the size of the gap the
+*last* one closed. Every layer was tested and correct: the driver's ack/nack against the driver, the
+pool's `job` against a channel, the SDK's `consume` against a fixture. **What no test covered was
+whether the three agreed** — and the three failure modes are all silent. A `Requeue` treated as an
+`Ack` loses work an application asked to retry; an `Ack` treated as a `Requeue` runs every job twice;
+a `Reject` nacked rather than acked brings a poisoned job back for ever. None of them is an error
+anywhere; they are a queue that behaves oddly. So the end-to-end test for this step asserts on the
+*queue* — `size` and `in_flight` after each outcome — rather than on the answer frame, because the
+reservation is what the policy is about.
+
+That is the seam pattern's fifth instance, and this one generalises it: what sits between two tested
+things is not always a `build_*` function. Here it was a **policy**, and the test that finds a policy
+bug is one that runs the whole path a deployment runs and then asks the durable state what happened.
+
+Two smaller things worth recording, both found this way rather than by reasoning:
+
+- **`max_jobs` and `max_requests` are one threshold under two names, and `WorkerPool::start_consumers`
+  is where that is written down.** A consumer serves one job at a time, so "requests served" and "jobs
+  handled" are the same counter counting the same events — which is why `[jobs.pool]` is a separate
+  type but not a separate pool.
+- **A consumer pool charges the same wait counters a request pool does.** The first version left
+  `requests_queue`, the wait histogram and `jobs_served` at zero for a consumer pool, which reads as
+  "no contention" on a pool with jobs queueing behind one another — a graph that says the opposite of
+  the truth. The fix is that `WorkerPool::job` charges exactly what `attempt` charges.
 
 Note the shape of the end of the list. gRPC is **no longer one XL item behind a gate**: it is three
 items of S–M each, the first of which needs no schema, no worker and no new listener. The XL item

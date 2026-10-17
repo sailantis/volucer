@@ -169,11 +169,23 @@ a question each implementation answers for itself, which is how one of them gets
 frame type, so a worker decides from the header before it touches any state.
 
 `ACK` is the terminal frame and the only place in this protocol where a payload **decides something the
-server does** rather than something it reports. `ack` acknowledges the reservation, `requeue`
-negatively acknowledges it so the job is handed out again, and `reject` acknowledges it *without*
-recording a failure — because a job an application has decided against is not a job that is waiting, and
-nacking it would bring it back for ever. The server imposes no retry count, no backoff and no
-dead-lettering; see `docs/plugins.md` §6.4.
+server does** rather than something it reports. The `outcome` field is one of three:
+
+| `outcome` | The queue does | Why |
+| --- | --- | --- |
+| `ack` | Settles the reservation | The job is done |
+| `requeue` | Negatively acknowledges, so the job is handed out again | Not done, and it should be retried |
+| `reject` | **Settles the reservation without recording a failure** | Not done, and it must not come back |
+
+`reject` is the arm worth reading twice. Nacking it would bring the job back for ever, and the server
+imposes no retry count, no backoff and no dead-lettering — see `docs/plugins.md` §6.4 for why those stay
+the application's. What makes the policy writable is that the driver increments `attempts` on every
+reservation, so an application that wants "give up after three" reads the number it is given rather than
+keeping a counter of its own.
+
+The frame also carries `peak_memory_bytes`, `keep_alive` and `duration_us`, which is a job's substitute
+for the `END` a request has. Without them `[jobs.pool] memory_limit_mb` and `max_jobs` would be settings
+that parse and are read by nothing.
 
 A job's `BODY` frames are raw bytes and are **not** parsed, exactly as a request's are not: the payload
 belongs to the application, the server never serializes it, and the `body_len` in the head is what lets
@@ -405,6 +417,12 @@ Everything else means the reader can no longer trust its position in the stream.
    output (and turns it into the response body when the handler returns null), `ini_set('display_errors', 'stderr')`
    sends warnings to stderr, and `emitLog`/`emitMetric` are the supported way to speak outside a
    request. See `src/Worker.php` in `sailantis/volucer-php-sdk`.
+
+   **A consumer captures too, and forwards what it captured as a `LOG`.** The rule is the same rule —
+   an unbuffered write to stdout lands inside a frame whatever the worker is doing — and only the
+   destination differs: a job has no response body for the bytes to become, so they go to the server's
+   log instead of to a client. A consumer that skipped the capture because "there is no response" would
+   be a consumer that corrupts its own stream the first time somebody left a `var_dump` in.
 2. **Graceful shutdown by construction.** Closing the child's stdin makes the worker's read
    return EOF and `waitRequest()` return `false`; the worker exits on its own. Only after a grace
    period does the supervisor kill it. There is no signal to catch and no flag to poll, which is
@@ -451,8 +469,10 @@ configuration:
 | Signal | Meaning |
 | --- | --- |
 | `keep_alive = false` in `END` | The application asked to be recycled (`Worker::recycle()`) |
+| `keep_alive = false` in `ACK` | The same, for a consumer |
 | `max_requests` reached | The configured request count for one worker |
-| `peak_memory_bytes` above `memory_limit_mb` | The worker's own report of its peak RSS for the request just finished |
+| `max_jobs` reached | The configured **job** count for one consumer — the same threshold under the name that is true for a jobs pool |
+| `peak_memory_bytes` above `memory_limit_mb` | The worker's own report of its peak RSS for the request just finished, or for the job just handled |
 
 The replacement is invisible to the request that triggered it: the response is returned, and the
 next request lands on a freshly booted worker. The pool's size does not change — `pick_slot`
@@ -473,6 +493,14 @@ response was malformed would make the application run twice, so the error is rep
 each exchange runs on a thread the pool is free to stop waiting on; the worker is killed to make
 the pending read return. That is also why a recycled worker's pipes are not reused after a
 timeout — the reader may still be inside a read.
+
+**A job's deadline kills too, and that asymmetry with a call is not an oversight.** A `JOB` exchange has
+a response to lose in exactly the way a request does — the consumer is either running the job or it is
+not — so a missed deadline is the same evidence a request's is: the consumer is gone or wedged, and it is
+replaced. The difference from a request is what happens to the *work*: the reservation outlives the
+consumer, so the job is handed out again when its lease expires rather than being lost. That is why the
+lease has to be longer than a job takes, and why it is the one setting `volucer.example.toml` warns
+about.
 
 **A call outlives a request, so a call's timeout is not a kill.** A `CALL` runs on the same
 exchange thread as the request that is in flight, which means the request's deadline covers it —

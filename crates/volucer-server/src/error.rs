@@ -73,6 +73,16 @@ pub enum ServerError {
         source: volucer_worker::WorkerError,
     },
 
+    /// A job could not be handed back to its pipeline.
+    ///
+    /// **Its own variant rather than a driver error passed through**, because the two are different
+    /// failures with different consequences and only one of them is recoverable: a driver that refused a
+    /// push is an application's problem, while a driver that refused a *nack* means a job a consumer has
+    /// already run is now stuck reserved until its lease expires — which is why the caller has to be able
+    /// to name it rather than read "the queue failed".
+    #[error("a job could not be handed back to its pipeline: {reason}")]
+    JobHandoff { reason: String },
+
     #[error("bad FastCGI protocol: {reason}")]
     BadProtocol { reason: String },
 

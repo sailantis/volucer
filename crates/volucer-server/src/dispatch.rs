@@ -228,6 +228,7 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
     };
 
     let mut pipelines: BTreeMap<String, Arc<dyn volucer_jobs::Driver>> = BTreeMap::new();
+    let mut consumed: BTreeMap<String, Arc<dyn volucer_jobs::Driver>> = BTreeMap::new();
     for (name, pipeline) in &jobs.pipelines {
         let driver: Arc<dyn volucer_jobs::Driver> = match pipeline {
             // Built per pipeline rather than per deployment, because a driver here *is* a pipeline's
@@ -235,20 +236,54 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
             // them would make a push to either appear in both.
             PipelineConfig::Memory(_) => Arc::new(volucer_jobs::MemoryDriver::single(name.clone())),
         };
-        tracing::info!(pipeline = %name, driver = %pipeline.driver(), "queue ready");
+        tracing::info!(
+            pipeline = %name,
+            driver = %pipeline.driver(),
+            // Stated per pipeline because it is the one thing an operator has to be able to check when a
+            // queue fills up: this node pushes to the pipeline *and* polls it, or only pushes to it.
+            consuming = jobs.consumes(name),
+            "queue ready"
+        );
+        if jobs.consumes(name) {
+            consumed.insert(name.clone(), Arc::clone(&driver));
+        }
         pipelines.insert(name.clone(), driver);
     }
 
-    Ok(Some(Arc::new(JobsPlane { pipelines })))
+    if consumed.is_empty() && !jobs.pipelines.is_empty() {
+        // Not a warning: a producer-only node is a documented deployment, and `docs/plugins.md` §6.4 says
+        // so. Logged at info because it is the answer to "why is nothing consuming", which is a question
+        // an operator will otherwise ask of a queue with jobs piling up in it.
+        tracing::info!(
+            pipelines = pipelines.len(),
+            "no pipeline is in `consume`, so this server only produces"
+        );
+    }
+
+    Ok(Some(Arc::new(JobsPlane {
+        pipelines,
+        consumed,
+    })))
 }
 
 /// The pipelines, and which of them this server consumes.
 ///
-/// One object rather than the two halves being passed separately, because the consumer side of step 5 will
-/// need the same drivers the producer namespace holds — and threading two maps through three signatures
-/// to avoid one struct is how a seam gets missed.
+/// One object rather than the two halves being passed separately, because the consumer side of step 5 needs
+/// the same drivers the producer namespace holds — and threading two maps through three signatures to avoid
+/// one struct is how a seam gets missed.
+///
+/// **The consumed set is derived here, once, from a configuration that has already been validated.** The
+/// alternative — asking `Config` at the point of use — would put the same rule in two places, and the
+/// interesting failure of that shape is a `consume` name that validation accepted but this object cannot
+/// resolve: a consumer that starts, polls nothing, and reports no error.
 pub struct JobsPlane {
     pipelines: BTreeMap<String, Arc<dyn volucer_jobs::Driver>>,
+    /// The subset of `pipelines` this server polls, in the configuration's `consume` order.
+    ///
+    /// A separate map rather than a flag per entry, because a `BTreeMap` has no way to carry one and the two
+    /// sets are asked different questions: the *producer* namespace needs all the drivers, and the poller
+    /// needs only the consumed ones.
+    consumed: BTreeMap<String, Arc<dyn volucer_jobs::Driver>>,
 }
 
 impl JobsPlane {
@@ -261,15 +296,33 @@ impl JobsPlane {
         self.pipelines.clone()
     }
 
-    /// The names this deployment consumes, in the order the configuration wrote them.
+    /// The pipelines this deployment consumes, in the configuration's `consume` order.
     ///
-    /// For the consumer side, and it is here rather than read from `Config` at the point of use so that a
-    /// name which is consumed but has no pipeline cannot reach this far — `Config::validate` refuses it.
+    /// **Consumption is a property of the node, not of the pipeline**, which is RoadRunner's rule and a
+    /// deployment one: a web node that pushes mail jobs and a worker node that consumes them run the same
+    /// configuration file, and the only difference between them is one line here. So a driver can be
+    /// present in a plane without being polled by *this* server, and that is the case this set exists to
+    /// express.
     pub fn consumed(&self) -> Vec<(&str, Arc<dyn volucer_jobs::Driver>)> {
-        self.pipelines
+        self.consumed
             .iter()
             .map(|(name, driver)| (name.as_str(), Arc::clone(driver)))
             .collect()
+    }
+
+    /// Every pipeline name this deployment configured, consumed or not.
+    pub fn names(&self) -> Vec<&str> {
+        self.pipelines.keys().map(String::as_str).collect()
+    }
+
+    /// One pipeline's driver, whether or not this server consumes it.
+    ///
+    /// The *producer's* view, and the reason it exists rather than a caller reaching into `consumed()`: a
+    /// deployment that only pushes to a pipeline still has that pipeline's driver, because the push goes
+    /// to the same storage either way. A caller that used `consumed()` to find a driver to push to would
+    /// work on a worker node and fail on a web node, which is the confusion this accessor removes.
+    pub fn driver(&self, pipeline: &str) -> Option<Arc<dyn volucer_jobs::Driver>> {
+        self.pipelines.get(pipeline).map(Arc::clone)
     }
 }
 
@@ -278,6 +331,7 @@ impl std::fmt::Debug for JobsPlane {
         // Hand-written because `dyn Driver` is not `Debug`, and the names are more useful anyway.
         f.debug_struct("JobsPlane")
             .field("pipelines", &self.pipelines.keys().collect::<Vec<_>>())
+            .field("consumed", &self.consumed.keys().collect::<Vec<_>>())
             .finish()
     }
 }

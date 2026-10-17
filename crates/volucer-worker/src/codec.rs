@@ -21,7 +21,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crate::error::{Result, WorkerError};
 use crate::header::{flags, write_frame, Checksum, Header, MessageType};
 use crate::message::{
-    Call, Codec, Control, ErrorReport, Hello, HelloAck, JobHeader, JobOutcome, Json, LogRecord,
+    Ack, Call, Codec, Control, ErrorReport, Hello, HelloAck, JobHeader, Json, LogRecord,
     MetricRecord, RequestEnd, RequestHeader, ResponseHead, Return,
 };
 
@@ -126,6 +126,16 @@ impl BoundedChannel {
         self.channel.request(request, body)
     }
 
+    /// Take the telemetry the worker has emitted and nobody has read yet.
+    ///
+    /// Forwarded for a different caller than the request path: a request's records arrive on its
+    /// `WorkerResponse`, while a job has no response object, so the pool draining one has to reach the
+    /// channel's own buffer. Nothing else reads this, and the request path deliberately does not — see
+    /// `ChannelExchange`'s job answer for why the two differ.
+    pub fn take_metrics(&mut self) -> Vec<MetricRecord> {
+        self.channel.take_metrics()
+    }
+
     /// The same request, with the send and receive phases kept apart.
     ///
     /// The pool needs the stage, not the response: a failure while sending can be replayed
@@ -164,7 +174,7 @@ impl BoundedChannel {
         head: JobHeader,
         body: &[u8],
         on_stage: impl FnMut(RequestStage),
-    ) -> Result<JobOutcome> {
+    ) -> Result<Ack> {
         self.channel.job(head, body, on_stage)
     }
 
@@ -546,7 +556,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         head: JobHeader,
         body: &[u8],
         mut on_stage: impl FnMut(RequestStage),
-    ) -> Result<JobOutcome> {
+    ) -> Result<Ack> {
         let request_id = self.take_request_id();
         // The length is stamped from the bytes about to be framed, so the declaration and the frames
         // cannot disagree — the same rule `send_request` follows, and for the same reason: a caller that
@@ -936,7 +946,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     ///
     /// The frame buffer is taken and put back on every path, exactly as `collect_response` does, so a
     /// failed job does not cost the next one its capacity.
-    fn collect_job(&mut self, request_id: u32) -> Result<JobOutcome> {
+    fn collect_job(&mut self, request_id: u32) -> Result<Ack> {
         let mut frame_buffer = std::mem::take(&mut self.scratch);
         let outcome = self.read_job(request_id, &mut frame_buffer);
         self.scratch = frame_buffer;
@@ -944,7 +954,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     }
 
     /// The read loop of [`WorkerChannel::collect_job`].
-    fn read_job(&mut self, request_id: u32, frame_buffer: &mut Vec<u8>) -> Result<JobOutcome> {
+    fn read_job(&mut self, request_id: u32, frame_buffer: &mut Vec<u8>) -> Result<Ack> {
         loop {
             let policy = self.checksum;
             let Some((header, len)) =
@@ -1142,7 +1152,7 @@ pub fn write_hello_ack<W: Write>(writer: &mut W, ack: &HelloAck) -> Result<()> {
 mod tests {
     use super::*;
     use crate::header::{crc32c, HEADER_LEN, PROTOCOL_VERSION};
-    use crate::message::HelloAck;
+    use crate::message::{HelloAck, JobOutcome};
 
     /// Builds the byte stream a worker would send, frame by frame.
     ///
@@ -2073,8 +2083,13 @@ mod tests {
         script.json(
             MessageType::Ack,
             1,
-            &JobOutcome::Requeue {
-                reason: Some("the mail server was down".to_string()),
+            &Ack {
+                outcome: JobOutcome::Requeue {
+                    reason: Some("the mail server was down".to_string()),
+                },
+                peak_memory_bytes: 8192,
+                keep_alive: false,
+                duration_us: 1500,
             },
         );
         let mut channel = script.channel();
@@ -2096,9 +2111,15 @@ mod tests {
 
         assert_eq!(
             outcome,
-            JobOutcome::Requeue {
-                reason: Some("the mail server was down".to_string())
-            }
+            Ack {
+                outcome: JobOutcome::Requeue {
+                    reason: Some("the mail server was down".to_string())
+                },
+                peak_memory_bytes: 8192,
+                keep_alive: false,
+                duration_us: 1500,
+            },
+            "the recycling signals travel with the outcome, because a job has no END frame"
         );
 
         let frames = sent_frames(&channel.writer);
@@ -2124,7 +2145,7 @@ mod tests {
     #[test]
     fn a_job_exchange_reports_the_send_phase_before_the_read_phase() {
         let mut script = WorkerScript::default();
-        script.json(MessageType::Ack, 1, &JobOutcome::Ack);
+        script.json(MessageType::Ack, 1, &Ack::default());
         let mut channel = script.channel();
 
         let mut stages = Vec::new();
@@ -2150,7 +2171,7 @@ mod tests {
                     traceparent: None,
                 },
             )
-            .json(MessageType::Ack, 1, &JobOutcome::Ack);
+            .json(MessageType::Ack, 1, &Ack::default());
         let mut channel = script.channel();
         channel.set_call_handler(Box::new(|call: &Call| {
             assert_eq!(call.name, "kv.get");
@@ -2158,7 +2179,7 @@ mod tests {
         }));
 
         let outcome = channel.job(JobHeader::default(), b"", |_| {}).unwrap();
-        assert_eq!(outcome, JobOutcome::Ack);
+        assert_eq!(outcome, Ack::default());
 
         let frames = sent_frames(&channel.writer);
         assert_eq!(frames[0].0.message_type, MessageType::Job);
@@ -2202,7 +2223,7 @@ mod tests {
     #[test]
     fn a_job_ack_under_the_wrong_id_is_rejected_but_leaves_the_stream_usable() {
         let mut script = WorkerScript::default();
-        script.json(MessageType::Ack, 7, &JobOutcome::Ack);
+        script.json(MessageType::Ack, 7, &Ack::default());
         let mut channel = script.channel();
 
         let error = channel
@@ -2240,12 +2261,12 @@ mod tests {
                     unit: "count".to_string(),
                 },
             )
-            .json(MessageType::Ack, 1, &JobOutcome::Ack);
+            .json(MessageType::Ack, 1, &Ack::default());
         let mut channel = script.channel();
 
         assert_eq!(
             channel.job(JobHeader::default(), b"", |_| {}).unwrap(),
-            JobOutcome::Ack
+            Ack::default()
         );
         // Kept on the channel, because a job has no response object to attach them to and a scrape
         // reads the lifetime buffers.

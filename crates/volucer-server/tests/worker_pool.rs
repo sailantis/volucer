@@ -25,7 +25,7 @@ use volucer_core::config::{
     WorkerConfig,
 };
 use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
-use volucer_server::{Dispatcher, WorkerPool};
+use volucer_server::{Consumers, Dispatcher, WorkerPool};
 
 mod common;
 use common::serial;
@@ -1897,6 +1897,210 @@ $worker->run(static function (Request $request, Worker $worker) use (&$held): Re
     probe.release_all(&resource).expect("clean up");
 }
 
+/// A job pushed into a pipeline is consumed by a real PHP process, and the outcome it reports is what the
+/// queue acts on.
+///
+/// # Why this test is the one that matters for the consumer half
+///
+/// `docs/plugins.md` §8 records the pattern four times: `set_call_handler`, `build_stores`, `build_locks`,
+/// `build_queues` — **the wiring between two tested things is where the untested bug lives**, and an
+/// end-to-end test through the entry point a *deployment* uses is not optional for a service added to the
+/// registry. This is the fifth instance and it is a slightly different shape, which is why it is worth
+/// having: what is between the jobs engine and the worker pool here is not a registration but a *policy* —
+/// which of `Ack`, `Requeue` and `Reject` does what to a reservation, and what happens to a job nobody
+/// could hand to a consumer.
+///
+/// Every layer of that was tested separately. `MemoryDriver`'s ack/nack were tested against the driver;
+/// `WorkerPool::job` returns an `Ack` and is tested against a channel; the SDK's `consume` picks an outcome
+/// and is tested against a fixture. **Nothing tested that the three agree**, and the failure modes are all
+/// silent: a `Requeue` treated as an `Ack` loses work an application asked to retry, an `Ack` treated as a
+/// `Requeue` runs every job twice, and a `Reject` nacked rather than acked brings a poisoned job back for
+/// ever. None of those shows up as an error anywhere — they show up as a queue that behaves oddly.
+///
+/// The test drives it the way a deployment does: `Dispatcher::from_config` builds the plane, a real
+/// `php consumer.php` is booted through `WorkerPool::start_consumers`, and `Consumers::poll_once` runs one
+/// pass over the pipeline. Then the *queue* is asked what happened, which is the assertion that makes this
+/// about the reservation rather than about the answer frame.
+#[test]
+fn a_consumed_job_is_acked_requeued_or_rejected_as_its_consumer_decided() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!(
+        "volucer-jobs-consume-{}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("consumer.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Job;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->consume(static function (Job $job, Worker $worker): string|bool|null {{
+    // Every decision in one place, selected by the task name, so the test asserts on the *effect* of each
+    // rather than on a fixture's shape. `RetryOnce` is the only one that needs state across attempts, and
+    // it gets it from the attempt count the server puts on every job — which is also the assertion that
+    // the counter is real rather than a constant.
+    switch ($job->task) {{
+        case 'ok':
+            // A cache write from inside a job: the call plane has to work on this exchange too, or a
+            // consumer that reaches for the server mid-job deadlocks until its lease runs out.
+            $worker->call('jobs.size', ['pipeline' => 'emails']);
+            return null;
+        case 'retry':
+            return $job->attempts === 1 ? false : null;
+        case 'poison':
+            return 'this job is not worth retrying';
+        default:
+            throw new RuntimeException('unexpected task ' . $job->task);
+    }}
+}});
+"#
+        ),
+    )
+    .expect("write the consumer");
+
+    let pipeline = |name: &str| {
+        (
+            name.to_string(),
+            volucer_core::config::PipelineConfig::Memory(
+                volucer_core::config::MemoryPipelineConfig {},
+            ),
+        )
+    };
+
+    // A producer-only dispatcher: the plane it builds is the same object a consumer polls, and building it
+    // through the configuration is what makes this a test of the *wiring* rather than of a struct.
+    let mut configured = Config {
+        backends: Default::default(),
+        default_backend: None,
+        ..Config::default()
+    };
+    configured.jobs = Some(volucer_core::config::JobsConfig {
+        consume: vec!["emails".to_string()],
+        pipelines: [pipeline("emails")].into_iter().collect(),
+        pool: None,
+    });
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the plane is built");
+    let plane = dispatcher.queues().expect("the [jobs] table built a plane");
+    let driver = plane.driver("emails").expect("emails is a pipeline");
+
+    let pool_config = volucer_core::config::JobsPoolConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers: 1,
+        memory_limit_mb: None,
+        max_jobs: None,
+        job_lease_seconds: 60,
+        // Two, so that one `poll_once` reserves the pair pushed below and the test can be about what
+        // happened to each rather than about how many passes it took to get to them. The production
+        // default is one, which is what a worker pool should ask for — see `default_job_prefetch`.
+        prefetch: 2,
+        checksum: Default::default(),
+        transport: Default::default(),
+        working_dir: None,
+        env: Default::default(),
+    };
+    let consumers = Consumers::new(
+        &plane,
+        WorkerPool::start_consumers("jobs", &pool_config).expect("the consumer boots"),
+        Duration::from_secs(60),
+        2,
+    );
+    assert_eq!(
+        consumers.pipelines(),
+        vec!["emails"],
+        "one pipeline is polled"
+    );
+
+    // Push four jobs with distinct tasks, and give them ids we can look for again.
+    let push = |task: &str| {
+        volucer_jobs::Driver::push(&*driver, "emails", volucer_jobs::Pushed::new(task))
+            .expect("pushed")
+    };
+    let ok_id = push("ok");
+    let retry_id = push("retry");
+
+    // One pass: every ready job is reserved, handed to the consumer, and settled.
+    let handled = consumers.poll_once().expect("the pass succeeds");
+    assert_eq!(handled, 2, "both jobs were handed to the consumer");
+
+    // **The queue is the thing asked what happened**, which is what makes this about the reservation.
+    assert_eq!(
+        volucer_jobs::Driver::size(&*driver, "emails").expect("size"),
+        1,
+        "the requeued job is ready again and the acknowledged one is gone"
+    );
+    assert_eq!(
+        volucer_jobs::Driver::in_flight(&*driver, "emails").expect("in flight"),
+        0,
+        "and neither is still reserved, so both reservations were settled"
+    );
+
+    // The requeued job comes back as attempt two, and this time the consumer acknowledges it.
+    let handled = consumers.poll_once().expect("the second pass succeeds");
+    assert_eq!(handled, 1, "only the requeued job was ready");
+    assert_eq!(
+        volucer_jobs::Driver::size(&*driver, "emails").expect("size"),
+        0,
+        "and this time it was acknowledged, so the queue is empty"
+    );
+    let (acked, requeued, rejected) = consumers.counts();
+    assert_eq!(
+        (acked, requeued, rejected),
+        (2, 1, 0),
+        "one requeue on the first attempt and two acknowledgements"
+    );
+    let _ = ok_id;
+
+    // A rejected job is **acknowledged from the queue's point of view**: it does not come back, and it is
+    // not recorded as a failure of the reservation. This is the arm whose opposite — nacking — would bring
+    // a poisoned job back for ever, and it is the one nothing else in the tree tests.
+    let poison_id = push("poison");
+    assert_eq!(consumers.poll_once().expect("the pass succeeds"), 1);
+    assert_eq!(
+        volucer_jobs::Driver::size(&*driver, "emails").expect("size"),
+        0,
+        "a rejected job is gone rather than requeued, which is what stops a poison job looping"
+    );
+    assert_eq!(
+        consumers.counts(),
+        (2, 1, 1),
+        "and it is counted as rejected"
+    );
+    let _ = (retry_id, poison_id);
+
+    // The consumer's own telemetry reached the pool's scrape queue rather than being dropped: a job has no
+    // response object to carry it, so this is the path that only exists for consumers. The scrape is
+    // asserted to *run*, because a consumer pool that published nothing would be a `[metrics]` table with
+    // three worker gauges missing and no error anywhere.
+    let pool = consumers.pool();
+    let registry = volucer_metrics::Registry::new();
+    volucer_metrics::http::describe(&registry);
+    pool.publish_metrics(&registry);
+    assert!(
+        registry.render().contains("rr_http_total_workers"),
+        "a consumer pool publishes the same worker gauges a request pool does, so one scrape describes \
+         both: {}",
+        registry.render()
+    );
+    assert_eq!(
+        pool.jobs_served(),
+        4,
+        "the pool counted every job it handed over — two, then the requeued one, then the poison — through \
+         the same counter a request pool counts requests with"
+    );
+}
+
 /// A worker pushes a job through the `jobs` namespace, over a real channel, into a real pipeline.
 ///
 /// The fourth instance of the end-to-end obligation (`set_call_handler`, `build_stores`, `build_locks`,
@@ -2017,12 +2221,10 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
     // end-to-end test rather than a call-plane test: the job the worker pushed is really in a queue, and
     // it carries what the worker sent.
     let queues = dispatcher.queues().expect("the [jobs] table built a plane");
-    let consumed = queues.consumed();
-    let (_, emails) = consumed
-        .iter()
-        .find(|(name, _)| *name == "emails")
-        .expect("emails is a pipeline");
-    let reserved = volucer_jobs::Driver::reserve(&**emails, "emails", 1, Duration::from_secs(60))
+    let emails = queues
+        .driver("emails")
+        .expect("emails is a pipeline this deployment configured");
+    let reserved = volucer_jobs::Driver::reserve(&*emails, "emails", 1, Duration::from_secs(60))
         .expect("reserved");
     assert_eq!(reserved.len(), 1, "the pushed job must be reservable");
     assert_eq!(reserved[0].job.task, "App\\Jobs\\SendEmail");

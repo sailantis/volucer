@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
-use volucer_worker::{BoundedChannel, MessageType, WorkerError};
+use volucer_worker::{Ack, BoundedChannel, JobHeader, MessageType, WorkerError};
 
 /// Both directions of one worker's pipes, buffered.
 ///
@@ -31,6 +31,15 @@ pub(super) enum Exchange {
     /// on a timeout the thread outlives the call that made it. So the pool serializes the head and
     /// sends the bytes, and the worker cannot tell which side of the boundary encoded them.
     Request { head: Vec<u8>, body: Vec<u8> },
+    /// Send one job and collect the consumer's terminal answer.
+    ///
+    /// The head arrives **already built** rather than already encoded, and the asymmetry with
+    /// [`Exchange::Request`] is the reason the two are separate variants instead of one with a flag:
+    /// a request head borrows a CGI environment and therefore *must* cross this boundary as bytes,
+    /// while a job head is built from a driver's `Reserved` and owns everything in it. Encoding it
+    /// here costs nothing extra and keeps `volucer-worker` the only place that knows the job frame's
+    /// shape.
+    Job { head: JobHeader, body: Vec<u8> },
     /// Send one frame from an already-encoded payload.
     Send {
         message_type: MessageType,
@@ -45,20 +54,29 @@ impl Exchange {
     ///
     /// `on_stage` is called as the request moves from writing to reading, so a
     /// failure can be attributed to the half it happened in. Only
-    /// [`Exchange::Request`] has two phases; every other exchange reports `Reading`
-    /// once, because a control or a frame write has nothing to read and its result
+    /// [`Exchange::Request`] and [`Exchange::Job`] have two phases; every other exchange reports
+    /// `Reading` once, because a control or a frame write has nothing to read and its result
     /// is not retried.
     fn run(
         self,
         channel: &mut Channel,
         on_stage: &mut dyn FnMut(RequestStage),
-    ) -> std::result::Result<Option<WorkerResponse>, WorkerError> {
+    ) -> std::result::Result<Option<Completed>, WorkerError> {
         match self {
             Exchange::Request { head, body } => {
                 // The stage is reported by the channel as it moves from writing to reading, which
                 // is the only place that can know where a failure happened.
                 let result = channel.request_encoded(head, &body, &mut *on_stage);
-                result.map(Some)
+                result.map(|response| Some(Completed::Response(response)))
+            }
+            Exchange::Job { head, body } => {
+                let result = channel.job(head, &body, &mut *on_stage);
+                // The telemetry the consumer emitted while handling the job travels back with the
+                // answer, drained from the channel's lifetime buffer. A request finds its records on
+                // the response object; a job has no response object, so without this they would sit
+                // in the channel until the consumer was recycled — which is exactly when a scrape can
+                // no longer see them.
+                result.map(|ack| Some(Completed::Job(ack, channel.take_metrics())))
             }
             Exchange::Send {
                 message_type,
@@ -72,6 +90,24 @@ impl Exchange {
             }
         }
     }
+}
+
+/// What one exchange produced.
+///
+/// An enum rather than a generic because the exchange thread is one thread per worker for that
+/// worker's whole life, and it is created by `start` before anybody knows which exchange it will be
+/// asked to run first. So the *thread* is not generic and this is: the answer travels as a value, and
+/// the two callers destructure the variant they asked for. A caller that finds the other one has a bug
+/// in this file, not a protocol condition, which is why both arms report it as a closed worker.
+enum Completed {
+    Response(WorkerResponse),
+    /// The consumer's answer, and the telemetry it emitted while producing it.
+    ///
+    /// The records travel *with* the answer rather than being fetched later, because the buffer lives
+    /// inside the exchange thread and the pool has no other way to reach it. A request path gets the
+    /// same records on `WorkerResponse`; a job has no such object, so the exchange brings them back
+    /// itself.
+    Job(Ack, Vec<volucer_worker::MetricRecord>),
 }
 
 /// A worker's pipes, and the thread that owns them.
@@ -111,7 +147,7 @@ pub(super) struct ChannelExchange {
 ///
 /// A failure carries the [`RequestStage`] it happened in, because that is what says
 /// whether the request could have been delivered.
-type Answer = std::result::Result<Option<WorkerResponse>, (RequestStage, WorkerError)>;
+type Answer = std::result::Result<Option<Completed>, (RequestStage, WorkerError)>;
 
 impl ChannelExchange {
     /// Start the exchange thread that owns a freshly handshaken worker's pipes.
@@ -176,12 +212,42 @@ impl ChannelExchange {
         };
 
         match self.round_trip(exchange, timeout) {
-            Ok(Some(response)) => Ok(response),
-            // `request` always answers with a response, so a `None` here would be
-            // the thread misbehaving rather than a protocol condition.
-            Ok(None) => Err((
+            Ok(Some(Completed::Response(response))) => Ok(response),
+            // `request` always answers with a response, so a `None` — or a job's answer arriving for
+            // a request — would be the thread misbehaving rather than a protocol condition.
+            Ok(_) => Err((
                 RequestStage::Reading,
                 WorkerError::Closed("the exchange thread answered without a response".to_string()),
+            )),
+            Err(failure) => Err(failure),
+        }
+    }
+
+    /// Hand one job to a consumer and wait for its terminal answer.
+    ///
+    /// The same shape as `request` — post an exchange, wait on a channel, let the timeout be the
+    /// caller's — because there is one exchange thread per worker and it runs whichever exchange it
+    /// is told to. That is the point of the design: a job is not a second thread, a second pipe or a
+    /// second protocol; it is one more thing the same thread can be asked to do.
+    pub fn job(
+        &mut self,
+        head: JobHeader,
+        body: &[u8],
+        timeout: Duration,
+    ) -> std::result::Result<(Ack, Vec<volucer_worker::MetricRecord>), (RequestStage, WorkerError)>
+    {
+        let exchange = Exchange::Job {
+            head,
+            body: body.to_vec(),
+        };
+
+        match self.round_trip(exchange, timeout) {
+            Ok(Some(Completed::Job(ack, metrics))) => Ok((ack, metrics)),
+            Ok(_) => Err((
+                RequestStage::Reading,
+                WorkerError::Closed(
+                    "the exchange thread answered a job without an outcome".to_string(),
+                ),
             )),
             Err(failure) => Err(failure),
         }
@@ -214,10 +280,10 @@ impl ChannelExchange {
             .map_err(|(_, source)| source)?
         {
             // `Send` writes a frame and reads nothing, so its answer carries no
-            // response and never can.
+            // completion and never can.
             None => Ok(()),
             Some(_) => Err(WorkerError::Closed(
-                "the exchange thread answered a frame write with a response".to_string(),
+                "the exchange thread answered a frame write with a completion".to_string(),
             )),
         }
     }
@@ -243,7 +309,7 @@ impl ChannelExchange {
         &mut self,
         exchange: Exchange,
         timeout: Duration,
-    ) -> std::result::Result<Option<WorkerResponse>, (RequestStage, WorkerError)> {
+    ) -> std::result::Result<Option<Completed>, (RequestStage, WorkerError)> {
         // Fail fast once the thread is known to be gone. Without this the send below
         // would succeed — the sender is still alive, only the answer end is closed —
         // and the call would block until the timeout for a worker that cannot answer.

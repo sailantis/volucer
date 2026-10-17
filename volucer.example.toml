@@ -498,11 +498,22 @@ base_port = 19001
 # acknowledged. It is for work that can be regenerated. A queue that has to
 # survive a restart needs a driver with a server behind it.
 #
-# jobs.pool configures the consumers. `job_lease_seconds` is the one setting that
-# must be longer than a job takes: a lease that runs out while the work is still
-# running means a second consumer picks the job up and it happens twice. There is
-# no way to detect that from here, which is why it is a number an operator sets
-# rather than one the server guesses.
+# jobs.pool configures the consumers. The command is a *consumer*, which is the
+# consumer example in the PHP SDK rather than a request worker: it boots once and
+# keeps whatever it booted -- a connection pool, a container, a warm cache --
+# across every job it handles, where a request worker resets per-request state
+# between requests. The two are told apart by the frame the work arrives in, so
+# pointing this at the wrong one is refused by name rather than served wrongly.
+#
+# `job_lease_seconds` is the one setting that must be longer than a job takes: a
+# lease that runs out while the work is still running means a second consumer
+# picks the job up and it happens twice. There is no way to detect that from
+# here, which is why it is a number an operator sets rather than one the server
+# guesses.
+#
+# The three keys a consumer inherits from a backend -- `checksum`, `transport`,
+# `env` -- are here because a consumer is a process: the transport is the one
+# that matters, since its default is a socket on Windows and a pipe elsewhere.
 # ---------------------------------------------------------------------------
 # [jobs]
 # consume = ["emails"]
@@ -520,3 +531,6 @@ base_port = 19001
 # memory_limit_mb = 128
 # job_lease_seconds = 300            # 5 minutes; must exceed the slowest job
 # prefetch = 1                       # one job at a time, which is what one consumer can do
+# checksum = "required"              # "optional" lets a consumer skip the per-frame crc32c
+# transport = "pipe"                 # or "socket"; the default follows the platform
+# env = { QUEUE_DATABASE = "jobs" }  # a consumer may talk to a different database

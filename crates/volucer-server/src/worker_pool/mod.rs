@@ -88,12 +88,14 @@ use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use volucer_core::config::WorkerConfig;
+use volucer_core::config::{JobsPoolConfig, WorkerConfig};
 use volucer_fcgi::{Request, Response};
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
 use volucer_worker::message::MetricRecord;
-use volucer_worker::{Control, HelloAck, MessageType, RequestHeaderJson, WorkerError, UNSOLICITED};
+use volucer_worker::{
+    Ack, Control, HelloAck, JobHeader, MessageType, RequestHeaderJson, WorkerError, UNSOLICITED,
+};
 
 mod exchange;
 mod handshake;
@@ -103,6 +105,18 @@ mod spec;
 
 /// How long a single request may take before the worker is replaced.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a single job may take before the consumer is replaced.
+///
+/// The same span as [`REQUEST_TIMEOUT`], and that is a decision rather than a copy: a job is work an
+/// application chose to do *later*, so the interesting cases are long, and the only thing this bounds is
+/// how long the pool waits before deciding the consumer is gone. It is deliberately **not** the pipeline's
+/// `job_lease_seconds` — that is how long the *queue* holds the reservation, this is how long the *pool*
+/// waits for an answer, and making them one number would mean a deployment could not give a job a lease
+/// longer than its answer timeout without also making a hung consumer look alive.
+///
+/// See `JobsPoolConfig::job_lease_seconds` in `volucer-core`.
+const JOB_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a worker has to exit after being told to, before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -353,6 +367,41 @@ impl WorkerPool {
         Self::start_with(name, config, None)
     }
 
+    /// Start a pool from a jobs pool's configuration.
+    ///
+    /// The consumers' side of `[jobs.pool]`, and it exists because that table is a
+    /// [`JobsPoolConfig`] rather than a [`WorkerConfig`] — see that type's documentation for why the
+    /// fields differ. What the two have in common is everything `WorkerPool` actually does: boot,
+    /// handshake, lease a slot, enforce a deadline by killing, recycle on a threshold. So this
+    /// translates one table into the other rather than duplicating the pool, and the translation is
+    /// the entire content of the function.
+    ///
+    /// **`max_requests` is `max_jobs`, and this is where that is said out loud.** On a consumer pool
+    /// one slot serves one job at a time, so "requests served" and "jobs handled" are the same counter
+    /// counting the same events. That is also why `after_response` — the recycling decision, which
+    /// reads that counter — needs no jobs-specific version.
+    ///
+    /// `services` is empty and always will be: a consumer's channel carries `JOB`, `ACK` and `CALL`
+    /// from the application, and the config table has no key to grant anything because there is nothing
+    /// sensible for it to grant. A consumer needing something from the server asks *through the
+    /// application*, not through its own channel.
+    pub fn start_consumers(name: &str, config: &JobsPoolConfig) -> Result<Self> {
+        Self::start_with(
+            name,
+            &WorkerConfig {
+                command: config.command.clone(),
+                workers: config.workers,
+                memory_limit_mb: config.memory_limit_mb,
+                max_requests: config.max_jobs,
+                working_dir: config.working_dir.clone(),
+                env: config.env.clone(),
+                services: Vec::new(),
+                checksum: config.checksum,
+                transport: config.transport,
+            },
+            None,
+        )
+    }
     /// Start a pool whose workers may make calls.
     ///
     /// The same pool as [`WorkerPool::start`] with a method registry installed on every worker's
@@ -663,6 +712,177 @@ impl WorkerPool {
         self.free_slots() > 0
     }
 
+    /// Hand one job to the next consumer in rotation.
+    ///
+    /// # Why this does not reuse `attempt`'s retry policy
+    ///
+    /// A request is replayed when the failure proves the application may not have run it — that is what
+    /// `may_retry` decides, from the stage and the verb. **A job has no verb**, and a stage alone is not
+    /// enough: a job that failed while `Sending` certainly did not reach the consumer, but the sensible
+    /// answer there is not "try the next consumer" either — it is to hand the job back to the pipeline,
+    /// where its `attempts` counter and its lease are the application's to reason about.
+    ///
+    /// So this reports the failure and the caller requeues. Doing it here would put a retry policy in the
+    /// server that no application asked for, and it would be one that cannot be turned off: the two
+    /// consumers of one job would be two different database transactions.
+    ///
+    /// The consumer's *fate* is still decided here, and the rule is the one a request uses: a fatal
+    /// failure drops the exchange so the slot is replaced before it serves anything else, and a
+    /// non-fatal one leaves the consumer in rotation.
+    pub fn job(&self, pipeline: &str, job: &volucer_jobs::Job) -> Result<Ack> {
+        let queued_at = Instant::now();
+        let lease = self.acquire()?;
+        let index = lease.index();
+        // The same three counters the request path charges, and for the same reason: a consumer waiting
+        // for a slot is queueing exactly as a request is, and a pool that published `requests_queue` and
+        // the wait histogram as zero for a busy consumer pool would be a graph that says there is no
+        // contention while jobs queue behind one another.
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // The same question `attempt` asks and for the same reason: a leased slot can still hold a dead
+        // consumer, and the process is the only thing that answers it.
+        if !slot.is_available() {
+            tracing::warn!(pool = %self.name, slot = index, "a consumer died; replacing it");
+            let outcome = respawn(
+                &self.name,
+                &self.spec,
+                &self.guard,
+                self.call_handler.as_ref(),
+                &mut slot,
+            );
+            drop(slot);
+            return match outcome {
+                Ok(()) => Err(ServerError::NoWorker {
+                    backend: self.name.clone(),
+                }),
+                Err(source) => Err(source),
+            };
+        }
+
+        let outcome = match invoke_job(&mut slot, pipeline, job) {
+            Ok((ack, metrics)) => {
+                self.stash_metrics(metrics);
+                ack
+            }
+            Err(AttemptError { source, .. }) => {
+                if slot.exchange.is_none() {
+                    replace(
+                        &self.name,
+                        &self.spec,
+                        &self.guard,
+                        self.call_handler.as_ref(),
+                        &mut slot,
+                    );
+                }
+                return Err(ServerError::WorkerProtocol {
+                    backend: self.name.clone(),
+                    source,
+                });
+            }
+        };
+
+        let duration = started.elapsed();
+        self.after_job(&mut slot, &outcome, duration);
+        Ok(outcome)
+    }
+
+    /// Hand one job back to its pipeline, whatever the reason.
+    ///
+    /// A free function rather than a method on the driver, because "requeue" means the same thing to
+    /// every driver and a driver that could refuse it would be a driver whose `nack` is an error the
+    /// caller cannot act on. The error is returned rather than logged so the caller can decide whether
+    /// the *failure to requeue* is worth more than the failure that caused it.
+    pub fn requeue(
+        driver: &dyn volucer_jobs::Driver,
+        pipeline: &str,
+        reservation: &str,
+    ) -> Result<()> {
+        driver
+            .nack(pipeline, reservation)
+            .map_err(|source| ServerError::JobHandoff {
+                reason: source.to_string(),
+            })
+    }
+
+    /// Decide what a completed job means for the consumer that produced it.
+    ///
+    /// The counterpart of [`WorkerPool::after_response`], and it deliberately shares its *rules* rather
+    /// than its code: the three recycling signals are the same three (the consumer asked, a count was
+    /// reached, memory went over a limit), and reading them from an `Ack` instead of an `END` is the whole
+    /// difference. The per-slot counter it reads is the same one — a slot serves one job at a time, so
+    /// "served" is "handled" for a consumer pool, which is why `max_jobs` and `max_requests` are the same
+    /// threshold under two names.
+    ///
+    /// `duration` is passed in rather than taken from the `Ack`: the figure a worker reports is the
+    /// application's own time, and the pool's is the same span measured from this side. The pool's is
+    /// what a recycle threshold on *slow work* would be built from, and it is not used for one today.
+    fn after_job(&self, slot: &mut Slot, ack: &Ack, duration: Duration) {
+        slot.served += 1;
+        slot.peak_memory_bytes = ack.peak_memory_bytes;
+
+        let mut recycle = if ack.keep_alive {
+            None
+        } else {
+            Some("the consumer asked to be recycled")
+        };
+
+        if recycle.is_none() {
+            if let Some(max) = self.max_requests {
+                // `max_jobs` in the configuration, and `0` means never — the same rule the request
+                // pool documents at length, and the same reason it is not a bare comparison.
+                if max > 0 && slot.served >= max {
+                    recycle = Some("max_jobs");
+                }
+            }
+        }
+
+        if recycle.is_none() {
+            if let Some(limit) = self.memory_limit_bytes {
+                if slot.peak_memory_bytes > limit {
+                    recycle = Some("memory_limit_mb");
+                }
+            }
+        }
+        if let Some(reason) = recycle {
+            tracing::debug!(
+                pool = %self.name,
+                pid = slot.child.id(),
+                reason,
+                duration_us = duration.as_micros() as u64,
+                "recycling a consumer"
+            );
+            replace(
+                &self.name,
+                &self.spec,
+                &self.guard,
+                self.call_handler.as_ref(),
+                slot,
+            );
+        }
+    }
+
+    /// Jobs this pool has handed to its consumers.
+    ///
+    /// The same counter [`WorkerPool::requests_served`] reads, reported under the name that is true for a
+    /// consumer pool. One counter rather than two, because `job` charges exactly what `attempt` charges —
+    /// a slot wait, a bucket and a served count — and a second counter would be one more thing that can
+    /// disagree with the recycling decision, which reads this one.
+    pub fn jobs_served(&self) -> u64 {
+        self.served.load(Ordering::Relaxed)
+    }
+
     /// Publish this pool's gauges into a metrics registry.
     ///
     /// One call at one moment, so the numbers a scrape reads are one picture of the pool: the parts
@@ -882,6 +1102,24 @@ impl WorkerPool {
         let duration = started.elapsed();
         self.after_response(&mut slot, &response);
         Ok(render(response, duration))
+    }
+
+    /// Move a consumer's telemetry into the pool's queue for the next scrape.
+    ///
+    /// The records are taken from the *exchange's* answer rather than read off a response, because a job
+    /// has no response object to carry them: the request path finds its records on `WorkerResponse` and
+    /// this one is handed them. Drained rather than copied, which is what bounds the queue — a worker
+    /// emitting one sample per job is bounded by the jobs it handles, but one emitting a sample per loop
+    /// iteration is not, and a buffer that only grew would be a leak wearing a feature's name.
+    fn stash_metrics(&self, records: Vec<MetricRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.extend(records);
     }
 
     /// Replace the worker in a slot, for an operator or a test.
@@ -1222,6 +1460,57 @@ fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerRespo
             // and neither alone is enough. See `may_retry`.
             Err(AttemptError {
                 retryable: may_retry(stage, request),
+                source,
+            })
+        }
+    }
+}
+
+/// Run one job on a consumer, putting the slot back into rotation if the pipes survived.
+///
+/// The counterpart of [`invoke`], and it deliberately does not compute a `retryable` flag: a job has no
+/// verb, so there is no "would running this twice matter?" to ask — see [`WorkerPool::job`] for why the
+/// answer for a job belongs to the pipeline's lease rather than to this function.
+fn invoke_job(
+    slot: &mut Slot,
+    pipeline: &str,
+    job: &volucer_jobs::Job,
+) -> std::result::Result<(Ack, Vec<MetricRecord>), AttemptError> {
+    let head = JobHeader {
+        pipeline: pipeline.to_string(),
+        id: job.id.clone(),
+        task: job.task.clone(),
+        headers: job
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        attempts: job.attempts,
+        // Stamped by the channel from the bytes it frames; this is the value it will overwrite.
+        body_len: 0,
+        traceparent: job.header("traceparent").map(str::to_string),
+    };
+
+    let result = match slot.exchange.as_mut() {
+        Some(exchange) => exchange.job(head, &job.payload, JOB_TIMEOUT),
+        // A slot is only chosen while it has an exchange, so this cannot happen; reported rather than
+        // panicked, for the same reason `invoke` reports it.
+        None => Err((
+            RequestStage::Sending,
+            WorkerError::Closed("the consumer has no exchange".to_string()),
+        )),
+    };
+
+    match result {
+        Ok(answer) => Ok(answer),
+        Err((stage, source)) => {
+            if source.is_fatal() {
+                // The stream has desynchronised, or the consumer is gone. Either way this slot must not
+                // serve again until it is replaced, and `Slot::exchange` is what records that.
+                slot.terminate();
+            }
+            Err(AttemptError {
+                retryable: matches!(stage, RequestStage::Sending),
                 source,
             })
         }

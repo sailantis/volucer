@@ -462,6 +462,59 @@ impl JobOutcome {
     }
 }
 
+/// The terminal frame of a `JOB` exchange: what the consumer decided, and what it cost.
+///
+/// # Why this wraps [`JobOutcome`] rather than being it
+///
+/// Because a job has no `END` frame, and the three things `END` carries are the three things the
+/// pool recycles on: `peak_memory_bytes` against `memory_limit_mb`, `keep_alive` for a consumer that
+/// asks to be replaced, and `duration_us` for the profile. A job exchange that reported only the
+/// outcome would make `[jobs.pool] memory_limit_mb` a setting the configuration accepts and nothing
+/// reads — which is worse than not offering it, because an operator would have no way to tell.
+///
+/// Flattened rather than nested for a wire reason: the frame already says it is an `ACK`, so an
+/// envelope inside it would be a second copy of the same fact, and flattening keeps the JSON
+/// `{"outcome":"ack","peak_memory_bytes":…}` rather than adding a level that every reader has to
+/// traverse. Adding these fields is additive in the protocol's sense — a consumer that does not know
+/// them sends an object the server reads with defaults, and the pool then recycles on memory limits it
+/// cannot see, which is exactly what a worker that does not report does today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    /// Whether the job was handled, should be retried, or was given up on.
+    ///
+    /// The only field that decides something the *server* does; the rest are what it reports.
+    #[serde(flatten)]
+    pub outcome: JobOutcome,
+    /// The consumer's peak resident set in bytes, for `memory_limit_mb`.
+    ///
+    /// Per job and not per process, for the reason `RequestEnd::peak_memory_bytes` documents: the SDK
+    /// resets PHP's high-water mark after reading it, so this describes the job that just finished.
+    #[serde(default)]
+    pub peak_memory_bytes: u64,
+    /// Whether this consumer is willing to handle another job.
+    ///
+    /// A consumer that reports `false` is replaced rather than reused — the same signal as
+    /// `RequestEnd::keep_alive`, and the mechanism an application uses when it has put itself into a
+    /// state it cannot clean up. **Defaulting to `true`**, so a consumer that says nothing is reused:
+    /// the fail-safe direction is the one that does not silently recycle a worker on every job.
+    #[serde(default = "default_true")]
+    pub keep_alive: bool,
+    /// How long the application spent handling the job, in microseconds.
+    #[serde(default)]
+    pub duration_us: u64,
+}
+
+impl Default for Ack {
+    fn default() -> Self {
+        Ack {
+            outcome: JobOutcome::Ack,
+            peak_memory_bytes: 0,
+            keep_alive: default_true(),
+            duration_us: 0,
+        }
+    }
+}
+
 /// A description of a failure, used in `Error` frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorReport {

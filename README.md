@@ -987,15 +987,25 @@ exporter layer on top of the above — `tracing-opentelemetry` plus `opentelemet
 and RoadRunner defaults to the same transport for the same reason). Doing it in that order is what
 makes it a layer rather than a rewrite.
 
-There is also **no external services yet beyond KV and locks**: no job queue, no gRPC, and no way to
+There is also **no external services yet beyond KV, locks and queues**: no gRPC, and no way to
 tell a running server anything other than a signal. A worker can now reach a **key-value storage**
-(`[kv.<name>]`, memory or Redis) and a **lock backend** (`[lock]`, memory) through the call plane,
-which is the `CALL`/`RETURN` pair on the worker channel — a frame a worker writes *unprompted*,
-mid-request, and the server answers. Both are off until a backend's `services` list names them, so
-the default deployment's workers can reach nothing.
-[docs/plugins.md](./docs/plugins.md) is the design for the rest — jobs, metrics, gRPC, and a
+(`[kv.<name>]`, memory or Redis), a **lock backend** (`[lock]`, memory or Redis), and the
+**queues** (`[jobs]`, memory) through the call plane, which is the `CALL`/`RETURN` pair on the worker
+channel — a frame a worker writes *unprompted*, mid-request, and the server answers. All of them are
+off until a backend's `services` list names them, so the default deployment's workers can reach
+nothing.
+[docs/plugins.md](./docs/plugins.md) is the design for the rest — metrics, gRPC, and a
 separate, cheaper track for running Django and Rails as supervised HTTP origins — and its step table
 records what is built.
+
+**The queues are the one service with a second side.** Everything above is a worker asking the server
+for something; a queue also has the server *giving* work to a process. That is a second exchange on
+the same channel — `JOB` in, `ACK` back — and the same pool that supervises request workers
+supervises consumers, with the same recycling rules. A consumer is told apart from a request worker by
+the frame the work arrives in, because the difference an application has to know is whether its own
+state is reset between units of work: a request worker resets, a consumer does not. See
+[docs/worker-protocol.md](./docs/worker-protocol.md) and `example/consumer.php` in the
+[PHP SDK](https://github.com/sailantis/volucer-php-sdk).
 
 **Locks are not a correctness primitive**, and the API is shaped so that an application can be
 correct about that rather than only warned: a TTL lock has no fencing token, so a worker that stalls
