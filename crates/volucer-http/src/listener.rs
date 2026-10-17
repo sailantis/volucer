@@ -1336,11 +1336,24 @@ async fn upstream(
         cleartext,
     );
 
-    let answer = front_end
+    // A gRPC call, so a failure has to be reported the way gRPC reports one: HTTP 200 with a status
+    // in the trailers, never an HTTP error status. See `grpc_failure`.
+    let is_grpc = volucer_upstream::is_grpc(&request.headers);
+
+    let answer = match front_end
         .dispatcher
         .dispatch_upstream(backend, request)
         .await
-        .map_err(map_server_error)?;
+    {
+        Ok(answer) => answer,
+        Err(err) => {
+            return Err(if is_grpc {
+                grpc_failure(err)
+            } else {
+                map_server_error(err)
+            })
+        }
+    };
 
     let answer = volucer_upstream::translate_response(answer);
 
@@ -1537,7 +1550,26 @@ fn from_cgi(response: volucer_fcgi::Response) -> Result<Response<ResponseBody>> 
 }
 
 /// A plain-text error page for a failure that never reached the application.
+///
+/// **Except for a gRPC call, whose failure must not be an error page at all.** A gRPC client reads the
+/// outcome from the trailer section, so an HTML or plain-text body under a `502` is unreadable to it
+/// — it reports "unexpected HTTP status" and the failure this server is trying to report is lost. So
+/// the one case where the status is in the trailers produces a `200` with a trailer-carrying body,
+/// and everything else produces the page it always did.
 fn error_response(err: &HttpError) -> Response<ResponseBody> {
+    if let HttpError::Grpc { status, .. } = err {
+        let (code, headers, body) = volucer_upstream::grpc_error(*status);
+        let mut builder = Response::builder().status(code);
+        for (name, value) in headers.iter() {
+            builder = builder.header(name, value);
+        }
+        // The body yields no data frames and then the trailers — which is why it has to be boxed as
+        // an `UnsyncBoxBody` like every other response body here rather than assembled from bytes.
+        return builder
+            .body(ResponseBody::new(body))
+            .expect("a trailer-carrying gRPC failure is a valid response");
+    }
+
     let body = format!("{}\n", err);
     Response::builder()
         .status(err.status())
@@ -1560,6 +1592,56 @@ fn map_server_error(err: ServerError) -> HttpError {
         HttpError::Overloaded
     } else {
         HttpError::BadGateway(err.to_string())
+    }
+}
+
+/// A failed gRPC call, mapped to the status a gRPC client can actually read.
+///
+/// The mapping is a *refusal* rather than a translation, and that is the whole point: a gRPC client
+/// reads the outcome from the trailer section, so every one of `map_server_error`'s statuses —
+/// 502, 503, 504 — is unreadable to it. It would report "unexpected HTTP status 502" and the
+/// operator would have no way to tell a dead origin from a slow one. So the status travels where the
+/// client looks for it, and the HTTP status is a plain 200.
+///
+/// **A proxy can only determine a few of the sixteen codes**, which is why [`GrpcStatus`] has the
+/// variants it has and no more:
+///
+/// - An origin that could not be **reached**, and one that was reached but did not answer in time,
+///   are both [`GrpcStatus::Unavailable`]. That is the code the specification defines as *transient*
+///   and the one a client is permitted to retry, and it is the honest answer: the call did not fail,
+///   the transport did. `DEADLINE_EXCEEDED` would be wrong — that code is reserved for a deadline the
+///   *caller* set, and this server imposes none on an upstream of its own.
+/// - A full pool is also `UNAVAILABLE`, for the same reason: transient, and a retry is the correct
+///   response. `RESOURCE_EXHAUSTED` is the other candidate and is wrong, because that code is about
+///   the *caller's* quota.
+/// - A route that reaches no HTTP origin at all — a gRPC client sent to a `worker` or CGI backend —
+///   is [`GrpcStatus::Unimplemented`], which is what a gRPC client expects from a server that does
+///   not serve the method it asked for. Not transient, so a client does not retry it.
+/// - Anything else is [`GrpcStatus::Internal`]: the origin answered and the answer was the problem,
+///   so a retry would get the same thing.
+///
+/// The distinction is deliberately *not* the 502/504 one. That split exists to tell an operator which
+/// component to look at; this one exists to tell a client whether retrying can help.
+fn grpc_failure(err: ServerError) -> HttpError {
+    let status = match &err {
+        // A route with no HTTP path at all — a gRPC client hitting a `worker` or CGI backend. That is
+        // literally what gRPC's `UNIMPLEMENTED` means: this server does not implement the service
+        // asked for. It is the code a client expects from a server that does not serve a method, and
+        // it is *not* transient, so a client does not retry it.
+        ServerError::WrongProtocol { .. } => volucer_upstream::GrpcStatus::Unimplemented,
+        // Transient failures, and the three the specification gives a client permission to retry.
+        _ if err.is_timeout() || err.is_busy() || err.is_unreachable_upstream() => {
+            volucer_upstream::GrpcStatus::Unavailable
+        }
+        // The origin answered, and the answer was the problem.
+        _ => volucer_upstream::GrpcStatus::Internal,
+    };
+    // The reason goes to the log in full — this is the only place it survives, since `grpc-message`
+    // carries a fixed string a client could act on and this does not.
+    tracing::warn!(%err, status = status.name(), "a gRPC call failed");
+    HttpError::Grpc {
+        status,
+        source: Box::new(map_server_error(err)),
     }
 }
 

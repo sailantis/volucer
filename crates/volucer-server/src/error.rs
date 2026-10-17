@@ -172,6 +172,23 @@ impl ServerError {
             ServerError::NoWorker { .. } | ServerError::AllBusy { .. }
         )
     }
+
+    /// Whether an HTTP origin could not be reached at all.
+    ///
+    /// Distinct from [`ServerError::is_timeout`] and [`ServerError::is_busy`] because a gRPC failure
+    /// maps the three differently: a timeout and a full pool are both `UNAVAILABLE` (transient, and
+    /// what a client may retry), while an origin that answered and answered badly is `INTERNAL`.
+    /// A refused connection is `Unreachable` upstream, which is neither busy nor a timeout — and
+    /// mapping it to `INTERNAL` would be telling a client not to retry a network blip.
+    pub fn is_unreachable_upstream(&self) -> bool {
+        match self {
+            ServerError::Upstream { source, .. } => source.is_unreachable(),
+            // A `WrongProtocol` means the route resolved to a backend with no HTTP path, so the
+            // origin was never dialled. Reported as *not* unreachable: it is a configuration
+            // mistake, and `UNAVAILABLE` would invite a client to retry for ever.
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ServerError>;

@@ -45,6 +45,24 @@ impl UpstreamError {
     pub fn is_timeout(&self) -> bool {
         matches!(self, UpstreamError::Timeout)
     }
+
+    /// Whether the origin could not be *reached* at all, as opposed to reached and unusable.
+    ///
+    /// Its own predicate because a gRPC failure has to distinguish the two and the 502/504 split does
+    /// not need to: `docs/plugins.md` §6.6's status mapping maps an unreachable origin to
+    /// `UNAVAILABLE`, which the specification defines as *transient* and which is the code a client
+    /// is allowed to retry, while an origin that answered badly is `INTERNAL` and is not. A mapping
+    /// that used `is_timeout` for this would call a refused connection `INTERNAL` and a retrying
+    /// client would never retry.
+    ///
+    /// A `BadResponse` is deliberately *not* unreachable: the origin answered, so the failure is the
+    /// origin's rather than the network's, and that is exactly the distinction a client acts on.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(
+            self,
+            UpstreamError::Unreachable(_) | UpstreamError::Timeout | UpstreamError::Io(_)
+        )
+    }
 }
 
 impl From<hyper_util::client::legacy::Error> for UpstreamError {

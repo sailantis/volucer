@@ -233,10 +233,195 @@ pub fn translate_response(response: UpstreamResponse) -> UpstreamResponse {
     }
 }
 
+/// A gRPC failure, as the wire spells one.
+///
+/// gRPC reports every outcome the same way: **HTTP 200 with a status in the trailers**, not an
+/// HTTP error status. A proxy that answers `502` for a gRPC call has produced something no gRPC
+/// client can read — the client sees an HTTP status it was not expecting and cannot map to a gRPC
+/// status code, so the failure an operator needs to see becomes "unexpected status". This type is
+/// the mapping, and it is the second of the two things `docs/plugins.md` §6.6 lists as the whole of
+/// what tier A still needed once the transport worked.
+///
+/// The numbers are the specification's, not invented here: `0` `OK`, `12` `UNIMPLEMENTED`,
+/// `13` `INTERNAL`, `14` `UNAVAILABLE`. Only four, because **these are the four a proxy can
+/// actually determine** — every other code describes something that happened inside the
+/// application, and a proxy that invented one would be lying about it. An application that wants
+/// to say `NOT_FOUND` says it in its own trailers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcStatus {
+    /// The origin could not be reached, or the connection died mid-call.
+    ///
+    /// `UNAVAILABLE` rather than `INTERNAL`, and the distinction matters to a client: the
+    /// specification defines `UNAVAILABLE` as *transient*, and it is what makes a client retry
+    /// against a different endpoint. A retryable failure reported as `INTERNAL` is a retry that
+    /// never happens.
+    Unavailable,
+    /// The origin answered, but not in a way this server can pass on — a protocol error, or a
+    /// response the pool refused.
+    Internal,
+    /// The route resolved to a backend that is not an upstream, or the origin's reply was not
+    /// gRPC at all.
+    Unimplemented,
+}
+
+impl GrpcStatus {
+    /// The numeric status, as gRPC defines it.
+    pub fn code(self) -> u8 {
+        match self {
+            GrpcStatus::Unimplemented => 12,
+            GrpcStatus::Internal => 13,
+            GrpcStatus::Unavailable => 14,
+        }
+    }
+
+    /// The status name, for a reader who is looking at a log rather than a client.
+    pub fn name(self) -> &'static str {
+        match self {
+            GrpcStatus::Unimplemented => "UNIMPLEMENTED",
+            GrpcStatus::Internal => "INTERNAL",
+            GrpcStatus::Unavailable => "UNAVAILABLE",
+        }
+    }
+
+    /// The message that travels beside the status.
+    ///
+    /// A constant rather than the failing operation's own error text, and that is a decision rather
+    /// than laziness: `grpc-message` is percent-encoded ASCII (gRPC's own specification), and an
+    /// origin's error message is arbitrary bytes which would have to be escaped or dropped. A
+    /// client cannot act on "connection refused while dialling unix:/run/app.sock" any more than on
+    /// this sentence; the operator can act on it, and the operator reads the log, where the real
+    /// reason is written in full. So the wire carries a status a client can branch on and the
+    /// **log** carries the reason a human needs.
+    pub fn message(self) -> &'static str {
+        match self {
+            GrpcStatus::Unavailable => "the origin is unreachable",
+            GrpcStatus::Internal => "the origin failed the call",
+            GrpcStatus::Unimplemented => "this route is not served by a gRPC origin",
+        }
+    }
+}
+
+/// What a gRPC request's answer should be when this server produces it rather than the origin.
+///
+/// One constructor so the three things that must agree always do: **HTTP 200**, a `content-type` a
+/// gRPC client accepts, and a trailer section carrying `grpc-status`. Any of the three alone is a
+/// client that cannot read the answer — a `502` with correct trailers is unreadable, and a `200`
+/// with the status in a *header* is unreadable too, because gRPC clients read the status from the
+/// trailer section specifically so that a streaming reply can be answered before the status exists.
+///
+/// The body is empty because a failed call has no message. That is not a placeholder: a gRPC client
+/// sees a zero-length body and a non-OK status and reports the status, which is exactly right.
+pub fn grpc_error(status: GrpcStatus) -> (hyper::StatusCode, HeaderMap, GrpcErrorBody) {
+    let mut headers = HeaderMap::new();
+    // `application/grpc` with no suffix: there is no message, so there is no encoding to name.
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    // **The declaration that makes the trailer section exist on HTTP/1.1.** hyper's h1 server writes
+    // chunked framing for an unknown-length body, but it only enables its trailer-writing path when
+    // the response carries a `Trailer` header naming the fields to come — read in
+    // `hyper-1.12.0/src/proto/h1/role.rs`, where the `TRAILER` arm is what sets
+    // `allowed_trailer_fields`. Without this header the reply is a chunked `200` whose body ends
+    // `0\r\n\r\n` with **no trailers at all**, which a gRPC client reads as a successful call with an
+    // empty message: the failure vanishes rather than being misreported, which is worse.
+    //
+    // HTTP/2 has native trailer frames and needs no declaration, so this is a no-op there — but it is
+    // legal (`RFC 9113` §8.1) and it is what makes the same response correct on both transports.
+    headers.insert(
+        hyper::header::TRAILER,
+        HeaderValue::from_static("grpc-status, grpc-message"),
+    );
+    headers.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
+    (
+        hyper::StatusCode::OK,
+        headers,
+        GrpcErrorBody {
+            trailers: Some(grpc_trailers(status)),
+        },
+    )
+}
+
+/// The trailer fields that carry a gRPC status.
+///
+/// Constructed rather than forwarded, and this is the header this tier exists to be able to write:
+/// `docs/plugins.md` §6.6 lists *"write `grpc-status` and `grpc-message` as trailers"* as the row
+/// that needs no schema, and §9.7 records that the tree had no code that constructed a trailer at
+/// all. `crates/volucer-upstream/tests/trailers.rs` had already measured the other direction — that
+/// an origin's trailers cross this proxy untouched — so this is the missing half.
+pub fn grpc_trailers(status: GrpcStatus) -> HeaderMap {
+    let mut trailers = HeaderMap::new();
+    // A number as a decimal string, not a binary integer: gRPC's trailer fields are HTTP fields, and
+    // `grpc-status` is defined as a decimal in ASCII.
+    trailers.insert(
+        "grpc-status",
+        HeaderValue::from_str(&status.code().to_string())
+            .expect("a decimal number is a header value"),
+    );
+    trailers.insert("grpc-message", HeaderValue::from_static(status.message()));
+    trailers
+}
+
+/// A body that yields no data frames and then a trailer section.
+///
+/// Forty lines, and hand-written for the reason `crate::static_files`'s `FileBody` is: the natural
+/// alternative is `http_body_util`'s adapters over a `Stream`, and the only way to build one without
+/// a new dependency is `futures` — a large tree for a type whose whole content is "empty, then two
+/// fields".
+///
+/// `poll_frame` yields `Frame::trailers` **exactly once**. `hyper` calls it again after that, and a
+/// second `Some(trailers)` would be a protocol error; returning `None` is what ends the body cleanly.
+pub struct GrpcErrorBody {
+    /// Taken on the first poll rather than cloned, so the two states are "not yet sent" and "sent".
+    trailers: Option<HeaderMap>,
+}
+
+impl hyper::body::Body for GrpcErrorBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<
+        Option<std::result::Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>>,
+    > {
+        std::task::Poll::Ready(
+            self.get_mut()
+                .trailers
+                .take()
+                .map(|trailers| Ok(hyper::body::Frame::trailers(trailers))),
+        )
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // The body ends after the trailers, and `hyper` reads this to decide whether to keep the
+        // connection — so it has to disagree with "no frames yet", not with "nothing to say".
+        self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.trailers.is_none() {
+            // Everything has been yielded, so the length really is zero and saying so lets hyper
+            // frame it exactly.
+            return hyper::body::SizeHint::with_exact(0);
+        }
+        // **Unknown, not zero, and a `with_exact(0)` here silently loses the trailers.** This is the
+        // bug this test exists for: with an exact hint, hyper's HTTP/1.1 server concluded the body was
+        // complete, wrote `Content-Length: 0` and never polled for a trailer section at all — so a
+        // gRPC client got a `200` with no `grpc-status` anywhere and read it as an empty successful
+        // call. An unknown length is what makes hyper choose chunked framing, which is the only
+        // framing HTTP/1.1 has for a trailer section. (HTTP/2 needs no chunking, so this costs
+        // nothing there.)
+        hyper::body::SizeHint::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use http_body_util::{BodyExt, Empty};
+    use hyper::body::Body as _;
     use hyper::header::{CONNECTION, EXPECT, TRANSFER_ENCODING, UPGRADE};
     use std::net::IpAddr;
 
@@ -327,6 +512,119 @@ mod tests {
         // needs to know rather than a copy of the characters that arrived.
         let outgoing = request(HeaderMap::new()).headers;
         assert_eq!(values(&outgoing, "te"), vec!["trailers".to_string()]);
+    }
+
+    #[test]
+    fn a_grpc_failure_is_http_200_with_the_status_in_the_trailers() {
+        // The mapping `docs/plugins.md` §6.6 calls the whole of tier A's remaining work. Every
+        // assertion here is a different way for a gRPC client to be unable to read the answer:
+        //
+        // - a `502` is unreadable, because gRPC reports outcomes in trailers and the client never
+        //   sees one under an HTTP error status;
+        // - a status in a *header* rather than a trailer is unreadable for a streamed reply, which
+        //   is the case the trailer convention exists for;
+        // - a `content-type` that is not `application/grpc` makes a client reject the reply before
+        //   it ever looks at the status.
+        let (status, headers, body) = grpc_error(GrpcStatus::Unavailable);
+
+        assert_eq!(status, hyper::StatusCode::OK, "a gRPC failure is HTTP 200");
+        assert_eq!(
+            headers.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "application/grpc",
+            "or a client will not read it as gRPC at all"
+        );
+
+        // The trailer section, read off the body rather than inspected as a field: the question is
+        // what a client receives, and a `HeaderMap` this function also returned could agree with a
+        // body that yields nothing.
+        let frames = tokio_test_block_on(collect_frames(body));
+        assert_eq!(frames.data, 0, "a failed call carries no message");
+        let trailers = frames.trailers.expect("the status must be in the trailers");
+        assert_eq!(
+            trailers.get("grpc-status").map(|v| v.to_str().unwrap()),
+            Some("14"),
+            "UNAVAILABLE is 14, and it is the code the specification lets a client retry. Got \
+             {trailers:?}, which is either no status at all or the wrong one"
+        );
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "the origin is unreachable"
+        );
+
+        // The control: the same call with a status an origin would send, so the mapping is a mapping
+        // rather than one hard-coded answer.
+        let (_, _, body) = grpc_error(GrpcStatus::Unimplemented);
+        let trailers = tokio_test_block_on(collect_frames(body))
+            .trailers
+            .expect("trailers");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "12");
+
+        // And no status is spelled as a *name*: `grpc-status` is defined as a decimal in ASCII, and
+        // a client parsing `UNAVAILABLE` would fail or, worse, read a number out of it.
+        for status in [
+            GrpcStatus::Unavailable,
+            GrpcStatus::Internal,
+            GrpcStatus::Unimplemented,
+        ] {
+            let code = status.code().to_string();
+            assert!(
+                code.parse::<u8>().is_ok(),
+                "{} must be a decimal, not a name",
+                status.name()
+            );
+        }
+    }
+
+    /// The frames a body yields, collected without an executor.
+    ///
+    /// `Waker::noop()` rather than a hand-written no-op waker, which is a clippy error now
+    /// (`manual_noop_waker`) and was three lines of code doing what one call does.
+    ///
+    /// A hand-rolled `block_on` at all because the crates that would provide one — `futures`, tokio's
+    /// `test-util` — are not dependencies of this crate, and the async work here is a `poll_frame`
+    /// that is `Ready` on its first call. That is worth stating: a helper that silently needed an
+    /// executor would hide the fact that this body never awaits.
+    fn tokio_test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("this body must never be pending"),
+        }
+    }
+
+    /// What a body actually yields: the data bytes and the trailer fields, separately.
+    struct Frames {
+        data: usize,
+        trailers: Option<HeaderMap>,
+    }
+
+    /// Collect `GrpcErrorBody` specifically rather than any `Body`.
+    ///
+    /// Concrete rather than generic because the generic version needs `Data: Buf` and `Error:
+    /// Display` bounds that only this one type satisfies here — and a helper that had to be
+    /// *more* general than its one caller would be a helper nobody could use again anyway.
+    async fn collect_frames(body: GrpcErrorBody) -> Frames {
+        let mut data = 0;
+        let mut trailers = None;
+        let mut body = Box::pin(body);
+        loop {
+            let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
+            match frame {
+                None => break,
+                Some(Ok(frame)) => {
+                    if let Some(chunk) = frame.data_ref() {
+                        data += chunk.len();
+                    }
+                    if let Ok(fields) = frame.into_trailers() {
+                        assert!(trailers.is_none(), "trailers are yielded exactly once");
+                        trailers = Some(fields);
+                    }
+                }
+                Some(Err(err)) => panic!("the body must not fail: {err}"),
+            }
+        }
+        Frames { data, trailers }
     }
 
     #[test]

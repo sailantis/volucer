@@ -2122,6 +2122,121 @@ origin = "http://{}"
     }
 }
 
+/// **A failed gRPC call is a `200` with the status in the trailers, not a `502`.**
+///
+/// The mapping `docs/plugins.md` §6.6 lists as the remaining half of tier A, driven through the
+/// deployment's entry point: a real listener, a real request, and a backend whose origin is
+/// deliberately not there.
+///
+/// Both halves in one test, and the contrast is the point. A plain HTTP request to the same dead
+/// origin *must* still be a `502` — that is the status every proxy answers and every client and
+/// operator expects. A gRPC request to it must be a `200`, because a gRPC client reads the outcome
+/// from the trailer section and an HTTP error status is invisible to it: it would report
+/// "unexpected status 502" and the failure volucer is trying to report would be lost.
+///
+/// The chunked framing is asserted rather than assumed, because there is nowhere else for the
+/// trailers to travel: a `200` with `content-length` and no `Transfer-Encoding` is a reply a gRPC
+/// client cannot read the status out of, and it would look like a successful call with no message.
+#[test]
+fn a_failed_grpc_call_is_a_200_with_the_status_in_the_trailers() {
+    let origin = Origin::start(OriginBehaviour::EchoLength);
+    // The port is taken and then released, so nothing is listening — an origin that cannot be
+    // reached, which is the failure being mapped.
+    let dead = {
+        let listener = OriginListener::bind("127.0.0.1:0").expect("bind a probe port");
+        let port = listener.local_addr().expect("an address").port();
+        drop(listener);
+        port
+    };
+
+    let mut config = upstream_config(&origin);
+    let Some(BackendConfig::Upstream(upstream)) = config.backends.get_mut("node") else {
+        panic!("the backend is an upstream");
+    };
+    upstream.origin = format!("http://127.0.0.1:{dead}");
+
+    let routing = front_controller_routing();
+    let dispatcher = match Dispatcher::from_config(&config, routing.clone()) {
+        Ok(dispatcher) => dispatcher,
+        Err(err) => {
+            eprintln!("skipping: the upstream backend could not be built: {err}");
+            return;
+        }
+    };
+    let Some(server) = Server::start(
+        dispatcher,
+        routing,
+        HttpLimits::default(),
+        volucer_core::config::StaticConfig::default(),
+    ) else {
+        panic!("the listener must start");
+    };
+    let address = server.address.clone();
+
+    // A one-message gRPC body: compression flag 0, a big-endian length of 5, then five bytes. The
+    // framing is what makes this a *gRPC* request rather than an HTTP one with an unusual content
+    // type, and nothing here parses it — which is the whole of §6.6's claim.
+    let call = "POST /pkg.Service/Method HTTP/1.1\r\nHost: example.test\r\n\
+                Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: 5\r\n\
+                Connection: close\r\n\r\n\x00\x00\x00\x00\x05";
+    let raw = exchange_raw(&address, call.as_bytes());
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK"),
+        "a gRPC failure is HTTP 200, or the client cannot read the status.\nGot: {text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+        "the trailers need chunked framing to travel in, or the status has nowhere to go.\nGot: {text}"
+    );
+    // The trailer fields, read out of the chunked trailer section rather than out of the head:
+    // `grpc-status` in a *header* is the mistake that makes a streamed gRPC reply unanswerable.
+    //
+    // The head is checked **line by line** rather than by searching it for the name, because a
+    // legitimate `Trailer: grpc-status, grpc-message` declaration contains the name too — and a
+    // naive `contains` would either pass for the wrong reason or, as the first version of this
+    // did, fail for one. What must not appear is a header *field* named `grpc-status`.
+    let (head, tail) = text.split_once("\r\n0\r\n").unwrap_or((&text, ""));
+    assert!(
+        !head
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("grpc-status:")),
+        "the status must be a trailer, not a header — a header cannot be sent after a streamed \
+         body, which is why gRPC puts it in the trailer section.\nGot: {text}"
+    );
+    assert!(
+        tail.to_ascii_lowercase().contains("grpc-status: 14"),
+        "UNAVAILABLE (14) is what an unreachable origin is, and it is the code the specification \
+         lets a client retry.\nGot: {text}"
+    );
+
+    // The control: the same dead origin, the same server, a request that is *not* gRPC.
+    let plain = get(&address, "/anything");
+    assert_eq!(
+        plain.status, 502,
+        "an ordinary HTTP request to an unreachable origin is still a 502 — the gRPC mapping is a \
+         different answer to a different protocol, not a change to this one: {plain:?}"
+    );
+    let _ = origin;
+}
+
+/// Send a raw request and return the bytes, without parsing them.
+///
+/// `exchange` parses into an `Exchange`, which cannot represent a trailer section — it stops at the
+/// header terminator. The gRPC mapping is *about* the trailer section, so this test reads the raw
+/// bytes instead, which is also how a gRPC client sees them.
+fn exchange_raw(address: &str, request: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    stream.write_all(request).expect("write the request");
+    stream.flush().expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read the response");
+    raw
+}
+
 /// Send a gRPC-shaped POST and return whatever came back, or nothing on the fixture's timeout.
 ///
 /// Deliberately not asserting on the answer: the fixture is not an HTTP/2 server, so a completed call

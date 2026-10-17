@@ -37,7 +37,10 @@ pub use client::{
 };
 pub use error::{Result, UpstreamError};
 pub use origin::{Origin, UpstreamTls};
-pub use translate::{prepare_request, translate_response};
+pub use translate::{
+    grpc_error, grpc_trailers, is_grpc, prepare_request, translate_response, GrpcErrorBody,
+    GrpcStatus,
+};
 
 /// The configuration model's checked origin, re-exported.
 ///

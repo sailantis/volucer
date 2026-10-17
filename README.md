@@ -146,11 +146,29 @@ Two things about what this key does *not* do, both deliberate:
   is an application deploy rather than a server one.
 
 A gRPC call is routed like any other request — the media type is `application/grpc*`, and the path is
-`/pkg.Service/Method`. The trailers a gRPC reply ends with already cross the proxy untouched,
-measured in `crates/volucer-upstream/tests/trailers.rs`, and the one header gRPC requires the server
-to receive — `TE: trailers` — is written by the proxy rather than forwarded, because RFC 9110 §7.6.1
-makes `TE` hop-by-hop and forwarding a client's own list would let it ask an origin for an encoding
-this server never negotiated.
+`/pkg.Service/Method`. Three things the server does beyond relaying, all of which a gRPC client
+depends on:
+
+- **`TE: trailers` is written by the proxy rather than forwarded.** RFC 9110 §7.6.1 makes `TE`
+  hop-by-hop, so a client's own list must not cross — but gRPC requires the server to *receive* it, and
+  forwarding the client's value would let it ask an origin for an encoding this server never
+  negotiated. Exactly one spelling is written, for every request.
+- **An origin's reply trailers cross untouched**, measured in
+  `crates/volucer-upstream/tests/trailers.rs` — they travel as frames, so a `grpc-status` the
+  application wrote arrives without this server doing anything.
+- **A failure this server has to report is a `200` with `grpc-status` in the trailers**, never a `502`.
+  A gRPC client reads the outcome from the trailer section, so an HTTP error status is invisible to it:
+  it would report "unexpected HTTP status" and the failure would be lost. The code is one of the few a
+  proxy can actually determine — `UNAVAILABLE` (14) for an origin that is unreachable, timed out or
+  has no capacity, because the specification defines it as transient and permits a retry;
+  `UNIMPLEMENTED` (12) for a route served by something that is not a gRPC origin; `INTERNAL` (13) for an
+  origin that answered badly. A proxy that invented the other codes would be lying about what happened
+  inside the application, so an application that wants to say `NOT_FOUND` says it in its own trailers.
+
+The reply is framed as `Transfer-Encoding: chunked` with a `Trailer` declaration, because HTTP/1.1 has
+nowhere else for a trailer section to live. That is not decoration: without the declaration hyper
+writes a chunked body that ends with no trailers at all, which a gRPC client reads as a *successful*
+call with an empty message — the failure vanishing rather than being misreported.
 
 **An `https:` origin is always verified, and there is no `verify = false`.** `ca` names a PEM file to
 verify against and defaults to the public roots; `sni` names the certificate's host when it differs

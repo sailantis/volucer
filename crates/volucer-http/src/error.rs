@@ -75,6 +75,26 @@ pub enum HttpError {
     /// it in a loop.
     #[error("TLS is configured but unusable: {reason}")]
     Tls { reason: String },
+
+    /// A gRPC call failed, and gRPC's answer is HTTP **200** with a status in the trailers.
+    ///
+    /// Its own variant rather than a status code on another one, because the reason this server
+    /// cannot answer a gRPC failure the way it answers every other failure is a *protocol* fact and
+    /// not a choice: an HTTP error status is unreadable to a gRPC client, which reads the outcome
+    /// from the trailer section and has no status code to branch on otherwise. A proxy that answers
+    /// `502` to a gRPC call has thrown away the failure it is trying to report.
+    ///
+    /// Carries the real error's text so the **log** says what happened — the wire carries a fixed
+    /// message, because `grpc-message` is percent-encoded ASCII and an origin's error text is
+    /// arbitrary bytes a client could not act on anyway. What a client needs is a status it can
+    /// branch on; what an operator needs is this string, and this is where it lives.
+    #[error("the gRPC call failed: {source}")]
+    Grpc {
+        /// The status the client is told, in the trailers.
+        status: volucer_upstream::GrpcStatus,
+        /// The whole failure, for the log.
+        source: Box<HttpError>,
+    },
 }
 
 impl HttpError {
@@ -95,6 +115,10 @@ impl HttpError {
             | HttpError::Runtime(_)
             | HttpError::Io(_)
             | HttpError::Tls { .. } => 500,
+            // **200**, and this is the one variant whose status is not an error status at all.
+            // gRPC reports every outcome in the trailer section, so the failure travels as
+            // `grpc-status` and the HTTP status is a plain success. See `grpc_failure`.
+            HttpError::Grpc { .. } => 200,
         }
     }
 
@@ -108,6 +132,8 @@ impl HttpError {
             502 => "Bad Gateway",
             503 => "Service Unavailable",
             504 => "Gateway Timeout",
+            // A gRPC failure is a 200, so it takes the success phrase rather than an error one.
+            200 => "OK",
             _ => "Internal Server Error",
         }
     }
