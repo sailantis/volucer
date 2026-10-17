@@ -165,6 +165,66 @@ it: there, routing is a path string and the descriptors belong to an optional re
 **RPC.** `rpc.Version` and `rpc.Config` exist; `rpc.Config` returns the server's configuration to
 anyone who can reach the socket. §4.5 treats that as a hazard rather than a feature.
 
+### 1.4 The rest of the bundle, sorted by what it would cost here
+
+The survey above covers the six plugins that were asked for. This is the remainder of
+`roadrunner/container/plugins.go` — the picture in the README names most of them — sifted once so
+that "is there anything else worth taking?" has a written answer instead of a re-derivation. The
+sorting rule is the one §5 states: **what does it cost here, given what is already built?**
+
+#### Worth building — a feature a deployment would notice missing
+
+| What | RR's shape | What it costs here | Why it is worth it |
+| --- | --- | --- | --- |
+| **`volucer workers` / `volucer reset`** (§4.6) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S.** The methods exist and are tested; the process has no client for them. A `Command::Rpc` that opens one pool's channel and sends `workers.list` | §4.6 already promises it, and the promise is currently false: `volucer serve\|check\|version` is the whole CLI. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing |
+| **`http.trusted_subnets` + forwarded headers** | `proxy_ip_parser` | **S–M.** A CIDR check against the peer, then the first non-empty of an ordered header list | **Not a convenience — a correctness bug today.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Two places, both of which already take an address |
+| **`metrics.observe`** | `metrics.collect` | **S.** One registry entry and one namespace arm | `emitMetric` already rides the wire and lands in a `Vec` nobody reads (`codec.rs:1136`), which §6.1 called the first thing to fix |
+| **Rate limiting** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
+
+#### Worth considering — real value, but it duplicates or complicates something that exists
+
+| What | RR's shape | What it costs here | The argument against, and what would beat it |
+| --- | --- | --- | --- |
+| **`file` KV driver** | `boltdb` | **S–M**: an embedded store, or a directory of files | Already §6.2's next driver, so it is here only to be counted. Note what a filesystem buys that boltdb does not: a cache survives a restart **without a dependency**, which is the whole reason it beats `memcached` in this order |
+| **`server.access_log` rotation** | `app-logger` is request logs *out of the application*; RR does not rotate either | **S** if it is "reopen on `SIGHUP`"; **M+** if it is rotation by age or size | A log an unprivileged server cannot reopen survives exactly one `logrotate` and then writes to a deleted inode for ever, silently. **The signal is already wired** — `SIGHUP` reloads, so "reopen the log first" is a few lines rather than a subsystem. Size-based rotation is where it becomes a subsystem, and `logrotate` already exists |
+| **`max_request_size`** | `http.max_request_size` | **S** — one `HttpLimits` field read beside the CLI's `--max-connections` | Today `max_body_bytes` is a constant, so the only way to bound a public upload endpoint is to recompile. Weak, because the limit exists at all and only its configurability is missing |
+
+#### Not worth building, and the reason is a property of something already here
+
+- **`centrifuge` (WebSockets/broadcast)** — **L**, and it is a second product rather than a plugin:
+  rooms, a hub, a presence protocol, and a client SDK. §7.3's rule about dead bridges applies to
+  scope too. More decisively, WebSockets are already refused here for one specific reason — the
+  hop-by-hop filter drops `Connection` and `Upgrade`, so a handshake does not survive (README,
+  *Backends*) — which means this is *two* projects rather than one: the upgrade path, then the hub
+  on top of it.
+- **`tcp`** — gone from RR v3, and structurally impossible here for a reason RR states itself: PHP
+  workers are stateless between requests, so a TCP session has no home. The same objection covers
+  the SMTP-server example in the picture.
+- **`memory`/`boltdb` jobs drivers, and the other five brokers** — the `Driver` trait makes each one
+  a module, but §9.4's argument stands: seven brokers is not a feature. `redis` and `memory` cover
+  the single-node and the shared case; anything else should be *your* broker's client on the HTTP
+  side, or a driver when somebody needs it.
+- **`gzip`/`zstd`/`headers`/`send`/`static`/`fileserver`** — every one is something nginx already
+  does, and `precompressed` covers the case where compression has to be *free*. §9 is where that
+  sentence belongs; the exception is `send` (X-Sendfile), which is genuinely useful only when the
+  file is not reachable from the front-end and the proxy has a faster path to it — a condition that
+  does not hold here.
+- **`service` (a mini systemd) and `temporal`** — `service` supervises arbitrary children, which
+  §7.1's `command` already does for an origin and php-fpm does for anything else. `temporal` is a
+  workflow engine: a separate product with its own protocol, not a plugin. **`otel`** is done in its
+  useful half (§6.7) without the SDK; **`informer`/`resetter`** are the first row of this table;
+  **`status`**, **`rpc`**, **`metrics`**, **`kv`**, **`lock`**, **`jobs`**, **`grpc`** are §6; **`logger`**
+  and **`app-logger`** are the access log plus the worker `LOG` frame.
+- **`protoreg`** — see §10 item 2. It exists to feed reflection, which is declined, and it is the
+  `protox` cost moved into a plugin.
+- **`plugin-abis`** — a compile-time DI container in Go, so there is no ABI to copy; `plan.md` item 39
+  already refuses it.
+
+**None of the four rows in the first table is large, and only the second is a defect rather than a
+missing feature.** That is the useful conclusion of the sort: the parts of RoadRunner that volucer
+has deliberately not copied are the parts that duplicate a reverse proxy or a framework, and the
+parts that remain are small.
+
 ---
 
 ## 2. The question this document has to answer first
@@ -423,7 +483,10 @@ the one that would be forgotten:
 - `volucer workers` and `volucer reset` as CLI clients of the method registry, which is exactly what
   RR's CLI is (`roadrunner/internal/cli/workers/command.go:32`, `informer.List`). Neither needs a
   service: they read the pool (`restart(index)`, `crates/volucer-server/src/worker_pool/mod.rs:653`)
-  and the configuration that already exist.
+  and the configuration that already exist. **The methods are built and the clients are not** — see
+  §1.4's first row. The sentence that matters is that no *service* has to exist for them, which
+  turned out to be true: `workers.list` and `worker.reset` are answered by the server's own
+  dispatcher, so the CLI needs a channel and nothing else.
 - The `status`/health endpoint (§6.1) can borrow the same `ready` notion.
 - Every §6 service has somewhere to live from the day it is written.
 
@@ -1066,6 +1129,14 @@ a `prost_types::FileDescriptorSet` **purely in Rust, with no `protoc` binary**, 
 in the service bag (§5). Reflection is a small *service*, not a request-path dependency, and it may
 legitimately be off.
 
+**It is off, and the reason is stronger than "optional" — see §10 item 2 for the decision and for
+the transcoding case that would be the real reason to load descriptors.** The short form: after
+tier B, there is nothing left in this server that a schema would let it do. Tier A and tier B carry
+framed bytes and write two trailer fields, so the only consumer a descriptor would have is
+reflection itself, which buys a `grpcurl` user a `.proto` file they can already bring. Not building
+it keeps the graph free of `prost`, `prost-types` and `protox`, which `Cargo.lock` can confirm by
+their absence rather than by intention.
+
 #### The decision, restated as two independent ones
 
 Replace *"static or dynamic `.proto`"* with:
@@ -1096,7 +1167,9 @@ measured, but an h2c path for a plaintext gRPC origin does not exist and is the 
 item 3). It was that, and the estimate held. Tier B: **M**, and it was a little more than M: the
 config key and the SDK contract were each small, but *routing to a worker became protocol-aware*, and
 that meant a new error shape on the CGI path plus the SDK's two-protocol request path — the kind of
-change that is only small once it is understood. Tier C: **M** (`protox` + a reflection service). The
+change that is only small once it is understood. Tier C: **M** (`protox` + a reflection service), and
+**declined** — §10 item 2 records why, and the reason is stronger than "optional": nothing in this
+server has a use for the schema other than the service that would exist to hand it out. The
 worker-as-work question: **L** on its own, and no longer on the critical path for either A or B.
 
 ### 6.7 OTLP export — **done**, and two of this section's own premises were false
@@ -1333,7 +1406,7 @@ progress on something earlier look bigger.
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | **Done.** Not the layer the plan named: measured, `http-proto` needs `prost`, and a layer cannot carry the span id PHP already has. Hand-written OTLP/JSON over the existing client — **0 new packages** |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | **Done.** `protocol = "h2c"` for plaintext and socket origins, `TE: trailers` constructed rather than forwarded, and a failure reported as a `200` with `grpc-status` in the trailers. No protobuf crate, no worker, no new listener |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | **Done.** `grpc_services` on a backend, `UNIMPLEMENTED` for anything else, and the application's status moved into the trailers. The application states its outcome in two response headers; the server never parses a message. Five of this section's own premises were corrected on contact, and the largest is that routing to a *worker* became protocol-aware |
-| 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | The only descriptor consumer; may legitimately be "not yet" |
+| 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | **Settled: not built**, and §10 item 2 is the decision. The only descriptor consumer turned out to be the service itself — a reply is already-framed bytes the server never decodes — so no other use could justify loading a schema either |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
 
@@ -1651,12 +1724,22 @@ machine that parses what arrives. This server never parses a frame; hyper does.
    the full statement, including the case that first made the rule concrete (`?` in a method, where the
    server and the SDK initially disagreed).
 
-2. **Reflection, and whether descriptors are ever loaded.** §6.6 makes runtime `.proto` parsing a
-   property of one optional service (`protox` → `prost-types` → `ServerReflection`). The question
-   that remains is whether that service is worth a protobuf dependency *at all*: without it, a
+2. **Reflection, and whether descriptors are ever loaded.** **Settled: nothing in this server parses
+   a `.proto`, and no descriptor is loaded anywhere.** §6.6 made runtime parsing a property of one
+   optional service (`protox` → `prost-types` → `ServerReflection`), and that service is not built: a
    `grpcurl` user supplies their own `.proto`, which is what they already do against every
-   non-reflective server. Deciding "not yet" is a legitimate outcome and removes the only
-   protobuf crate from the graph.
+   non-reflective server, and declining removes the only protobuf crate from the graph.
+
+   **The question that looked like it might reopen this does not, and finding that out is the useful
+   part.** A worker's reply is a complete, already-framed message — tier B's SDK says so in its own
+   constructor — so *sending* one needs no descriptor, only a length read off the bytes. The one case
+   that genuinely does need a message descriptor is **answering a client that cannot decode
+   `application/grpc+proto` itself**: gRPC-JSON transcoding, where the reply is a `protojson` document
+   and the encoding is defined over the schema rather than over the bytes. That needs the *response's
+   own* type, which belongs to the application, so a reflection registry could not supply it either —
+   it is a transcoding feature and belongs in item 11 below, not in a descriptor question. Everything
+   else on the wire is length-delimited: one compression-flag byte, a big-endian `u32` length, then
+   exactly that many bytes.
 3. **How a plaintext gRPC origin says it speaks h2.** **Settled, and the answer was the explicit
    key**: `protocol = "h2c"` on an `http://` or `unix:` origin, refused beside `https://` where ALPN
    is the answer. `UpstreamProtocol` has one variant and no `Http1`, so HTTP/1.1 is the absence of the
@@ -1698,3 +1781,14 @@ machine that parses what arrives. This server never parses a frame; hyper does.
 10. **Whose deadline is a kill?** §4.2 item 3 and its hazard: a call blocking past the request's
     deadline currently means the worker is killed. The policy (report the call as *unknown state* and
     keep the worker, versus kill) is a decision, not a detail, and §6.3's error variant depends on it.
+11. **gRPC-JSON transcoding, which is the one thing a descriptor would actually buy.** A browser
+    cannot speak `application/grpc+proto` natively, and the usual answer — `grpc-gateway`, Envoy, or
+    gRPC's own `grpc-web` proxy — is a second process with the same schema problem. The shape here
+    would be a `content-type` that names JSON and a route that transcodes, and it is genuinely harder
+    than any of tiers A–C for a reason worth stating: **transcoding needs the response's own message
+    type**, which belongs to the application, so it is not something a reflection registry could
+    supply even if tier C existed. It also collides with §6.6's central claim — that a message is
+    bytes and the schema is the application's — because a transcoder has to decode. Recorded rather
+    than recommended, and **gRPC-Web is the same question with a smaller answer**: it is a framing
+    layer over the bytes already carried, needing no schema at all, and would be the version to build
+    first if a browser ever has to call a service directly.

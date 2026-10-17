@@ -1176,6 +1176,13 @@ correct about that rather than only warned: a TTL lock has no fencing token, so 
 past its lease can be writing while somebody else holds it. Use a lock to avoid duplicated work;
 where a real invariant is at stake, use the storage's own conditional write.
 
+**gRPC has no reflection, and nothing anywhere reads a `.proto`.** A client that wants to introspect
+supplies its own definition, which is what it already does against every non-reflective server;
+`docs/plugins.md` §10 item 2 is the decision and the reason. The consequence worth knowing as an
+operator is the one that follows from carrying bytes rather than messages: a call whose path names
+no service is answered `UNIMPLEMENTED` from the `grpc_services` list alone, without a worker being
+asked — so a typo in a service name and a service that was never built are the same answer.
+
 ### Build prerequisites
 
 `rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.
