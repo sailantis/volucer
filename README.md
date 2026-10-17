@@ -114,6 +114,44 @@ unix:/run/node.sock         a unix socket, no network at all
 A base path and credentials are refused by name, because neither would be honoured: a route prefix
 belongs in the route table, where it is.
 
+#### gRPC: `protocol = "h2c"` on a plaintext or unix-socket origin
+
+gRPC's transport **is** HTTP/2, so a gRPC backend that is reached over `https://` needs nothing —
+TLS negotiates the protocol through ALPN. A plaintext or `unix:` origin has no handshake to negotiate
+in, and the answer there is h2c: HTTP/2 with prior knowledge, meaning the client opens the connection
+and sends the HTTP/2 preface without an upgrade dance. That is what a gRPC client does, and volucer
+has to be told to do it:
+
+```toml
+[backends.greeter]
+kind = "upstream"
+origin = "unix:/run/greeter.sock"
+protocol = "h2c"          # the origin speaks HTTP/2 with prior knowledge
+command = '/srv/greeter/greeter --listen /run/greeter.sock'
+```
+
+`protocol = "h2c"` is the *only* value, and absent means HTTP/1.1 — so there is no key to write for
+the ordinary case and no way to state a setting that changes nothing. Beside an `https://` origin it
+is **refused**, because there the handshake answers the question and a claim of prior knowledge would
+be wrong whenever the origin offers `http/1.1` only.
+
+Two things about what this key does *not* do, both deliberate:
+
+- **It is a fact about the origin, not about the route.** The alternative was inferring it from the
+  route that selected the backend, which needs no key — but it would make an origin's protocol depend
+  on where a request came from. Stated here, it is one fact about one address.
+- **It never parses a message.** volucer carries gRPC bytes and writes two header names; the
+  application owns the schema. `.proto` files never enter this server's build or its dependency
+  graph — that is `docs/plugins.md` §9.6's divergence from RoadRunner, and it is why a `.proto` change
+  is an application deploy rather than a server one.
+
+A gRPC call is routed like any other request — the media type is `application/grpc*`, and the path is
+`/pkg.Service/Method`. The trailers a gRPC reply ends with already cross the proxy untouched,
+measured in `crates/volucer-upstream/tests/trailers.rs`, and the one header gRPC requires the server
+to receive — `TE: trailers` — is written by the proxy rather than forwarded, because RFC 9110 §7.6.1
+makes `TE` hop-by-hop and forwarding a client's own list would let it ask an origin for an encoding
+this server never negotiated.
+
 **An `https:` origin is always verified, and there is no `verify = false`.** `ca` names a PEM file to
 verify against and defaults to the public roots; `sni` names the certificate's host when it differs
 from the address dialled:

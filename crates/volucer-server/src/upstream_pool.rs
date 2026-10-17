@@ -441,7 +441,7 @@ fn probe_address(origin: &OriginSpec) -> String {
     match origin {
         OriginSpec::Network { host, port, .. } => format!("{host}:{port}"),
         #[cfg(unix)]
-        OriginSpec::Socket(path) => format!("unix:{}", path.display()),
+        OriginSpec::Socket { path, .. } => format!("unix:{}", path.display()),
     }
 }
 
@@ -601,11 +601,43 @@ mod tests {
     ///
     /// The probe connects and drops, so a program that accepts and keeps listening is enough; a
     /// `gunicorn` is exactly this with more work in between.
-    fn listener_command(port: u16) -> String {
-        // `python -m http.server` binds the port and answers `GET`, and the probe only needs a TCP
-        // connection to succeed. Chosen over a shell trick because it is present on every machine
-        // this project is built on and it has no quoting to get wrong.
-        format!("python -m http.server {port} --bind 127.0.0.1")
+    /// The interpreter to start an HTTP origin with, or `None` when the machine has none that works.
+    ///
+    /// **Two bugs are fixed by this one function, and the second was only visible on Windows.** The
+    /// first: the names must be *tried*, because the interpreter on Linux is `python3` and a
+    /// hardcoded `python` made the test fail with "the origin command python does not exist" *after*
+    /// the guard had already decided the machine had one.
+    ///
+    /// The second is subtler and worth more: **on Windows `python3.exe` exists as a Microsoft Store
+    /// stub** — an App Execution Alias that is a real file, passes `is_file()`, and exits `9009`
+    /// without running anything. A guard that asks "is there a file with this name" therefore
+    /// *passes* and the test fails one layer deeper with a `StartupExited`. So the check is that the
+    /// interpreter runs, which is the property the test actually needs and the only one that cannot
+    /// be faked by a file's existence.
+    fn python() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|name| {
+            let binary = volucer_core::program::resolve_program(name);
+            if !binary.is_file() {
+                return false;
+            }
+            std::process::Command::new(&binary)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
+    /// A listener that accepts connections and answers, so the readiness probe succeeds.
+    ///
+    /// `python -m http.server` binds the port and answers `GET`; the probe only needs a TCP connection
+    /// to succeed. Chosen over a shell trick because it has no quoting to get wrong and because a
+    /// *real* server is what this test is about — a supervisor that starts a command and waits for it
+    /// to answer needs a command that behaves like the thing a deployment would name.
+    fn listener_command(interpreter: &str, port: u16) -> String {
+        format!("{interpreter} -m http.server {port} --bind 127.0.0.1")
     }
 
     fn free_port() -> u16 {
@@ -682,10 +714,17 @@ mod tests {
 
     #[test]
     fn a_supervised_origin_that_answers_is_ready_and_is_killed_on_shutdown() {
+        let Some(interpreter) = python() else {
+            eprintln!("skipping: no python binary on PATH, so there is no origin to supervise");
+            return;
+        };
         let port = free_port();
-        let mut supervisor =
-            Supervisor::start("app", &config(&listener_command(port)), &origin(port))
-                .expect("the origin starts and answers");
+        let mut supervisor = Supervisor::start(
+            "app",
+            &config(&listener_command(interpreter, port)),
+            &origin(port),
+        )
+        .expect("the origin starts and answers");
         let pid = supervisor.pid();
         assert!(pid > 0);
         supervisor.shutdown();

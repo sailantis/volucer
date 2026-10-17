@@ -723,7 +723,8 @@ impl Dispatcher {
     ///
     /// `None` for the three CGI kinds, so a caller that asks for the wrong one cannot accidentally
     /// reach an origin — and the client is borrowed rather than cloned, because it shares its pool
-    /// through `&self` and cloning it per request would be an `Arc` bump for nothing.
+    /// through `&self` and cloning it per request would be an `Arc` bump for nothing. Deref through
+    /// the box happens here, once, so no caller has to know the field is boxed.
     pub fn upstream(
         &self,
         backend: &str,

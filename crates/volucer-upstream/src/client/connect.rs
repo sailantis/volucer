@@ -242,6 +242,12 @@ async fn dial(inner: &Inner) -> Result<ConnIo> {
             // Set once per *connection*, not per request: the pool reuses this for many requests,
             // and a small request behind Nagle's algorithm is a latency bug.
             let _ = stream.set_nodelay(true);
+            // A plaintext origin's protocol is the configuration's whole answer: there is no
+            // handshake to negotiate one and no upgrade a gRPC client would perform, so a claimed
+            // h2c origin is spoken to in HTTP/2 `hyper` never even asks about.
+            if inner.origin.speaks_h2() {
+                return Ok(ConnIo(Box::new(PlainH2Io(stream))));
+            }
             Ok(ConnIo(Box::new(stream)))
         }
         Origin::Network { tls: Some(_), .. } => {
@@ -271,9 +277,12 @@ async fn dial(inner: &Inner) -> Result<ConnIo> {
             })))
         }
         #[cfg(unix)]
-        Origin::Socket(path) => {
+        Origin::Socket { path, .. } => {
             let stream = tokio::net::UnixStream::connect(path).await?;
-            Ok(ConnIo(Box::new(UnixIo(stream))))
+            Ok(ConnIo(Box::new(UnixIo {
+                stream,
+                h2c: inner.origin.speaks_h2(),
+            })))
         }
     }
 }
@@ -346,12 +355,22 @@ impl Connection for TlsIo {
     }
 }
 
-/// A unix socket, with the `Connected` value `hyper-util` gives that type itself.
-#[cfg(unix)]
-struct UnixIo(tokio::net::UnixStream);
+/// A plaintext TCP stream that claims to speak HTTP/2.
+///
+/// A newtype rather than a flag on the origin read at `connected()` time, because `Connected` is
+/// produced by the *IO type* and a wrapper is the only place the claim can be attached without
+/// reaching back into the connector. The alternative — an `Io` impl that asks the origin — would make
+/// every `poll_read` depend on configuration, which is both slower and a second place for the answer
+/// to live.
+///
+/// Only constructed for a plaintext origin that was declared to speak h2c; the ordinary plaintext
+/// origin is a bare `TcpStream`, whose own `Connected` impl is the empty one. That is deliberate: a
+/// wrapper that returned `Connected::new()` for `h2c: false` would make "the configuration said HTTP/2"
+/// and "this type always claims h2" indistinguishable, and the h2c test's negative case would then
+/// pass for the wrong reason.
+struct PlainH2Io(TcpStream);
 
-#[cfg(unix)]
-impl tokio::io::AsyncRead for UnixIo {
+impl tokio::io::AsyncRead for PlainH2Io {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -361,8 +380,7 @@ impl tokio::io::AsyncRead for UnixIo {
     }
 }
 
-#[cfg(unix)]
-impl tokio::io::AsyncWrite for UnixIo {
+impl tokio::io::AsyncWrite for PlainH2Io {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -380,11 +398,64 @@ impl tokio::io::AsyncWrite for UnixIo {
     }
 }
 
+impl Connection for PlainH2Io {
+    fn connected(&self) -> Connected {
+        // The one line the whole h2c path is: measured in `tests/h2c.rs`, this is what makes
+        // `hyper-util`'s client open with the HTTP/2 connection preface instead of an HTTP/1.1
+        // request line.
+        Connected::new().negotiated_h2()
+    }
+}
+
+/// A unix socket, with the `Connected` value `hyper-util` gives that type itself.
+#[cfg(unix)]
+struct UnixIo {
+    stream: tokio::net::UnixStream,
+    /// Whether this socket was declared to speak h2c. See [`Origin::speaks_h2`].
+    h2c: bool,
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncRead for UnixIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncWrite for UnixIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 #[cfg(unix)]
 impl Connection for UnixIo {
     fn connected(&self) -> Connected {
-        // `hyper-util`'s own impl for `tokio::net::UnixStream` returns an empty `Connected`; this
-        // is the same value, spelled out because the impl reached through `ConnIo` would not be.
-        Connected::new()
+        // `hyper-util`'s own impl for `tokio::net::UnixStream` returns an empty `Connected`; this is
+        // the same value, spelled out because the impl reached through `ConnIo` would not be — plus
+        // the one bit that makes a gRPC origin on a socket reachable at all.
+        let connected = Connected::new();
+        if self.h2c {
+            connected.negotiated_h2()
+        } else {
+            connected
+        }
     }
 }

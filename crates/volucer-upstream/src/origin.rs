@@ -69,11 +69,22 @@ pub enum Origin {
         base: Uri,
         /// Only ever present for an `https:` base.
         tls: Option<UpstreamTls>,
+        /// That this origin speaks h2c — HTTP/2 with prior knowledge, no handshake to negotiate it.
+        ///
+        /// Never `true` beside `tls`: `OriginSpec::parse` writes `None` for the `https` arm, and
+        /// `validate` refuses a `protocol` beside a handshake, so a TLS origin's protocol is ALPN's
+        /// answer and nothing else can claim otherwise.
+        h2c: bool,
     },
 
     /// A unix socket on this host. There is no scheme and no port to speak of.
     #[cfg(unix)]
-    Socket(PathBuf),
+    Socket {
+        /// The socket to dial.
+        path: PathBuf,
+        /// That this socket speaks h2c. See [`Origin::speaks_h2`].
+        h2c: bool,
+    },
 }
 
 impl Origin {
@@ -83,12 +94,17 @@ impl Origin {
     /// parser, so this cannot be handed an unvalidated origin — which is what makes the "no
     /// unverified TLS" rule structural rather than a habit.
     pub fn from_spec(spec: &volucer_core::config::OriginSpec) -> Result<Origin> {
+        // Read once here rather than at each arm: the configuration model already refuses a
+        // `protocol` beside a handshake, so "is there a claim" and "is it TLS" cannot disagree — and
+        // reading it in one place is what keeps that from becoming two rules.
+        let h2c = spec.protocol().is_some();
         match spec {
             volucer_core::config::OriginSpec::Network {
                 scheme,
                 host,
                 port,
                 tls,
+                ..
             } => {
                 let text = format!("{scheme}://{host}:{port}");
                 let base = text
@@ -97,10 +113,16 @@ impl Origin {
                 Ok(Origin::Network {
                     base,
                     tls: tls.clone(),
+                    // A TLS origin negotiates through ALPN, and `spec.protocol()` is `None` for one
+                    // by construction, so this cannot be `true` where it would be wrong.
+                    h2c,
                 })
             }
             #[cfg(unix)]
-            volucer_core::config::OriginSpec::Socket(path) => Ok(Origin::Socket(path.clone())),
+            volucer_core::config::OriginSpec::Socket { path, .. } => Ok(Origin::Socket {
+                path: path.clone(),
+                h2c,
+            }),
         }
     }
 
@@ -122,7 +144,26 @@ impl Origin {
         match self {
             Origin::Network { base, .. } => base.scheme_str(),
             #[cfg(unix)]
-            Origin::Socket(_) => None,
+            Origin::Socket { .. } => None,
+        }
+    }
+
+    /// Whether this origin speaks HTTP/2 with prior knowledge.
+    ///
+    /// **The whole of the h2c mechanism.** `hyper-util`'s legacy client reads
+    /// `Connected::negotiated_h2()` off the connector's response and dispatches to its HTTP/2 state
+    /// machine instead of its HTTP/1.1 one; a connector that answers `true` here is all it takes for
+    /// hyper to open with the HTTP/2 connection preface. Measured in
+    /// `crates/volucer-upstream/tests/h2c.rs`, assertion and control both.
+    ///
+    /// Answered from the configuration and not from anything the origin said, because there is
+    /// nothing for it to say: h2c's prior-knowledge form has no handshake and no upgrade, so a
+    /// plaintext origin cannot advertise anything a client could read before sending its preface.
+    pub fn speaks_h2(&self) -> bool {
+        match self {
+            Origin::Network { h2c, .. } => *h2c,
+            #[cfg(unix)]
+            Origin::Socket { h2c, .. } => *h2c,
         }
     }
 
@@ -136,7 +177,7 @@ impl Origin {
         match self {
             Origin::Network { tls, .. } => tls.as_ref(),
             #[cfg(unix)]
-            Origin::Socket(_) => None,
+            Origin::Socket { .. } => None,
         }
     }
 
@@ -150,7 +191,7 @@ impl Origin {
         match self {
             Origin::Network { base, .. } => base.authority(),
             #[cfg(unix)]
-            Origin::Socket(_) => None,
+            Origin::Socket { .. } => None,
         }
     }
 
@@ -165,7 +206,7 @@ impl Origin {
         let base = match self {
             Origin::Network { base, .. } => base,
             #[cfg(unix)]
-            Origin::Socket(_) => return None,
+            Origin::Socket { .. } => return None,
         };
         let host = base.authority()?.host().to_string();
         let port = base.port_u16().unwrap_or(match base.scheme_str() {
@@ -179,7 +220,7 @@ impl Origin {
     #[cfg(unix)]
     pub fn socket_path(&self) -> Option<&PathBuf> {
         match self {
-            Origin::Socket(path) => Some(path),
+            Origin::Socket { path, .. } => Some(path),
             Origin::Network { .. } => None,
         }
     }
@@ -198,7 +239,7 @@ impl Origin {
         let host = match self {
             Origin::Network { base, .. } => base.authority()?.host().to_string(),
             #[cfg(unix)]
-            Origin::Socket(_) => return None,
+            Origin::Socket { .. } => return None,
         };
         Some(unbracket(&host))
     }
@@ -331,7 +372,7 @@ mod tests {
     #[test]
     fn a_unix_origin_has_no_scheme_host_or_name() {
         let origin = Origin::from_spec(&spec("unix:/run/app.sock")).expect("builds");
-        assert!(matches!(origin, Origin::Socket(_)));
+        assert!(matches!(origin, Origin::Socket { .. }));
         assert_eq!(origin.scheme(), None);
         assert!(origin.authority().is_none());
         assert!(origin.tls().is_none());

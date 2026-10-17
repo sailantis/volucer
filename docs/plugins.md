@@ -923,9 +923,12 @@ the construction side alone.
 over TLS**: `negotiated_h2` is set from the ALPN result and nothing else ever sets it
 (`crates/volucer-upstream/src/client/connect.rs:264`, and `TlsIo`'s `Connection` impl at `:338`),
 so a plaintext or `unix:` origin is pinned to HTTP/1.1. gRPC's transport is HTTP/2, so tier A needs
-either TLS with ALPN or an explicit h2c path that does not exist yet. This is a decision for tier A
-rather than a defect in the proxy — the h1 path carries the trailers correctly today — but it is
-invisible until something needs h2c, which is exactly why it is written down here.
+either TLS with ALPN or an explicit h2c path. This is a decision for tier A rather than a defect in
+the proxy — the h1 path carries the trailers correctly today — but it is invisible until something
+needs h2c, which is exactly why it is written down here.
+
+**Both halves are now built.** TLS with ALPN already worked; the h2c path is `protocol = "h2c"` on a
+plaintext or `unix:` origin, and §10 item 3 has the decision record.
 
 #### What the server actually has to do, and what needs a schema
 
@@ -965,14 +968,28 @@ makes the positive one mean anything: with the claim, hyper opens with the HTTP/
 without it, the same client sends `POST … HTTP/1.1`. Falsified by making the claim a no-op, which fails
 the positive case and leaves the control passing.
 
-What tier A needs, then, is the *policy* rather than a mechanism: a configuration key saying "this
+What tier A needed, then, was the *policy* rather than a mechanism: a configuration key saying "this
 origin speaks h2", and `connect.rs` answering `negotiated_h2` for the plaintext and unix origins so
-marked. That is a handful of lines and one new key — see §10 item 3, which is now a decision about
-vocabulary rather than about feasibility. TLS with ALPN already works and needs nothing.
+marked. **Both are now built** — `protocol = "h2c"`, with the vocabulary decision recorded in §10
+item 3 — and the *transport* half of tier A is therefore done. TLS with ALPN needed nothing.
 
 This is what makes volucer a gRPC *server* for runtimes that already speak it — Node's
 `@grpc/grpc-js`, Go, Python's `grpcio` — **using the same `upstream` backend §7.1 is adding anyway**.
 It is the cheapest gRPC capability in this document and it should land first.
+
+What tier A still needs beyond the transport, and what writing it found: **`TE: trailers` was in
+`NEVER_FORWARDED`, and gRPC's protocol requires the server to receive it.** It is hop-by-hop by RFC
+9110 §7.6.1, so the client's own value must not cross — but the intent must, and the proxy now writes
+exactly one spelling of it rather than forwarding whatever arrived, because forwarding a client's
+list would let it ask an origin for an encoding this server never negotiated. That is the first
+header this proxy *constructs* rather than filters, and it is the reason a gRPC route needed more
+than a config key.
+
+`is_grpc` recognises a call by its media type and by nothing else: `application/grpc` with an optional
+`+proto`/`+json`/`-web` suffix, followed by the end of the value, `;`, `+` or `-`. The first version was
+a bare prefix test and accepted `application/grpcx`, which its own test caught — a media type is a
+token rather than a string, and `application/grpcx` is a different type that begins with the same
+letters.
 
 **Tier B — the application as the gRPC handler (still no schema on the server).**
 `CALL`/`RETURN` (§4.2) carries the method path and the raw message bytes; the application decodes
@@ -1260,7 +1277,7 @@ progress on something earlier look bigger.
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **Done.** Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | **Done.** Not the layer the plan named: measured, `http-proto` needs `prost`, and a layer cannot carry the span id PHP already has. Hand-written OTLP/JSON over the existing client — **0 new packages** |
-| 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
+| 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | **In progress.** The transport is done: `protocol = "h2c"` for plaintext and socket origins, and `TE: trailers` constructed rather than forwarded. What remains is the reply-side trailer construction and the status mapping. No protobuf crate, no worker, no new listener |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | Reuses the in-flight request, so it does not touch the one-request invariant |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | The only descriptor consumer; may legitimately be "not yet" |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
@@ -1515,14 +1532,21 @@ actually live. §6.6 carries the citations.
    `grpcurl` user supplies their own `.proto`, which is what they already do against every
    non-reflective server. Deciding "not yet" is a legitimate outcome and removes the only
    protobuf crate from the graph.
-3. **How a plaintext gRPC origin says it speaks h2.** The mechanism is settled by measurement —
-   `Connected::negotiated_h2()` is what makes hyper use its HTTP/2 client, and the connector already
-   forwards that answer, so the code is a handful of lines. What is left is the *vocabulary*: a new
-   configuration key on an `http://` or `unix:` origin declaring it speaks h2 with prior knowledge. The
-   candidates are a `protocol` field beside `origin` (`protocol = "h2c"`), or inferring it from the
-   route that selected the backend. The first is explicit and the second needs no key but makes an
-   origin's protocol depend on where a request came from, which is the kind of implicit coupling this
-   project has refused elsewhere. **One deployment decision, not an open technical question.**
+3. **How a plaintext gRPC origin says it speaks h2.** **Settled, and the answer was the explicit
+   key**: `protocol = "h2c"` on an `http://` or `unix:` origin, refused beside `https://` where ALPN
+   is the answer. `UpstreamProtocol` has one variant and no `Http1`, so HTTP/1.1 is the absence of the
+   key rather than a value of it — the same rule `restart` follows, and for the same reason: a default
+   would make "unset" and "set to the default" indistinguishable, and only one of those is a fact
+   about the origin. The rejected alternative was inferring it from the route that selected the
+   backend, which needs no key but makes an origin's protocol depend on where a request came from.
+
+   The claim lives on `OriginSpec` — on *both* its variants, since a gRPC application on a unix socket
+   is the shape this key exists for — which is what makes "`protocol` beside a handshake was refused"
+   a property of the type rather than of `validate` having run. `Origin::speaks_h2()` reads it, and
+   the connector answers `negotiated_h2()` for a plaintext TCP stream through a newtype or for a
+   socket through a flag. Measured end to end in `crates/volucer-http/tests/frontend.rs`, with the
+   negative case in the same test: a proxy that spoke h2 to every origin would pass a positive-only
+   test and be broken for every HTTP/1.1 origin in the tree.
 4. **Streaming responses in the worker protocol.** `RESPONSE` declares `body_len` up front, so an
    application must buffer. That is fine for HTML and wrong for a large download or a
    Server-Sent Events endpoint. Is a chunked response (unknown length, terminated by `LAST`) a v2

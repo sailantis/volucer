@@ -186,14 +186,22 @@ pub enum Backend {
     /// dispatcher needs.
     Upstream {
         name: String,
-        client: volucer_upstream::UpstreamClient<UpstreamBody>,
+        /// The pooled client to the origin.
+        ///
+        /// Boxed, and that is a measurement rather than a preference: on Linux the unboxed client made
+        /// this variant the largest in the enum and `clippy::large_enum_variant` fired — a warning that
+        /// was **already** present before this variant grew a `supervisor` field, so the fix belongs
+        /// here rather than in the new field. A boxed client is one indirection per request, and the
+        /// client is a pool of connections where per-request cost is a syscall anyway.
+        ///
+        /// The alternative was boxing the `supervisor` and leaving this: that keeps the enum the size
+        /// of a connection pool, which is the thing a `Backend` is used *per request* through. The
+        /// client is reached on the request path; the supervisor is reached once, at shutdown.
+        client: Box<volucer_upstream::UpstreamClient<UpstreamBody>>,
         /// The origin's process, when this backend was asked to start one.
         ///
-        /// Behind a `Mutex` for the reason the supervisor's own watcher needs one: the process has
-        /// to be killable from `shutdown` while a watcher thread is polling it. Boxed because a
-        /// `Supervisor` is a thread handle and a process table entry, and inlining it would make
-        /// this variant — and therefore *every* `Backend`, including the three that start nothing —
-        /// that much larger. `None` is the original shape of an upstream: somebody else's process,
+        /// Behind a `Mutex`, because the process has to be killable from `shutdown` while a watcher
+        /// thread is polling it. `None` is the original shape of an upstream: somebody else's process,
         /// which is nginx's or systemd's job, and still the common case.
         supervisor: Option<Mutex<Box<Supervisor>>>,
     },
@@ -256,12 +264,15 @@ impl Backend {
                 // but a `Backend` can be built from a `BackendConfig` that never went through it,
                 // and an origin that cannot parse would otherwise become a 502 on every request for
                 // a reason the log does not name.
-                let spec =
-                    volucer_core::config::OriginSpec::parse(&upstream.origin, upstream.tls.clone())
-                        .map_err(|reason| ServerError::Misconfigured {
-                            backend: name.to_string(),
-                            reason: format!("backends.{name}.origin: {reason}"),
-                        })?;
+                let spec = volucer_core::config::OriginSpec::parse_with(
+                    &upstream.origin,
+                    upstream.tls.clone(),
+                    upstream.protocol,
+                )
+                .map_err(|reason| ServerError::Misconfigured {
+                    backend: name.to_string(),
+                    reason: format!("backends.{name}.origin: {reason}"),
+                })?;
                 let origin = volucer_upstream::Origin::from_spec(&spec).map_err(|source| {
                     ServerError::Misconfigured {
                         backend: name.to_string(),
@@ -290,7 +301,7 @@ impl Backend {
                 };
                 Ok(Backend::Upstream {
                     name: name.to_string(),
-                    client,
+                    client: Box::new(client),
                     supervisor,
                 })
             }

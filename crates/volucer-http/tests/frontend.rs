@@ -1944,15 +1944,22 @@ fn free_origin_port() -> u16 {
 /// deployment would name. `python -m http.server` is present on every machine this project builds
 /// on, binds a port, and answers a request.
 ///
+/// **The interpreter is a parameter rather than the word `python`**, and that is a bug this test had:
+/// the guard resolved `python3` on Linux while the command said `python`, so the test ran and failed
+/// with "the origin command python does not exist" — a fixture that decided whether to run using one
+/// answer and then asked for a different one. The two must be the same value, or the guard is worse
+/// than no guard.
+///
 /// The directory is quoted because `split_command` is deliberately not a shell: a space in the path
 /// would otherwise split into two arguments. The config *literal* it is written into matters too,
 /// and this test found that the hard way — a Windows path in a TOML **basic** string needs its
 /// backslashes doubled, so `command = "…\Temp\x"` is a TOML parse error at `\T`. Single quotes make
 /// it a literal string and leave the path alone, which is the spelling the example configuration
 /// uses for every path for the same reason.
-fn python_http_server(port: u16, dir: &Path) -> String {
+fn python_http_server(interpreter: &Path, port: u16, dir: &Path) -> String {
     format!(
-        "python -m http.server {port} --bind 127.0.0.1 --directory \"{}\"",
+        "{} -m http.server {port} --bind 127.0.0.1 --directory \"{}\"",
+        interpreter.display(),
         dir.display()
     )
 }
@@ -1971,7 +1978,7 @@ fn python_http_server(port: u16, dir: &Path) -> String {
 ///    `tracing` concern; what is asserted here is that its pipes did not fill up and block it).
 #[test]
 fn a_configured_origin_command_is_started_waited_for_reached_and_stopped() {
-    let Some(_) = find_python() else {
+    let Some(interpreter) = find_python() else {
         eprintln!("skipping: no python binary on PATH");
         return;
     };
@@ -1994,7 +2001,7 @@ origin = "http://127.0.0.1:{port}"
 command = '{}'
 ready_timeout_ms = 20000
 "#,
-        python_http_server(port, &root)
+        python_http_server(&interpreter, port, &root)
     );
     let config = Config::from_toml(&text).expect("a supervised origin parses");
     let routing = front_controller_routing();
@@ -2042,10 +2049,193 @@ ready_timeout_ms = 20000
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Find `python` on `PATH`, for the one test whose origin is not a fixture.
+/// **A configured `protocol = "h2c"` decides what the origin is actually spoken to in.**
+///
+/// The whole of the h2c mechanism is one line — a connector answering `Connected::negotiated_h2()` —
+/// and `crates/volucer-upstream/tests/h2c.rs` already measured that hyper obeys it. What no unit test
+/// in that crate could reach is whether the *configuration* ever gets there through a deployment's
+/// entry point, which is the seam this suite exists for: `Config::from_toml` -> `Dispatcher` ->
+/// `Server` -> a request.
+///
+/// Both halves are asserted against the same fixture and one config key, and the negative one is what
+/// makes the positive one mean anything: a proxy that spoke h2 to every origin would pass a test that
+/// only checked the h2c case, and would be broken for every ordinary HTTP origin in this tree.
+///
+/// The assertion is on the **first bytes on the wire**, not on a version field this server reports:
+/// the question is what the origin was actually sent.
+#[test]
+fn a_configured_h2c_origin_is_spoken_to_in_http2_and_a_plain_one_is_not() {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    for (protocol, wants_h2) in [(Some("h2c"), true), (None, false)] {
+        let origin = ProtocolOrigin::spawn();
+        let protocol = protocol
+            .map(|value| format!("protocol = {value:?}\n"))
+            .unwrap_or_default();
+        let text = format!(
+            r#"
+default_backend = "grpc"
+[server]
+http = "127.0.0.1:0"
+[backends.grpc]
+kind = "upstream"
+origin = "http://{}"
+{protocol}"#,
+            origin.address
+        );
+        let config = Config::from_toml(&text).expect("a gRPC-shaped origin parses");
+        let routing = front_controller_routing();
+        let dispatcher =
+            Dispatcher::from_config(&config, routing.clone()).expect("the client builds");
+        let Some(server) = Server::start(
+            dispatcher,
+            routing,
+            HttpLimits::default(),
+            volucer_core::config::StaticConfig::default(),
+        ) else {
+            panic!("the listener must start");
+        };
+
+        // The call cannot complete — the fixture answers with a SETTINGS frame and nothing else —
+        // because what is under test is what was *sent*. A gRPC-shaped POST, since that is the shape
+        // the path exists for.
+        let address = server.address.clone();
+        let _ = post_grpc(&address, "/pkg.Service/Method");
+        let sent = origin.first_bytes();
+
+        if wants_h2 {
+            assert!(
+                sent.starts_with(PREFACE),
+                "protocol = \"h2c\" must make the client send the HTTP/2 preface.\nexpected {:?}\n\
+                 got      {:?}",
+                String::from_utf8_lossy(PREFACE),
+                String::from_utf8_lossy(&sent)
+            );
+        } else {
+            assert!(
+                sent.starts_with(b"POST /pkg.Service/Method HTTP/1.1"),
+                "with no `protocol` key the origin must be spoken to in HTTP/1.1.\ngot {:?}",
+                String::from_utf8_lossy(&sent)
+            );
+            assert!(!sent.starts_with(PREFACE), "and must not send the preface");
+        }
+    }
+}
+
+/// Send a gRPC-shaped POST and return whatever came back, or nothing on the fixture's timeout.
+///
+/// Deliberately not asserting on the answer: the fixture is not an HTTP/2 server, so a completed call
+/// is not the point. A client that fails here is still a client that sent the preface.
+fn post_grpc(address: &str, path: &str) -> String {
+    let Ok(mut stream) = TcpStream::connect(address) else {
+        return String::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    // A one-message gRPC body: compression flag 0, length 5, then five bytes. The framing is what
+    // makes this a *gRPC* request rather than an HTTP one with an unusual content type, and it is
+    // deliberately never parsed by anything here.
+    let body = [0u8, 0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'];
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: origin\r\nContent-Type: application/grpc+proto\r\n\
+         TE: trailers\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// An origin that records the first bytes it is sent and answers with an empty SETTINGS frame.
+///
+/// `crates/volucer-upstream/tests/h2c.rs` has a fixture of the same shape for the client-level
+/// question; this one is deliberately its own, because that file asserts on a hand-written connector
+/// and this one asserts on the *configured* one. Sharing a fixture between them would let a change to
+/// the connector make both pass for the same wrong reason.
+struct ProtocolOrigin {
+    address: String,
+    first_bytes: std::sync::mpsc::Receiver<Vec<u8>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProtocolOrigin {
+    fn spawn() -> ProtocolOrigin {
+        let listener = OriginListener::bind("127.0.0.1:0").expect("bind an origin");
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking accept so this thread ends with the test");
+        let address = listener.local_addr().expect("an address").to_string();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, first_bytes) = std::sync::mpsc::channel();
+
+        let watching = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        let mut buffer = [0u8; 64];
+                        let read = stream.read(&mut buffer).unwrap_or(0);
+                        // One connection is enough; a second would be the pool's, and the first is
+                        // the one that carries the preface.
+                        let _ = sender.send(buffer[..read].to_vec());
+                        // An empty SETTINGS frame, so an h2 client sees a server rather than a reset.
+                        let _ = stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+                        let _ = stream.flush();
+                        break;
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if watching.load(AtomicOrdering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        ProtocolOrigin {
+            address,
+            first_bytes,
+            stop,
+        }
+    }
+
+    fn first_bytes(&self) -> Vec<u8> {
+        self.first_bytes
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ProtocolOrigin {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Find a `python` on `PATH` that actually runs, for the one test whose origin is not a fixture.
+///
+/// **`is_file()` is not enough, and the failure it lets through is specific to Windows:** there,
+/// `python3.exe` is commonly a Microsoft Store App Execution Alias — a real file that exits `9009`
+/// without running an interpreter. A guard that asks only whether the name exists passes, and the
+/// test then fails one layer deeper with a `StartupExited` that reads like a volucer bug. So the
+/// check is that it runs, which is the property the test needs and the only one a file's existence
+/// cannot fake.
 fn find_python() -> Option<PathBuf> {
     #[cfg(windows)]
-    let names: &[&str] = &["python.exe", "python3.exe", "python", "python3"];
+    let names: &[&str] = &["python3.exe", "python.exe", "python3", "python"];
     #[cfg(not(windows))]
     let names: &[&str] = &["python3", "python"];
 
@@ -2053,7 +2243,17 @@ fn find_python() -> Option<PathBuf> {
     for dir in std::env::split_paths(&path) {
         for name in names {
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            if !candidate.is_file() {
+                continue;
+            }
+            let runs = std::process::Command::new(&candidate)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if runs {
                 return Some(candidate);
             }
         }

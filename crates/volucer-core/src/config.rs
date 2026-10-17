@@ -2174,9 +2174,11 @@ impl BackendConfig {
     /// into a configuration error, `preflight` into a warning.
     pub fn origin(&self) -> Option<std::result::Result<OriginSpec, String>> {
         match self {
-            BackendConfig::Upstream(upstream) => {
-                Some(OriginSpec::parse(&upstream.origin, upstream.tls.clone()))
-            }
+            BackendConfig::Upstream(upstream) => Some(OriginSpec::parse_with(
+                &upstream.origin,
+                upstream.tls.clone(),
+                upstream.protocol,
+            )),
             _ => None,
         }
     }
@@ -2198,6 +2200,40 @@ pub struct UpstreamConfig {
     /// handshake for it to describe.
     #[serde(default)]
     pub tls: Option<UpstreamTlsConfig>,
+
+    /// That a plaintext or `unix:` origin speaks HTTP/2 with **prior knowledge** (h2c).
+    ///
+    /// Absent — the default — means HTTP/1.1, which is what every ordinary HTTP origin speaks and
+    /// what this client spoke before the key existed. `true` makes the connector answer
+    /// `negotiated_h2()` for this origin and nothing else, which is the whole mechanism: measured in
+    /// `crates/volucer-upstream/tests/h2c.rs`, making that one claim is what makes hyper open with
+    /// the HTTP/2 connection preface instead of an HTTP/1.1 request line.
+    ///
+    /// # Why this is a key rather than something inferred
+    ///
+    /// gRPC's transport *is* HTTP/2, so a plaintext or unix-socket gRPC backend needs h2c — there is
+    /// no ALPN to negotiate it on a transport without a handshake. The alternative considered and
+    /// refused was inferring it from the route that selected the backend
+    /// (`docs/plugins.md` §10 item 3): that needs no key, but it makes an origin's *protocol* depend
+    /// on where a request came from, which is the kind of implicit coupling this project refuses
+    /// elsewhere. Stated here, it is one fact about one origin that an operator can read.
+    ///
+    /// # What it refuses
+    ///
+    /// Beside `https://`, by `validate`: TLS negotiates HTTP/2 through ALPN (RFC 7301), and a claim
+    /// of prior knowledge there would be a second answer to a question the handshake already
+    /// answered — and the wrong one when the origin offers `http/1.1` only. `http://` and `unix:`
+    /// are not two settings for one thing either; they are one setting for two transports, since
+    /// there is no handshake on either.
+    ///
+    /// # The failure if the origin does not actually speak h2
+    ///
+    /// A connection error or a reset rather than a silent downgrade, because a client's first bytes
+    /// are the HTTP/2 preface and an HTTP/1.1 peer answers them with a 400. That is a loud failure
+    /// and the right one: an origin that does not speak h2 is a deployment mistake, and guessing
+    /// HTTP/1.1 for a gRPC route would surface as a protocol error somewhere far less obvious.
+    #[serde(default)]
+    pub protocol: Option<UpstreamProtocol>,
 
     /// Command line that starts the origin, e.g.
     /// `gunicorn myapp.wsgi --bind unix:/run/app.sock`.
@@ -2279,6 +2315,25 @@ pub struct UpstreamConfig {
     pub ready_timeout_ms: u64,
 }
 
+/// Which HTTP version a plaintext or unix-socket origin is spoken to in.
+///
+/// One variant, deliberately. HTTP/1.1 is the absence of this key rather than a value of it — the
+/// same reason [`UpstreamConfig::restart`] is an `Option` — so there is no `Http1` to write and no
+/// way to state a setting that changes nothing. Adding a second variant later is a one-line change
+/// here and a match arm in the connector, which is the shape that keeps "absent" and "explicitly
+/// HTTP/1.1" from becoming two different things to test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProtocol {
+    /// HTTP/2 over cleartext, with prior knowledge — no ALPN, no upgrade, no `h2c` header dance.
+    ///
+    /// That is what a gRPC client does: it opens a connection and sends the HTTP/2 preface. The name
+    /// `h2c` is the IETF's for the cleartext form (`RFC 9113` §3.2 covers the prior-knowledge form
+    /// too); there is deliberately no `"h2c-upgrade"`, because an upgrade is a mechanism for a client
+    /// that must assume HTTP/1.1 first and gRPC clients do not.
+    H2c,
+}
+
 /// When a supervised upstream origin is started again after it exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2329,6 +2384,7 @@ impl UpstreamConfig {
         UpstreamConfig {
             origin: origin.into(),
             tls: None,
+            protocol: None,
             command: None,
             working_dir: None,
             env: BTreeMap::new(),
@@ -2412,13 +2468,29 @@ pub enum OriginSpec {
         port: u16,
         /// How to verify an `https:` origin. Always `Some` for `https`, always `None` for `http`.
         tls: Option<UpstreamTlsConfig>,
+        /// That this origin speaks h2c — HTTP/2 with prior knowledge. Never set for `https:`.
+        ///
+        /// On the *spec* rather than passed beside it because it describes the same thing the other
+        /// four fields do: how this address is reached. A caller that got an `OriginSpec` therefore
+        /// has the protocol, which is what makes "`protocol` beside a handshake was refused" a
+        /// property of the type rather than of `validate` having run.
+        protocol: Option<UpstreamProtocol>,
     },
     /// A unix socket on this host.
     ///
     /// Only produced on a platform that has one. On Windows the parse refuses `unix:` by name
     /// rather than accepting a path nothing can dial — the same rule `Endpoint` uses.
     #[cfg(unix)]
-    Socket(PathBuf),
+    Socket {
+        /// The socket to dial.
+        path: PathBuf,
+        /// That this socket speaks h2c. See [`OriginSpec::protocol`].
+        ///
+        /// A field rather than something inferred from "it is a socket", which would be wrong: the
+        /// ordinary unix-socket origin is `php-fpm` or gunicorn speaking HTTP/1.1, and assuming h2
+        /// for every socket would break them.
+        protocol: Option<UpstreamProtocol>,
+    },
 }
 
 impl OriginSpec {
@@ -2434,6 +2506,18 @@ impl OriginSpec {
     /// credentials would look honoured when nothing consumes them, an unknown scheme would be
     /// treated as plaintext, and a `tls` table beside `http` would look like a verified hop.
     pub fn parse(spec: &str, tls: Option<UpstreamTlsConfig>) -> std::result::Result<Self, String> {
+        Self::parse_with(spec, tls, None)
+    }
+
+    /// Parse an origin that may also be declared to speak h2c.
+    ///
+    /// [`OriginSpec::parse`] is this with no protocol, which keeps the four call sites that have no
+    /// `protocol` key — a diagnostic, a test, the exporter's endpoint — from inventing one.
+    pub fn parse_with(
+        spec: &str,
+        tls: Option<UpstreamTlsConfig>,
+        protocol: Option<UpstreamProtocol>,
+    ) -> std::result::Result<Self, String> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Err("it is empty".to_string());
@@ -2462,7 +2546,10 @@ impl OriginSpec {
                         path.len()
                     ));
                 }
-                return Ok(OriginSpec::Socket(PathBuf::from(path)));
+                return Ok(OriginSpec::Socket {
+                    path: PathBuf::from(path),
+                    protocol,
+                });
             }
             #[cfg(not(unix))]
             {
@@ -2528,6 +2615,7 @@ impl OriginSpec {
                 host,
                 port,
                 tls: Some(tls.unwrap_or_default()),
+                protocol: None,
             }),
             _ => {
                 if tls.is_some() {
@@ -2542,6 +2630,7 @@ impl OriginSpec {
                     host,
                     port,
                     tls: None,
+                    protocol,
                 })
             }
         }
@@ -2552,7 +2641,7 @@ impl OriginSpec {
         match self {
             OriginSpec::Network { scheme, .. } => scheme,
             #[cfg(unix)]
-            OriginSpec::Socket(_) => "unix",
+            OriginSpec::Socket { .. } => "unix",
         }
     }
 
@@ -2565,7 +2654,7 @@ impl OriginSpec {
         match self {
             OriginSpec::Network { host, port, .. } => Some((host.clone(), *port)),
             #[cfg(unix)]
-            OriginSpec::Socket(_) => None,
+            OriginSpec::Socket { .. } => None,
         }
     }
 
@@ -2574,7 +2663,7 @@ impl OriginSpec {
         match self {
             OriginSpec::Network { .. } => None,
             #[cfg(unix)]
-            OriginSpec::Socket(path) => Some(path),
+            OriginSpec::Socket { path, .. } => Some(path),
         }
     }
 
@@ -2587,13 +2676,32 @@ impl OriginSpec {
         match self {
             OriginSpec::Network { tls, .. } => tls.as_ref(),
             #[cfg(unix)]
-            OriginSpec::Socket(_) => None,
+            OriginSpec::Socket { .. } => None,
         }
     }
 
     /// Whether this origin is reached over TLS.
     pub fn is_tls(&self) -> bool {
         self.tls().is_some()
+    }
+
+    /// Whether this origin was declared to speak h2c, on either transport.
+    ///
+    /// Read by the client's connector to answer `negotiated_h2()` for a plaintext or socket origin.
+    /// Never `true` for `https:`, and that is structural rather than checked here: the `https` arm of
+    /// the parser writes `protocol: None` unconditionally, so a spec that came from an `https://`
+    /// string cannot carry a claim even if one was passed in.
+    ///
+    /// One accessor over both variants rather than one per transport, because the *question* is one
+    /// question — "does this address speak HTTP/2 with prior knowledge?" — and a unix-socket gRPC
+    /// backend is the shape this key exists for. A second accessor for sockets would be an invitation
+    /// to forget the case that matters.
+    pub fn protocol(&self) -> Option<UpstreamProtocol> {
+        match self {
+            OriginSpec::Network { protocol, .. } => *protocol,
+            #[cfg(unix)]
+            OriginSpec::Socket { protocol, .. } => *protocol,
+        }
     }
 
     /// Whether the origin is on this host rather than across a network.
@@ -2612,7 +2720,7 @@ impl OriginSpec {
                         .is_ok_and(|ip| ip.is_loopback())
             }
             #[cfg(unix)]
-            OriginSpec::Socket(_) => true,
+            OriginSpec::Socket { .. } => true,
         }
     }
 }
@@ -3858,12 +3966,24 @@ impl Config {
                 // Parsing is also the validation of the `[backends.<n>.tls]` table: the origin and
                 // the table are only meaningful together, so `OriginSpec::parse` takes the table and
                 // refuses one that has no handshake to describe.
-                let origin = OriginSpec::parse(&u.origin, u.tls.clone())
+                let origin = OriginSpec::parse_with(&u.origin, u.tls.clone(), u.protocol)
                     .map_err(|reason| Error::Config(format!("backends.{name}.origin: {reason}")))?;
                 // The scheme decides whether a `tls` table belongs at all, and the parse above has
                 // already refused the combination that does not. `origin` is kept in scope rather
                 // than discarded so the rule is readable here: `sni` and `ca` are only reachable
                 // for a `https:` origin.
+
+                // `protocol` beside a handshake is refused, because there the answer is ALPN's and a
+                // claim of prior knowledge would be a second, worse answer: it would be wrong
+                // whenever the origin offers `http/1.1` only, and the client would send the h2
+                // preface to an HTTP/1.1 peer.
+                if u.protocol.is_some() && origin.is_tls() {
+                    return bad(format!(
+                        "backends.{name}.protocol is set beside an `https://` origin, where the \
+                         protocol is negotiated by ALPN during the handshake; remove the key to let \
+                         the handshake decide, which is also what makes an HTTP/1.1-only origin work"
+                    ));
+                }
 
                 // The supervisor's three knobs, checked here because every one of them is a
                 // setting whose wrong value is silent rather than loud at runtime.
@@ -8366,6 +8486,89 @@ binary = "/usr/bin/php-cgi"
             !prefix(&cgi, "cgi"),
             "php-cgi emits the file it is pointed at, so the stat is the guard"
         );
+    }
+
+    #[test]
+    fn a_plaintext_origin_can_be_declared_to_speak_h2_and_a_tls_one_cannot() {
+        // The transport decision of `docs/plugins.md` §10 item 3. gRPC's transport is HTTP/2, and on
+        // a transport with no handshake there is no ALPN to negotiate it — so the configuration has
+        // to say it, and this is where that answer is checked.
+        let config = Config::from_toml(&upstream_config(
+            "origin = \"http://127.0.0.1:3000\"\nprotocol = \"h2c\"",
+        ))
+        .expect("the file parses");
+        config
+            .validate()
+            .expect("h2c on a plaintext origin is valid");
+        let Some(BackendConfig::Upstream(upstream)) = config.backends.get("node") else {
+            panic!("the backend is an upstream");
+        };
+        assert_eq!(upstream.protocol, Some(UpstreamProtocol::H2c));
+        // And it reaches the *spec*, which is what the client's connector reads. A key that parsed
+        // but stopped here would be a setting nothing consumes.
+        let spec =
+            OriginSpec::parse_with(&upstream.origin, upstream.tls.clone(), upstream.protocol)
+                .expect("a loopback origin");
+        assert_eq!(spec.protocol(), Some(UpstreamProtocol::H2c));
+
+        // Beside a handshake it is refused, because there the answer is ALPN's and a claim of prior
+        // knowledge would be wrong whenever the origin offers `http/1.1` only.
+        let err = Config::from_toml(&upstream_config(
+            "origin = \"https://node.internal:8443\"\nprotocol = \"h2c\"",
+        ))
+        .expect("the file parses")
+        .validate()
+        .expect_err("a handshake negotiates the protocol, so claiming one is a second answer");
+        assert!(err.to_string().contains("ALPN"), "{err}");
+
+        // A misspelled value is refused by name rather than read as the default — and the enum has
+        // exactly one variant, so `http2` and `h2` are both mistakes rather than synonyms.
+        for value in ["\"http2\"", "\"h2\"", "\"http/2\"", "\"true\""] {
+            let text = upstream_config(&format!(
+                "origin = \"http://127.0.0.1:3000\"\nprotocol = {value}"
+            ));
+            assert!(
+                Config::from_toml(&text).is_err(),
+                "protocol = {value} must not be accepted"
+            );
+        }
+
+        // Absent is HTTP/1.1, and it stays absent rather than becoming a value: the same rule
+        // `restart` follows, and for the same reason — a default would make "unset" and "set to the
+        // default" indistinguishable.
+        let plain = Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\""))
+            .expect("parses");
+        let Some(BackendConfig::Upstream(upstream)) = plain.backends.get("node") else {
+            panic!("the backend is an upstream");
+        };
+        assert_eq!(upstream.protocol, None);
+        assert_eq!(
+            OriginSpec::parse(&upstream.origin, None)
+                .expect("a loopback origin")
+                .protocol(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_socket_can_be_declared_to_speak_h2_too() {
+        // The shape this key exists for: a gRPC application on a unix socket, which is what a
+        // Node/Go/Python gRPC server behind volucer looks like. The socket and the network case are
+        // two transports and one question, so they are asserted separately rather than assumed to
+        // share an answer.
+        let spec = OriginSpec::parse_with("unix:/run/grpc.sock", None, Some(UpstreamProtocol::H2c))
+            .expect("a socket origin");
+        assert_eq!(spec.socket_path(), Some(Path::new("/run/grpc.sock")));
+        assert_eq!(
+            spec.protocol(),
+            Some(UpstreamProtocol::H2c),
+            "the claim has to reach a socket as well as an address, or the gRPC-over-socket case \
+             cannot be expressed at all"
+        );
+        // And the ordinary socket origin — php-fpm, gunicorn — stays HTTP/1.1.
+        let plain = OriginSpec::parse("unix:/run/php-fpm.sock", None).expect("a socket origin");
+        assert_eq!(plain.protocol(), None);
     }
 
     #[test]

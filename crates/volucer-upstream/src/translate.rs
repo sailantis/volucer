@@ -31,6 +31,13 @@ use crate::client::{connection_named, UpstreamRequest, UpstreamResponse};
 /// chunked upload only works end to end if the incoming framing is dropped.
 ///
 /// `Expect` is here for a reason of its own — see [`prepare_request`].
+///
+/// **`TE` is here and is the one entry with a documented exception.** RFC 9110 §7.6.1 makes it
+/// hop-by-hop, so a generic proxy must drop it. gRPC is not generic: its protocol *requires* the
+/// client to send `TE: trailers` and requires it to arrive, which is how a server knows the client
+/// can read the trailers a gRPC reply ends with. Every gRPC-aware proxy therefore guarantees it —
+/// see [`prepare_request`] for exactly what volucer does with it, which is to *construct* it rather
+/// than to forward whatever arrived.
 const NEVER_FORWARDED: [&str; 10] = [
     "connection",
     "keep-alive",
@@ -48,6 +55,31 @@ fn never_forwarded(name: &HeaderName) -> bool {
     NEVER_FORWARDED
         .iter()
         .any(|candidate| name.as_str().eq_ignore_ascii_case(candidate))
+}
+
+/// Whether this request is a gRPC call.///
+/// By `content-type`, which is the only thing that says so: gRPC's media type is `application/grpc`
+/// with optional suffixes (`+proto`, `+json`, and the `-web`/`-web-text` forms), and
+/// `docs/plugins.md` §6.6 is explicit that the server never parses a message — so this is a prefix
+/// test and nothing more. A `:path` shaped like `/pkg.Service/Method` is *not* the test, because an
+/// HTTP route can be spelled that way and must keep working.
+///
+/// The prefix has to be followed by the end of the value, `;`, `+`, or `-` — not by any byte. The
+/// first version was a bare `starts_with("application/grpc")` and accepted `application/grpcx`,
+/// which is caught by the test below: a media type is a token rather than a string, and
+/// `application/grpcx` is a *different* type that happens to begin with the same letters. Treating
+/// it as gRPC would route an ordinary origin's response down the h2 path.
+pub fn is_grpc(headers: &HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let lowered = value.trim().to_ascii_lowercase();
+            let Some(rest) = lowered.strip_prefix("application/grpc") else {
+                return false;
+            };
+            matches!(rest.as_bytes().first(), None | Some(b';' | b'+' | b'-'))
+        })
 }
 
 /// Build the request an origin should receive.
@@ -71,6 +103,28 @@ fn never_forwarded(name: &HeaderName) -> bool {
 /// We forward on the same connection the client is waiting on and never generate an interim `100`,
 /// so an `Expect` that reached the origin would make a client wait for a reply that is coming from
 /// a place it is not listening. Stripping it makes the client stop waiting, which is correct.
+///
+/// # `TE: trailers` is constructed, not forwarded
+///
+/// The only place this function *adds* a header a client sent. RFC 9110 §7.6.1 makes `TE`
+/// hop-by-hop, so it is in [`NEVER_FORWARDED`] and the client's own value is dropped — but gRPC's
+/// protocol requires the server to receive `TE: trailers`, and the server is the origin here. Two
+/// consequences worth stating:
+///
+/// - **Value `trailers` is enough, and is exactly what gRPC requires.** A client is not obliged to
+///   spell the case or the list the same way (`te: trailers, deflate` is legal), so *forwarding* it
+///   would mean forwarding a hop-by-hop header whose value this server has no reason to trust.
+///   Writing the one value gRPC defines is both simpler and more correct.
+/// - **It is added for every request, not only for gRPC ones.** A generic client that sets
+///   `TE: trailers` means it — that is what the header says — and the origin is the next hop, so
+///   telling it so is the honest forwarding of the client's *intent* rather than of its characters.
+///   Restricting it to gRPC would also make the h2c path and the TLS/ALPN path disagree about what a
+///   gRPC origin sees, since the former is decided here and the latter by the handshake.
+///
+/// The alternative — forwarding `TE` verbatim and letting the origin sort it out — was refused
+/// because it is precisely the hop-by-hop leak the list exists to prevent, and because a client
+/// could then ask an origin for `TE: gzip` and get a compressed reply this server would pass on
+/// without ever having negotiated it.
 pub fn prepare_request<B>(
     headers: HeaderMap,
     method: Method,
@@ -130,8 +184,10 @@ pub fn prepare_request<B>(
         HeaderValue::from_static(if cleartext { "http" } else { "https" }),
     );
 
-    // `TE` and `TRAILER` are referenced so the constants above stay the single source of names;
-    // `CONNECTION`, `EXPECT`, `TRANSFER_ENCODING`, `UPGRADE` likewise.
+    // Constructed rather than forwarded — see this function's `TE` section. Appended after the
+    // filter so a client-supplied value cannot survive alongside it, and added unconditionally
+    // because a generic client that set it meant it.
+    outgoing.append(hyper::header::TE, HeaderValue::from_static("trailers"));
 
     UpstreamRequest {
         method,
@@ -246,6 +302,60 @@ mod tests {
 
         assert!(!outgoing.contains_key("x-private"), "named by Connection");
         assert!(outgoing.contains_key("x-public"), "not named");
+    }
+
+    #[test]
+    fn te_trailers_is_constructed_for_every_request_and_the_clients_value_is_dropped() {
+        // gRPC's protocol requires the server to see `TE: trailers`. It is hop-by-hop (RFC 9110
+        // §7.6.1), so the client's own value must not cross — but the *intent* must, and exactly one
+        // spelling of it, so this is the one header the proxy writes rather than forwards.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::TE,
+            HeaderValue::from_static("trailers, deflate"),
+        );
+        let outgoing = request(headers).headers;
+
+        assert_eq!(
+            values(&outgoing, "te"),
+            vec!["trailers".to_string()],
+            "the client's list must not survive: `deflate` would have the origin compress a reply \
+             this server never negotiated"
+        );
+
+        // And it is added for a request that did not ask, because the value is what the next hop
+        // needs to know rather than a copy of the characters that arrived.
+        let outgoing = request(HeaderMap::new()).headers;
+        assert_eq!(values(&outgoing, "te"), vec!["trailers".to_string()]);
+    }
+
+    #[test]
+    fn a_grpc_call_is_recognised_by_its_content_type_and_nothing_else() {
+        // The server never parses a message (`docs/plugins.md` §6.6), so `content-type` is the whole
+        // of what identifies a gRPC call — including the `-web` and `+json` forms, which are still
+        // gRPC's framing and still need the h2 path and the trailer handling.
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                hyper::header::CONTENT_TYPE,
+                HeaderValue::from_str(value).expect("a header value"),
+            );
+            is_grpc(&headers)
+        };
+
+        assert!(with("application/grpc"));
+        assert!(with("application/grpc+proto"));
+        assert!(with("application/grpc+json"));
+        assert!(with("application/grpc-web"));
+        assert!(with("application/grpc-web+proto"));
+        // Case and surrounding whitespace are not the protocol.
+        assert!(with("Application/GRPC+Proto"));
+        assert!(with(" application/grpc "));
+
+        assert!(!with("application/json"));
+        assert!(!with("application/grpcx"));
+        assert!(!with("text/plain"));
+        assert!(!is_grpc(&HeaderMap::new()), "no content-type is not gRPC");
     }
 
     #[test]

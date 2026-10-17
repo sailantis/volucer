@@ -334,7 +334,11 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                 // cheap to notice. A malformed origin is *not* reported here — `Config::validate`
                 // refuses it outright, so repeating it as a warning would be a weaker second
                 // answer to a question already answered.
-                let Ok(origin) = OriginSpec::parse(&upstream.origin, upstream.tls.clone()) else {
+                let Ok(origin) = OriginSpec::parse_with(
+                    &upstream.origin,
+                    upstream.tls.clone(),
+                    upstream.protocol,
+                ) else {
                     continue;
                 };
                 if let Some(path) = origin.socket_path() {

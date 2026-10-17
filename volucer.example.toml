@@ -285,6 +285,14 @@ socket = "unix:/run/php/php-fpm.sock"
 # ca = "/etc/ssl/internal-ca.pem"   # absent = the public roots
 # sni = "node.internal"             # optional; defaults to the origin's host
 #
+# gRPC needs HTTP/2, and TLS negotiates that through ALPN on its own -- so only a
+# plaintext or unix-socket origin needs to be told. `h2c` is HTTP/2 with prior
+# knowledge: the client opens the connection and sends the HTTP/2 preface, with no
+# upgrade. That is what a gRPC client does, and it is the only value this key takes;
+# absent means HTTP/1.1. It is refused beside an `https://` origin, where the
+# handshake is the answer.
+# protocol = "h2c"
+#
 # ---------------------------------------------------------------------------
 # Supervising the origin, for a runtime whose own server volucer should start.
 #
