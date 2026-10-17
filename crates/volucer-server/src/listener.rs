@@ -328,6 +328,20 @@ fn server_error_status(err: &ServerError) -> u16 {
 /// log: this listener's peer really is nginx, and nginx's own access log carries the real client.
 /// Writing the header nginx put in `X-Forwarded-For` instead would make this log assert a peer it
 /// never saw, which is the one thing a log must not do.
+///
+/// **Checked against nginx's own `fastcgi_params`, and the conclusion is that `[server.proxy]` must
+/// *not* be applied on this path.** nginx sets `REMOTE_ADDR = $remote_addr` — the address it saw the
+/// client at, already resolved by nginx's own `real_ip` handling — so the *param* is the client's
+/// address even though the socket belongs to nginx. The `HTTP_*` params beside it are the client's
+/// own claims, relayed verbatim, which nginx has not vouched for. A policy that preferred a
+/// relayed header over `REMOTE_ADDR` here would therefore replace a value the proxy established
+/// with one the client asserted: the two front-ends look symmetric and are not, and the asymmetry is
+/// this line rather than an oversight.
+///
+/// So the trust list is a property of the **HTTP** front-end, where the peer really is a proxy when
+/// one is configured. If this listener is ever put behind something that forwards raw FastCGI
+/// without setting `REMOTE_ADDR`, that deployment is unaddressed — and it would need the *socket*
+/// peer to be trusted, which is a different check from the one `[server.proxy]` makes.
 fn record_fastcgi(
     observe: &Observability,
     context: &RequestContext,

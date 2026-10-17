@@ -1052,9 +1052,21 @@ fn serve(
     // The handles one listener needs: the shared table, the one registry, and TLS when it speaks
     // it. Built per listener because the resolver is `Some` for a TLS listener and `None` for a
     // plaintext one, which is what keeps a plaintext listener from carrying TLS state at all.
+    //
+    // The client-address policy rides here rather than being a second argument to each binder, so a
+    // deployment behind nginx and one that is not differ in the configuration alone. It is built
+    // once, before the closure, because `[server.proxy]` is restart-only and so cannot move on a
+    // reload — `restart_only` is the list an operator is shown, and it names this table.
+    let client_ip = Arc::new(
+        config
+            .server
+            .client_ip()
+            .map_err(|reason| ServerError::Listener { reason })?,
+    );
     let handles_for = |speaks_tls: bool| {
         let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry))
-            .with_observability(Arc::clone(&observe));
+            .with_observability(Arc::clone(&observe))
+            .with_client_ip(Arc::clone(&client_ip));
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
             _ => handles,
@@ -1649,6 +1661,7 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: listener addresses (the sockets are already bound)",
         "a reload does not change: backends, their commands and worker counts (the processes are running)",
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
+        "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
     ]
 }
 
@@ -2458,7 +2471,12 @@ document_root = "/from/file"
         let lines = restart_only();
         let joined = lines.join("\n");
 
-        for required in ["listener addresses", "backends", "min_version"] {
+        for required in [
+            "listener addresses",
+            "backends",
+            "min_version",
+            "server.proxy",
+        ] {
             assert!(
                 joined.contains(required),
                 "the restart-only list must name {required:?}, or an operator who edited it gets \

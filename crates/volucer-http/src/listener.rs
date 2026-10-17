@@ -246,6 +246,12 @@ struct FrontEnd {
     /// a deployment behind nginx runs both front-ends, and two access logs would mean the same
     /// application's requests appear in two files depending on which front-end received them.
     observe: Arc<volucer_observe::Observability>,
+    /// Whose forwarded headers are believed. Off resolves every request to its own peer.
+    ///
+    /// Beside `observe` because it is the same kind of thing — a process-wide decision both
+    /// front-ends share — and because the two are read at the same point in the request path: the
+    /// address that is logged is the address the policy resolved.
+    client_ip: Arc<volucer_core::ClientIpPolicy>,
 }
 
 impl FrontEnd {
@@ -295,6 +301,17 @@ pub struct ReloadHandles {
     ///
     /// Defaults to disabled, so `ReloadHandles::new` keeps costing nothing.
     pub observe: Arc<volucer_observe::Observability>,
+    /// Whose forwarded headers are believed, when a reverse proxy is in front.
+    ///
+    /// Here for the same reason `observe` is: it is a process-wide decision both front-ends have to
+    /// agree on, and it is not reloadable. **Restart-only**, unlike the site table — the same
+    /// treatment `[server.tls]`'s `alpn` gets and for the same kind of reason: it is a statement
+    /// about the deployment's topology rather than about a request, and a reload that appeared to
+    /// apply it while a running connection kept the old answer would be worse than one that
+    /// refused. `serve`'s `restart_only` list names it on every reload.
+    ///
+    /// Defaults to off, so every existing caller keeps resolving to the peer address.
+    pub client_ip: Arc<volucer_core::ClientIpPolicy>,
 }
 
 impl ReloadHandles {
@@ -305,6 +322,7 @@ impl ReloadHandles {
             registry,
             tls: None,
             observe: Arc::new(volucer_observe::Observability::disabled()),
+            client_ip: Arc::new(volucer_core::ClientIpPolicy::off()),
         }
     }
 
@@ -312,6 +330,17 @@ impl ReloadHandles {
     #[must_use]
     pub fn with_observability(mut self, observe: Arc<volucer_observe::Observability>) -> Self {
         self.observe = observe;
+        self
+    }
+
+    /// The same, with a trust list for the peers whose forwarded headers are believed.
+    ///
+    /// A builder beside [`ReloadHandles::with_observability`] rather than an argument on `new`, for
+    /// the reason that one is: every existing caller and every test constructs these handles without
+    /// a policy, and those must keep compiling and keep resolving to the peer address.
+    #[must_use]
+    pub fn with_client_ip(mut self, client_ip: Arc<volucer_core::ClientIpPolicy>) -> Self {
+        self.client_ip = client_ip;
         self
     }
 
@@ -774,6 +803,7 @@ impl HttpListener {
                 redirect_to_https,
                 https_port: Some(https_port),
                 observe: Arc::clone(&handles.observe),
+                client_ip: Arc::clone(&handles.client_ip),
             }),
             tls: acceptor,
             accept_plain,
@@ -978,13 +1008,28 @@ async fn serve_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let remote_addr = peer.ip().to_string();
+    // The peer address as the client's, which is the answer whenever no trust list is configured —
+    // and the answer for a peer that is not on the list, whatever the list says. Only the IP is kept
+    // and not the port: the policy is about the *host*, and the client's port is not sent to the
+    // backend at all, so a `REMOTE_PORT` that was really the proxy's is a reader this deliberately
+    // does not create.
+    let peer_ip = peer.ip();
     let service = service_fn(move |request: Request<Incoming>| {
         let front_end = Arc::clone(&front_end);
-        let remote_addr = remote_addr.clone();
         // Infallible because a failure is turned into an error page, not
         // propagated: a 502 the client can read beats a dropped connection.
-        async move { Ok::<_, Infallible>(handle(request, front_end, remote_addr, cleartext).await) }
+        async move {
+            // **Resolved here, once, from the request's own headers.** Two readers depend on the
+            // answer — `REMOTE_ADDR` for the backend and the access log's `peer` — and resolving them
+            // separately is how the two come to disagree, which is a log that contradicts what the
+            // application was told. It is inside the closure rather than outside because the headers
+            // are what it reads.
+            let remote_addr = front_end
+                .client_ip
+                .resolve(peer_ip, &HttpHeaders(request.headers()))
+                .to_string();
+            Ok::<_, Infallible>(handle(request, front_end, remote_addr, cleartext).await)
+        }
     });
 
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -1124,6 +1169,21 @@ async fn handle(
 /// request id or a trace context, so `None` is the honest answer.
 fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The HTTP side of [`volucer_core::HeaderLookup`].
+///
+/// A newtype rather than an `impl` on `HeaderMap`, because `HeaderMap` is `hyper`'s type and the
+/// trait is ours: the orphan rule would refuse it, and wrapping keeps the resolution rule in
+/// `volucer-core` with one set of tests covering both front-ends.
+struct HttpHeaders<'a>(&'a hyper::HeaderMap);
+
+impl volucer_core::HeaderLookup for HttpHeaders<'_> {
+    fn header(&self, name: &str) -> Option<&str> {
+        // `HeaderMap`'s own lookup is case-insensitive, so the canonicalisation the policy did is
+        // for deduplication and for the FastCGI side rather than for correctness here.
+        header_str(self.0, name)
+    }
 }
 
 /// The authority a redirect should name.

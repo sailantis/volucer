@@ -1524,6 +1524,166 @@ origin = {origin}
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// **`[server.proxy]` reaches the request path, and the trust decision is what decides.**
+///
+/// The defect this closes is invisible from the client's side, which is why it is asserted at the
+/// origin rather than in the answer: behind a proxy, the address the *backend* is told is the
+/// proxy's, so anything keyed on it — a rate limit, an IP allow-list, an abuse heuristic — keys on
+/// the proxy and cannot tell two clients apart.
+///
+/// Two requests are made from the **same socket peer** and the two answers must differ, which is the
+/// only shape that can tell the policy apart from "the address always comes from the header" and
+/// from "the address never does":
+///
+/// 1. A claim **with** a trusted peer is believed, and the backend is told the claimed address.
+/// 2. The same claim **without** a trusted peer is ignored, and the backend is told the peer's
+///    address — which is the security property, since a client can always send a header.
+///
+/// The negative case is what makes the positive one mean something: a server that trusted every
+/// header would pass step 1 and has a spoofing hole, and one that trusted none would pass step 2 and
+/// still be broken behind a proxy.
+#[test]
+fn a_proxy_trust_list_decides_whether_a_forwarded_address_is_believed() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    // A backend that echoes the environment, so the assertion is on what PHP would actually read
+    // rather than on what the server believes it sent.
+    if find_php().is_none() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let origin = TestOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let root = std::env::temp_dir().join(format!("volucer-proxy-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let script = root.join("echo.php");
+    std::fs::write(
+        &script,
+        "<?php header('X-Saw-Remote: ' . ($_SERVER['REMOTE_ADDR'] ?? 'none')); echo 'ok';",
+    )
+    .expect("write the probe script");
+
+    let config_path = root.join("volucer.toml");
+    // The trust list names `127.0.0.1` and nothing else. The test's own client *is* 127.0.0.1, so the
+    // same socket is on the list in one run and off it in the other by editing one line — which is
+    // the point: the decision is the configuration's, not the connection's.
+    let config_for = |trusted: bool| {
+        format!(
+            r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:0"
+document_root = {root}
+[server.proxy]
+trusted_subnets = [{subnets}]
+trusted_headers = ["X-Forwarded-For"]
+[backends.app]
+kind = "spawn_cgi"
+binary = {php}
+base_port = {port}
+"#,
+            root = toml_string(&root.display().to_string()),
+            subnets = if trusted { "\"127.0.0.1\"" } else { "" },
+            php = toml_string(&php_cgi.display().to_string()),
+            port = free_port_run(1).expect("a free port for the php-cgi pool"),
+        )
+    };
+
+    for (trusted, expected, why) in [
+        (
+            true,
+            "203.0.113.9",
+            "a trusted peer's claim is the address the backend is told",
+        ),
+        (
+            false,
+            "127.0.0.1",
+            "an untrusted peer's claim is ignored, however plausible it looks",
+        ),
+    ] {
+        std::fs::write(&config_path, config_for(trusted)).expect("write the config");
+        let Some(server) = Server::start(&binary, &config_path) else {
+            panic!("the server did not start with a proxy table of trusted={trusted}");
+        };
+        let address = server
+            .http_address
+            .clone()
+            .expect("the configuration asked for an HTTP listener");
+
+        let answer = http_get_with(&address, "/echo.php", &[("X-Forwarded-For", "203.0.113.9")]);
+        assert_eq!(answer.status, 200, "{why}: {answer:?}");
+        assert_eq!(
+            answer.header("x-saw-remote"),
+            Some(expected),
+            "{why}: {answer:?}"
+        );
+
+        drop(server);
+    }
+
+    // And the same resolution reaches an *upstream* origin, through the other code path. The claim
+    // and the header are deliberately different here: `X-Real-Ip` is what the policy is told to
+    // believe, so the address it resolves is `198.51.100.9`, while the client's own `X-Forwarded-For`
+    // is relayed verbatim by the append rule. The outgoing chain is therefore the client's claim
+    // **followed by the address this server resolved** — and the *second* element is the assertion.
+    // A test that sent one header and checked for it would pass with the policy switched off, since
+    // the append rule alone puts it there.
+    let upstream_config = format!(
+        r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:0"
+document_root = {root}
+[server.proxy]
+trusted_subnets = ["127.0.0.1"]
+trusted_headers = ["X-Real-Ip"]
+[backends.node]
+kind = "upstream"
+origin = {origin}
+"#,
+        root = toml_string(&root.display().to_string()),
+        origin = toml_string(&origin.origin_url()),
+    );
+    std::fs::write(&config_path, upstream_config).expect("write the config");
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start with an upstream backend");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+    let _ = http_get_with(
+        &address,
+        "/api/things",
+        &[
+            ("X-Real-Ip", "198.51.100.9"),
+            ("X-Forwarded-For", "203.0.113.11"),
+        ],
+    );
+    let request = origin.first_request().to_ascii_lowercase();
+    // Two field lines rather than one comma-joined list: the append rule adds a header, and RFC 7230
+    // §3.2.2 makes the two equivalent. The second line is the assertion — the address this server
+    // *resolved* from `X-Real-Ip`, which the client did not send in that header.
+    assert!(
+        request.contains("x-forwarded-for: 203.0.113.11"),
+        "the client's own claim must still reach the origin: {request:?}"
+    );
+    assert!(
+        request.contains("x-forwarded-for: 198.51.100.9"),
+        "and the address this server resolved from `X-Real-Ip` must be appended after it, which is \
+         the half a policy-off server would not produce: {request:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A POST body reaches an origin, and its length is re-derived rather than forwarded.
 ///
 /// The second half is the framing rule: the outgoing `Content-Length` is the body's, not the

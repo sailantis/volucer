@@ -971,7 +971,10 @@ implementation cannot honour should be _stated_, or the operator finds out from 
 - listener addresses (`http`, `https`, `fastcgi`) — a bound socket cannot move;
 - backends, their commands and worker counts — those are running processes with live pipes;
 - `[server.tls]` `min_version` and `alpn` — they are baked into the `rustls::ServerConfig` that the
-  acceptor holds, and rustls does not let that be rebuilt in place.
+  acceptor holds, and rustls does not let that be rebuilt in place;
+- `[server.proxy]` — whose forwarded headers are believed is a statement about this deployment's
+  topology rather than about a request, and it is deliberately the same kind of setting as `alpn`
+  rather than the same kind as the site table.
 
 **A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
 a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
@@ -1064,6 +1067,34 @@ Three things it deliberately does not do, each stated rather than implied:
   in a `User-Agent` lets a client write fields of *this* log line. A hostile agent string was
   measured producing 31 fields where the format has 15, with its own `200` landing where this server's
   status belongs.
+
+**The first field is the client's address, which behind a proxy has to be told to the server.**
+That is `[server.proxy]`, and without it the field is the proxy:
+
+```toml
+[server.proxy]
+trusted_subnets = ["127.0.0.1", "10.0.0.0/8"]   # the networks whose word is believed
+trusted_headers = ["X-Real-Ip", "X-Forwarded-For"]   # consulted in this order
+```
+
+**The trust list is the feature, not the headers.** `X-Forwarded-For` is a request header, so any
+client can send one; an address from a header is believed only when the TCP peer is inside a
+configured network. With no list — the default — no header is read at all, which is also why a
+direct deployment needs no configuration. A range that does not parse stops the server rather than
+being dropped: a trust list is somewhere a typo is a security decision, and a shortened list is not
+visible afterwards.
+
+The **order** of `trusted_headers` is the security-relevant part: the first header that yields a
+parsable address wins. The default follows RoadRunner's — `Forwarded`, then the `X-Forwarded-For`
+family — and it is worth knowing what that does *not* fix: `X-Forwarded-For` is appended to by every
+hop, so behind a CDN its left-most element is the client's own *claim* rather than its address. A
+deployment that knows its topology should name the list.
+
+On the **FastCGI** listener this table is deliberately not consulted. nginx sets
+`REMOTE_ADDR = $remote_addr` — the address it saw the client at, already resolved by nginx's own
+`real_ip` handling — so the param is the client's address even though the socket belongs to nginx,
+while the `HTTP_*` params beside it are the client's own claims relayed verbatim. Preferring a header
+there would replace a value the proxy established with one the client asserted.
 
 ### The request id
 

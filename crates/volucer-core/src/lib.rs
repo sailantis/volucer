@@ -1,5 +1,6 @@
 //! Shared building blocks for volucer: configuration, backend model and PHP discovery.
 
+pub mod clientip;
 pub mod config;
 pub mod error;
 pub mod hostmap;
@@ -7,7 +8,7 @@ pub mod php;
 pub mod preflight;
 pub mod program;
 pub mod sites;
-
+pub use clientip::{ClientIpPolicy, HeaderLookup};
 pub use config::{BackendConfig, Config, Listener, ServerConfig};
 pub use error::{Error, Result};
 pub use hostmap::HostMap;

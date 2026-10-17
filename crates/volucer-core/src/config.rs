@@ -1491,6 +1491,52 @@ pub struct ServerConfig {
     /// floods it, and quieting the diagnostics erases the record of who requested what.
     #[serde(default)]
     pub access_log: Option<AccessLogConfig>,
+
+    /// Where the client's address comes from when a reverse proxy is in front.
+    ///
+    /// **Absent is the default and means the peer address**, which is what every existing
+    /// deployment already gets. The table exists because turning it on is a *trust* statement —
+    /// `X-Forwarded-For` is a request header, so believing it from an arbitrary client is worse
+    /// than ignoring it — and a trust statement should have to be written down and named.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
+}
+
+/// Which peers may assert a client address, and through which headers.
+///
+/// The defect this answers is invisible: behind nginx every request arrives from nginx, so the
+/// access log records the proxy and anything keyed on the address — a rate limiter, an IP
+/// allow-list — keys on the proxy rather than the client. Both look like correct behaviour until
+/// two clients have to be told apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Networks whose forwarded headers are believed, e.g. `["127.0.0.1", "10.0.0.0/8"]`.
+    ///
+    /// **An empty list means the feature is off, and an absent `[server.proxy]` is the same thing.**
+    /// A bare address is a network of one, which is how a single local proxy is named. Every entry
+    /// is parsed at load time: a range that does not parse is a startup failure rather than a
+    /// silently dropped entry, because a trust list is one of the few settings where a typo is a
+    /// security decision and a shortened list is not visible afterwards.
+    ///
+    /// The names are RoadRunner's, and deliberately so: `http.trusted_subnets` is what an operator
+    /// migrating from RoadRunner — or an nginx config they are copying from — already has in mind.
+    #[serde(default)]
+    pub trusted_subnets: Vec<String>,
+
+    /// The headers to consult, in order, when the peer is trusted.
+    ///
+    /// **The order is the security-relevant part**, not a preference: the first header that yields
+    /// a parsable address wins. Defaults to `Forwarded`, then the `X-Forwarded-For` family, which is
+    /// RoadRunner's order. `X-Forwarded-For` is appended to by every hop, so behind a CDN its first
+    /// element is the *client's own claim* rather than the client's address — a deployment that
+    /// knows its topology should name this list rather than rely on the default.
+    ///
+    /// A name that is blank or repeated is dropped rather than refused, and any name other than the
+    /// two structured headers is read as a single address, which is what makes a CDN's own header
+    /// usable without a code change.
+    #[serde(default)]
+    pub trusted_headers: Vec<String>,
 }
 
 /// The access log's destination and shape.
@@ -1595,6 +1641,24 @@ impl ServerConfig {
             return self.http.is_some();
         }
         tls.plain
+    }
+
+    /// The client-address policy this deployment asks for, or the reason it is not usable.
+    ///
+    /// Returns a policy that is **off** when there is no `[server.proxy]` table or no
+    /// `trusted_subnets`, which is the same answer either way: no header is consulted and every
+    /// request resolves to its own peer.
+    ///
+    /// An error means a range did not parse, and it names the offending entry. That is the one
+    /// setting here where the failure has a direction: a dropped range is a proxy whose headers are
+    /// suddenly disbelieved, so a rate limit keyed on the address throttles every user at once and
+    /// the reason is not in the logs.
+    pub fn client_ip(&self) -> std::result::Result<crate::clientip::ClientIpPolicy, String> {
+        let Some(proxy) = &self.proxy else {
+            return Ok(crate::clientip::ClientIpPolicy::off());
+        };
+        crate::clientip::ClientIpPolicy::new(&proxy.trusted_subnets, &proxy.trusted_headers)
+            .map_err(|reason| format!("server.proxy.trusted_subnets: {reason}"))
     }
 }
 
@@ -3188,6 +3252,12 @@ impl Config {
         if let Some(https) = &self.server.https {
             parse_listener(https).map_err(|e| Error::Config(format!("server.https: {e}")))?;
         }
+
+        // The proxy trust list is *validated*, not merely deserialized, and this is the reason it is
+        // a method call: `trusted_subnets` is a security boundary where a typo has a direction —
+        // a range that fails to parse must stop the server rather than quietly not be trusted or,
+        // worse, be trusted in a wider form than written.
+        self.server.client_ip().map_err(Error::Config)?;
 
         // The metrics and status listeners are validated here even though they are not `server.*`,
         // because a *typo* in an address is a configuration mistake and belongs in the same message
@@ -8383,6 +8453,68 @@ path = "/var/log/volucer/access.log"
         let absolute =
             resolve_access_log_path(Path::new("/var/log/a.log"), Path::new("/etc/volucer"));
         assert_eq!(absolute, PathBuf::from("/var/log/a.log"));
+    }
+
+    #[test]
+    fn a_proxy_table_parses_and_an_absent_one_means_the_feature_is_off() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.proxy]
+trusted_subnets = ["127.0.0.1", "10.0.0.0/8"]
+trusted_headers = ["X-Forwarded-For"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("valid");
+        let policy = config.server.client_ip().expect("the ranges parse");
+        assert!(policy.is_enabled());
+        assert!(policy.trusts("127.0.0.1".parse().unwrap()));
+        assert!(policy.trusts("10.4.5.6".parse().unwrap()));
+        assert!(!policy.trusts("203.0.113.7".parse().unwrap()));
+        assert_eq!(policy.header_names(), vec!["X-Forwarded-For"]);
+
+        // The default, and the one that matters: no table, no header consulting, every request
+        // resolves to its own peer. An existing deployment is not changed by upgrading.
+        let bare = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
+        bare.validate().expect("valid");
+        assert!(!bare.server.client_ip().expect("off").is_enabled());
+    }
+
+    #[test]
+    fn a_proxy_range_that_does_not_parse_stops_the_server_rather_than_being_dropped() {
+        // The failure has a direction here: a dropped range is a proxy whose headers are suddenly
+        // disbelieved, so a rate limit keyed on the address throttles every user at once and nothing
+        // in the logs says why. Refusing to start is the only safe answer.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.proxy]
+trusted_subnets = ["10.0.0.0/8", "10.0.0.0/99"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("a bad range is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("trusted_subnets") && message.contains("/99"),
+            "the message must name the entry, got: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_inside_the_proxy_table_is_refused() {
+        // `deny_unknown_fields`, for the reason every other table has it: a misspelled key that is
+        // ignored is a trust list that does not say what the operator thinks it says.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.proxy]
+trusted_subnet = ["10.0.0.0/8"]
+"#;
+        let err = Config::from_toml(text).expect_err("the typo is refused");
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]

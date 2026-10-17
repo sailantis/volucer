@@ -215,6 +215,55 @@ fastcgi = "127.0.0.1:9080"
 # this log line.
 
 # ---------------------------------------------------------------------------
+# Behind a reverse proxy: whose word for the client's address is believed.
+#
+# WITHOUT this table the peer's own address is the client's, which is correct for
+# every direct deployment and wrong for every proxied one. Behind nginx a request
+# arrives from nginx, so the access log's first field is the proxy and anything
+# keyed on the address -- a rate limit, an IP allow-list -- keys on the proxy. That
+# failure is invisible from the client's side, which is why the table has to be
+# written down rather than inferred.
+#
+# `trusted_subnets` is a trust list, not a convenience: X-Forwarded-For is a
+# request header, so any client can send one. An address from a header is believed
+# only when the TCP peer is inside one of these networks, and with the list empty
+# (or this table absent) no header is read at all.
+#
+# Names follow RoadRunner's `http.trusted_subnets`, so an operator migrating from
+# it -- or copying an nginx snippet -- keeps the vocabulary.
+#
+# Restart-only, like `[server.tls]`'s `alpn`: it describes this deployment's
+# topology rather than a request, and `SIGHUP` reports that it was not applied.
+#
+# On the FastCGI listener this table is deliberately NOT consulted. nginx sets
+# `REMOTE_ADDR = $remote_addr`, so the param is already the client as nginx
+# resolved it; preferring a header there would replace a value the proxy
+# established with one the client merely asserted.
+# ---------------------------------------------------------------------------
+# [server.proxy]
+# trusted_subnets = ["127.0.0.1", "10.0.0.0/8"]
+#   The networks whose forwarded headers are believed. A bare address is a network
+#   of one, which is how a single local proxy is named. Every entry is parsed at
+#   startup and a range that does not parse stops the server rather than being
+#   dropped: a trust list is somewhere a typo is a security decision, and a
+#   shortened list is not visible afterwards.
+#
+# trusted_headers = ["X-Real-Ip", "X-Forwarded-For"]
+#   The headers to consult, IN ORDER -- the first that yields a parsable address
+#   wins, so the order is the security-relevant part rather than a preference.
+#   Defaults to `Forwarded`, then the X-Forwarded-For family, which is RoadRunner's
+#   order. Note what that default does NOT fix: X-Forwarded-For is appended to by
+#   every hop, so behind a CDN the left-most element is the client's own CLAIM
+#   rather than its address. A deployment that knows its topology should name this
+#   list explicitly.
+#
+#   "Forwarded" is read as RFC 7239 and its `for=` target is taken; every other
+#   name is read as a single address, which is what makes a CDN's own header
+#   usable without a code change. A blank or repeated name is dropped rather than
+#   refused. Four spellings are accepted in a value: `203.0.113.7`,
+#   `2001:db8::1`, `203.0.113.7:51234` and `[2001:db8::1]:51234`.
+
+# ---------------------------------------------------------------------------
 # Persistent worker pool: the PHP process boots the application once and stays
 # resident. volucer talks to it over the child's stdin/stdout pipes using its
 # own framed protocol. State is NOT reset by PHP per request, so the

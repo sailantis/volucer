@@ -177,7 +177,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 | What | RR's shape | What it costs here | Why it is worth it |
 | --- | --- | --- | --- |
 | **`volucer workers` / `volucer reset`** (§4.6) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S.** The methods exist and are tested; the process has no client for them. A `Command::Rpc` that opens one pool's channel and sends `workers.list` | §4.6 already promises it, and the promise is currently false: `volucer serve\|check\|version` is the whole CLI. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing |
-| **`http.trusted_subnets` + forwarded headers** | `proxy_ip_parser` | **S–M.** A CIDR check against the peer, then the first non-empty of an ordered header list | **Not a convenience — a correctness bug today.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Two places, both of which already take an address |
+| **`http.trusted_subnets` + forwarded headers** — **built, §6.8** | `proxy_ip_parser` | **S–M**, and it was S–M. A CIDR check against the peer, then the first parsable of an ordered header list, hand-rolled rather than a crate | **Not a convenience — a correctness bug, and the only defect in this table.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Both places already took an address, which is why the change is small |
 | **`metrics.observe`** | `metrics.collect` | **S.** One registry entry and one namespace arm | `emitMetric` already rides the wire and lands in a `Vec` nobody reads (`codec.rs:1136`), which §6.1 called the first thing to fix |
 | **Rate limiting** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
 
@@ -223,8 +223,8 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 - **`plugin-abis`** — a compile-time DI container in Go, so there is no ABI to copy; `plan.md` item 39
   already refuses it.
 
-**None of the four rows in the first table is large, and only the second is a defect rather than a
-missing feature.** That is the useful conclusion of the sort: the parts of RoadRunner that volucer
+**One of the four rows in the first table was a defect rather than a missing feature, and it is
+built — §6.8.** That is the useful conclusion of the sort: the parts of RoadRunner that volucer
 has deliberately not copied are the parts that duplicate a reverse proxy or a framework, and the
 parts that remain are small.
 
@@ -1380,6 +1380,105 @@ freshly minted id — exactly what a `tracing-opentelemetry` layer does — fail
 with `left: "0707070707070707", right: "92f318462a646683"` and the message naming why. The test does
 not merely agree with the code; it detects the defect the section is about.
 
+### 6.8 Whose address is the client's — **done**, and it was a defect rather than a feature
+
+The one row of §1.4's first table that was **something wrong** rather than something missing. Behind
+nginx every connection arrives from nginx, so two readers of the peer address were quietly wrong in a
+way that looks like correct behaviour:
+
+- the access log's first field recorded the **proxy**, so "who requested this" had no answer in the
+  one place an operator looks for it;
+- anything keyed on the address — a rate limiter, an IP allow-list, an abuse heuristic — keyed on the
+  proxy, which means it limits *nginx* and cannot tell two clients apart at all.
+
+Neither is visible from the client's side, and a single-machine test passes, so this is the kind of
+defect that ships. It is also why it went first: the other three rows add a feature nobody is missing
+yet, and this one was wrong in every deployment that already has a proxy.
+
+#### The trust list is the feature, and the headers are the easy part
+
+`X-Forwarded-For` is a **request header**, so any client can send one. A design that reads it is not
+resolving an address, it is accepting a claim. So the rule is not "read the header" but "read the
+header *only if the peer is a proxy this deployment named*":
+
+1. The peer's address is inside a configured `trusted_subnets` entry → the first header in
+   `trusted_headers` that yields a parsable address is the client.
+2. Otherwise → **no header is read at all**, and the peer is the answer. An untrusted claim is not a
+   weaker answer, it is no answer.
+
+Which is why **the empty list is the default and means the feature is off**: an existing deployment
+is not changed by upgrading, and turning it on is a statement that a specific proxy is in front. The
+names are RoadRunner's (`http.trusted_subnets`, `http.trusted_headers`) because an operator copying
+an nginx snippet already has that vocabulary.
+
+Two decisions inside that are worth more than the rest:
+
+- **A malformed range stops the server.** Every other list in this configuration drops what it cannot
+  read. A trust list cannot: a range that fails to parse is a proxy whose headers are suddenly
+  disbelieved, so a rate limit keyed on the address throttles every user at once and *nothing in the
+  logs says why*. `10.0.0.0/8` with a `/99` is refused at startup, naming the entry.
+- **Host bits past the prefix are masked rather than kept.** `10.1.2.3/8` means `10.0.0.0/8`, which is
+  what the `/8` asked for. The other direction — trusting `10.1.2.3` while the file appears to say
+  `/8` — is the failure that would actually be dangerous, so the test pins the direction.
+
+#### What was deliberately *not* wired, and the check that decided it
+
+The FastCGI front-end **does not consult this table**, and it had a comment saying so before the
+feature existed ("`REMOTE_ADDR` here is nginx\`s address … writing the header nginx put in
+`X-Forwarded-For` instead would make this log assert a peer it never saw"). That comment turned out to
+describe the right *outcome* for a partly wrong *reason*: this listener logs the param, and the param
+is not the socket peer.
+
+Reading nginx's own `conf/fastcgi_params` settled it. nginx sets
+
+    fastcgi_param  REMOTE_ADDR        $remote_addr;
+
+— the address **nginx** saw the client at, already resolved by nginx's own `real_ip` handling — while
+the `HTTP_*` params beside it are the client's claims relayed verbatim. So `REMOTE_ADDR` is already
+the client's address, and applying the policy here would replace a value the *proxy* established with
+one the *client* merely asserted. The two front-ends look symmetric and are not; the asymmetry is that
+one line.
+
+That is a better outcome than a reversal would have been, and it is worth naming because the
+symmetric-looking change was the obvious one to make. The unaddressed case is now stated in the doc
+comment instead: a listener behind something that forwards raw FastCGI without setting `REMOTE_ADDR`
+would need the *socket* peer trusted, which is a different check.
+
+#### Where it lives, and why it is restart-only
+
+The policy is a field on `ReloadHandles` beside `observe` — the struct that already means "what a
+front-end must be handed that a reload may also move" — so both front-ends read one instance and the
+request path resolves an address **once**, in the same expression that feeds both `REMOTE_ADDR` and
+the log record. Resolving them separately is exactly how the two come to disagree, which would be a
+log that contradicts the application.
+
+It is **restart-only**, and `restart_only()` names it on every reload. The alternative was to put it
+on `Reloaded`, whose fields are per-site maps that `Reloaded::from_sites` derives and which
+`volucer-watch` owns. A `vec![Cidr]` per request does not belong in a per-site map, and worse: a trust
+list that silently did not change on `SIGHUP` while the operator believes it did is a security bug
+with a slow fuse. A statement about the deployment's topology is the same kind of setting as `alpn`,
+which is already restart-only for a comparable reason.
+
+#### Verified
+
+- **The trust check is falsifiable in both directions, and was falsified in both.** Making `resolve`
+  return the peer unconditionally fails the *trusted* half; removing the `trusts` guard so every
+  header is believed fails the *untrusted* half with
+  `x-saw-remote: 203.0.113.9` where `127.0.0.1` belongs. A test that only checked the first half would
+  pass against a server with a spoofing hole.
+- **End to end through `serve`, against a real `php-cgi`**, because the assertion that matters is what
+  `$_SERVER['REMOTE_ADDR']` holds rather than what the server believes it sent. The two runs differ in
+  one line of configuration and use the **same socket peer**, so the decision is demonstrably the
+  configuration's rather than the connection's.
+- **The upstream half is asserted on the appended field, not on the client's own claim.** The request
+  carries `X-Real-Ip` (which the policy is told to believe) *and* `X-Forwarded-For` (which the append
+  rule relays verbatim); the assertion is that the resolved `198.51.100.9` appears in the outgoing
+  chain. Checking only for `X-Forwarded-For: 203.0.113.11` would pass with the policy switched off,
+  which is a test that confirms the append rule and calls it the feature.
+- 13 unit tests over the parser and the policy, including the ranges that would panic a naive mask
+  (`/0` and `/32` shift by a full width), the four spellings a forwarded address arrives in, and the
+  RFC 7239 `for=` target — with `by=` as the control that it is not mistaken for it.
+
 ---
 
 ## 7. Python/Django and Ruby/Rails
@@ -1522,6 +1621,7 @@ progress on something earlier look bigger.
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | **Done.** `protocol = "h2c"` for plaintext and socket origins, `TE: trailers` constructed rather than forwarded, and a failure reported as a `200` with `grpc-status` in the trailers. No protobuf crate, no worker, no new listener |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | **Done.** `grpc_services` on a backend, `UNIMPLEMENTED` for anything else, and the application's status moved into the trailers. The application states its outcome in two response headers; the server never parses a message. Five of this section's own premises were corrected on contact, and the largest is that routing to a *worker* became protocol-aware |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | **Settled: not built**, and §10 item 2 is the decision. The only descriptor consumer turned out to be the service itself — a reply is already-framed bytes the server never decodes — so no other use could justify loading a schema either |
+| — | **`http.trusted_subnets` + forwarded headers** — §6.8 | — | S–M | **Done.** Independent of 1–9, and the only item in §1.4 that was a *defect* rather than a missing feature: behind nginx the access log and any future rate limit both keyed on the proxy. Restart-only, and deliberately not applied on the FastCGI path |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
 
@@ -1914,3 +2014,14 @@ machine that parses what arrives. This server never parses a frame; hyper does.
     than recommended, and **gRPC-Web is the same question with a smaller answer**: it is a framing
     layer over the bytes already carried, needing no schema at all, and would be the version to build
     first if a browser ever has to call a service directly.
+12. **Whether an untrusted peer's `X-Forwarded-For` should be *stripped* rather than ignored.** §6.8
+    ignores it, which is the conservative answer and enough for the two readers that exist (the log
+    and `REMOTE_ADDR`). A **rate limiter** changes the shape of the question, because it is the first
+    reader whose correctness depends on the *chain*: the fully correct algorithm walks the list
+    backwards from the peer and stops at the first untrusted hop, which is what tells two clients
+    apart behind nested proxies. That needs every hop's address rather than the one §6.8 resolves, so
+    it is a decision for the rate-limit step rather than a defect in this one. The other half of the
+    same question: an origin downstream of volucer sees the client's claim relayed verbatim, which is
+    `X-Forwarded-*`'s specified behaviour — but a deployment where the origin *trusts* that header and
+    volucer is the last hop would want the claim dropped instead. Recorded, not changed: no origin in
+    this tree reads it.
