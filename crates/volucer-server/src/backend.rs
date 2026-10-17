@@ -372,6 +372,28 @@ impl Backend {
         }
     }
 
+    /// Whether this backend is the kind a gRPC call can be delivered to, and which service.
+    ///
+    /// **Only a `worker` answers, and only for a service its own `grpc_services` list names.** The
+    /// other three kinds are not gRPC handlers for three different reasons rather than one: an
+    /// `external` or `spawn_cgi` backend is a CGI process with no channel the server could hand
+    /// method bytes to and a request scope that resets underneath it, and an `upstream` speaks gRPC
+    /// itself — it is tier A, and the server is a proxy for it rather than its handler.
+    ///
+    /// A path that is not a gRPC path at all, or names a service this backend was not granted, is
+    /// `None` — the answer that becomes `UNIMPLEMENTED` rather than a dispatch. Returning the
+    /// service as well as the answer is deliberate: it is what a log line and a test need, and
+    /// re-parsing the path at either of those places would be a second implementation of the rule.
+    pub fn granted_grpc_call<'a>(
+        &self,
+        path: &'a str,
+    ) -> Option<volucer_core::config::GrpcPath<'a>> {
+        match self {
+            Backend::Worker { pool, .. } => pool.granted_grpc_call(path),
+            Backend::External { .. } | Backend::SpawnCgi { .. } | Backend::Upstream { .. } => None,
+        }
+    }
+
     /// Whether this backend can serve a request right now.
     ///
     /// **False for a worker pool with no free slot, and true for everything else**, which is the
@@ -614,6 +636,7 @@ mod tests {
                 env: Default::default(),
                 checksum: Default::default(),
                 services: Vec::new(),
+                grpc_services: Vec::new(),
                 transport: Default::default(),
             }),
         )

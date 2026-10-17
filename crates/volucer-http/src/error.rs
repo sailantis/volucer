@@ -84,16 +84,22 @@ pub enum HttpError {
     /// from the trailer section and has no status code to branch on otherwise. A proxy that answers
     /// `502` to a gRPC call has thrown away the failure it is trying to report.
     ///
-    /// Carries the real error's text so the **log** says what happened — the wire carries a fixed
-    /// message, because `grpc-message` is percent-encoded ASCII and an origin's error text is
-    /// arbitrary bytes a client could not act on anyway. What a client needs is a status it can
-    /// branch on; what an operator needs is this string, and this is where it lives.
-    #[error("the gRPC call failed: {source}")]
+    /// Carries the real reason as **text** rather than as another `HttpError`, and that is what makes
+    /// it usable from both places a gRPC failure is born: a dispatch that failed (which has a
+    /// `ServerError` and, through [`HttpError`], an HTTP status it would have used) and a call the
+    /// server refused before dispatching (which has no `ServerError` at all, because nothing was
+    /// asked of a backend). One of those two has only a sentence, so a sentence is what the variant
+    /// holds.
+    ///
+    /// The sentence goes to the **log**, not to the wire: `grpc-message` is percent-encoded ASCII and
+    /// this is arbitrary text. The wire carries a fixed message a client could act on; the operator
+    /// reads the log, where the reason is written in full.
+    #[error("the gRPC call failed: {reason}")]
     Grpc {
         /// The status the client is told, in the trailers.
         status: volucer_upstream::GrpcStatus,
-        /// The whole failure, for the log.
-        source: Box<HttpError>,
+        /// Why, in full, for the log.
+        reason: String,
     },
 }
 

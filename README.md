@@ -1142,16 +1142,25 @@ trace stops at the queue boundary in one direction. And every request that is tr
 there is no sampler, which for a busy deployment means the `batch_size` and `interval_ms` are the
 only knobs — see `docs/plugins.md` §6.7 for what was measured and what is deliberately left out.
 
-There is also **no external services yet beyond KV, locks and queues**: no gRPC, and no way to
-tell a running server anything other than a signal. A worker can now reach a **key-value storage**
+There is also **no external services yet beyond KV, locks, queues and gRPC**: no way to tell a
+running server anything other than a signal. A worker can now reach a **key-value storage**
 (`[kv.<name>]`, memory or Redis), a **lock backend** (`[lock]`, memory or Redis), and the
 **queues** (`[jobs]`, memory or Redis) through the call plane, which is the `CALL`/`RETURN` pair on
 the worker channel — a frame a worker writes *unprompted*, mid-request, and the server answers. All
 of them are off until a backend's `services` list names them, so the default deployment's workers
 can reach nothing.
-[docs/plugins.md](./docs/plugins.md) is the design for the rest — gRPC, and a
-separate, cheaper track for running Django and Rails as supervised HTTP origins — and its step table
-records what is built.
+[docs/plugins.md](./docs/plugins.md) is the design for the rest — a separate, cheaper track for
+running Django and Rails as supervised HTTP origins — and its step table records what is built.
+
+**gRPC is two tiers, and both are in.** Tier A proxies a call to an origin that already speaks gRPC
+(`kind = "upstream"`, with `protocol = "h2c"` for a plaintext or unix-socket origin); tier B serves it
+from the application, which needs no origin at all. `grpc_services = ["greeter.Greeter"]` on a `worker`
+backend is what permits a service to reach it — the opposite direction from `services`, which decides
+what the application may call. The server **never parses a message**: it routes on the `:path`, carries
+the framed bytes, and puts the application's `grpc-status` into the trailer section, where a gRPC client
+reads it. A call naming a service that is not listed is answered `UNIMPLEMENTED` without reaching a
+worker at all. The one thing a handler has to state is its outcome, as a `Volucer\GrpcResponse`; see
+[`Worker::onGrpc`](https://github.com/sailantis/volucer-php-sdk) and §6.6 of the design document.
 
 **The queues are the one service with a second side.** Everything above is a worker asking the server
 for something; a queue also has the server *giving* work to a process. That is a second exchange on

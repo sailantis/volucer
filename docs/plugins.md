@@ -1006,6 +1006,58 @@ with whatever it already uses. Needs:
 The server never parses a message. Note that RoadRunner needs `protoc-gen-php-grpc` only because
 *its* worker wants typed DTOs; the transport does not require them, and neither will this.
 
+**Both halves of tier B are now built**, and three of the design's own premises needed correcting on
+contact — each one recorded here rather than quietly fixed:
+
+1. **The allow-list key is not `services`, and it is not a path prefix.** `grpc_services` is a second
+   key on the same backend because the two lists answer *opposite* questions: `services` decides what
+   the application may **call**, `grpc_services` decides what may be **delivered** to it. One key would
+   have meant a worker granted `kv.sessions` also being a gRPC endpoint for every service anyone
+   invented. It holds **service names**, not paths and not methods — `"greeter.Greeter"` — because a
+   method the application does not implement is one it can answer `UNIMPLEMENTED` to itself, while
+   listing methods here would put the application's interface in the server's file and make every
+   application deploy a server configuration change. That is §6.6's whole argument, and the key's shape
+   is where it has to hold.
+2. **The call is not always granted — the *service* is, and the refusal is `UNIMPLEMENTED`.** §10 item 1
+   asked whether an unlisted method is `UNIMPLEMENTED` or `NOT_FOUND`. It is `UNIMPLEMENTED`, and not
+   only because that is what a gRPC client expects from a non-reflective server: `NOT_FOUND` would
+   leak whether a service *exists*, which is the same argument §4.5 makes about `config.describe`.
+   What the code added to the question is that the granularity is the **service** and nothing finer —
+   see item 3 below for why a path-level rule could not have worked.
+3. **A gRPC path is two segments and both have to be protobuf names.** `/pkg.Service/Method`, exactly:
+   a third segment is refused, and so is `Method?x=1` — not by a rule about query strings but because
+   `?` is not a byte a protobuf identifier may contain. The first version of this had the server and
+   the *SDK* disagreeing about that last case, because PHP's `parse_url` strips a query and Rust's
+   parser does not; the two now state the same rule and each says so in its own source.
+4. **Routing to a `worker` backend had to become protocol-aware, one level above the backend.** The
+   listener decided *upstream versus CGI* before it had read the body, because an origin's body must
+   not be touched. A gRPC call to a worker has to be refused **before the body is read** as well, since
+   buffering a body for a call that will not be dispatched is work an attacker asked for — so the
+   allow-list check sits in the same pre-body position as the upstream branch, and the CGI path's
+   failures now carry which *kind* they were (a request that never became a CGI request, or a backend
+   that was asked and failed), because only the second is a gRPC status.
+5. **The application states its outcome in two ordinary response headers, and the server moves them.**
+   This is the SDK contract, and it is smaller than the sketch above: not an interface with `handle()`,
+   but a `GrpcResponse` value whose status and message become `grpc-status` and `grpc-message` on the
+   `RESPONSE` head. The worker protocol's head has nowhere else to put them. What the *client* library
+   gets is `Request::grpcMethod()` and `Request::isGrpc()` — reading the path and the media type, which
+   is all either side needs.
+
+**A worker that serves both protocols is the ordinary shape, and the SDK had to change for it.** One
+pool is one backend, so a `worker` backend reached by an HTTP route *and* by `grpc_services` has one
+process answering both. `Worker::serve` therefore identifies a call by `content-type` rather than by
+how the process was started, and the SDK grew `onGrpc()` beside `run()` so that both halves can be
+registered before either loop begins. A worker that never registered a gRPC handler answers
+`UNIMPLEMENTED` rather than crashing — which is also the honest answer for a plain PHP application a
+misconfigured client sends `content-type: application/grpc` to.
+
+**What tier B does *not* do, and the one place it does not generalise.** The reply is buffered: the
+worker protocol declares `body_len` in the `RESPONSE` head, so a server-streaming method has nowhere to
+put its later messages. That is §10 item 4, it is unrelated to gRPC's own streaming (which the transport
+would carry fine), and it is a property of the worker protocol rather than of this tier. The other
+limit is one-request-in-flight: a gRPC call is *work* for a worker, so tier B reuses the request that is
+already in flight and adds no second exchange — which is why it never touched §10 item 9.
+
 **Tier C — reflection (the only descriptor consumer).**
 `grpc.reflection.v1.ServerReflection/ServerReflectionInfo` answers with a serialized
 `FileDescriptorSet` for the requested symbols, so `grpcurl` and `grpcui` can introspect without
@@ -1041,9 +1093,11 @@ Replace *"static or dynamic `.proto`"* with:
 
 **Sizing.** Tier A: **S–M plus one transport decision** — the trailer construction is small and
 measured, but an h2c path for a plaintext gRPC origin does not exist and is the real cost (§10
-item 3). Tier B: **M** (a config surface, an SDK contract, tests). Tier C: **M** (`protox` + a
-reflection service). The worker-as-work question: **L** on its own, and no longer on the critical
-path for either A or B.
+item 3). It was that, and the estimate held. Tier B: **M**, and it was a little more than M: the
+config key and the SDK contract were each small, but *routing to a worker became protocol-aware*, and
+that meant a new error shape on the CGI path plus the SDK's two-protocol request path — the kind of
+change that is only small once it is understood. Tier C: **M** (`protox` + a reflection service). The
+worker-as-work question: **L** on its own, and no longer on the critical path for either A or B.
 
 ### 6.7 OTLP export — **done**, and two of this section's own premises were false
 
@@ -1278,7 +1332,7 @@ progress on something earlier look bigger.
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **Done.** Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | **Done.** Not the layer the plan named: measured, `http-proto` needs `prost`, and a layer cannot carry the span id PHP already has. Hand-written OTLP/JSON over the existing client — **0 new packages** |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | **Done.** `protocol = "h2c"` for plaintext and socket origins, `TE: trailers` constructed rather than forwarded, and a failure reported as a `200` with `grpc-status` in the trailers. No protobuf crate, no worker, no new listener |
-| 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | Reuses the in-flight request, so it does not touch the one-request invariant |
+| 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | **Done.** `grpc_services` on a backend, `UNIMPLEMENTED` for anything else, and the application's status moved into the trailers. The application states its outcome in two response headers; the server never parses a message. Five of this section's own premises were corrected on contact, and the largest is that routing to a *worker* became protocol-aware |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | The only descriptor consumer; may legitimately be "not yet" |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
@@ -1437,6 +1491,51 @@ TOML basic string needs its backslashes doubled**, so `command = "…\Temp\x"` i
 `\T`. The example configuration and the integration test both write paths in single quotes, which
 is the spelling that survives being copied to either platform.
 
+**Step 8 is done, and it re-taught the step-3 rule in a place where it looked like it could not
+apply: a service delivered to a worker is not a registry entry, and it needed a seam of its own.**
+
+Every gRPC assertion in this step is one test —
+`a_grpc_call_reaches_a_php_worker_and_its_status_comes_back_in_the_trailers` — and it is one test for
+a reason: `granted_grpc_call` had to be reached from `Config::from_toml` → `Dispatcher` → `Server` → a
+real PHP process, exactly as `build_stores` and `build_locks` had to be, and for the fourth time *no
+test below the seam could see its absence*. It was falsified twice rather than once — making the
+allow-list admit everything failed it at the config assertion, and disabling the front-end's gate
+alone failed it at the assertion that the application was never asked — because the two halves fail in
+opposite directions and a single falsification would have proved only one of them wired.
+
+Four more things the code settled that the design did not:
+
+- **Routing to a `worker` backend had to become protocol-aware, and that is the real cost of tier B.**
+  The listener chose *upstream versus CGI* before reading the body, because an origin's body must not be
+  touched; a gRPC call to a worker has to be refused in that same pre-body position, because buffering a
+  body for a call that will not be dispatched is work an attacker asked for. What that forced is a
+  second *kind* on the CGI path's failure — "the request never became a CGI request" (a 404, whatever the
+  protocol) versus "a backend was asked and failed" (where the gRPC mapping belongs) — and collapsing
+  them would mean answering a missing script with a `grpc-status`, claiming a service was consulted
+  where none was.
+- **The service is what is granted; the method is the application's.** Listing methods in
+  `grpc_services` would put the application's interface in the server's file, so every application
+  deploy would become a server configuration change — the coupling §6.6 exists to avoid. And the
+  grant is a **literal service name** rather than a `path_prefix`, which is a decision the earlier
+  draft had left open: a prefix can express `/pkg.Service/` but can also express `/pkg.Service/../other`
+  unless a second rule refuses it, while two segments checked as protobuf names cannot name a service
+  that is not one. See §10 item 1.
+- **A worker serves both protocols, and that is the ordinary shape rather than a special case** — one
+  pool is one backend, so a `worker` backend reached by an HTTP route *and* by `grpc_services` has one
+  process answering both. The SDK's request path therefore identifies a call by `content-type` rather
+  than by how the process was started, which cost it `onGrpc()` beside `run()`. The failure mode this
+  avoids is quiet: a worker that answered gRPC framing to ordinary requests would pass any test that
+  only made gRPC calls.
+- **The server and the SDK disagreed about a query string, and a test found it rather than a reading.**
+  PHP's `parse_url($uri, PHP_URL_PATH)` *strips* a query; the server's parser does not, because `?` is
+  not a byte a protobuf identifier may contain. So `/a.B/M?x=1` was a refusal on one side and a
+  method call on the other — invisible, because either side alone is self-consistent. The SDK now
+  reads the path without `parse_url` and says why, and both sides' tests assert the same cases.
+
+Sizing, as revised by building it: **M was right and the estimate was still optimistic.** The config
+key is a dozen lines and the SDK contract is two methods; what was not M-sized was making the *request
+path* protocol-aware, and that is a property of adding a second protocol to a router that had one.
+
 ---
 
 ## 9. Divergences, stated as divergences
@@ -1501,6 +1600,13 @@ schema-independent, and the descriptors are needed only by an optional reflectio
 practical consequence is that a `.proto` change is an application deploy and never a server one,
 and that no build step enters the server's dependency graph.
 
+**Tier B kept that promise, and the way it did is worth stating because it is a stronger claim than
+tier A's.** The application never sees a decoded message either: a gRPC handler is handed the framed
+bytes, the method name as two strings, and nothing else. There is no generated DTO, no `protoc`, and no
+descriptor anywhere on the path — the SDK's own reply helper does not encode a message, it carries one.
+The one thing the SDK *does* know about gRPC is where the outcome goes (two trailer fields) and how a
+media type is spelled, and both are protocol rather than schema.
+
 The `upstream`-origin tier of that design is also the honest answer for gRPC today: a runtime that
 already speaks gRPC is reached the same way a Django or Rails app is (§7.1), and volucer does not
 need to be in the message path to be useful.
@@ -1516,6 +1622,14 @@ body to the client without conversion. So the residual risk is one small `Body` 
 the status mapping — not a hand-written HTTP/2 state machine, which is where nginx's two CVEs
 actually live. §6.6 carries the citations.
 
+**Tier B confirmed it, and the confirmation has a shape worth naming: every bug on this path was in
+the *construction* of a reply and none of them was in the transport.** `GrpcReplyBody` is the second
+hand-written body in the tree and it needed the same two things its sibling does — an unknown size hint
+while anything remains, and a `Trailer` declaration naming the fields — both of which are hyper's rules
+rather than gRPC's, and both of which fail *silently*: a reply with either mistake is a valid `200` that
+a gRPC client reads as a successful call with no message. nginx's CVEs are in the other half, the state
+machine that parses what arrives. This server never parses a frame; hyper does.
+
 ---
 
 ## 10. Open decisions
@@ -1525,6 +1639,17 @@ actually live. §6.6 carries the citations.
    the same `path_prefix` routing used for HTTP — and does a call whose method is not in the list
    answer `UNIMPLEMENTED` or `NOT_FOUND`? The first is what a gRPC client expects from a server
    that does not implement a method; the second leaks whether the service exists.
+
+   **Settled, and building tier B changed the answer twice.** The key is `grpc_services` — a *second*
+   key beside `services`, not a reuse of it, because the two answer opposite questions (what a worker
+   may call, and what may be delivered to it). It holds **literal service names**; the answer is
+   `UNIMPLEMENTED` for the reason item 1 already gives, and the reason it must be literal names rather
+   than `path_prefix` is not that a prefix could not express `/pkg.Service/` but that it *could also
+   express anything else* — a prefix table admits a path like `/pkg.Service/../other` unless a second
+   rule refuses it, whereas two segments with both halves checked as protobuf names cannot name a
+   service that is not one. A route that names no method is refused for the same reason; see §6.6 for
+   the full statement, including the case that first made the rule concrete (`?` in a method, where the
+   server and the SDK initially disagreed).
 
 2. **Reflection, and whether descriptors are ever loaded.** §6.6 makes runtime `.proto` parsing a
    property of one optional service (`protox` → `prost-types` → `ServerReflection`). The question

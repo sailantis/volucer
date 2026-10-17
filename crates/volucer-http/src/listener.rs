@@ -1151,6 +1151,30 @@ fn redirect_authority(host: &str, https_port: Option<u16>, own_port: u16) -> Str
     }
 }
 
+/// Why a CGI dispatch produced no response.
+///
+/// **Two kinds, because they need different answers and only one of them is a backend's fault.** A
+/// request that never became a CGI request — a path naming no script, one the configuration forbids —
+/// is answered `404`/`403` whatever the protocol, because there is no call to report a gRPC status
+/// about: nothing was dispatched, so nothing failed. A backend that was asked and failed is where the
+/// gRPC mapping applies.
+///
+/// Collapsing them would mean either answering a missing script with a `grpc-status`, which claims a
+/// service was consulted where none was, or answering a dead worker with a `404`, which hides a
+/// failure an operator needs.
+enum BackendFailure {
+    /// The request never became a CGI request; nothing reached a backend.
+    Request(HttpError),
+    /// A backend was asked, and did not answer.
+    Backend(volucer_server::ServerError),
+}
+
+impl From<HttpError> for BackendFailure {
+    fn from(err: HttpError) -> Self {
+        BackendFailure::Request(err)
+    }
+}
+
 /// Read the body, build the CGI environment, dispatch, and translate the answer.
 async fn prepare(
     request: Request<Incoming>,
@@ -1239,6 +1263,10 @@ async fn prepare(
         .map(|route| route.backend.clone())
         .unwrap_or_else(|| front_end.dispatcher.default_backend().to_string());
 
+    // A gRPC call leaves this function twice as often as a plain request does, so the one answer is
+    // decided here rather than at each of them.
+    let is_grpc = volucer_upstream::is_grpc(&parts.headers);
+
     // The one branch between the two request paths, and it is here rather than inside the
     // dispatcher on purpose: every other backend is a blocking process on a pipe, so making the
     // dispatcher's *type* async to accommodate the one that is not would drag `spawn_blocking`
@@ -1249,6 +1277,50 @@ async fn prepare(
     // touched at all.
     if front_end.dispatcher.is_upstream(&backend) {
         return upstream(front_end, &backend, parts, body, &remote_addr, cleartext).await;
+    }
+
+    // **A gRPC call this backend was not granted is refused here**, and every part of that sentence
+    // is load-bearing.
+    //
+    // *Before the body is read*: a gRPC call is delivered to an application, and this server is not
+    // one. Reading a request body for a call that will not be dispatched is work an attacker asked
+    // for, on a path whose whole purpose is refusing.
+    //
+    // *Before any backend is reached*: `services` is what a worker may call, `grpc_services` is what
+    // it may be asked to do, and both are per-backend because a worker facing the public and one
+    // serving an internal tool are different trust boundaries. Checking after dispatch would mean
+    // the boundary was advisory.
+    //
+    // *`UNIMPLEMENTED`, not a 404 or a 501*: gRPC's own code for "this server does not implement that
+    // service", and the code a client already handles for every other non-reflective server. It is
+    // also not transient, so a client does not retry a call that will never be served.
+    //
+    // The reason names the grant that would have been needed and the one that was missing, because
+    // the operator reading the log is the person who has to fix the file — and `parse_grpc_path` is
+    // asked directly rather than through the grant check so that "not a method path" and "the wrong
+    // service" are told apart in the sentence rather than both reading as a refusal.
+    if is_grpc
+        && front_end
+            .dispatcher
+            .granted_grpc_call(&backend, parts.uri.path())
+            .is_none()
+    {
+        let path = parts.uri.path();
+        let reason = match volucer_core::config::parse_grpc_path(path) {
+            None => format!(
+                "{path:?} is not a gRPC method path; a call addresses its service as \
+                 `/pkg.Service/Method`"
+            ),
+            Some(call) => format!(
+                "backend {backend:?} does not list the service {:?} in its grpc_services, so this \
+                 call was not delivered to it",
+                call.service
+            ),
+        };
+        return Err(grpc_refusal(
+            volucer_upstream::GrpcStatus::Unimplemented,
+            reason,
+        ));
     }
 
     let body = read_body(body, front_end.limits.max_body_bytes).await?;
@@ -1264,22 +1336,40 @@ async fn prepare(
     let front_end = Arc::clone(front_end);
     let routing = routing.clone();
     let routes = site.routes.clone();
-    let blocking = tokio::task::spawn_blocking(move || {
-        let cgi_request = if skips_stat {
-            to_cgi_routed(&parts, body, &routing, front_end.server_port, &remote_addr)?
-        } else {
-            to_cgi(&parts, body, &routing, front_end.server_port, &remote_addr)?
-        };
-        // The site's own table, so the routing decision above and the dispatch agree.
-        front_end
-            .dispatcher
-            .dispatch_with_routes(&routes, &cgi_request)
-            .map_err(map_server_error)
-    });
+    let blocking =
+        tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
+            let cgi_request = if skips_stat {
+                to_cgi_routed(&parts, body, &routing, front_end.server_port, &remote_addr)?
+            } else {
+                to_cgi(&parts, body, &routing, front_end.server_port, &remote_addr)?
+            };
+            // The site's own table, so the routing decision above and the dispatch agree.
+            //
+            // Mapped rather than mapped to an HTTP status here, because *which* mapping applies depends
+            // on the protocol and the protocol is not known on this side of the thread: a gRPC failure is
+            // a 200 with a status in the trailers, and a `502` is unreadable to a gRPC client.
+            front_end
+                .dispatcher
+                .dispatch_with_routes(&routes, &cgi_request)
+                .map_err(BackendFailure::Backend)
+        });
 
-    let response = blocking
-        .await
-        .map_err(|err| HttpError::BadGateway(format!("the dispatch task failed: {err}")))??;
+    let response = match blocking.await {
+        Ok(Ok(response)) => response,
+        // A request that never reached a backend: a 404 and a 403 mean what they always meant,
+        // because there is no call whose outcome a gRPC status could describe.
+        Ok(Err(BackendFailure::Request(err))) => return Err(err),
+        // A backend that was asked and failed. For a gRPC call the outcome travels in the trailers —
+        // the failure is "the call did not happen", which is a *protocol* fact rather than a
+        // component one, so the mapping is chosen by protocol before it is chosen by component.
+        Ok(Err(BackendFailure::Backend(err))) if is_grpc => return Err(grpc_failure(err)),
+        Ok(Err(BackendFailure::Backend(err))) => return Err(map_server_error(err)),
+        Err(err) => {
+            return Err(HttpError::BadGateway(format!(
+                "the dispatch task failed: {err}"
+            )))
+        }
+    };
 
     if !response.stderr.is_empty() {
         // Where a developer looks first when PHP complains, exactly as in the
@@ -1290,6 +1380,9 @@ async fn prepare(
         );
     }
 
+    if is_grpc {
+        return grpc_answer(response);
+    }
     from_cgi(response)
 }
 
@@ -1549,6 +1642,62 @@ fn from_cgi(response: volucer_fcgi::Response) -> Result<Response<ResponseBody>> 
         .map_err(|err| HttpError::BadGateway(format!("the backend sent an unusable header: {err}")))
 }
 
+/// A worker's answer to a gRPC call, put on the wire the way gRPC requires.
+///
+/// This is tier B's construction side, and it is the same job [`error_response`] does for a
+/// *failure* this server produces: take what the application said and move the outcome into the
+/// trailer section, where a gRPC client reads it. The difference is that this one carries the
+/// application's bytes too — a successful call has a message.
+///
+/// The application expresses its outcome as two ordinary response headers, because the worker
+/// protocol's `RESPONSE` head has nowhere else to put them; `volucer_upstream::grpc_reply` moves
+/// them. Everything that can go wrong with that is explained there; what matters here is that the
+/// application is never asked to know gRPC's wire format, only to name a status and a message.
+///
+/// **A refusal to even try.** The body has to be a `Vec` rather than the borrowed slice `from_cgi`
+/// relays, because an HTTP/1.1 body with a trailer section is chunked and hyper needs it as frames;
+/// and a gRPC message is small enough that the copy is not the interesting cost. A *streamed* gRPC
+/// reply — a server-streaming method — is §10 item 4, and it is where this type would have to
+/// change.
+fn grpc_answer(response: volucer_fcgi::Response) -> Result<Response<ResponseBody>> {
+    let (status, headers, body) = response.parse();
+
+    if status != 200 {
+        // The application answered a gRPC call with a non-200 HTTP status. `grpc_reply` below forces
+        // 200 and would therefore *hide* the application's own status line — so the one case where
+        // the application said something this server cannot represent is reported rather than
+        // silently rewritten. It is almost always a PHP error page, which is a bug in the
+        // application, and a 200 with an `INTERNAL` status is the honest translation of it.
+        tracing::warn!(
+            status,
+            "an application answered a gRPC call with an HTTP status other than 200; \
+                      reporting it as INTERNAL in the trailers, because a gRPC client reads the \
+                      outcome there and has no HTTP status to branch on"
+        );
+        return Err(grpc_refusal(
+            volucer_upstream::GrpcStatus::Internal,
+            format!(
+                "the application answered a gRPC call with HTTP {status} rather than a gRPC status \
+                 in the trailers"
+            ),
+        ));
+    }
+
+    let owned: Vec<(String, String)> = headers
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    let (status, headers, body) = volucer_upstream::grpc_reply(owned, body.to_vec());
+
+    let mut builder = Response::builder().status(status);
+    for (name, value) in headers.iter() {
+        builder = builder.header(name, value);
+    }
+    builder.body(ResponseBody::new(body)).map_err(|err| {
+        HttpError::BadGateway(format!("the application sent an unusable header: {err}"))
+    })
+}
+
 /// A plain-text error page for a failure that never reached the application.
 ///
 /// **Except for a gRPC call, whose failure must not be an error page at all.** A gRPC client reads the
@@ -1636,13 +1785,21 @@ fn grpc_failure(err: ServerError) -> HttpError {
         // The origin answered, and the answer was the problem.
         _ => volucer_upstream::GrpcStatus::Internal,
     };
-    // The reason goes to the log in full — this is the only place it survives, since `grpc-message`
-    // carries a fixed string a client could act on and this does not.
-    tracing::warn!(%err, status = status.name(), "a gRPC call failed");
-    HttpError::Grpc {
-        status,
-        source: Box::new(map_server_error(err)),
-    }
+    grpc_refusal(status, map_server_error(err).to_string())
+}
+
+/// A gRPC call this server refused, as the client has to be told about it.
+///
+/// One constructor for both refusals, so the log line cannot disagree with the wire: the status is
+/// what the client reads and the reason is what the operator reads, and they are written together
+/// here or not at all.
+///
+/// `reason` names what happened in the deployment's vocabulary. It deliberately does **not** reach
+/// the wire — `grpc-message` carries [`GrpcStatus::message`], which is a fixed sentence a client
+/// could act on. The reason's home is the log, which is the one place a full explanation survives.
+fn grpc_refusal(status: volucer_upstream::GrpcStatus, reason: String) -> HttpError {
+    tracing::warn!(status = status.name(), %reason, "a gRPC call was refused");
+    HttpError::Grpc { status, reason }
 }
 
 /// A CGI-environment failure, in HTTP terms.

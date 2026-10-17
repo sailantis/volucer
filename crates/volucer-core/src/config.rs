@@ -712,6 +712,107 @@ impl Config {
     }
 }
 
+/// A gRPC call's address, split out of the `:path` it arrived on.
+///
+/// gRPC's own routing rule is a string and nothing more, which is `docs/plugins.md` §6.6's first
+/// row: `:path` is `/pkg.Service/Method`, and reading it needs no descriptor and no schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrpcPath<'a> {
+    /// The fully-qualified service, e.g. `greeter.Greeter`.
+    pub service: &'a str,
+    /// The method on that service, e.g. `SayHello`.
+    pub method: &'a str,
+}
+
+/// Split a `:path` into the service and method a gRPC call addresses.
+///
+/// `None` for anything that is not a gRPC path, and the shape is deliberately strict rather than
+/// forgiving, because the one thing a wrong answer here does is route an arbitrary URL into a
+/// worker that believed it was reading a method name:
+///
+/// - exactly one `/` after the leading one — gRPC's own grammar has no room for a third segment,
+///   so `/a.B/M/extra` is not a method and must not be treated as one;
+/// - neither part empty, so `//` and `/Method` are refused;
+/// - the service a legal protobuf full name ([`is_valid_grpc_service`]), because that is what it is;
+/// - the method a legal protobuf identifier, for the same reason. A method that is not one is not
+///   a method this server should be handing an application as a name.
+///
+/// A **query string is not stripped, and there is no special case for one**: gRPC addresses a method
+/// by `:path` alone, so `/pkg.Service/Method?x=1` is not a path any gRPC client sends, and the `?` is
+/// refused because it is not a byte a protobuf identifier may contain. That is deliberate rather than
+/// incidental: a test for a query would be a second rule to keep in step with this one, and the
+/// identifier rule already covers it. What the rule *does* need to catch is a separator hidden after
+/// one — `?` then `/` — and the third-segment check above is what does that.
+pub fn parse_grpc_path(path: &str) -> Option<GrpcPath<'_>> {
+    let rest = path.strip_prefix('/')?;
+    // `split_once` rather than `split('/').collect()`: a second `/` must be a refusal, not a third
+    // field nobody reads. Checking the remainder for a separator is what makes that true.
+    let (service, method) = rest.split_once('/')?;
+    if method.contains('/') || method.is_empty() {
+        return None;
+    }
+    if !is_valid_grpc_service(service) || !is_valid_proto_identifier(method) {
+        return None;
+    }
+    Some(GrpcPath { service, method })
+}
+
+/// Whether a name is a legal protobuf **full service name**: identifiers joined by dots.
+///
+/// Used for two things, which is why it is one function: validating a `grpc_services` entry at
+/// startup, and validating the service an incoming path names. If they were two rules, a
+/// configuration could name a service no request could ever address — or, worse, the two could
+/// disagree about a name that is *nearly* legal, which is precisely the class of typo the
+/// allow-list exists to catch.
+pub fn is_valid_grpc_service(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(is_valid_proto_identifier)
+}
+
+/// Whether a name matches protobuf's `ident`: a letter or `_`, then letters, digits or `_`.
+///
+/// Case-sensitive, deliberately. Protobuf identifiers are, so a case-insensitive match here would
+/// let `greeter.greeter` be granted by a list naming `greeter.Greeter` — and the two are different
+/// services that could be routed to different backends.
+fn is_valid_proto_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(first) => {
+            (first.is_ascii_alphabetic() || first == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        }
+        None => false,
+    }
+}
+
+impl Config {
+    /// Whether a gRPC call to `path` may reach this backend's workers.
+    ///
+    /// The membership test a *deployment* asks; the server asks the same question of the list it
+    /// captured at startup, through [`granted_grpc_call`], which is where the rule lives. This
+    /// exists for `check` and for tests, where reading it out of the file is the point.
+    pub fn serves_grpc(&self, backend: &str, path: &str) -> bool {
+        let Some(BackendConfig::Worker(worker)) = self.backends.get(backend) else {
+            return false;
+        };
+        granted_grpc_call(&worker.grpc_services, path).is_some()
+    }
+}
+
+/// The gRPC call a `:path` addresses, when `services` grants it; `None` otherwise.
+///
+/// **The one implementation of the routing rule**, called from two places that must not disagree:
+/// the server, against the list it captured when it built the backend, and the configuration, when
+/// `check` reads the file. Two copies of "parse the path, then look the service up" is exactly the
+/// drift the allow-list exists to prevent — one of them would eventually normalise a name the other
+/// did not, and a service would be granted in one place and refused in the other.
+pub fn granted_grpc_call<'a>(services: &[String], path: &'a str) -> Option<GrpcPath<'a>> {
+    let call = parse_grpc_path(path)?;
+    services
+        .iter()
+        .any(|granted| granted == call.service)
+        .then_some(call)
+}
+
 /// The Prometheus endpoint.
 ///
 /// Its own listener rather than a route on `[server]`, and that is not a style choice. The HTTP
@@ -2829,6 +2930,34 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub services: Vec<String>,
 
+    /// Which gRPC services this backend's workers may be asked to handle.
+    ///
+    /// **The opposite direction from `services`, and that is why it is a second key.** `services`
+    /// decides what the application may *call*; this decides what may be *delivered* to it. A
+    /// gRPC call arriving at `/greeter.Greeter/SayHello` is matched against this list by service
+    /// name, and a request naming a service that is not here never reaches a worker: it is answered
+    /// `UNIMPLEMENTED` by the server itself, which is what a gRPC client expects from a server that
+    /// does not implement a method.
+    ///
+    /// **Absent means none**, exactly as for `services`, and for the same reason: the list is the
+    /// whole of what a route may reach, so the safe default has to be the empty one. A backend that
+    /// names no gRPC service answers `UNIMPLEMENTED` to every gRPC call, which is also the right
+    /// answer for a worker that was never meant to speak gRPC at all — including a plain PHP
+    /// application that a misconfigured client happens to send `content-type: application/grpc` to.
+    ///
+    /// Only a `worker` backend has the key. A `worker` has a channel the server agreed to install a
+    /// handler on and a process that outlives a request; `external` and `spawn_cgi` reset per request
+    /// and have no such contract, and an `upstream` speaks gRPC itself and needs no permission from
+    /// here — see `docs/plugins.md` §6.6 for the tiers.
+    ///
+    /// **Service names, not paths and not methods.** `"greeter.Greeter"` is a service; a method
+    /// underneath it (`SayHello`) is the application's business, because a method the application
+    /// does not implement is a method it can answer `UNIMPLEMENTED` to itself. Listing methods here
+    /// would mean editing the server's configuration on every application deploy, which is the
+    /// coupling §6.6 exists to avoid.
+    #[serde(default)]
+    pub grpc_services: Vec<String>,
+
     /// Whether the per-frame `crc32c` is verified.
     ///
     /// Defaults to [`ChecksumMode::Required`], which is what every volucer release
@@ -3943,6 +4072,32 @@ impl Config {
                     }
                     if !seen.insert(namespace) {
                         return bad(format!("services names {namespace:?} twice"));
+                    }
+                }
+
+                // The gRPC side of the same rule, in the other direction: a name here decides what
+                // may be *delivered* to this backend's workers. Checked against protobuf's own
+                // grammar rather than against a table, because there is no table to check against —
+                // the services live in the application, not in this file, and that is §6.6's whole
+                // point.
+                //
+                // A name that is not a legal service is refused rather than warned about, and the
+                // failure mode it prevents is the quiet one: `grpc_services = ["Greeter"]` beside a
+                // client calling `/greeter.Greeter/SayHello` is a worker granted nothing, so every
+                // call is answered `UNIMPLEMENTED` and no log line says why. That is the same silent
+                // shape the `services` check exists for.
+                let mut seen_service = std::collections::BTreeSet::new();
+                for service in &w.grpc_services {
+                    if !is_valid_grpc_service(service) {
+                        return bad(format!(
+                            "grpc_services contains {service:?}, which is not a protobuf service \
+                             name; a service is identifiers joined by dots, e.g. \
+                             \"greeter.Greeter\" — check the name in the application's `.proto`, \
+                             with its package"
+                        ));
+                    }
+                    if !seen_service.insert(service) {
+                        return bad(format!("grpc_services names {service:?} twice"));
                     }
                 }
             }
@@ -5765,6 +5920,241 @@ services = ["config", "config"]
         assert!(
             err.to_string().contains("twice"),
             "the error must say what is wrong: {err}"
+        );
+    }
+
+    /// A gRPC path is split into a service and a method, and only a gRPC path is.
+    ///
+    /// The refusals matter more than the acceptance, because the thing a lenient answer does is route
+    /// an arbitrary URL into a worker that believed it was reading a method name. Each case below is a
+    /// way that could happen.
+    #[test]
+    fn a_grpc_path_is_two_segments_and_both_have_to_be_names() {
+        let split = |path: &str| {
+            parse_grpc_path(path).map(|call| (call.service.to_string(), call.method.to_string()))
+        };
+
+        assert_eq!(
+            split("/greeter.Greeter/SayHello"),
+            Some(("greeter.Greeter".to_string(), "SayHello".to_string()))
+        );
+        // A package with several components is still one service name, and a method starting with an
+        // underscore is legal protobuf.
+        assert_eq!(
+            split("/a.b.c.v1_2/Get_Thing"),
+            Some(("a.b.c.v1_2".to_string(), "Get_Thing".to_string()))
+        );
+
+        // Not a gRPC path at all: no leading slash, no method, an empty method.
+        assert_eq!(split("greeter.Greeter/SayHello"), None);
+        assert_eq!(split("/greeter.Greeter"), None);
+        assert_eq!(split("/greeter.Greeter/"), None);
+        assert_eq!(split("/"), None);
+        assert_eq!(split(""), None);
+        // **A third segment is not a deeper method.** gRPC's grammar has no room for one, so treating
+        // it as a method would hand an application the string `SayHello/extra` as a method name.
+        assert_eq!(split("/a.B/M/extra"), None);
+        // A query string is not stripped: gRPC addresses a method by `:path` alone, and the `?` that
+        // would begin one is not a byte a protobuf identifier may contain, so it is refused by the
+        // same rule that refuses a hyphen. The client's own implementation of this rule makes the same
+        // choice, and the two must not differ.
+        assert_eq!(split("/a.B/M?x=1"), None);
+        // Neither part may be something other than a protobuf name.
+        assert_eq!(split("/-/M"), None, "a service is not a punctuation mark");
+        assert_eq!(
+            split("/a.B/9M"),
+            None,
+            "a method does not start with a digit"
+        );
+        assert_eq!(
+            split("/a..B/M"),
+            None,
+            "an empty package part is not a name"
+        );
+        assert_eq!(split("/.a.B/M"), None);
+        assert_eq!(split("/a.B./M"), None);
+        assert_eq!(split("/a-B/M"), None, "a hyphen is not an identifier byte");
+        assert_eq!(split("/a.B/M-x"), None);
+    }
+
+    /// A service name is validated the same way as the service a path names, and both are
+    /// case-sensitive.
+    ///
+    /// One function, deliberately: if the configuration's rule and the path's rule were two, a
+    /// deployment could name a service no request could ever address, or the two could disagree about
+    /// a name that is *nearly* legal — which is exactly the class of typo an allow-list catches.
+    #[test]
+    fn a_service_name_is_identifiers_joined_by_dots() {
+        assert!(is_valid_grpc_service("Greeter"));
+        assert!(is_valid_grpc_service("greeter.Greeter"));
+        assert!(is_valid_grpc_service("a.b.c.v1"));
+        assert!(is_valid_grpc_service("_hidden.v1"));
+
+        assert!(!is_valid_grpc_service(""));
+        assert!(!is_valid_grpc_service(".Greeter"));
+        assert!(!is_valid_grpc_service("Greeter."));
+        assert!(!is_valid_grpc_service("greeter..Greeter"));
+        assert!(!is_valid_grpc_service("greeter/Greeter"));
+        assert!(!is_valid_grpc_service("9greeter.Greeter"));
+        assert!(!is_valid_grpc_service("greeter.Greeter "));
+
+        // Case-sensitive, and this is the one that would otherwise let a typo be granted by accident:
+        // protobuf identifiers are case-sensitive, so these are two different services.
+        assert_eq!(
+            parse_grpc_path("/greeter.greeter/M")
+                .map(|call| call.service)
+                .filter(|service| *service == "greeter.Greeter"),
+            None,
+            "a granted `greeter.Greeter` must not admit `greeter.greeter`"
+        );
+        assert!(
+            is_valid_grpc_service("greeter.Greeter") && is_valid_grpc_service("greeter.greeter")
+        );
+    }
+
+    /// A service outside a backend's grant never reaches it, which is the whole of the key.
+    ///
+    /// Both halves asserted, because a grant that admits everything would pass a test that only checked
+    /// the granted case — and the failure mode of the lenient reading is silent: the call arrives, the
+    /// application has no handler for it, and the client gets an error from the application rather than
+    /// the refusal the server should have made.
+    #[test]
+    fn only_a_granted_service_reaches_a_worker_backend() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_services = ["greeter.Greeter"]
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        config.validate().expect("a legal service name validates");
+
+        assert!(config.serves_grpc("app", "/greeter.Greeter/SayHello"));
+        // Any method on a granted service: a method the application does not implement is one it can
+        // answer `UNIMPLEMENTED` to itself, so listing methods here would put the application's
+        // interface in the server's file.
+        assert!(config.serves_grpc("app", "/greeter.Greeter/Anything"));
+
+        // A different service, a different case, and a path that is not a method path.
+        assert!(!config.serves_grpc("app", "/greeter.greeter/SayHello"));
+        assert!(!config.serves_grpc("app", "/other.Service/SayHello"));
+        assert!(!config.serves_grpc("app", "/greeter.Greeter"));
+        assert!(!config.serves_grpc("app", "/a.B/M/extra"));
+        // An unknown backend is not a grant either.
+        assert!(!config.serves_grpc("nope", "/greeter.Greeter/SayHello"));
+    }
+
+    /// `grpc_services` is absent by default, and the default is the safe one.
+    ///
+    /// The same argument `services` makes, in the other direction. A worker that was never meant to
+    /// speak gRPC answers `UNIMPLEMENTED` to every gRPC call, which is also the right answer for a
+    /// plain PHP application a misconfigured client happens to send `content-type: application/grpc`
+    /// to — its routes are not method paths, and nothing about them should become deliverable because
+    /// a client lied about its protocol.
+    #[test]
+    fn grpc_services_is_absent_by_default_and_absent_grants_nothing() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        config
+            .validate()
+            .expect("no grant is not a misconfiguration");
+        assert!(config.backends["app"].kind() == "worker");
+        assert!(
+            !config.serves_grpc("app", "/greeter.Greeter/SayHello"),
+            "absenting `grpc_services` must grant nothing, not everything"
+        );
+    }
+
+    /// A name in `grpc_services` that is not a protobuf service name is refused where the file is read.
+    ///
+    /// The failure mode it prevents is quiet. `grpc_services = ["Greeter"]` beside a client calling
+    /// `/greeter.Greeter/SayHello` — a name written without its package, which is what an operator
+    /// copying from a method name rather than from a `.proto` produces — is a worker granted nothing,
+    /// so every call is answered `UNIMPLEMENTED` and no log line says why.
+    #[test]
+    fn a_grpc_service_name_that_is_not_a_protobuf_name_is_refused() {
+        let with = |service: &str| {
+            let text = format!(
+                r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_services = ["{service}"]
+"#
+            );
+            Config::from_toml(&text)
+                .expect("the file parses; the value is what is wrong")
+                .validate()
+        };
+
+        with("greeter.Greeter").expect("a legal name validates");
+
+        for bad in ["Greeter/", "greeter.Greeter/SayHello", "", "a b.C", "9a.B"] {
+            let err = with(bad).expect_err("must not validate");
+            let message = err.to_string();
+            assert!(
+                message.contains("grpc_services"),
+                "the error must name the key: {message}"
+            );
+            assert!(
+                message.contains("greeter.Greeter"),
+                "and show what a service name looks like, because the operator has to fix the file \
+                 from the message alone: {message}"
+            );
+        }
+    }
+
+    /// A service listed twice in `grpc_services` is refused, for `services`' own reason.
+    #[test]
+    fn a_grpc_service_listed_twice_is_refused() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_services = ["a.B", "a.B"]
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let err = config.validate().expect_err("must not validate");
+        assert!(err.to_string().contains("twice"), "{err}");
+    }
+
+    /// `grpc_services` beside a backend with no channel to deliver a call through is refused.
+    ///
+    /// `deny_unknown_fields` is what makes this an error rather than a silently ignored key — the same
+    /// argument the `services` key's own test makes, and the reason it is worth a second test is that
+    /// the two keys are on the same table and a reader will assume they behave alike. They do; what
+    /// this asserts is that the *table* they are on is the only one that has them.
+    #[test]
+    fn grpc_services_beside_a_kind_that_has_no_channel_is_refused() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "external"
+socket = "127.0.0.1:9000"
+grpc_services = ["a.B"]
+"#;
+        let err = Config::from_toml(text).expect_err("must fail");
+        assert!(
+            err.to_string().contains("grpc_services"),
+            "the error has to name the key that does not belong: {err}"
         );
     }
 

@@ -232,6 +232,22 @@ working_dir = "."
                           # remote-execution surface and this key is the only thing limiting
                           # it. "workers" also allows worker.reset, so grant it only to an
                           # operator's worker, never to one facing the public.
+#
+# grpc_services = ["greeter.Greeter"]
+                          # gRPC services this backend's workers may be ASKED TO SERVE. The
+                          # opposite direction from `services`, which is why it is a second
+                          # key: `services` is what the application may call, this is what may
+                          # be delivered to it. Absent means none, for the same reason. Names
+                          # are protobuf service names (with their package) and never method
+                          # names -- a method the application does not implement is one it
+                          # answers UNIMPLEMENTED to itself, which keeps the application's
+                          # interface out of this file. A call naming anything else never
+                          # reaches a worker: the server answers UNIMPLEMENTED itself.
+                          #
+                          # The server never parses a message; a handler is handed the framed
+                          # bytes and the method path (`$request->grpcMethod()`) and states its
+                          # outcome with `Volucer\GrpcResponse`, whose status the server moves
+                          # into the trailer section where gRPC clients read it.
 # transport = "pipe"      # Defaults to "socket" on Windows and "pipe" elsewhere,
                           # which is the measured winner on each: PHP's stream layer
                           # reads a Windows pipe ~100x slower than a socket, and that

@@ -38,8 +38,9 @@ pub use client::{
 pub use error::{Result, UpstreamError};
 pub use origin::{Origin, UpstreamTls};
 pub use translate::{
-    grpc_error, grpc_trailers, is_grpc, prepare_request, translate_response, GrpcErrorBody,
-    GrpcStatus,
+    grpc_error, grpc_reply, grpc_trailers, is_grpc, is_grpc_media_type, is_never_forwarded,
+    prepare_request, translate_response, GrpcErrorBody, GrpcOutcome, GrpcReplyBody, GrpcStatus,
+    GRPC_MESSAGE, GRPC_STATUS,
 };
 
 /// The configuration model's checked origin, re-exported.

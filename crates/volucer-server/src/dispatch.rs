@@ -815,6 +815,20 @@ impl Dispatcher {
         self.dispatch_to(name, request)
     }
 
+    /// The gRPC call a path addresses, when the backend its route selects was granted that service.
+    ///
+    /// `None` for every case that is not "a worker this deployment agreed may serve this service":
+    /// a non-`worker` backend, a path that is not a gRPC path, and a service absent from that
+    /// backend's own list. The caller turns all of them into the same `UNIMPLEMENTED`, which is what
+    /// gRPC means by "this server does not implement that method" — see `docs/plugins.md` §6.6.
+    pub fn granted_grpc_call<'a>(
+        &self,
+        backend: &str,
+        path: &'a str,
+    ) -> Option<volucer_core::config::GrpcPath<'a>> {
+        self.backends.get(backend)?.granted_grpc_call(path)
+    }
+
     /// Send a request to the backend its route selects.
     pub fn dispatch(&self, request: &Request) -> Result<Response> {
         // The name is borrowed rather than cloned into a `String`. `backend_for` and

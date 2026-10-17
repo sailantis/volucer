@@ -134,6 +134,7 @@ fn config(workers: u32) -> WorkerConfig {
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
+        grpc_services: Vec::new(),
         transport: Default::default(),
     }
 }
@@ -737,6 +738,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
+        grpc_services: Vec::new(),
         transport: Default::default(),
     };
     let pool = WorkerPool::start("test", &config).expect("pool starts");
@@ -849,6 +851,7 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
+        grpc_services: Vec::new(),
         transport: Default::default(),
     };
 
@@ -1014,6 +1017,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
+        grpc_services: Vec::new(),
         transport: Default::default(),
     };
     let pool = WorkerPool::start("test", &config).expect("pool starts");
@@ -1137,6 +1141,7 @@ fn slow_pool(tag: &str, workers: u32, micros: u64, max_wait: Option<Duration>) -
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
+        grpc_services: Vec::new(),
         transport: Default::default(),
     };
     let mut pool = WorkerPool::start("test", &config).expect("pool starts");

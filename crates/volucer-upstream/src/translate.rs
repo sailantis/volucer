@@ -52,9 +52,18 @@ const NEVER_FORWARDED: [&str; 10] = [
 ];
 
 fn never_forwarded(name: &HeaderName) -> bool {
+    is_never_forwarded(name.as_str())
+}
+
+/// [`never_forwarded`] for a name that has not been parsed into a [`HeaderName`] yet.
+///
+/// The same list, reached from two shapes: the proxy's own header maps hold `HeaderName`s, while a
+/// worker's answer carries its headers as `String` pairs and parsing each one into a `HeaderName`
+/// just to ask this question would allocate per header to answer a comparison.
+pub fn is_never_forwarded(name: &str) -> bool {
     NEVER_FORWARDED
         .iter()
-        .any(|candidate| name.as_str().eq_ignore_ascii_case(candidate))
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 /// Whether this request is a gRPC call.///
@@ -73,13 +82,20 @@ pub fn is_grpc(headers: &HeaderMap) -> bool {
     headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            let lowered = value.trim().to_ascii_lowercase();
-            let Some(rest) = lowered.strip_prefix("application/grpc") else {
-                return false;
-            };
-            matches!(rest.as_bytes().first(), None | Some(b';' | b'+' | b'-'))
-        })
+        .is_some_and(is_grpc_media_type)
+}
+
+/// Whether a `content-type` value is gRPC's media type.
+///
+/// Split out of [`is_grpc`] because a worker's answer carries its content type as a plain
+/// `(name, value)` pair rather than as a `HeaderMap` entry, and asking the same question of a
+/// `String` by rebuilding a `HeaderMap` would be a copy per request to reuse a comparison.
+pub fn is_grpc_media_type(value: &str) -> bool {
+    let lowered = value.trim().to_ascii_lowercase();
+    let Some(rest) = lowered.strip_prefix("application/grpc") else {
+        return false;
+    };
+    matches!(rest.as_bytes().first(), None | Some(b';' | b'+' | b'-'))
 }
 
 /// Build the request an origin should receive.
@@ -230,6 +246,265 @@ pub fn translate_response(response: UpstreamResponse) -> UpstreamResponse {
         headers,
         body,
         version,
+    }
+}
+
+/// The two trailer field names gRPC defines for an outcome, and the only two the server moves.
+pub const GRPC_STATUS: &str = "grpc-status";
+/// See [`GRPC_STATUS`].
+pub const GRPC_MESSAGE: &str = "grpc-message";
+
+/// The result of one call, as the application expressed it: a status and a message.
+///
+/// Taken out of a worker's response *headers*, because that is the only place an application can
+/// put them: the worker protocol's `RESPONSE` head is a status and a list of headers, with no
+/// trailer section of its own. The server moves the pair into the trailers, which is where gRPC
+/// requires them to be — see [`grpc_reply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcOutcome {
+    /// The numeric status, as the application gave it.
+    pub status: u8,
+    /// The message, if the application sent one.
+    pub message: Option<String>,
+}
+
+impl GrpcOutcome {
+    /// Read the outcome an application expressed in its response headers.
+    ///
+    /// `None` when no `grpc-status` was sent, which is a *failure of the contract* rather than a
+    /// successful call: gRPC's own rule is that an absent status is a protocol error, and the
+    /// failure mode of treating it as `OK` is the worst one available — a call that failed is
+    /// reported to the client as having succeeded, with an empty message. So it becomes
+    /// [`GrpcStatus::Internal`] at the call site, along with a log line naming the application.
+    ///
+    /// A status that is not a number is `None` for the same reason: it is not a status, and
+    /// guessing at what the application meant would be reporting a code it did not send.
+    pub fn from_headers<'a, I>(headers: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut status: Option<u8> = None;
+        let mut message: Option<String> = None;
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case(GRPC_STATUS) {
+                // The *first* wins for both, matching how the CGI path resolves a duplicate header
+                // and how a proxy reads a repeated one: a later duplicate must not be able to
+                // overwrite the status the application stated first.
+                if status.is_none() {
+                    status = value.trim().parse::<u8>().ok();
+                }
+            } else if name.eq_ignore_ascii_case(GRPC_MESSAGE) && message.is_none() {
+                message = Some(value.to_string());
+            }
+        }
+        status.map(|status| GrpcOutcome { status, message })
+    }
+}
+
+/// A gRPC reply this server constructs around an application's answer.
+///
+/// Four things have to be true together, and each alone is a call a client cannot read:
+///
+/// - **the HTTP status is `200`** — gRPC reports the outcome in the trailer section, and a client
+///   that sees `500` reports "unexpected status" and never looks at the trailers;
+/// - **`grpc-status` and `grpc-message` are in the trailer section, not in the headers** — gRPC's
+///   specification requires it, because a streaming reply has to be able to send headers before its
+///   outcome exists;
+/// - **the trailer section is declared** with `Trailer:` — hyper's HTTP/1.1 encoder writes trailers
+///   only for the fields that header names, and silently drops the rest (`is_valid_trailer_field`
+///   and `encode_trailers` in `hyper`'s h1 `encode.rs`). Without it the reply is a chunked `200`
+///   whose body ends `0\r\n\r\n` and a client reads a successful call with no message;
+/// - **the body has an unknown length** — an exact size hint makes hyper conclude the body is
+///   complete and never poll for a trailer section at all. That is `GrpcReplyBody::size_hint`.
+///
+/// The application's own bytes are passed through untouched: the server carries gRPC's
+/// length-delimited framing without decoding it, which is `docs/plugins.md` §6.6's "the schema is
+/// not the server's problem". A message the application forgot to frame is a message the client
+/// rejects, and that is the application's bug to see rather than one this server could fix by
+/// guessing at the bytes.
+pub fn grpc_reply<I>(headers: I, body: Vec<u8>) -> (hyper::StatusCode, HeaderMap, GrpcReplyBody)
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let headers = headers.into_iter();
+    // Two passes over the application's headers are needed — one to take the outcome, one to build
+    // what is left — so they are collected once rather than iterated twice. The list is a response's
+    // headers, on the order of ten entries.
+    let given: Vec<(String, String)> = headers.collect();
+
+    let outcome = GrpcOutcome::from_headers(
+        given
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+
+    let mut outgoing = HeaderMap::with_capacity(given.len() + 1);
+    let mut saw_content_type = false;
+    for (name, value) in &given {
+        // The outcome travels in the trailer section, so it must not also travel as a header. A
+        // client that read `grpc-status: 0` from a header *and* a status from the trailers would be
+        // reading two answers, and gRPC's own rule is that the header form is a protocol error.
+        if name.eq_ignore_ascii_case(GRPC_STATUS) || name.eq_ignore_ascii_case(GRPC_MESSAGE) {
+            continue;
+        }
+        // Hop-by-hop and framing headers do not cross this hop. `Content-Length` in particular has
+        // to go: the body below deliberately reports an unknown length so hyper chooses chunked
+        // framing, and a length that disagreed with it would be refused as a protocol error.
+        //
+        // The same list the response leg already uses, for the same reason and from the same place:
+        // an application is the *other* side of this hop, so a header that must not cross one hop
+        // must not cross this one either.
+        if is_never_forwarded(name) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) else {
+            // A header the application sent that is not a header. Skipped rather than fatal, as in
+            // `from_cgi`: the rest of the reply is still sendable, and a gRPC client that loses one
+            // metadata entry is better served than one that gets no reply at all.
+            continue;
+        };
+        if name == hyper::header::CONTENT_TYPE {
+            saw_content_type = true;
+        }
+        outgoing.append(name, value);
+    }
+
+    // A gRPC reply with no content type is one a client refuses before it reads a byte of the body,
+    // so the absence is filled in rather than passed on. Only the absence: an application that said
+    // `application/grpc+proto` keeps it, because that is a claim about its own encoding.
+    if !saw_content_type {
+        outgoing.insert(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/grpc"),
+        );
+    }
+    outgoing.insert(
+        hyper::header::TRAILER,
+        HeaderValue::from_static("grpc-status, grpc-message"),
+    );
+    outgoing.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
+
+    let trailers = match outcome {
+        Some(outcome) => {
+            let mut trailers = HeaderMap::new();
+            trailers.insert(
+                GRPC_STATUS,
+                HeaderValue::from_str(&outcome.status.to_string())
+                    .expect("a decimal number is a header value"),
+            );
+            if let Some(message) = outcome.message {
+                // Percent-encoded ASCII is what the specification requires of this field, and the
+                // application supplied a `String` that may not be. An unencodable message is dropped
+                // rather than the call being failed: the status is the part a client branches on.
+                if let Ok(value) = HeaderValue::from_str(&sanitise_grpc_message(&message)) {
+                    trailers.insert(GRPC_MESSAGE, value);
+                }
+            }
+            trailers
+        }
+        // No status at all is not a successful call, and reporting it as one is the failure this
+        // whole function exists to prevent. `INTERNAL` is what gRPC means by "the server failed in a
+        // way it cannot describe", and the application is who it happened to.
+        None => grpc_trailers(GrpcStatus::Internal),
+    };
+
+    (
+        hyper::StatusCode::OK,
+        outgoing,
+        GrpcReplyBody {
+            data: Some(bytes::Bytes::from(body)),
+            trailers: Some(trailers),
+        },
+    )
+}
+
+/// Make a string safe to send as `grpc-message`.
+///
+/// The field is defined as percent-encoded ASCII, so anything outside the printable range —
+/// including the percent sign itself, which would otherwise begin an escape sequence — has to be
+/// encoded. Encoding is chosen over rejection because the message is advisory: a client shows it to
+/// a developer, and a developer is better served by a mangled-but-present sentence than by nothing.
+fn sanitise_grpc_message(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    for byte in message.bytes() {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            // `%` cannot survive verbatim: it would either be read as the start of an escape the
+            // application never wrote, or make a client's decoder report a malformed field.
+            if byte == b'%' {
+                out.push_str("%25");
+            } else {
+                out.push(byte as char);
+            }
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// A body that yields the application's bytes and then a trailer section.
+///
+/// The sibling of [`GrpcErrorBody`], and the difference between them is the whole of tier B: that
+/// one carries a failure and no data, this one carries data *and* an outcome. `poll_frame` yields at
+/// most one data frame and then the trailers, and the two ordering rules that make trailers survive
+/// hyper's HTTP/1.1 encoder are the same two — an unknown size hint while anything remains, and a
+/// `Trailer` declaration on the response. Both are explained where they are implemented below.
+pub struct GrpcReplyBody {
+    data: Option<bytes::Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl GrpcReplyBody {
+    /// The bytes of the body, for the tests and for anything that needs to inspect them.
+    pub fn data(&self) -> Option<&bytes::Bytes> {
+        self.data.as_ref()
+    }
+}
+
+impl hyper::body::Body for GrpcReplyBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<
+        Option<std::result::Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>>,
+    > {
+        // An empty data frame is skipped rather than yielded, so the two states below are "something
+        // left to send" and "done" and the caller never sees a zero-length data frame before the
+        // trailers — which a strict HTTP/2 client would accept but which no server needs to send.
+        if let Some(data) = self.data.take() {
+            if !data.is_empty() {
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))));
+            }
+        }
+        std::task::Poll::Ready(
+            self.get_mut()
+                .trailers
+                .take()
+                .map(|trailers| Ok(hyper::body::Frame::trailers(trailers))),
+        )
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none() && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        // Exactly zero only once there is genuinely nothing left, which is what `is_end_stream`
+        // above already says. While anything remains the length is *unknown*, and that is not a
+        // detail: `GrpcErrorBody::size_hint` carries the measurement, and the same one applies here
+        // — an exact hint makes hyper write `Content-Length` and stop polling, so the trailer
+        // section never exists and the call's outcome is lost. Unknown length is what selects the
+        // chunked framing HTTP/1.1 has for trailers; HTTP/2 needs no chunking and is unaffected.
+        if self.is_end_stream() {
+            return hyper::body::SizeHint::with_exact(0);
+        }
+        hyper::body::SizeHint::default()
     }
 }
 
@@ -809,5 +1084,275 @@ mod tests {
         let outgoing = request(headers).headers;
 
         assert!(!outgoing.contains_key("x-y"));
+    }
+
+    fn outcome(headers: &[(&str, &str)]) -> Option<GrpcOutcome> {
+        GrpcOutcome::from_headers(headers.iter().copied())
+    }
+
+    #[test]
+    fn an_application_states_its_outcome_in_two_response_headers() {
+        assert_eq!(
+            outcome(&[("grpc-status", "0"), ("grpc-message", "OK")]),
+            Some(GrpcOutcome {
+                status: 0,
+                message: Some("OK".to_string()),
+            })
+        );
+        // The name is matched case-insensitively, because an application writing `Grpc-Status` has
+        // sent the same field — and a PHP header block is written by the application, not by `hyper`.
+        assert_eq!(
+            outcome(&[("Grpc-Status", "5"), ("GRPC-MESSAGE", "not found")]),
+            Some(GrpcOutcome {
+                status: 5,
+                message: Some("not found".to_string()),
+            })
+        );
+        // A status with no message is legal: the status is the part a client branches on.
+        assert_eq!(
+            outcome(&[("grpc-status", "0")]),
+            Some(GrpcOutcome {
+                status: 0,
+                message: None,
+            })
+        );
+        // Whitespace around the number is not part of it.
+        assert_eq!(outcome(&[("grpc-status", " 14 ")]).unwrap().status, 14);
+
+        // **No status is not a successful call.** `None` rather than a default of `0`, because
+        // defaulting would report a call that failed as having succeeded with an empty message —
+        // which is the one failure mode this whole path exists to prevent.
+        assert_eq!(outcome(&[]), None);
+        assert_eq!(outcome(&[("grpc-message", "OK")]), None);
+        // Something that is not a number is not a status. Guessing at what the application meant
+        // would be reporting a code it never sent.
+        assert_eq!(outcome(&[("grpc-status", "")]), None);
+        assert_eq!(outcome(&[("grpc-status", "OK")]), None);
+        assert_eq!(outcome(&[("grpc-status", "-1")]), None);
+        assert_eq!(outcome(&[("grpc-status", "300")]), None);
+
+        // A duplicate takes the *first*, matching how the CGI path resolves a repeated header, so a
+        // later one cannot overwrite the status the application stated first.
+        assert_eq!(
+            outcome(&[("grpc-status", "0"), ("grpc-status", "13")])
+                .unwrap()
+                .status,
+            0
+        );
+        assert_eq!(
+            outcome(&[
+                ("grpc-status", "13"),
+                ("grpc-message", "first"),
+                ("grpc-message", "second"),
+            ])
+            .unwrap()
+            .message
+            .as_deref(),
+            Some("first")
+        );
+    }
+
+    /// The four things a gRPC reply has to be, asserted together because each alone is a call a
+    /// client cannot read.
+    #[test]
+    fn a_reply_puts_the_outcome_in_the_trailers_and_the_status_is_200() {
+        let (status, headers, body) = grpc_reply(
+            [
+                (
+                    "content-type".to_string(),
+                    "application/grpc+proto".to_string(),
+                ),
+                ("grpc-status".to_string(), "0".to_string()),
+                ("grpc-message".to_string(), "OK".to_string()),
+                ("x-app".to_string(), "kept".to_string()),
+            ],
+            b"\x00\x00\x00\x00\x05hello".to_vec(),
+        );
+
+        // 1. HTTP 200, always. A gRPC client sees an error status and reports "unexpected status",
+        //    never reading the trailers — so the failure it is being told about is lost.
+        assert_eq!(status, hyper::StatusCode::OK);
+
+        // 2. The status is a *trailer*, not a header. A header is sent before the body, and a streamed
+        //    reply's outcome does not exist yet at that point, which is why the protocol puts it after.
+        assert!(
+            !headers.contains_key("grpc-status") && !headers.contains_key("grpc-message"),
+            "the outcome must not also travel as headers: {headers:?}"
+        );
+
+        // 3. The trailer section is declared. hyper's h1 encoder writes only the fields this names,
+        //    and silently drops the rest — so without it the reply is a chunked `200` whose body ends
+        //    `0\r\n\r\n` and the client reads a successful call with an empty message.
+        assert_eq!(
+            headers.get(hyper::header::TRAILER).unwrap(),
+            "grpc-status, grpc-message"
+        );
+
+        // 4. The application's own headers survive, including its encoding claim.
+        assert_eq!(
+            headers.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "application/grpc+proto"
+        );
+        assert_eq!(headers.get("x-app").unwrap(), "kept");
+
+        // And the framing rule that makes the trailer section exist at all: an *unknown* size while
+        // anything remains. An exact hint makes hyper conclude the body is complete and never poll
+        // for trailers.
+        assert_eq!(body.size_hint().exact(), None);
+
+        let frames = poll_to_completion(collect_frames_of(body));
+        assert_eq!(frames.data, b"\x00\x00\x00\x00\x05hello".len());
+        let trailers = frames.trailers.expect("the outcome has to arrive");
+        assert_eq!(trailers.get(GRPC_STATUS).unwrap(), "0");
+        assert_eq!(trailers.get(GRPC_MESSAGE).unwrap(), "OK");
+    }
+
+    /// An application that sends no status is reported as a **failure**, not as success.
+    ///
+    /// The falsification half of the test above: `grpc_reply` would still produce a well-formed reply
+    /// if it defaulted a missing status to `0`, and the difference is only visible in the trailers.
+    /// A call that failed being reported as having succeeded is the worst outcome this path can
+    /// produce, so it has its own assertion.
+    #[test]
+    fn a_reply_with_no_status_is_internal_rather_than_a_success() {
+        let (status, headers, body) = grpc_reply(
+            [("content-type".to_string(), "application/grpc".to_string())],
+            Vec::new(),
+        );
+
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert!(headers.contains_key(hyper::header::TRAILER));
+
+        let frames = poll_to_completion(collect_frames_of(body));
+        let trailers = frames.trailers.expect("a status is always sent");
+        assert_eq!(
+            trailers.get(GRPC_STATUS).unwrap(),
+            "13",
+            "an absent status is INTERNAL: reporting it as 0 tells a client a failed call succeeded"
+        );
+    }
+
+    /// A reply with no content type gets one, because a gRPC client refuses the answer otherwise.
+    #[test]
+    fn a_reply_with_no_content_type_is_given_grpcs() {
+        let (_, headers, _) =
+            grpc_reply([("grpc-status".to_string(), "0".to_string())], Vec::new());
+        assert_eq!(
+            headers.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "application/grpc"
+        );
+    }
+
+    /// Framing and hop-by-hop headers do not cross from an application either.
+    ///
+    /// `Content-Length` is the load-bearing one: the body reports an unknown length so that hyper
+    /// chooses chunked framing, and an application-supplied length that disagreed with it would be a
+    /// protocol error rather than a reply.
+    #[test]
+    fn an_applications_framing_headers_do_not_cross() {
+        let (_, headers, _) = grpc_reply(
+            [
+                ("grpc-status".to_string(), "0".to_string()),
+                ("content-length".to_string(), "999".to_string()),
+                ("transfer-encoding".to_string(), "chunked".to_string()),
+                ("connection".to_string(), "keep-alive".to_string()),
+                ("keep-alive".to_string(), "timeout=5".to_string()),
+            ],
+            b"body".to_vec(),
+        );
+
+        for absent in [
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+        ] {
+            assert!(
+                !headers.contains_key(absent),
+                "{absent} must not cross from the application: {headers:?}"
+            );
+        }
+    }
+
+    /// A `grpc-message` with bytes a header cannot hold is encoded rather than dropped or fatal.
+    ///
+    /// The field is percent-encoded ASCII by definition. An application's error text is arbitrary
+    /// bytes, so something has to give — and the status is the part a client branches on, which is why
+    /// the message is made presentable rather than the call being failed.
+    #[test]
+    fn a_message_with_unusual_bytes_is_percent_encoded() {
+        let (_, _, body) = grpc_reply(
+            [
+                ("grpc-status".to_string(), "13".to_string()),
+                (
+                    "grpc-message".to_string(),
+                    "bad \"quote\" % and a\nnewline".to_string(),
+                ),
+            ],
+            Vec::new(),
+        );
+
+        let frames = poll_to_completion(collect_frames_of(body));
+        let value = frames.trailers.unwrap();
+        let message = value.get(GRPC_MESSAGE).unwrap().to_str().unwrap();
+        // The newline can only be sent as an escape, and `%` cannot survive verbatim: it would be
+        // read as the start of an escape the application never wrote.
+        assert_eq!(message, "bad \"quote\" %25 and a%0Anewline");
+    }
+
+    /// `is_grpc_media_type` is the same rule as `is_grpc`, and both are reachable.
+    ///
+    /// Two entry points because the two callers hold different types — a listener has a `HeaderMap`,
+    /// a worker's answer has a `String` — and the risk of splitting one rule in two is that they drift.
+    #[test]
+    fn the_media_type_test_is_the_same_rule_from_a_string() {
+        assert!(is_grpc_media_type("application/grpc"));
+        assert!(is_grpc_media_type("application/grpc+proto"));
+        assert!(is_grpc_media_type(" Application/GRPC "));
+        assert!(!is_grpc_media_type("application/grpcx"));
+        assert!(!is_grpc_media_type("application/json"));
+        assert!(!is_grpc_media_type(""));
+    }
+
+    /// Collect the frames of a `GrpcReplyBody`, the same way `collect_frames` does for the error body.
+    async fn collect_frames_of(body: GrpcReplyBody) -> Frames {
+        let mut data = 0;
+        let mut trailers = None;
+        let mut body = Box::pin(body);
+        loop {
+            let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
+            match frame {
+                None => break,
+                Some(Ok(frame)) => {
+                    if let Some(chunk) = frame.data_ref() {
+                        data += chunk.len();
+                    }
+                    if let Ok(fields) = frame.into_trailers() {
+                        assert!(trailers.is_none(), "trailers are yielded exactly once");
+                        trailers = Some(fields);
+                    }
+                }
+                Some(Err(err)) => panic!("the body must not fail: {err}"),
+            }
+        }
+        Frames { data, trailers }
+    }
+
+    /// A minimal executor, so `translate.rs`'s tests stay free of a runtime dependency.
+    ///
+    /// The alternative is making the whole module `#[tokio::test]`, which needs the `macros` and
+    /// `rt` features on a crate whose *library* has no async runtime at all — a dev-dependency
+    /// would hide that, but this is four lines and describes what these bodies actually need: **they
+    /// never return `Pending`**, because every one of them answers from state it already holds.
+    fn poll_to_completion<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            // A `panic!` rather than a loop: a body that suspends would be a body that never answers,
+            // and looping here would turn that into a hang instead of a failure.
+            Poll::Pending => panic!("these bodies never return Pending"),
+        }
     }
 }

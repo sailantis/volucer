@@ -396,6 +396,7 @@ impl WorkerPool {
                 working_dir: config.working_dir.clone(),
                 env: config.env.clone(),
                 services: Vec::new(),
+                grpc_services: Vec::new(),
                 checksum: config.checksum,
                 transport: config.transport,
             },
@@ -485,6 +486,20 @@ impl WorkerPool {
     /// Number of workers in the pool, which does not change.
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// The gRPC call a `:path` addresses, when this pool's workers were granted that service.
+    ///
+    /// Read off the spec — the list captured at startup — rather than from a live configuration, so
+    /// the answer cannot change under a request because a reload landed (see `Spec::grpc_services`).
+    ///
+    /// The caller reaches this through `Backend`/`Dispatcher`, which know *which* pool a route
+    /// selected; this only answers the membership question for the pool it is.
+    pub fn granted_grpc_call<'a>(
+        &self,
+        path: &'a str,
+    ) -> Option<volucer_core::config::GrpcPath<'a>> {
+        volucer_core::config::granted_grpc_call(&self.spec.grpc_services, path)
     }
 
     /// The mean time a request waited for a slot, in microseconds.

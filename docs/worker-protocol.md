@@ -340,6 +340,41 @@ that produced a valid error page.
 threshold — the same idea as RoadRunner's `max_worker_memory` — and `keep_alive`. A worker that
 handled a fatal error reports `keep_alive = false` and is replaced instead of reused.
 
+### gRPC calls, over the same exchange
+
+A gRPC call is delivered as an ordinary `REQUEST`, and this is a decision rather than a shortcut:
+**the server never parses a gRPC message** (`docs/plugins.md` §6.6), so a call is a request whose
+body happens to be length-delimited framed messages instead of a form. Reusing `REQUEST` is what
+makes that true rather than merely claimed — there is no second exchange to teach about framing, and
+the one-request-in-flight invariant is untouched, because a gRPC call *is* the request in flight.
+
+What tells the two apart is `content-type`, on **both** sides, and this is the one convention that has
+to be shared: a worker identifies a call by the media type of the request it just read, exactly as the
+server did before delivering it. `HELLO_ACK`'s `runtime` field is where a worker says which protocol
+implementation it is, which is what makes a mixed deployment diagnosable.
+
+```
+server  ──REQUEST (content-type: application/grpc+proto, body = framed messages)─►  worker
+        ◄─RESPONSE (status = 200, headers: grpc-status, [grpc-message], body_len)──
+        ◄─BODY (the application's framed reply), LAST──────────────────────────────
+        ◄─END──────────────────────────────────────────────────────────────────────
+```
+
+Three things about that are protocol rather than application:
+
+- **The status is `200`, and the outcome is a header.** gRPC reports every outcome in the *trailer
+  section*, so the server moves `grpc-status` and `grpc-message` out of the `RESPONSE` head and into the
+  trailers it constructs. The worker protocol has no trailer concept and does not need one: this is the
+  only place a header becomes something else, and it is stated here because a reader of this document
+  who expects the header verbatim would be right about every other field.
+- **A missing `grpc-status` is not success.** The server reports `INTERNAL`, because gRPC defines an
+  absent status as a protocol error and the alternative reading is that a failed call succeeded.
+- **`UNIMPLEMENTED` (12) is a normal answer, not an error.** A method the application does not
+  implement is one it is entitled to refuse, and the worker says so by naming that status rather than
+  by failing the request. `RESPONSE`'s `status` field is still `200` — the HTTP status is not where a
+  gRPC outcome lives, and putting a non-200 there is a bug the server reports as `INTERNAL` rather than
+  forwarding.
+
 `peak_memory_bytes` is **per request, not per process**, and the protocol says so because the two
 behave differently. PHP's `memory_get_peak_usage(true)` is a high-water mark that begins at
 process start and never falls, so reporting it raw would mean a worker that peaked once — during

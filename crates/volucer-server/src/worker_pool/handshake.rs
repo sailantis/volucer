@@ -421,6 +421,7 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
         env: BTreeMap::new(),
         checksum: Checksum::Optional,
         transport,
+        grpc_services: Vec::new(),
     }
 }
 

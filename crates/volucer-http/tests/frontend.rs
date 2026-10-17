@@ -134,6 +134,7 @@ fn worker_config(workers: u32) -> Config {
                 env: Default::default(),
                 checksum: Default::default(),
                 services: Vec::new(),
+                grpc_services: Vec::new(),
                 transport: Default::default(),
             }),
         )]
@@ -2235,6 +2236,202 @@ fn exchange_raw(address: &str, request: &[u8]) -> Vec<u8> {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read the response");
     raw
+}
+
+/// **A gRPC call reaches a PHP worker and its outcome comes back in the trailers.**
+///
+/// Tier B, driven through the deployment's own entry point — `Config::from_toml` -> `Dispatcher` ->
+/// `Server` -> a real PHP worker process. Every part of this is a thing that can be absent while the
+/// layers below it are correct, which is why it is one test rather than four:
+///
+/// 1. the `grpc_services` allow-list is read from the file and admits the call, so a granted service
+///    reaches a worker at all;
+/// 2. the body crosses the CGI environment, the worker protocol and back **unframed and unparsed** —
+///    the server carries gRPC's bytes without decoding them, which is §6.6's whole claim;
+/// 3. the application's `grpc-status` header becomes a **trailer**, not a header, and the reply is an
+///    HTTP 200 — the construction half tier A built, now carrying a real application's answer;
+/// 4. **an HTTP route on the same worker still works.** The two protocols share one pool, so a change
+///    that made every request gRPC would pass 1–3 and break the ordinary case.
+///
+/// The negative case is in the same test for the reason the h2c test's is: a server that delivered
+/// every call to every worker would pass the positive half and ignore the allow-list entirely.
+#[test]
+fn a_grpc_call_reaches_a_php_worker_and_its_status_comes_back_in_the_trailers() {
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+
+    // One config, through `from_toml`, so the allow-list is read by the same code a deployment's file
+    // is read by. The `example` worker serves both protocols; see its own comments.
+    let script = example_worker();
+    let text = format!(
+        r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:0"
+[backends.app]
+kind = "worker"
+command = 'php "{}"'
+workers = 2
+grpc_services = ["greeter.Greeter"]
+"#,
+        script.display()
+    );
+    let config = Config::from_toml(&text).expect("a worker serving both protocols parses");
+    config.validate().expect("a legal service name validates");
+    let routing = front_controller_routing();
+
+    // The allow-list, asserted on the configuration the test is about to serve. A grant that admitted
+    // everything would pass every assertion below about the granted service.
+    assert!(config.serves_grpc("app", "/greeter.Greeter/SayHello"));
+    assert!(
+        !config.serves_grpc("app", "/other.Service/SayHello"),
+        "a service that is not listed must not be admitted"
+    );
+
+    let dispatcher = match Dispatcher::from_config(&config, routing.clone()) {
+        Ok(dispatcher) => dispatcher,
+        Err(err) => {
+            eprintln!("skipping: the worker pool could not start: {err}");
+            return;
+        }
+    };
+    let Some(server) = Server::start(
+        dispatcher,
+        routing,
+        HttpLimits::default(),
+        volucer_core::config::StaticConfig::default(),
+    ) else {
+        panic!("the listener must start");
+    };
+    let address = server.address.clone();
+
+    // A one-message gRPC body: compression flag 0, a big-endian length of 5, then five bytes. Nothing
+    // anywhere in volucer parses this, and that is the point — the assertion below is that the bytes
+    // come back, not that they mean anything.
+    let body = b"\x00\x00\x00\x00\x05hello";
+    let call = format!(
+        "POST /greeter.Greeter/SayHello HTTP/1.1\r\nHost: example.test\r\n\
+         Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let mut raw = call.into_bytes();
+    raw.extend_from_slice(body);
+
+    let raw = exchange_raw(&address, &raw);
+    let answer = String::from_utf8_lossy(&raw).into_owned();
+
+    assert!(
+        answer.starts_with("HTTP/1.1 200 OK"),
+        "a gRPC reply is an HTTP 200, whatever the outcome.\nGot: {answer}"
+    );
+    assert!(
+        answer
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "the trailers need chunked framing to travel in.\nGot: {answer}"
+    );
+    // The head is checked **line by line**, because a legitimate `Trailer: grpc-status, grpc-message`
+    // declaration contains the name too — a `contains` on the head would either pass for the wrong
+    // reason or, as an earlier version of the tier A test did, fail for one.
+    let (head, tail) = answer.split_once("\r\n0\r\n").unwrap_or((&answer, ""));
+    assert!(
+        !head
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("grpc-status:")),
+        "the status must be a trailer, not a header.\nGot: {answer}"
+    );
+
+    // The application answered `SayHello` with a framed message, and it arrived whole. The framing is
+    // the *application's*; this asserts the bytes rather than a decoded message, because decoding one
+    // would need the schema the server deliberately does not have.
+    //
+    // Searched for in the response's **raw bytes**, and that is not fastidiousness: the message framing
+    // is `00 00 00 22`, which is not valid UTF-8, so a `String::from_utf8_lossy` rendering of it has
+    // already replaced the very bytes this asserts on. (This test found that the hard way: the first
+    // version hexed the lossy string and could never have passed.)
+    let payload = b"hello from volucer's gRPC handler\n";
+    // gRPC's inner framing, which is the whole of what makes this schema-independent: one compression
+    // flag byte, then a big-endian `u32` length, then that many bytes.
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    let prefix = hex(&framed);
+    assert!(
+        hex(&raw).contains(&prefix),
+        "the application's framing must arrive byte for byte — one compression flag, a big-endian \
+         length of {}.\nExpected the hex {prefix}\nGot: {answer}",
+        payload.len()
+    );
+    assert!(
+        answer.contains("hello from volucer's gRPC handler"),
+        "and so must the message itself.\nGot: {answer}"
+    );
+
+    assert!(
+        tail.to_ascii_lowercase().contains("grpc-status: 0"),
+        "the application's own status has to be in the trailer section.\nGot: {answer}"
+    );
+
+    // The **method the application was asked for**, and the reason this is asserted from the other
+    // direction: a worker that could not tell which method it was serving would answer `SayHello`'s
+    // reply to every call, and the status would still be `0`.
+    let unknown = format!(
+        "POST /greeter.Greeter/Nope HTTP/1.1\r\nHost: example.test\r\n\
+         Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let mut raw = unknown.into_bytes();
+    raw.extend_from_slice(body);
+    let answer = String::from_utf8_lossy(&exchange_raw(&address, &raw)).into_owned();
+    let (_, tail) = answer.split_once("\r\n0\r\n").unwrap_or((&answer, ""));
+    assert!(
+        tail.to_ascii_lowercase().contains("grpc-status: 12"),
+        "a method the application does not implement is UNIMPLEMENTED (12), which a client treats as \
+         final rather than retrying.\nGot: {answer}"
+    );
+
+    // A service **not** in `grpc_services` never reaches a worker: the server answers it itself. Both
+    // halves of the difference in one test, because "the server refused" and "the application
+    // refused" produce the same status and only the reason in the log tells them apart.
+    let refused = format!(
+        "POST /other.Service/SayHello HTTP/1.1\r\nHost: example.test\r\n\
+         Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let mut raw = refused.into_bytes();
+    raw.extend_from_slice(body);
+    let answer = String::from_utf8_lossy(&exchange_raw(&address, &raw)).into_owned();
+    assert!(
+        answer.starts_with("HTTP/1.1 200 OK"),
+        "a refused call is still a 200.\nGot: {answer}"
+    );
+    let (_, tail) = answer.split_once("\r\n0\r\n").unwrap_or((&answer, ""));
+    assert!(
+        tail.to_ascii_lowercase().contains("grpc-status: 12"),
+        "an ungranted service is UNIMPLEMENTED, and it is the *server* that says so.\nGot: {answer}"
+    );
+    assert!(
+        !answer.contains("hello from volucer"),
+        "and the application must not have been asked: the reply must carry no message.\nGot: {answer}"
+    );
+
+    // **The ordinary case, on the same worker.** A change that made every request gRPC — the plausible
+    // bug, since the branch is one `is_grpc` call — would pass everything above and break this.
+    let plain = get(&address, "/health");
+    assert_eq!(
+        plain.status, 200,
+        "an HTTP route on the same worker pool still answers as HTTP: {plain:?}"
+    );
+    assert!(
+        plain.text().contains("ok"),
+        "and with the application's own body: {:?}",
+        plain.text()
+    );
 }
 
 /// Send a gRPC-shaped POST and return whatever came back, or nothing on the fixture's timeout.

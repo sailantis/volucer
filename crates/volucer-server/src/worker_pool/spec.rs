@@ -29,6 +29,18 @@ pub(super) struct Spec {
     /// How to connect to the worker. On the spec for the same reason as `checksum`: a
     /// replaced worker must be reached the same way as the one it replaces.
     pub(super) transport: WorkerTransport,
+    /// The gRPC services this pool's workers were granted, captured from the configuration.
+    ///
+    /// **Captured rather than read from the configuration per request**, for the reason the registry
+    /// is built per backend and not per process: the list is a decision made once, at startup, about
+    /// what this pool may be asked to do. Reaching into a live configuration would also make the
+    /// answer depend on a reload landing mid-request, which is the ordering hazard the listener's
+    /// snapshot exists to prevent.
+    ///
+    /// Beside `checksum` and `transport` because it is the same *kind* of fact — a handshake-time
+    /// property of this pool — and because a replaced worker must be granted what the worker it
+    /// replaces was granted, which is what putting it on the spec gives for free.
+    pub(super) grpc_services: Vec<String>,
 }
 
 impl Spec {
@@ -75,6 +87,7 @@ impl Spec {
                 ChecksumMode::Optional => Checksum::Optional,
             },
             transport: config.transport,
+            grpc_services: config.grpc_services.clone(),
         })
     }
 }
@@ -94,6 +107,7 @@ mod tests {
             env: Default::default(),
             checksum: Default::default(),
             services: Vec::new(),
+            grpc_services: Vec::new(),
             transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
@@ -115,6 +129,7 @@ mod tests {
             env: Default::default(),
             checksum: Default::default(),
             services: Vec::new(),
+            grpc_services: Vec::new(),
             transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
@@ -132,6 +147,7 @@ mod tests {
             env: Default::default(),
             checksum: Default::default(),
             services: Vec::new(),
+            grpc_services: Vec::new(),
             transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
