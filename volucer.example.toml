@@ -313,14 +313,14 @@ kind = "external"
 socket = "unix:/run/php/php-fpm.sock"
 
 # ---------------------------------------------------------------------------
-# Self-contained php-fpm: volucer starts php-fpm, which still manages its own
-# children. Unix only.
+# Self-contained php-fpm: volucer does not start php-fpm. There is no
+# `spawn_fpm` kind -- a file that carries one is rejected by name -- and that
+# is a decision rather than a gap. php-fpm already does pool management,
+# `pm.max_requests` recycling, multi-pool tenancy and graceful reload better
+# than a supervisor written here would, so `external` attaches to the pool
+# systemd already supervises. The removed kind parsed and validated while
+# startup refused it, which is the shape this file exists not to have.
 # ---------------------------------------------------------------------------
-# [backends.own_fpm]
-# kind = "spawn_fpm"
-# binary = "/usr/sbin/php-fpm"
-# config = "./fpm.conf"
-# socket = "unix:/run/volucer-fpm.sock"
 
 # ---------------------------------------------------------------------------
 # HTTP upstream: a runtime that already owns its HTTP loop (Node, Python, Go)

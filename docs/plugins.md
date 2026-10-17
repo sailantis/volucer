@@ -176,7 +176,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 
 | What | RR's shape | What it costs here | Why it is worth it |
 | --- | --- | --- | --- |
-| **`volucer workers` / `volucer reset`** (§4.6) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S.** The methods exist and are tested; the process has no client for them. A `Command::Rpc` that opens one pool's channel and sends `workers.list` | §4.6 already promises it, and the promise is currently false: `volucer serve\|check\|version` is the whole CLI. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing |
+| **`volucer workers` / `volucer reset`** (§4.6, §4.7) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S–M**, and not the **S** this was first called. The methods exist and are tested; what is missing is a way *in* from a second process, which is a listener rather than a client. Route it on the `[status]` listener that already exists — see §4.7 | §4.6 promises it and the promise was false in a way worth keeping written down: the channel the registry travels on is held by the pool and the child, so it has no second-process half. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing. **It also makes two subcommands optional**, which is why it is the endpoints rather than the CLI: `curl -f -XPOST .../workers/3/reset` is the whole command |
 | **`http.trusted_subnets` + forwarded headers** — **built, §6.8** | `proxy_ip_parser` | **S–M**, and it was S–M. A CIDR check against the peer, then the first parsable of an ordered header list, hand-rolled rather than a crate | **Not a convenience — a correctness bug, and the only defect in this table.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Both places already took an address, which is why the change is small |
 | **`metrics.observe`** | `metrics.collect` | **S.** One registry entry and one namespace arm | `emitMetric` already rides the wire and lands in a `Vec` nobody reads (`codec.rs:1136`), which §6.1 called the first thing to fix |
 | **Rate limiting** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
@@ -294,6 +294,12 @@ hazard 60). Internally the pieces exist and are unused by anything outside the p
 `crates/volucer-worker/src/message.rs`), per-listener `Stats`
 (`crates/volucer-server/src/listener.rs`), and the process-wide `volucer_watch::Registry` that
 owns the one reload path.
+
+**This section is still true, and that is the point.** §4.2–§4.6 were built, so an application inside a
+worker can now call `workers.list`, `worker.reset`, `kv.get`, `lock.acquire` and the rest. What is
+*not* built is the second process — which is what an operator has, and the reason the CLI is still
+`serve`, `check`, `version`. §4.6 assumed those two were one feature. §4.7 is the accounting of why
+they are not, and it is the only premise of this section that did not survive the code.
 
 ### 4.2 The design: one channel, one dispatcher
 
@@ -436,7 +442,7 @@ made 0 reserved. Two consequences follow, and both are load-bearing:
   *request's* deadline with nothing in the log naming the call responsible.
 
 `HELLO_ACK` gains one optional field, `runtime` (`"php"`/`"python"`/`"ruby"`), which §7.2 needs
-anyway and which lets the server apply the right policy without guessing. Additive, but see §4.7 —
+anyway and which lets the server apply the right policy without guessing. Additive, but see §4.8 —
 nothing here is versioned against a deployed peer.
 
 **What the discarded relay design would have added, and does not.** No second socket, therefore no
@@ -459,8 +465,9 @@ is a `RETURN` error naming the method**, not a dropped frame and not a dead work
 
 `workers.list`, `worker.reset` and `config.describe` need no new service at all — they read the pool
 and the configuration that already exist — so a control plane is available from the first commit
-here rather than after KV is written. `volucer workers` and `volucer reset` become CLI clients of
-it. `config.describe` is **redacted** (§4.6), because the answer includes driver config and would
+here rather than after KV is written. `volucer workers` and `volucer reset` are meant to be clients of
+it; **what that client has to connect *to* is §4.7, and it is not the channel this registry travels
+on.** `config.describe` is **redacted** (§4.6), because the answer includes driver config and would
 otherwise hand out credentials over a channel any worker can write to.
 
 ### 4.5 Security: the channel is now a remote-execution surface
@@ -483,17 +490,118 @@ the one that would be forgotten:
 
 ### 4.6 What this unlocks immediately
 
-- `volucer workers` and `volucer reset` as CLI clients of the method registry, which is exactly what
-  RR's CLI is (`roadrunner/internal/cli/workers/command.go:32`, `informer.List`). Neither needs a
-  service: they read the pool (`restart(index)`, `crates/volucer-server/src/worker_pool/mod.rs:653`)
-  and the configuration that already exist. **The methods are built and the clients are not** — see
-  §1.4's first row. The sentence that matters is that no *service* has to exist for them, which
-  turned out to be true: `workers.list` and `worker.reset` are answered by the server's own
-  dispatcher, so the CLI needs a channel and nothing else.
+- `volucer workers` and `volucer reset`, which would be clients of the method registry if the registry
+  were reachable — see §4.7, which is the one thing in §4 that had to be corrected after the code was
+  written. Neither needs a *service*: they read the pool
+  (`restart(index)`, `crates/volucer-server/src/worker_pool/mod.rs:1161`)
+  and the configuration that already exist. The sentence that matters is that no *service* has to exist
+  for them, which turned out to be true: `workers.list` and `worker.reset` are answered by the server's
+  own dispatcher, so nothing has to be written but the way in.
 - The `status`/health endpoint (§6.1) can borrow the same `ready` notion.
 - Every §6 service has somewhere to live from the day it is written.
 
-### 4.7 Versioning, now that nothing is deployed
+### 4.7 The correction: there is no channel for a second process
+
+**§1.4 and §4.6 both said the CLI "needs a channel and nothing else", and that is wrong** — wrong in
+a way worth writing down rather than quietly editing, because the sentence is plausible on first
+contact and would be re-derived by anyone reading §4.2 alone.
+
+The channel that carries `CALL`/`RETURN` is the pipe volucer itself created when it spawned
+`php worker.php` ([`boot`](crates/volucer-server/src/worker_pool/handshake.rs:167), which takes the
+child's `stdin`/`stdout`) or the loopback socket it bound for a socket-transport worker
+([`handshake.rs:162`](crates/volucer-server/src/worker_pool/handshake.rs:162)). Both ends of it are
+already held: one by the pool's exchange thread, the other by the child. **No second process can open
+it**, and on the pipe transport the kernel did not even give it a name. The method registry travels
+on that channel, so the registry is reachable from *inside an application* and from nothing else.
+
+**RoadRunner is not a counterexample, and the difference is the whole point.** `rr workers` is
+`net.Dial` to `rpc.listen` (`roadrunner/internal/rpc/client.go:70`) — a listener the plugin created
+*before* any worker existed, deliberately, because its CLI was always going to be a client of it.
+volucer's §4.2 removed exactly that listener and replaced it with the per-worker channel, which is a
+better design for the application-facing half and **has no second-process half at all**. The two
+halves were never the same feature, and collapsing them into "one socket" is where this document went
+wrong.
+
+So the missing piece is one inbound transport for a caller that is not a worker, and its shape is
+decided by one property: **it is the first thing in this process that a client the server did not
+spawn can connect to and *mutate* through.**
+
+#### The shape: an HTTP endpoint on the listener that already exists
+
+Not a raw line protocol, and not a second listener. The reasons, in order:
+
+- **A framing codec would have to be specified, and it already has been — as HTTP.** `workers.list`
+  answers JSON ([calls.rs](crates/volucer-server/src/calls.rs:2532), `serde_json::to_value`), and the
+  registry's whole point is that a method is a name, JSON params and a JSON result
+  ([§4.4](#44-the-method-registry)). HTTP carries that with no new document, and the alternative —
+  a length-prefixed frame the CLI must frame by hand — is a second wire format to version for no
+  reader that needs one.
+- **The listener already exists, already reaches the dispatcher, and is already off by default.**
+  §6.1's `[status]` endpoint holds one `Arc<Dispatcher>` and serves `/health` and `/ready` from it.
+  `Dispatcher::pools()` ([dispatch.rs:612](crates/volucer-server/src/dispatch.rs:612)) exists
+  specifically so that "which pool is worker 3 in" has one implementation, and its own comment
+  already names the CLI as the intended caller. `GET /workers` is that accessor rendered, and
+  `POST /workers/{index}/reset` is `WorkersNamespace::serve` with the index taken from the path
+  instead of from a JSON body.
+- **A second listener would be a second address to bind, to print, to firewall and to stop** — and
+  it would have to re-answer the question §6.1 already answered, about which of the process's
+  addresses faces the public. There is no *capability* argument for keeping the mutation endpoint off
+  the scrape port, because either address can be exposed by a one-line misconfiguration; what
+  protects the endpoint is that it does not exist unless asked for, which is the same rule that
+  makes `[metrics]` opt-in.
+- **It removes the one objection "why not a separate socket" does not already settle.** §4.2 refuses
+  a second socket *for the worker*, because a worker that blocks on two channels destroys
+  shutdown-by-construction. A CLI-facing socket is server-only and touches none of that — which is
+  why the shape here is a design choice rather than a consequence of §4.2. The choice is made on the
+  cost of a listener, not on protocol purity.
+
+#### What has to be written, and the two decisions that are not obvious
+
+**`[status]` grows a mutation switch, and it is off until it is set.** A `GET` is safe to hand to
+whoever can reach a port; a `POST` that recycles a worker is not. So the routes exist only when the
+deployment says so, which keeps §6.1's guarantee — a deployment that configured `[status]` for an
+orchestrator gains no mutation surface by upgrading:
+
+```toml
+[status]
+address = "127.0.0.1:2114"
+allow_worker_reset = true    # default false. Absent, POST is a 405 and GET /workers a 404
+```
+
+Two things follow from the routes being *inside* the status listener rather than beside it, and
+neither is a detail:
+
+1. **The reset must not run on the status listener's thread.** `RunningStatus` is a `tokio` runtime
+   ([status.rs:167](crates/volucer-http/src/status.rs:167)), and `WorkerPool::restart` boots a
+   process and completes a handshake under a 30-second deadline — blocking work with a blocking
+   failure mode. It goes through `spawn_blocking`, the same boundary the dispatcher is already
+   reached through on the request path.
+2. **A refusal is a status code, not a 200 with a JSON error.** `WorkerPool::restart` already
+   distinguishes the cases ([worker_pool/mod.rs:1161](crates/volucer-server/src/worker_pool/mod.rs:1161)):
+   an index past the end is `404`, a slot that is *serving a request* is `409` — because
+   `take_specific` returns `None` exactly when the worker is busy — and a respawn that failed is
+   `500`. A caller scripting this wants `curl -f` to fail on the first two, and a JSON envelope that
+   says the same thing would make it parse a document to find out.
+
+**What is *not* proposed: `config.describe` over HTTP.** The namespace exists and is redacted, but
+its whole threat model in §4.5 is a channel only an application can write to; a redacted document on
+a port an orchestrator scrapes is a different exposure, and it should not ride in on this row. It
+stays a worker-callable method.
+
+#### Verified against the code, not assumed
+
+- The registry is a `BTreeMap<String, Arc<dyn Namespace>>` and the same `WorkersNamespace` instance is
+  what answers a worker's call, so the status listener can hold an `Arc` to *that* rather than to a
+  second copy — one implementation of `workers.list`, two callers.
+- `MethodRegistry::serve` is `&Call -> Return` and needs nothing from the frame layer, so nothing
+  about `volucer-worker`'s message set changes: no new type number, no handshake field, no
+  `docs/worker-protocol.md` edit. This is the §4.8 argument reused, and it is why the row is small.
+- `RunningStatus` binds inside `start` and prints its `.local_addr()`, so a bound port is already a
+  startup fact and no new failure mode is introduced.
+- The status listener answers a 404 to every path it does not serve ([status.rs:28](crates/volucer-http/src/status.rs:28)),
+  which is the behaviour `POST /workers/{i}/reset` has to keep for the paths this row does not add.
+
+### 4.8 Versioning, now that nothing is deployed
 
 `protocol_version` stays `1` and gains no "v2" — it is the *frame* version, and the frame did not
 change. What changed is the message set, and the honest record of that is
@@ -1622,6 +1730,7 @@ progress on something earlier look bigger.
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | **Done.** `grpc_services` on a backend, `UNIMPLEMENTED` for anything else, and the application's status moved into the trailers. The application states its outcome in two response headers; the server never parses a message. Five of this section's own premises were corrected on contact, and the largest is that routing to a *worker* became protocol-aware |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | **Settled: not built**, and §10 item 2 is the decision. The only descriptor consumer turned out to be the service itself — a reply is already-framed bytes the server never decodes — so no other use could justify loading a schema either |
 | — | **`http.trusted_subnets` + forwarded headers** — §6.8 | — | S–M | **Done.** Independent of 1–9, and the only item in §1.4 that was a *defect* rather than a missing feature: behind nginx the access log and any future rate limit both keyed on the proxy. Restart-only, and deliberately not applied on the FastCGI path |
+| — | **`volucer workers` / `volucer reset`** — §4.7 | 1, 2, and §6.1's `[status]` listener | S–M | **Not built, and it is the operator's only lever on a running pool.** §4.6 called it a client; it is an endpoint, because the registry's channel has no second-process half. Routes on the listener `[status]` already brings up, behind an off-by-default key |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
 
