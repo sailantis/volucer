@@ -820,7 +820,12 @@ pub fn granted_grpc_call<'a>(services: &[String], path: &'a str) -> Option<GrpcP
 /// endpoint that inherited any of those would be one misconfiguration away from being either
 /// unreachable or public. A separate address on loopback is the shape every other server in this
 /// space uses, and it is the one an operator can firewall as a single line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` only, because [`CollectedMetric::buckets`] is `f64` and an `f64` cannot be `Eq`:
+/// `NaN != NaN`, so the reflexivity `Eq` promises does not hold. A bucket bound may not be `NaN`
+/// (validation refuses it) but the *type* cannot know that, and a derive that claimed otherwise
+/// would be the one lie a future refactor could build on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Where to listen, e.g. `127.0.0.1:2112` or `unix:/run/volucer/metrics.sock`.
@@ -846,10 +851,74 @@ pub struct MetricsConfig {
     /// whether the server is up.
     #[serde(default = "default_metrics_path")]
     pub path: String,
+
+    /// Application metrics this deployment accepts from its workers, by name.
+    ///
+    /// **This table is what makes `emitMetric` reach the exposition at all.** A registry refuses a
+    /// name nobody described — it has no `# TYPE` and no `# HELP` to write — so without an entry
+    /// here a worker's sample is decoded, counted as refused, and dropped. That is deliberate: the
+    /// set of metric names a process publishes is a decision about the deployment, and letting an
+    /// application widen it at runtime is how a `/metrics` page becomes unbounded.
+    ///
+    /// A table keyed by name rather than a list of objects, for the same reason `[backends]` and
+    /// `[kv]` are: the name *is* the identity, and a table makes two declarations of one name
+    /// unexpressible rather than something `validate` has to detect.
+    ///
+    /// RoadRunner's key of the same name, and its field names too — an operator arriving from it
+    /// writes the same block.
+    #[serde(default)]
+    pub collect: BTreeMap<String, CollectedMetric>,
 }
 
 fn default_metrics_path() -> String {
     "/metrics".to_string()
+}
+
+/// One application metric a deployment accepts from its workers.
+///
+/// The three kinds are Prometheus's, and the choice is not cosmetic: it decides what a sample
+/// *means*. A counter's sample is an increment, a gauge's is the value now, and a histogram's is one
+/// observation placed into buckets — and the registry applies exactly that, so a name declared as a
+/// gauge and written by a counter is a refusal with a reason rather than a graph that is subtly
+/// wrong.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectedMetric {
+    /// What a sample for this name means.
+    ///
+    /// Spelled `type` in TOML, which is RoadRunner's spelling and the word Prometheus itself uses in
+    /// `# TYPE`. It is a `kind` in Rust only because `type` is a keyword here.
+    #[serde(rename = "type")]
+    pub kind: CollectedKind,
+
+    /// The `# HELP` text. Required, for the reason [`MetricsConfig::collect`] gives: a registry
+    /// whose names carried no explanation would render a page of bare names, and the text has to be
+    /// the *operator's* rather than the worker's, because the operator is the one who declared it.
+    pub help: String,
+
+    /// Upper bounds for a histogram, in whatever unit the application reports.
+    ///
+    /// Sorted here rather than required to be sorted, because order carries no meaning — the
+    /// registry sorts too, and refusing an unsorted list would reject a block an operator wrote
+    /// correctly. Absent is legal and means a sum and a count with no buckets, which is what an
+    /// application that only wants an average should ask for.
+    ///
+    /// Refused on a counter or a gauge: a bucket list on a kind that has no buckets is a declaration
+    /// that will be ignored, and a setting read by nothing is worse than one that does not exist.
+    #[serde(default)]
+    pub buckets: Vec<f64>,
+}
+
+/// What a sample means, which is what decides how it is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollectedKind {
+    /// A sample is an increment, and must be a non-negative integer.
+    Counter,
+    /// A sample is the value now.
+    Gauge,
+    /// A sample is one observation, placed into the declared buckets.
+    Histogram,
 }
 
 /// The health and readiness endpoint.
@@ -3283,6 +3352,55 @@ impl Config {
                     )));
                 }
             }
+            // A collected name is validated as a *whole* metric name rather than as a prefix, and the
+            // two rules are not the same: a prefix may be empty and may not begin with a digit, while
+            // a name may do neither. A name that broke the rule would still be registered and still
+            // render — as a line Prometheus cannot parse, which drops the whole family and every
+            // family after it. That is silent, so it is refused here instead.
+            for (name, metric) in &metrics.collect {
+                if !is_metric_name(name) {
+                    return Err(Error::Config(format!(
+                        "metrics.collect.{name}: {name:?} is not a valid metric name; it must match \
+                         [a-zA-Z_][a-zA-Z0-9_]*, e.g. \"app_orders_total\""
+                    )));
+                }
+                // The `rr_` namespace is this server's own. An application metric landing there
+                // would collide with a metric an operator's dashboard already has, or silently
+                // replace it, and the failure would be a graph that means two different things over
+                // time. Refused rather than prefixed, because a prefix would make the name in the
+                // application's `emitMetric` and the name in the graph differ, which is a worse
+                // surprise than an error at startup.
+                if name.starts_with("rr_") {
+                    return Err(Error::Config(format!(
+                        "metrics.collect.{name}: names beginning with \"rr_\" are this server's own \
+                         metrics, so an application metric may not claim one; pick another name"
+                    )));
+                }
+                if metric.help.trim().is_empty() {
+                    return Err(Error::Config(format!(
+                        "metrics.collect.{name}: `help` must not be empty; it is the line a reader \
+                         sees six months from now, and a metric without one is a bare name"
+                    )));
+                }
+                // Buckets on a kind that has no buckets is a setting read by nothing, which is the
+                // failure mode `spawn_fpm` was removed for: it looks supported and cannot work.
+                if !metric.buckets.is_empty() && metric.kind != CollectedKind::Histogram {
+                    return Err(Error::Config(format!(
+                        "metrics.collect.{name}: `buckets` is only meaningful for a histogram, and \
+                         this one is declared as a {:?}; remove the key or change the type",
+                        metric.kind
+                    )));
+                }
+                // A bucket that is not a number, or a negative one, is a histogram whose `le` label
+                // would be unparseable. Non-finite is checked as well because TOML lets `inf` and
+                // `nan` be written and neither is a bound.
+                if let Some(bad) = metric.buckets.iter().find(|b| !b.is_finite() || **b < 0.0) {
+                    return Err(Error::Config(format!(
+                        "metrics.collect.{name}: the bucket bound {bad} is not a finite, \
+                         non-negative number"
+                    )));
+                }
+            }
         }
         if let Some(status) = &self.status {
             parse_listener(&status.address)
@@ -4395,6 +4513,25 @@ fn is_metric_name_prefix(prefix: &str) -> bool {
     prefix
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `name` may be a metric name.
+///
+/// Prometheus's rule is `[a-zA-Z_:][a-zA-Z0-9_:]*`, but **colons are refused here** even though the
+/// prefix rule above already refuses them, and the reason is different enough to say: a colon is
+/// reserved for recording rules, and a metric an application declares is the last thing that should
+/// be rewritten out from under it by whatever rule happened to match. The server's own names do not
+/// use one either, so nothing in this process needs the character.
+///
+/// Distinct from [`is_metric_name_prefix`] rather than a reuse: a prefix may be empty, and a name may
+/// not. Sharing one predicate would either accept an empty name or reject an absent prefix.
+fn is_metric_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Whether a byte may appear in an HTTP header name, per RFC 9110's `token`.
@@ -5724,6 +5861,172 @@ prefix = ""
 "#;
         let config = Config::from_toml(text).expect("config parses");
         config.validate().expect("valid");
+    }
+
+    /// A collected metric is a name, a kind and a help line, and all three reach the registry.
+    ///
+    /// The parse is asserted as well as the validation, because the key is `type` in TOML and `kind`
+    /// in Rust — a rename that lost the `serde` attribute would make every deployment's block an
+    /// unknown field, which is an error at the one place an operator copies from.
+    #[test]
+    fn a_collected_metric_states_its_name_kind_and_help() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+
+[metrics.collect.app_orders_total]
+type = "counter"
+help = "Orders the application counted"
+
+[metrics.collect.app_queue_depth]
+type = "gauge"
+help = "Jobs waiting"
+
+[metrics.collect.app_latency_seconds]
+type = "histogram"
+help = "Time to answer"
+buckets = [0.5, 0.1, 1.0]
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+
+        let metrics = config.metrics.expect("present");
+        assert_eq!(metrics.collect.len(), 3);
+
+        let counter = &metrics.collect["app_orders_total"];
+        assert_eq!(counter.kind, CollectedKind::Counter);
+        assert_eq!(counter.help, "Orders the application counted");
+        assert!(
+            counter.buckets.is_empty(),
+            "an absent bucket list is empty rather than an error, because a counter has no buckets"
+        );
+
+        // Order in the file is not a declaration of order, so it is not preserved and must not be
+        // refused either — the registry sorts its own bounds, and so does this.
+        assert_eq!(
+            metrics.collect["app_latency_seconds"].buckets,
+            vec![0.5, 0.1, 1.0],
+            "the bounds are kept as written; sorting is the registry's job, not the parser's"
+        );
+    }
+
+    /// A metric name that Prometheus cannot parse is refused at startup.
+    ///
+    /// The failure mode this prevents is silent in the worst way: the family still registers and
+    /// still renders, and a scraper that cannot parse one line drops the *whole* page — so one typo
+    /// in one name costs every metric, and the only symptom is an empty graph.
+    #[test]
+    fn rejects_a_collected_metric_name_prometheus_cannot_parse() {
+        for bad in [
+            "app-orders", // a hyphen
+            "9orders",    // a leading digit
+            "app.orders", // a dot, which means a label in Prometheus's own vocabulary
+            "app orders", // a space
+            "app:orders", // a colon, reserved for recording rules
+        ] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
+                 [metrics.collect.\"{bad}\"]\ntype = \"counter\"\nhelp = \"x\"\n"
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(
+                err.to_string().contains("is not a valid metric name"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// The `rr_` namespace belongs to the server, so an application metric may not claim a name in
+    /// it.
+    ///
+    /// Refused rather than silently prefixed: a prefix would make the name in `emitMetric` differ
+    /// from the name in the graph, which is a worse surprise at 3 a.m. than a refusal at startup.
+    /// The collision it prevents is real — `rr_http_request_total` is a name every operator's
+    /// dashboard already has, and an application that declared it would replace a server metric with
+    /// its own under the same label-free series.
+    #[test]
+    fn rejects_a_collected_metric_that_claims_the_servers_namespace() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+
+[metrics.collect.rr_http_request_total]
+type = "counter"
+help = "Mine now"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("rr_"), "{err}");
+    }
+
+    /// `buckets` on a kind that has no buckets is a setting read by nothing, so it is refused.
+    ///
+    /// This is the `spawn_fpm` argument: a key that parses, validates and is ignored is worse than
+    /// one that does not exist, because an operator has no way to find out which it is.
+    #[test]
+    fn rejects_buckets_on_a_kind_that_has_none() {
+        for kind in ["counter", "gauge"] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
+                 [metrics.collect.app_x]\ntype = \"{kind}\"\nhelp = \"x\"\nbuckets = [1.0]\n"
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("buckets"), "{kind}: {err}");
+        }
+    }
+
+    /// A bound has to be a number a `le` label can carry, which rules out what TOML will happily
+    /// parse: `inf` and `nan` are legal TOML floats and neither is a bucket bound.
+    #[test]
+    fn rejects_a_bucket_bound_that_is_not_a_finite_non_negative_number() {
+        for bad in ["inf", "-1.0", "nan"] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
+                 [metrics.collect.app_x]\ntype = \"histogram\"\nhelp = \"x\"\nbuckets = [{bad}]\n"
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("bucket bound"), "{bad}: {err}");
+        }
+    }
+
+    /// The help text is required and may not be blank, because `# HELP` is what makes a name
+    /// readable later and an empty one is the same as none.
+    #[test]
+    fn rejects_a_collected_metric_with_an_empty_help() {
+        for help in ["", "   "] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
+                 [metrics.collect.app_x]\ntype = \"counter\"\nhelp = \"{help}\"\n"
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("help"), "{help:?}: {err}");
+        }
+    }
+
+    /// A kind that is not one of the three is refused at parse time, by `serde`, rather than
+    /// becoming a metric nothing can write.
+    #[test]
+    fn rejects_an_unknown_collected_kind() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+
+[metrics.collect.app_x]
+type = "summary"
+help = "x"
+"#;
+        let err = Config::from_toml(text).expect_err("must be refused");
+        assert!(err.to_string().contains("summary"), "{err}");
     }
 
     #[test]

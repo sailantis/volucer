@@ -1395,11 +1395,25 @@ impl volucer_http::MetricsSource for DispatcherMetrics {
 ///
 /// It is initialised on first use, which is the first scrape — so a deployment with no `[metrics]`
 /// table never builds it at all, and the `describe` calls (idempotent) cost nothing.
+///
+/// **The application's own names come from the configuration, and they arrive through
+/// [`describe_collected`] rather than here**, because the `LazyLock` initialiser cannot see a
+/// `Config`. Both are idempotent, so the order the two run in does not matter — which is what lets
+/// the registry keep its "no global configuration" shape while still being process-wide.
 static METRICS: std::sync::LazyLock<volucer_metrics::Registry> = std::sync::LazyLock::new(|| {
     let registry = volucer_metrics::Registry::new();
     volucer_metrics::http::describe(&registry);
     registry
 });
+
+/// Declare a deployment's `[metrics.collect]` names in the process registry.
+///
+/// A one-line forwarder, and the commentary lives on [`volucer_server::describe_collected`] — which
+/// is where the function can be tested rather than copied. What this adds is the process's own
+/// registry, which a test cannot reach.
+fn describe_collected(metrics: &volucer_core::config::MetricsConfig) {
+    volucer_server::describe_collected(&METRICS, metrics);
+}
 
 /// Build the metrics and status listener, when the configuration asks for one.
 ///
@@ -1446,6 +1460,12 @@ fn build_status(
     };
 
     let metrics = config.metrics.as_ref().map(|metrics| {
+        // Registered before the listener exists, so the first scrape already knows the application's
+        // names. Doing it on scrape would mean the first few scrapes of a fresh process answered
+        // "undeclared" for a name the deployment had declared — a race whose symptom is an empty
+        // graph that fills in by itself.
+        describe_collected(metrics);
+
         let source: Arc<dyn volucer_http::MetricsSource> = Arc::new(DispatcherMetrics {
             dispatcher: Arc::clone(dispatcher),
             registry: &METRICS,

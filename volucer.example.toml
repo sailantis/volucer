@@ -476,14 +476,38 @@ base_port = 19001
 # series depends on the deployment rather than on what clients ask for.
 #
 # A worker may also publish its own sample: the PHP SDK's Worker::emitMetric
-# sends a METRIC frame that this server already decodes, and the sample lands
-# in this registry under the name the application chose. Those are the only
-# metrics whose cardinality is the application's business.
+# sends a METRIC frame that this server decodes, and the sample lands in this
+# registry under the name the deployment declared in [metrics.collect] below.
+# Those are the only metrics whose cardinality is the application's business.
+#
+# A sample whose name is not declared is refused, deliberately -- otherwise an
+# application could widen the published set at runtime. So the table is not an
+# optional extra: without it, emitMetric does nothing that anyone can see.
 # ---------------------------------------------------------------------------
 # [metrics]
 # address = "127.0.0.1:2112"
 # prefix = "myapp_"
 # path = "/metrics"
+#
+# [metrics.collect.app_orders_total]
+# type = "counter"          # counter | gauge | histogram
+# help = "Orders the application counted"
+#
+# [metrics.collect.app_queue_depth]
+# type = "gauge"
+# help = "Jobs waiting to be consumed"
+#
+# [metrics.collect.app_latency_seconds]
+# type = "histogram"
+# help = "Time the application took to answer"
+# buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+#
+# What `type` decides is what a sample *means*, because emitMetric sends a name
+# and a value and the worker does not know what it is counting: a counter's
+# sample is an increment (a whole, non-negative number), a gauge's is the value
+# now, and a histogram's is one observation. A name has to be a Prometheus name
+# -- letters, digits and underscores, no dots -- and may not begin with "rr_",
+# which is this server's own namespace.
 
 # ---------------------------------------------------------------------------
 # Health and readiness. Two endpoints on one listener, because they answer

@@ -25,6 +25,9 @@ pub use calls::{
 };
 pub use dispatch::Dispatcher;
 pub use dispatch::PoolDirectory;
+// For `serve` to declare a deployment's `[metrics.collect]` names in the process registry before the
+// listener exists, and for the pool tests to call the same function rather than copy it.
+pub use dispatch::describe_collected;
 pub use error::{Result, ServerError};
 pub use frontend::fastcgi::{self, IncomingRequest};
 pub use jobs::Consumers;

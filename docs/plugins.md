@@ -178,7 +178,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 | --- | --- | --- | --- |
 | **`volucer workers` / `volucer reset`** (§4.6, §4.7) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S–M**, and not the **S** this was first called. The methods exist and are tested; what is missing is a way *in* from a second process, which is a listener rather than a client. Route it on the `[status]` listener that already exists — see §4.7 | §4.6 promises it and the promise was false in a way worth keeping written down: the channel the registry travels on is held by the pool and the child, so it has no second-process half. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing. **It also makes two subcommands optional**, which is why it is the endpoints rather than the CLI: `curl -f -XPOST .../workers/3/reset` is the whole command |
 | **`http.trusted_subnets` + forwarded headers** — **built, §6.8** | `proxy_ip_parser` | **S–M**, and it was S–M. A CIDR check against the peer, then the first parsable of an ordered header list, hand-rolled rather than a crate | **Not a convenience — a correctness bug, and the only defect in this table.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Both places already took an address, which is why the change is small |
-| **`metrics.observe`** | `metrics.collect` | **S.** One registry entry and one namespace arm | `emitMetric` already rides the wire and lands in a `Vec` nobody reads (`codec.rs:1136`), which §6.1 called the first thing to fix |
+| **`metrics.observe`** — **built, §6.1** | `metrics.collect` | **S**, and it was **not** S. The estimate said "one registry entry and one namespace arm"; the real work was a declared-kind dispatch (`Registry::record`), a validation that runs *before* a series exists, a name rule, and fixing the SDK's own examples, which used dots and could never have rendered | `emitMetric` rode the wire and landed in a `Vec` nobody read (`codec.rs:1136`), which §6.1 called the first thing to fix. **That was fixed and the feature still did not work**: a registry refuses an undeclared name, so every real sample was dropped while three tests passed by declaring their own metric. The table was the feature, not an upgrade to it |
 | **Rate limiting** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
 
 #### Worth considering — real value, but it duplicates or complicates something that exists
@@ -458,6 +458,14 @@ Methods are `"<namespace>.<verb>"`: `kv.get`, `kv.set`, `lock.acquire`, `lock.re
 Params and results are JSON (the codec stays behind its boundary; msgpack remains available for the
 same reason it does in the worker protocol).
 
+> **`metrics.observe` is *not* how an application's numbers arrive, and the name in this list is a
+> leftover.** `emitMetric` is an unsolicited `METRIC` frame — there is no call, no return, and no
+> `metrics` namespace in [`CALL_NAMESPACES`](crates/volucer-core/src/config.rs) — and the declaration
+> that decides a sample's meaning is `[metrics.collect]` (§6.1). A `metrics.observe` method could
+> still be worth having, for an application that wants to *declare* a histogram at runtime rather
+> than a deployment declaring it in a file, but it is unbuilt and the frame path covers the common
+> case. Recorded here because a list of method names is read as a list of what exists.
+
 The registry maps a namespace to a handler, and the handler set is *the* thing a new feature
 registers with — which is §5's shape. It lives in `volucer-server`, is built by `serve` from the
 configured services, and the exchange thread holds an `Arc` to it. **A method that is not registered
@@ -728,12 +736,48 @@ sample to go.
   so `emitMetric` can be upgraded from fire-and-forget to a
   declared histogram without a protocol change.
 
+**Built, and the estimate above was wrong in the flattering direction.** The crate, the encoder,
+both listeners and the `absorb_metric` wiring landed first; what did not land for a long time was
+the `collect` table, and it turned out to be **not** an optional upgrade. A registry refuses a name
+nobody described — deliberately, so an application cannot widen the published set at runtime — and
+the only names the process described were `rr_http_*`. So **every `emitMetric` in every deployment
+was decoded, counted as `undeclared`, and dropped**, and the three tests of the path all passed
+because each of them declared its own metric by hand. The tests were the missing configuration.
+
+Four things came out of building it, and each is a decision rather than a detail:
+
+- **A sample's meaning comes from its declaration, not from the sender.** `emitMetric` carries a
+  name and a value, so `Registry::record` reads the declared kind and applies it — a counter's
+  sample is an increment, a gauge's is a reading, a histogram's is one observation. Without that,
+  the only way to write a sample was `observe`, which refuses anything that is not a histogram as
+  the wrong kind, so a declared counter would have been refused on every write.
+- **A counter's increment must be a whole, non-negative number**, refused rather than rounded — and
+  the check runs *before* the series is created. The first version checked it after, and a refused
+  sample left a zero-valued counter behind: the "metric that exists and never moves" that refusing
+  an undeclared name exists to prevent. A test that asserted the render was empty caught it.
+- **Names beginning `rr_` are refused**, because that namespace is the server's. The collision is
+  real: `rr_http_request_total` is a name every operator's dashboard already has, and an
+  application declaring it would replace a server metric under the same label-free series.
+- **Prometheus puts the unit in the name** (`_seconds`, `_bytes`), so `MetricRecord`'s `unit` field
+  has nowhere to go on the exposition. It is kept on the wire and not rendered; the declaration's
+  `help` and the name carry it.
+
+**And it caught the SDK documenting names that could never work.** `emitMetric`'s own signature
+allowed anything, and every example named a metric with dots — `request.count`, `example.request`,
+`worker.peak_memory_bytes`. A dot is illegal in a Prometheus name (it is Prometheus's own
+`recording.rule` vocabulary), so each of those was a sample that would arrive and silently do
+nothing. The SDK now says the rule in `emitMetric`'s docblock and uses `example_request_total` and
+`worker_peak_memory_bytes`.
+
 **What is hard.** Nothing conceptually; the discipline is in the cardinality budget. A label
 derived from a request path is how a metrics endpoint takes down a Prometheus server, so labels
 come from a closed set (status class, method, site name) and the registry caps distinct series per
 metric with a logged refusal beyond the cap.
 
-**Sizing.** S–M. Registry + encoder + two listeners + wiring `absorb_metric`.
+**Sizing.** S–M. Registry + encoder + two listeners + wiring `absorb_metric`. **The `collect`
+table alone was S, and understated for the reason above: the row in §1.4 read "one registry entry
+and one namespace arm" and the real work was a declared-kind dispatch, a pre-creation validation
+and a name rule the SDK was violating.**
 
 ### 6.2 KV
 
@@ -1720,7 +1764,7 @@ progress on something earlier look bigger.
 
 | # | Step | Depends on | Size | Why here |
 | --- | --- | --- | --- | --- |
-| 1 | **Metrics + status** | — | S–M | **Done.** No calls, no driver, no protocol change; makes everything after it observable |
+| 1 | **Metrics + status** | — | S–M | **Done**, and the `[metrics.collect]` half landed last (see §6.1): without it every `emitMetric` was refused as undeclared. No calls, no driver, no protocol change; makes everything after it observable |
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |

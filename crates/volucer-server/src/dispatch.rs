@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use volucer_core::config::{
-    BackendConfig, Config, KvStorageConfig, LockConfig, PipelineConfig, RouteConfig,
+    BackendConfig, Config, KvStorageConfig, LockConfig, MetricsConfig, PipelineConfig, RouteConfig,
 };
 use volucer_fcgi::{cgi, Request, Response};
 
@@ -356,6 +356,36 @@ impl std::fmt::Debug for JobsPlane {
             .field("pipelines", &self.pipelines.keys().collect::<Vec<_>>())
             .field("consumed", &self.consumed.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+/// Register the application metrics a deployment declared in `[metrics.collect]`.
+///
+/// **This is what makes `emitMetric` reach the exposition at all**, and it lives here rather than in
+/// the binary for one reason worth stating: *that is where a test can reach it*. A version of this in
+/// `main.rs` is testable only by copying its arms into a test, and a test that copies the code under
+/// test passes when the code regresses — which is the exact shape of the bug this function fixes.
+/// Three tests of the pool passed while every real `emitMetric` was dropped, because each of them
+/// declared its own metric by hand.
+///
+/// A registry refuses a name nobody described, deliberately: it has no `# TYPE` and no `# HELP` to
+/// write, and letting a worker widen the set at runtime is how a `/metrics` page becomes unbounded.
+/// So the deployment declares its names here, once, before anything is served.
+///
+/// Idempotent, because the registry is. Names are assumed valid: `Config::validate` has refused
+/// anything the exposition could not parse, and a second check here would be a rule written twice.
+pub fn describe_collected(registry: &volucer_metrics::Registry, metrics: &MetricsConfig) {
+    use volucer_core::config::CollectedKind;
+    use volucer_metrics::Kind;
+
+    for (name, metric) in &metrics.collect {
+        match metric.kind {
+            CollectedKind::Counter => registry.describe(name, Kind::Counter, &metric.help),
+            CollectedKind::Gauge => registry.describe(name, Kind::Gauge, &metric.help),
+            CollectedKind::Histogram => {
+                registry.describe_histogram(name, &metric.help, &metric.buckets)
+            }
+        }
     }
 }
 

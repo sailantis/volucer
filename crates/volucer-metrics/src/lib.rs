@@ -205,6 +205,9 @@ enum Refusal {
     AtCap,
     /// The name exists but not at the kind the caller used.
     WrongKind,
+    /// The sample does not fit the kind it was declared as — a counter's increment that is not a
+    /// non-negative integer, for instance.
+    BadSample,
 }
 
 fn refusal_reason(reason: Refusal) -> &'static str {
@@ -212,7 +215,26 @@ fn refusal_reason(reason: Refusal) -> &'static str {
         Refusal::Undeclared => "undeclared",
         Refusal::AtCap => "at-cap",
         Refusal::WrongKind => "wrong-kind",
+        Refusal::BadSample => "bad-sample",
     }
+}
+
+/// A counter's increment, or `None` if the sample cannot be one.
+///
+/// A counter accumulates, so its sample has to be a whole non-negative number: `1.0` per event is
+/// what `emitMetric` naturally writes, and `-1.0` or `0.5` means the application is measuring
+/// something a counter cannot express. Refused rather than clamped, because clamping would pick a
+/// meaning on the application's behalf and the graph would be confidently wrong.
+///
+/// The upper bound is `u64::MAX as f64`'s exact integer limit — above 2^53 an `f64` cannot represent
+/// every integer, so a larger value is a sample that lost precision on the wire rather than an
+/// increment anybody meant.
+fn counter_delta(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > 9_007_199_254_740_992.0
+    {
+        return None;
+    }
+    Some(value as u64)
 }
 
 /// The key a refusal is counted under: the metric name and the reason, so one name can appear more
@@ -440,6 +462,71 @@ impl Registry {
                 false
             }
         }
+    }
+
+    /// Record a sample whose meaning is decided by how the name was declared.
+    ///
+    /// **This is the method an application's own numbers arrive through**, and it exists because the
+    /// sender does not know what it is sending. `emitMetric` carries a name and a value and nothing
+    /// else — deliberately, since a worker's job is not to understand a metrics registry — so "is
+    /// this an increment, a reading, or an observation" is a question only the *declaration* can
+    /// answer. Without this, a sample could only be a histogram observation, and a name declared as
+    /// a counter would be refused as the wrong kind every time it was written. The table would
+    /// validate, the worker would emit, and the graph would be empty.
+    ///
+    /// Returns whether the sample was applied, which is `false` for an undeclared name, a series at
+    /// its cap, a sample that does not fit the declared kind, and — for a counter — a value that is
+    /// not a non-negative integer. Every one of those is counted by [`Registry::refused_series`]
+    /// under its own reason, so a `false` here is diagnosable rather than merely disappointing.
+    #[must_use]
+    pub fn record(&self, name: &str, labels: &[(&str, &str)], value: f64) -> bool {
+        // The counter check runs **before** the series exists, and that ordering is the whole reason
+        // it is here rather than inside the `Metric::Counter` arm below: `metric_for` creates a
+        // series on first use, so a sample refused after that point would leave a zero-valued metric
+        // behind — precisely the "metric that exists and never moves" that refusing an undeclared
+        // name exists to prevent. Found by a test that asserted the render was empty and read
+        // `app_x 0`.
+        if let Some(kind) = self.kind_of(name) {
+            if kind == Kind::Counter && counter_delta(value).is_none() {
+                self.refuse(name, Refusal::BadSample);
+                return false;
+            }
+        }
+
+        match self.metric_for(name, owned(labels)) {
+            Ok(metric) => match &*metric {
+                Metric::Counter(slot) => {
+                    // A counter's sample is an increment rather than a total, because that is what
+                    // `emitMetric` naturally writes (`1.0` per event) and what a Prometheus counter
+                    // accumulates. Already validated above; the `unwrap_or` cannot fire and is not a
+                    // second check, only the type's way of saying so.
+                    slot.fetch_add(counter_delta(value).unwrap_or(0), Ordering::Relaxed);
+                    true
+                }
+                Metric::Gauge(slot) => {
+                    slot.store(value.to_bits(), Ordering::Relaxed);
+                    true
+                }
+                // `false` when the value is above every bound, which is legal and worth a caller
+                // knowing, for the reason [`Registry::observe`] gives.
+                Metric::Histogram(histogram) => histogram.observe(value),
+            },
+            Err(refusal) => {
+                self.refuse(name, refusal);
+                false
+            }
+        }
+    }
+
+    /// The kind a name was declared at, or `None` if it was never declared.
+    ///
+    /// Read-only and does not create anything, which is what makes it usable as a pre-check: the
+    /// difference between "this name is a counter and the sample is wrong" and "this name does not
+    /// exist" is a difference the caller cannot see from [`Registry::record`]'s `bool`, and it
+    /// decides whether a series comes into being.
+    fn kind_of(&self, name: &str) -> Option<Kind> {
+        let families = self.families.read().expect("the registry lock");
+        families.get(name).map(|family| family.kind)
     }
 
     /// Every metric name currently registered, sorted.

@@ -1296,7 +1296,7 @@ fn a_slot_comes_back_after_a_failed_request() {
 /// piece could pass its own tests with the wire between them disconnected, which is exactly the
 /// failure the `absorb_metric` call this feature builds on had: it decoded the frame and dropped it.
 ///
-/// The SDK's example worker emits `example.request` on every request, so no fixture is involved and a
+/// The SDK's example worker emits `example_request_total` on every request, so no fixture is involved and a
 /// change to either side fails here.
 #[test]
 fn a_workers_own_metric_reaches_the_registry() {
@@ -1310,7 +1310,7 @@ fn a_workers_own_metric_reaches_the_registry() {
     // has to have decided to accept. `docs/plugins.md` §6.1 has the `[metrics] collect` table that will
     // make this a configuration entry rather than a call a test makes by hand.
     registry.describe_histogram(
-        "example.request",
+        "example_request_total",
         "Requests the example worker counted",
         &[],
     );
@@ -1325,11 +1325,11 @@ fn a_workers_own_metric_reaches_the_registry() {
     pool.publish_metrics(&registry);
     let rendered = registry.render();
     assert!(
-        rendered.contains("example.request_count 1"),
+        rendered.contains("example_request_total_count 1"),
         "the worker's own sample should reach the registry:\n{rendered}"
     );
     assert!(
-        rendered.contains("# HELP example.request Requests the example worker counted"),
+        rendered.contains("# HELP example_request_total Requests the example worker counted"),
         "and keep the help text the operator declared, not the worker's:\n{rendered}"
     );
 }
@@ -1347,7 +1347,7 @@ fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
     };
 
     let registry = volucer_metrics::Registry::new();
-    registry.describe_histogram("example.request", "Requests", &[]);
+    registry.describe_histogram("example_request_total", "Requests", &[]);
 
     pool.request(&get("/")).expect("a response");
     pool.publish_metrics(&registry);
@@ -1356,8 +1356,70 @@ fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
 
     let rendered = registry.render();
     assert!(
-        rendered.contains("example.request_count 1"),
+        rendered.contains("example_request_total_count 1"),
         "three scrapes, one sample:\n{rendered}"
+    );
+}
+
+/// A metric a deployment declares in `[metrics.collect]` is the one an emitted sample lands in.
+///
+/// **This is the gap the row in `docs/plugins.md` §1.4 called done.** The two tests above declare
+/// `example_request_total` by hand, which is exactly what an operator cannot do — so they proved the wire
+/// worked while the feature did not. A registry refuses a name nobody described, and the only names
+/// the process described were `rr_http_*`, so every `emitMetric` in a real deployment was decoded,
+/// counted as refused, and dropped. The tests passed because the *test* was the missing
+/// configuration.
+///
+/// So this one starts from a `Config` and takes the declaration from it, which is the path
+/// `build_status` takes. If `[metrics.collect]` stops reaching the registry, this fails; the tests
+/// above still pass.
+#[test]
+fn a_declared_metric_is_where_an_emitted_sample_lands() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+
+[metrics.collect.example_request_total]
+type = "histogram"
+help = "Requests the example worker counted"
+"#;
+    let config = Config::from_toml(text).expect("the configuration parses");
+    config.validate().expect("and is valid");
+    let metrics = config.metrics.as_ref().expect("a [metrics] table");
+
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    // Declared from the configuration, through the same function `build_status` calls — so a
+    // regression in the kind dispatch fails *here*, which is the property the hand-declaring tests
+    // above cannot have.
+    let registry = volucer_metrics::Registry::new();
+    volucer_server::describe_collected(&registry, metrics);
+
+    pool.request(&get("/")).expect("a response");
+    pool.publish_metrics(&registry);
+
+    let rendered = registry.render();
+    assert!(
+        rendered.contains("example_request_total_count 1"),
+        "the sample should land in the name the deployment declared:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("# HELP example_request_total Requests the example worker counted"),
+        "and the help text is the operator's, not the worker's:\n{rendered}"
+    );
+    assert_eq!(
+        registry
+            .refused_series()
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("rr_"))
+            .collect::<Vec<_>>(),
+        Vec::new(),
+        "and nothing *application* was refused, which is what the declaration buys — the pool's own \
+         rr_http_* gauges are refused here only because this test does not call http::describe"
     );
 }
 

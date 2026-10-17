@@ -917,21 +917,34 @@ impl WorkerPool {
         // is not, and a queue that only ever grows would be a leak wearing a feature's name. Drained
         // *before* the registry is written to, so a sample is never counted twice by two concurrent
         // scrapes — the `Mutex` makes the drain atomic, and the second scrape finds an empty queue.
-        let samples: Vec<(String, f64)> = {
+        let samples = {
             let mut pending = self
                 .pending_metrics
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *pending)
-                .into_iter()
-                .map(|record| (record.name, record.value))
-                .collect()
         };
-        for (name, value) in samples {
-            // An undeclared name is refused by the registry and counted there, which is the right place
-            // for that answer: whether a name is known is a property of the registry, not of the pool
-            // that forwarded it.
-            let _ = registry.observe(&name, &[], value);
+        for record in samples {
+            // `record` rather than `observe`, because the *declaration* decides what a sample means:
+            // a counter's is an increment and a gauge's is a reading, and a worker sending
+            // `emitMetric('app_orders_total', 1.0)` has no way to say which. See `Registry::record`.
+            //
+            // An undeclared name is refused by the registry and counted there, which is the right
+            // place for that answer: whether a name is known is a property of the registry, not of
+            // the pool that forwarded it.
+            if !registry.record(&record.name, &[], record.value) && !record.unit.is_empty() {
+                // The unit is the one field with nowhere to go: Prometheus puts it in the *name*
+                // (`_seconds`, `_bytes`), so a declaration that says `app_latency_seconds` has
+                // already said it and the record's copy is redundant. Warned about only when the
+                // sample was refused, because that is the case where the worker's own idea of the
+                // name may be what disagreed — and a warning per sample on the accepted path would
+                // be a log line per request.
+                tracing::debug!(
+                    metric = %record.name,
+                    unit = %record.unit,
+                    "a refused sample carried a unit; Prometheus takes the unit from the name"
+                );
+            }
         }
 
         // The free list is the pool's own answer to "which slots are available", so both the count

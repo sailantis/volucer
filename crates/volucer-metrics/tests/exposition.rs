@@ -308,3 +308,127 @@ fn a_histogram_with_no_bounds_counts_everything_in_plus_inf() {
          rr_only_sum_count 2\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `record`: a sample whose meaning comes from the declaration
+// ---------------------------------------------------------------------------
+//
+// These exist because the sender does not know what it is sending. `emitMetric` carries a name and a
+// value, so "is this an increment, a reading, or an observation" is answered by how the operator
+// declared the name — and every case below is one where the naive implementation (`observe`) would
+// silently do the wrong thing or nothing at all.
+
+/// A counter's sample is an increment, accumulated — not a value that replaces the last one.
+///
+/// This is the case the whole method exists for: before it, the only way to write a sample was
+/// `observe`, which refuses a counter as the wrong kind. A declared counter would have validated,
+/// the worker would have emitted, and the graph would have been empty.
+#[test]
+fn record_adds_to_a_counter_rather_than_replacing_it() {
+    let registry = Registry::new();
+    registry.describe("app_orders_total", Kind::Counter, "Orders counted");
+
+    for _ in 0..3 {
+        assert!(registry.record("app_orders_total", &[], 1.0));
+    }
+
+    assert_eq!(
+        registry.render(),
+        "# HELP app_orders_total Orders counted\n\
+         # TYPE app_orders_total counter\n\
+         app_orders_total 3\n"
+    );
+    assert_eq!(
+        registry.refused_series(),
+        Vec::new(),
+        "and nothing was refused on the accepted path"
+    );
+}
+
+/// A gauge's sample is the value now, so a second one replaces the first.
+#[test]
+fn record_sets_a_gauge() {
+    let registry = Registry::new();
+    registry.describe("app_queue_depth", Kind::Gauge, "Waiting");
+    assert!(registry.record("app_queue_depth", &[], 5.0));
+    assert!(registry.record("app_queue_depth", &[], 2.0));
+
+    assert_eq!(
+        registry.render(),
+        "# HELP app_queue_depth Waiting\n\
+         # TYPE app_queue_depth gauge\n\
+         app_queue_depth 2\n",
+        "the reading, not the sum"
+    );
+}
+
+/// A histogram's sample is one observation, which lands in cumulative buckets.
+#[test]
+fn record_observes_a_histogram() {
+    let registry = Registry::new();
+    registry.describe_histogram("app_latency_seconds", "Time", &[0.1, 1.0]);
+    assert!(registry.record("app_latency_seconds", &[], 0.05));
+    let _ = registry.record("app_latency_seconds", &[], 0.5);
+
+    assert_eq!(
+        registry.render(),
+        "# HELP app_latency_seconds Time\n\
+         # TYPE app_latency_seconds histogram\n\
+         app_latency_seconds_bucket{le=\"0.1\"} 1\n\
+         app_latency_seconds_bucket{le=\"1\"} 2\n\
+         app_latency_seconds_bucket{le=\"+Inf\"} 2\n\
+         app_latency_seconds_sum 0.55\n\
+         app_latency_seconds_count 2\n"
+    );
+}
+
+/// A counter's increment has to be a whole, non-negative number — refused rather than rounded,
+/// because rounding would pick a meaning on the application's behalf.
+///
+/// The reason is distinct from `wrong-kind`, which is a *declaration* mistake: this is a sample that
+/// does not fit a declaration that is itself correct, and an operator reading the refusal needs to
+/// know which of the two to fix.
+#[test]
+fn record_refuses_a_counter_increment_that_is_not_a_whole_non_negative_number() {
+    for bad in [-1.0, 0.5, f64::NAN, f64::INFINITY] {
+        let registry = Registry::new();
+        registry.describe("app_x", Kind::Counter, "X");
+
+        assert!(!registry.record("app_x", &[], bad), "{bad} must be refused");
+        assert_eq!(registry.render(), "", "and nothing was written for {bad}");
+        assert_eq!(
+            registry.refused_series(),
+            vec![("app_x:bad-sample".to_string(), 1)],
+            "{bad}"
+        );
+    }
+}
+
+/// A zero increment is legal — a counter may legitimately be told "this happened zero times" — and
+/// the series therefore appears, at zero, rather than being invisible.
+#[test]
+fn record_accepts_a_zero_increment() {
+    let registry = Registry::new();
+    registry.describe("app_x", Kind::Counter, "X");
+    assert!(registry.record("app_x", &[], 0.0));
+
+    assert_eq!(
+        registry.render(),
+        "# HELP app_x X\n\
+         # TYPE app_x counter\n\
+         app_x 0\n"
+    );
+}
+
+/// An undeclared name is refused by `record` as well, which is what makes `[metrics.collect]` the
+/// gate: a worker cannot widen the published set at runtime.
+#[test]
+fn record_refuses_an_undeclared_name() {
+    let registry = Registry::new();
+    assert!(!registry.record("app_never_declared", &[], 1.0));
+    assert_eq!(registry.render(), "");
+    assert_eq!(
+        registry.refused_series(),
+        vec![("app_never_declared:undeclared".to_string(), 1)]
+    );
+}
