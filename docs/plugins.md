@@ -846,6 +846,18 @@ consume, the trace has to continue across the call boundary, and the current obs
 is request-scoped by construction (`volucer-observe`). The call metadata should carry `traceparent`
 from the beginning — it costs a field now and is a protocol change later.
 
+**Done, and the field was already there.** `Call::traceparent` and `JobHeader::traceparent` both
+exist, and §6.7's exporter reads the same context they are filled from. What step 6 did have to add
+was the *parent*: `TraceContext::continuing` keeps the caller's trace and mints our own span id, so
+the caller's span id had nowhere to live and an exported span had no `parentSpanId` — a waterfall
+that broke at exactly the hop it exists to show. See §6.7.
+
+The remaining piece of this section is **not** built and is not part of step 6: a *job's* span is
+exported on the job's `JobHeader::traceparent`, but nothing yet emits a `SpanKind::Producer` span at
+the push or a `SpanKind::Consumer` span at the reserve. The types exist (`SpanKind::Producer` and
+`SpanKind::Consumer` are in `volucer-observe::span`) so it is a call site rather than a design
+question, and it belongs with whichever step next touches the jobs path.
+
 ### 6.6 gRPC — three tiers, and the schema is not the server's problem
 
 `docs/plan.md` §6 (*"gRPC — a named non-goal"*) settled the shape and recorded a trigger. This
@@ -1016,15 +1028,98 @@ item 3). Tier B: **M** (a config surface, an SDK contract, tests). Tier C: **M**
 reflection service). The worker-as-work question: **L** on its own, and no longer on the critical
 path for either A or B.
 
-### 6.7 OTLP export
+### 6.7 OTLP export — **done**, and two of this section's own premises were false
 
 Not on the original list, and adjacent to `metrics` in a way that invites confusion, so it is named
-so it can be excluded on purpose. `docs/plan.md` §6 already decided the shape: an exporter *layer*
-on top of the existing request ids and trace context, via `tracing-opentelemetry` and
-`opentelemetry-otlp` over **OTLP/HTTP on 4318**, which avoids `tonic` and `prost` entirely and is
-what RoadRunner defaults to for the same reason. It should land **after** metrics, because the
-metric registry is what makes the service bag and the listener pattern exist, and **before** gRPC,
-because gRPC spans are the reason anyone asks for it.
+so it can be excluded on purpose. `docs/plan.md` §6 decided the shape: an exporter on top of the
+existing request ids and trace context, over **OTLP/HTTP on 4318**, which is what RoadRunner
+defaults to. It lands **after** metrics, because the metric registry is what makes the service bag
+and the listener pattern exist, and **before** gRPC, because gRPC spans are the reason anyone asks
+for it.
+
+#### What the plan said, and what measurement changed
+
+Two claims in the paragraph above were checked before anything was built, and **both were wrong**.
+Recording them because each one moved the design:
+
+1. **"avoids `tonic` and `prost` entirely" — half true.** Measured from `opentelemetry-otlp`
+   0.33.1's own manifest: `http-proto = ["prost", "opentelemetry-http",
+   "opentelemetry-proto/gen-tonic-messages", "http", …]`. OTLP/HTTP avoids **`tonic`** — no gRPC, no
+   HTTP/2 framing of messages — but its body is a protobuf message, so `prost` is required. No
+   feature of that crate serializes traces without it; `http-json` names `prost` too, because it
+   round-trips through the generated types.
+2. **"an exporter *layer*" — the layer cannot carry the id.** `SpanBuilder` has no `with_span_id`
+   and `SdkTracer::build_with_context` always calls `config.id_generator.new_span_id()`, so a span id
+   can only be *inherited* from a parent context. But `volucer-observe` mints the span id it puts on
+   the request a backend receives — PHP's child span names **that** id as its parent. A layer-built
+   span would export a different one, and the trace would break at the very hop it exists to show.
+
+   The fix that makes the ids agree is to drive the encoder directly from spans volucer already
+   has, rather than to make the layer agree with them.
+
+#### What was built
+
+**`volucer-otlp`**, a new crate, and **`volucer-observe::span`**, and the hand-written encoder falls
+out of correction 1 the same way the Prometheus encoder and the access log already did: the format
+is a page of specification, and a hand-written encoder is the only way to guarantee it *cannot
+fail*. Measured cost of the alternative, from a scratch project resolving the real crates:
+
+| Transport | New packages for this workspace |
+| --- | --- |
+| `opentelemetry-otlp` with `reqwest-blocking-client` | **41** |
+| `opentelemetry-otlp` with `hyper-client` | **22** |
+| hand-written OTLP/JSON over the existing client | **0** |
+
+Zero, not "few": `Cargo.lock` went from 253 packages to 254, and the one addition is `volucer-otlp`
+itself. The transport is `volucer-upstream`'s client, so the exporter also inherits TLS against a
+named CA or the public roots, pooling, and one connector for both.
+
+#### Findings worth recording
+
+- **`RequestContext` discarded the parent span id.** `TraceContext::continuing` deliberately replaces
+  the span id with this hop's own — correct for the header it sends, but it meant the caller's span
+  id had nowhere to live. OTLP needs it as `parentSpanId`, and *absent* rather than all-zero for a
+  root span (the specification calls an all-zero one invalid). So a `parent_span_id` field was added,
+  and an untraced request deliberately does **not** get a synthetic parent: a trace this server
+  starts is not a continuation of anything.
+- **`Observability::is_enabled` was the wrong guard, and it would have exported nothing.** It reports
+  the *access log*. Tracing and access logging are separately configured, so a front-end that skipped
+  its record on `is_enabled` would export no spans at all in a deployment with `[telemetry]` and no
+  `[server.access_log]` — which is the ordinary way to try tracing first. `is_active` is the guard
+  the front-ends now use; the access log keeps its own.
+- **`Exporter::stop` takes `&self`, not `&mut self`, and that is forced.** The front-ends hold an
+  `Arc<dyn SpanRecorder>` pointing at the exporter for the whole run, so it is never uniquely owned
+  while it is running — a `&mut self` method could only be called by someone who had already given
+  the recorder away, which is everybody. A `Mutex<Option<JoinHandle>>` is the same shape the
+  listener's shutdown already uses. (The first version had `try_unwrap` here, which can never
+  succeed for exactly this reason.)
+- **The first encoder emitted invalid JSON — four resource attributes with no separators between
+  them.** The unit that found it was the one that parses the *whole* document rather than inspecting
+  a field, which is now the rule every test in that module follows. Verified independently by piping
+  the encoder's own output through Python's `json` module.
+- **OTLP/JSON's three traps**, each asserted rather than trusted: `bytes` fields are **lowercase hex,
+  not base64**, for `traceId`/`spanId`; 64-bit integers are **quoted strings**, because JSON numbers
+  are doubles and `1750000000000000000` has no nanosecond precision unquoted; and enums are integers
+  with camelCase field names.
+- **A `SystemTime` was needed beside the existing `Instant`.** A span's timestamp must be UNIX epoch
+  nanoseconds, which an `Instant` has no defined relation to, while a *duration* must come from a
+  monotonic clock because wall-clock time jumps when NTP corrects it. Both are taken in `begin`, in
+  the one call that says "this request has begun", so they cannot disagree.
+- **The FastCGI span's end time is derived from the elapsed duration**, not read again — which keeps
+  the exported span's duration and the access log's `request_time` the *same number* rather than two
+  readings of a clock that can step between them.
+- **A bad endpoint is reported, not fatal.** A server that refused to start because its telemetry
+  collector was misconfigured would invert the priority the access log already states: a deployment
+  whose log directory is missing logs that fact and serves anyway.
+- **A batch is dropped, never retried**, and the queue **drops rather than blocks** when full. The
+  alternative for either is converting a telemetry outage into an application outage, which is the
+  one outcome this project refuses everywhere else. What is not hidden: the first failure of an
+  outage warns, the recovery logs, and the shutdown summary prints exported/failed/dropped.
+
+**Falsified, and it was the important one.** Replacing `span_id: *context.trace.span_id()` with a
+freshly minted id — exactly what a `tracing-opentelemetry` layer does — fails the end-to-end test
+with `left: "0707070707070707", right: "92f318462a646683"` and the message naming why. The test does
+not merely agree with the code; it detects the defect the section is about.
 
 ---
 
@@ -1154,7 +1249,7 @@ progress on something earlier look bigger.
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **Done.** Biggest item; the consumer-side exchange is the interesting part |
-| 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |
+| 6 | **OTLP export** | 1, 5 (spans across a push) | M | **Done.** Not the layer the plan named: measured, `http-proto` needs `prost`, and a layer cannot carry the span id PHP already has. Hand-written OTLP/JSON over the existing client — **0 new packages** |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | Reuses the in-flight request, so it does not touch the one-request invariant |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | The only descriptor consumer; may legitimately be "not yet" |

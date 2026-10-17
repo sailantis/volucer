@@ -1,0 +1,27 @@
+[package]
+name = "volucer-otlp"
+description = "The OTLP/HTTP trace exporter: a hand-written encoder and a batching thread"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+volucer-core.workspace = true
+volucer-observe.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# The client, **reused rather than re-implemented**: `volucer-upstream` already dials `http:` and
+# `https:` with a pooled `client-legacy` client and a connector that reaches TCP, a named CA and the
+# public roots. An exporter that opened its own sockets would be a second TLS configuration to get
+# right, and reusing this one is what keeps the workspace's dependency count at zero new packages.
+volucer-upstream.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

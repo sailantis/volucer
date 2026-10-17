@@ -1061,7 +1061,33 @@ async fn handle(
         }
     }
 
-    if front_end.observe.is_enabled() {
+    // The server span, when a `[telemetry]` table asked for one. **After the id echo and before the
+    // access log**, so the exported span's status is the one the client sees — the same value the
+    // log records — rather than the status a backend returned before the front-end rewrote it.
+    //
+    // The path is logged, not the query: a query string is unbounded and often a secret, and this is
+    // a *trace* attribute that a backend indexes.
+    if let Some(path) = target.split('?').next() {
+        front_end.observe.record_server_span(
+            &context,
+            context.started_at,
+            std::time::SystemTime::now(),
+            volucer_observe::ServerSpanAttributes {
+                method: &method,
+                path,
+                host: host.as_deref(),
+                status: response.status().as_u16(),
+                name: "http.request",
+                status_message: None,
+                extra: &[],
+            },
+        );
+    }
+
+    // `is_active` and not `is_enabled`: the two sinks are separately configured, and a deployment
+    // with `[telemetry]` and no `[server.access_log]` — the ordinary way to try tracing first — must
+    // still export spans. The access log keeps its own guard below.
+    if front_end.observe.is_active() {
         // The body's exact length when the body knows it, and `0` when it does not. A `Full<Bytes>`
         // answer from a backend knows it; a streamed static file or an origin's `Incoming` does not,
         // and the count only exists after the write. Wrapping every response body in a counter to
@@ -1069,23 +1095,25 @@ async fn handle(
         // what is known and the README says which bodies report zero.
         let bytes_sent = response.body().size_hint().exact().unwrap_or(0);
         let id = context.id.as_str();
-        front_end
-            .observe
-            .access_log()
-            .record(&volucer_observe::access_log::Record {
-                id: &id,
-                method: &method,
-                target: &target,
-                protocol: &protocol,
-                peer,
-                host: host.as_deref(),
-                user_agent: user_agent.as_deref(),
-                referer: referer.as_deref(),
-                status: response.status().as_u16(),
-                total_seconds: started.elapsed().as_secs_f64(),
-                origin_seconds: None,
-                bytes_sent,
-            });
+        if front_end.observe.is_enabled() {
+            front_end
+                .observe
+                .access_log()
+                .record(&volucer_observe::access_log::Record {
+                    id: &id,
+                    method: &method,
+                    target: &target,
+                    protocol: &protocol,
+                    peer,
+                    host: host.as_deref(),
+                    user_agent: user_agent.as_deref(),
+                    referer: referer.as_deref(),
+                    status: response.status().as_u16(),
+                    total_seconds: started.elapsed().as_secs_f64(),
+                    origin_seconds: None,
+                    bytes_sent,
+                });
+        }
     }
     response
 }

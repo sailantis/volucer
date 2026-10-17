@@ -97,6 +97,144 @@ pub struct Config {
     /// other service follows.
     #[serde(default)]
     pub jobs: Option<JobsConfig>,
+
+    /// Where spans are exported. Absent means none are, which is the default.
+    ///
+    /// The same convention as [`Config::metrics`]: the presence of the table is what turns it on. A
+    /// `[metrics]` table and a `[telemetry]` table are independent, and a deployment may well have
+    /// one without the other — a Prometheus scrape costs one HTTP request a minute, while a trace
+    /// exporter sends a request per batch for as long as traffic lasts.
+    ///
+    /// **`endpoint` is required**, because there is no default collector address that is right for
+    /// anyone: `localhost:4318` is a guess that silently exports nothing on a host where the
+    /// collector runs elsewhere, and a table whose only key can be defaulted would be a table whose
+    /// presence already says everything.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// `[telemetry]`: where spans go, and what this process calls itself.
+///
+/// # Why this is not `[metrics]` with more keys
+///
+/// They are two protocols with different transports and different failure modes. Prometheus
+/// *pulls* on a scrape, so a scrape endpoint that is unreachable costs nothing; OTLP *pushes*, so an
+/// exporter that cannot reach its collector is a thread doing failed requests for as long as the
+/// deployment serves traffic. Merging them into one table would make "I want metrics but not
+/// traces" expressible only by leaving keys unset, which is the two-statements-one-thing this
+/// project's `[server.tls]` documentation already refuses.
+///
+/// # The `traceparent` this exports is the one already sent to PHP
+///
+/// Worth stating because it is the reason the export is driven directly rather than through a
+/// `tracing` subscriber layer: `volucer-observe` mints a trace id and a span id per request and puts
+/// *that* header on the request it hands a backend, so PHP's spans — and any origin's — name this
+/// server's span as their parent. An exporter that minted its own span id would export a parent no
+/// child points at, and the waterfall would break at exactly the seam it exists to show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// The collector's OTLP/HTTP endpoint: where `/v1/traces` is appended.
+    ///
+    /// `http://host:port` — **with no path**, because the path is the protocol's and not the
+    /// operator's: the specification fixes it at `/v1/traces`, and a deployment that wrote a
+    /// complete URL including it would end up posting to `/v1/traces/v1/traces`. A value that
+    /// already ends in `/v1/traces` is therefore *accepted and normalised* rather than refused,
+    /// since that is what most collector documentation quotes verbatim.
+    ///
+    /// `https:` is supported — the exporter reuses the `upstream` client, which already speaks TLS
+    /// against a named CA or the public roots.
+    pub endpoint: String,
+
+    /// The `service.name` resource attribute. Defaults to `volucer`.
+    ///
+    /// A resource attribute rather than a label, and it is the one every backend groups by. It
+    /// defaults rather than being required because a single-service deployment should not have to
+    /// invent a name for the only thing it runs.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+
+    /// Headers sent with every export, e.g. an API key for a hosted collector.
+    ///
+    /// A table, because a collector's authentication is a header and different vendors spell it
+    /// differently. **May carry a credential, which is why `config.describe` redacts it** — the same
+    /// rule the Redis URLs follow, and for the same reason.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+
+    /// How long one export request may take before it is abandoned. Defaults to 10s.
+    ///
+    /// A request deadline rather than a total budget: a collector that accepts a connection and
+    /// never answers must not hold the exporter's thread for ever, and abandoned spans are dropped
+    /// rather than queued without bound — the same rule the access log follows for a full disk.
+    #[serde(default = "default_telemetry_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// How many spans are held before a batch is sent. Defaults to 512.
+    ///
+    /// A batch is a compromise and both ends of it are real: one export per span is a request per
+    /// request, which is the load this feature exists to avoid adding, and an unbounded buffer is a
+    /// memory leak with a slow collector as its trigger. At the default, a batch of finished spans
+    /// is around 100 KB — measured from the encoder's own output — which is a request a collector
+    /// handles without noticing.
+    #[serde(default = "default_telemetry_batch_size")]
+    pub batch_size: usize,
+
+    /// How long a partly-filled batch waits before it is sent anyway. Defaults to 5s.
+    ///
+    /// Without this, a deployment serving one request a minute would export nothing until the
+    /// batch filled, which on a quiet service is the difference between a trace and no trace. The
+    /// timeout is what makes the feature usable below the batch size.
+    #[serde(default = "default_telemetry_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_service_name() -> String {
+    "volucer".to_string()
+}
+
+fn default_telemetry_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_telemetry_batch_size() -> usize {
+    512
+}
+
+fn default_telemetry_interval_ms() -> u64 {
+    5_000
+}
+
+/// The path the OTLP/HTTP trace service is fixed at by the specification.
+///
+/// A constant rather than a configuration key, because it is the protocol's rather than the
+/// deployment's: a collector that served traces elsewhere would not be an OTLP collector, and an
+/// operator who needs a path prefix has a reverse proxy for exactly that.
+pub const OTLP_TRACES_PATH: &str = "/v1/traces";
+
+impl TelemetryConfig {
+    /// The endpoint as an *origin* — scheme and authority, no path.
+    ///
+    /// # Why this exists rather than the exporter trimming it
+    ///
+    /// **One normaliser, because two would diverge and the divergence is invisible.** The first
+    /// version had the exporter strip a trailing `/v1/traces` while `validate` checked the raw string
+    /// with `OriginSpec::parse` — which refuses any path. That combination rejected a value the
+    /// documentation said was accepted, and a *user* pasting the complete URL their collector's
+    /// documentation quotes would have hit a configuration error naming a rule that reads as
+    /// arbitrary.
+    ///
+    /// Accepting the complete URL is the right side to fix on: it is what collector documentation
+    /// quotes verbatim, it is unambiguous, and refusing it teaches nothing. The path is the
+    /// protocol's, so it is removed here and appended by the exporter — which is what stops
+    /// `/v1/traces/v1/traces`, the failure this normalisation exists to prevent.
+    #[must_use]
+    pub fn base_endpoint(&self) -> &str {
+        let trimmed = self.endpoint.trim().trim_end_matches('/');
+        let base = trimmed.strip_suffix(OTLP_TRACES_PATH).unwrap_or(trimmed);
+        // Trailing slashes again, because `http://host:4318/v1/traces/` is a shape somebody writes.
+        base.trim_end_matches('/')
+    }
 }
 
 /// One `[kv.<name>]` storage: which driver, and that driver's own settings.
@@ -2681,6 +2819,69 @@ impl Config {
             }
         }
 
+        // The trace exporter, checked here for the same reason the listeners above are: a bad
+        // endpoint or a zero batch size is a configuration mistake, and `volucer check` should name
+        // it rather than a background thread discovering it on the first export — where the failure
+        // is a dropped batch rather than a message an operator ever reads.
+        if let Some(telemetry) = &self.telemetry {
+            // Parsed as an origin, not as a listener, because this is a *client* address: the
+            // exporter dials it. `parse_listener` accepts a bare `host:port` and a `unix:` path,
+            // both of which would be a configuration that parses and cannot be dialled as HTTP.
+            //
+            // Parsed through `base_endpoint`, which is the *same* normalisation the exporter uses —
+            // so a value this accepts is exactly a value the exporter can dial. Checking the raw
+            // string here while the exporter trimmed it is what made the first version reject a
+            // complete `/v1/traces` URL that the documentation promised to accept.
+            let base = telemetry.base_endpoint();
+            let spec = OriginSpec::parse(base, None).map_err(|reason| {
+                Error::Config(format!(
+                    "telemetry.endpoint {:?} is not a usable OTLP/HTTP endpoint: {reason}",
+                    telemetry.endpoint
+                ))
+            })?;
+            // A unix socket *is* dialable by the client, but the exporter is not given a path
+            // through this configuration — and accepting one that then dialled TCP would be the
+            // silent substitution this project's `bind_host` documentation already refuses.
+            if !matches!(spec, OriginSpec::Network { .. }) {
+                return Err(Error::Config(format!(
+                    "telemetry.endpoint {:?} is a unix socket; the trace exporter takes an \
+                     http:// or https:// address, e.g. \"http://127.0.0.1:4318\"",
+                    telemetry.endpoint
+                )));
+            }
+            // Zero is refused rather than read as "no deadline". A request with no deadline against
+            // a collector that accepts and never answers holds the exporter's thread for ever, and
+            // an operator who wrote `0` meant "no limit" — which is the one thing this must not do.
+            if telemetry.timeout_ms == 0 {
+                return Err(Error::Config(
+                    "telemetry.timeout_ms is 0; every export would be abandoned the moment it was \
+                     sent. Give a deadline in milliseconds, e.g. 10000"
+                        .to_string(),
+                ));
+            }
+            if telemetry.batch_size == 0 {
+                return Err(Error::Config(
+                    "telemetry.batch_size is 0, so a batch could never be filled and no span would \
+                     ever be sent. Use at least 1"
+                        .to_string(),
+                ));
+            }
+            if telemetry.service_name.is_empty() {
+                return Err(Error::Config(
+                    "telemetry.service_name is empty; it becomes the `service.name` resource \
+                     attribute, which is what every backend groups spans by"
+                        .to_string(),
+                ));
+            }
+            for name in telemetry.headers.keys() {
+                if name.is_empty() || name.bytes().any(|byte| !is_header_name_byte(byte)) {
+                    return Err(Error::Config(format!(
+                        "telemetry.headers has {name:?}, which is not a valid HTTP header name"
+                    )));
+                }
+            }
+        }
+
         // The KV storages, checked here for the same reason the listeners above are: an empty name or
         // a typo in one is a configuration mistake, and `volucer check` should say so rather than the
         // first `kv.get` from a worker.
@@ -3596,6 +3797,34 @@ fn is_metric_name_prefix(prefix: &str) -> bool {
     prefix
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a byte may appear in an HTTP header name, per RFC 9110's `token`.
+///
+/// A local predicate rather than a dependency: `telemetry.headers` is validated before any header
+/// type exists, because `volucer-core` is the leaf crate and cannot name `hyper`'s `HeaderName`. The
+/// check is the `token` production — the characters an unquoted field name is made of — which is
+/// exactly what would reject a key an operator copy-pasted from a vendor's documentation with a
+/// space or a colon in it.
+const fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn is_dns_name(name: &str) -> bool {
@@ -4926,6 +5155,160 @@ address = "127.0.0.1:2112"
         assert!(err.to_string().contains("no listener configured"), "{err}");
     }
 
+    /// The telemetry table is off unless written — the same convention `[metrics]` and
+    /// `[server.access_log]` follow, so an existing deployment is not changed by upgrading.
+    #[test]
+    fn telemetry_is_absent_unless_the_table_is_written() {
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n";
+        let config = Config::from_toml(text).expect("config parses");
+        assert!(config.telemetry.is_none());
+    }
+
+    #[test]
+    fn a_telemetry_table_defaults_everything_but_its_endpoint() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[telemetry]
+endpoint = "http://127.0.0.1:4318"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config
+            .validate()
+            .expect("a minimal telemetry table is valid");
+        let telemetry = config.telemetry.expect("present");
+        assert_eq!(telemetry.service_name, "volucer");
+        assert_eq!(telemetry.timeout_ms, 10_000);
+        assert_eq!(telemetry.batch_size, 512);
+        assert_eq!(telemetry.interval_ms, 5_000);
+        assert!(telemetry.headers.is_empty());
+    }
+
+    /// An endpoint that is not an origin is refused, and a bare `host:port` is the case that
+    /// matters: it is what `[metrics].address` takes, so an operator writing the telemetry endpoint
+    /// by analogy produces a value that parses as a *listener* and cannot be dialled as HTTP.
+    #[test]
+    fn rejects_a_telemetry_endpoint_that_is_not_an_origin() {
+        for bad in ["127.0.0.1:4318", "unix:/run/otel.sock", "localhost", ""] {
+            let text =
+                format!("[server]\nhttp = \"127.0.0.1:8080\"\n[telemetry]\nendpoint = \"{bad}\"\n");
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config
+                .validate()
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.to_string().contains("telemetry.endpoint"), "{err}");
+        }
+    }
+
+    /// **The shapes that must be accepted**, because a complete `/v1/traces` URL is what collector
+    /// documentation quotes verbatim and the first version of this validation rejected it: the
+    /// exporter trimmed the path while validation checked the raw string, so the two disagreed about
+    /// the same configuration and only one of them was documented. Fixed by sharing one normaliser
+    /// (`TelemetryConfig::base_endpoint`) between the two.
+    #[test]
+    fn accepts_every_spelling_of_the_same_endpoint() {
+        for spelling in [
+            "http://127.0.0.1:4318",
+            "http://127.0.0.1:4318/",
+            "http://127.0.0.1:4318/v1/traces",
+            // A trailing slash *after* the path, which is a shape somebody writes.
+            "http://127.0.0.1:4318/v1/traces/",
+            "https://collector.example:4318",
+        ] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[telemetry]\nendpoint = \"{spelling}\"\n"
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{spelling:?} must be accepted: {err}"));
+
+            let telemetry = config.telemetry.expect("present");
+            let base = telemetry.base_endpoint();
+            assert!(
+                !base.ends_with("/v1/traces"),
+                "{spelling:?} left the protocol path in {base:?}, so the export would be posted to \
+                 /v1/traces/v1/traces"
+            );
+            assert!(
+                !base.ends_with('/'),
+                "{spelling:?} left a trailing slash in {base:?}"
+            );
+        }
+    }
+
+    /// A zero deadline, a zero batch and an empty service name are three ways to configure
+    /// something that parses and can never work, so each is refused by name rather than accepted
+    /// and discovered by a background thread that drops every span.
+    #[test]
+    fn rejects_telemetry_settings_that_cannot_work() {
+        let base = "[server]\nhttp = \"127.0.0.1:8080\"\n[telemetry]\nendpoint = \"http://127.0.0.1:4318\"\n";
+
+        let text = format!("{base}timeout_ms = 0\n");
+        let err = Config::from_toml(&text)
+            .expect("config parses")
+            .validate()
+            .expect_err("a zero deadline must be refused");
+        assert!(err.to_string().contains("timeout_ms"), "{err}");
+
+        let text = format!("{base}batch_size = 0\n");
+        let err = Config::from_toml(&text)
+            .expect("config parses")
+            .validate()
+            .expect_err("a zero batch must be refused");
+        assert!(err.to_string().contains("batch_size"), "{err}");
+
+        let text = format!("{base}service_name = \"\"\n");
+        let err = Config::from_toml(&text)
+            .expect("config parses")
+            .validate()
+            .expect_err("an empty service name must be refused");
+        assert!(err.to_string().contains("service_name"), "{err}");
+    }
+
+    /// A header name that is not a token is refused here rather than at the first export, where the
+    /// failure would be a dropped batch instead of a message naming the key.
+    #[test]
+    fn rejects_a_telemetry_header_name_that_is_not_a_token() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[telemetry]
+endpoint = "http://127.0.0.1:4318"
+[telemetry.headers]
+"X-Api Key" = "secret"
+"#;
+        let err = Config::from_toml(text)
+            .expect("config parses")
+            .validate()
+            .expect_err("a space is not a token character");
+        assert!(err.to_string().contains("telemetry.headers"), "{err}");
+
+        // And a real vendor header is accepted, spelled the way their documentation spells it.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[telemetry]
+endpoint = "http://127.0.0.1:4318"
+[telemetry.headers]
+"x-honeycomb-team" = "abc123"
+"#;
+        Config::from_toml(text)
+            .expect("config parses")
+            .validate()
+            .expect("a token header name is valid");
+    }
+
+    /// An unknown key inside the table is refused, like every other table in this model: a
+    /// misspelled `endpont` must not leave a deployment exporting nothing with no message.
+    #[test]
+    fn rejects_an_unknown_key_in_the_telemetry_table() {
+        let text =
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[telemetry]\nendpont = \"http://x:4318\"\n";
+        let err = Config::from_toml(text).expect_err("a typo must not parse");
+        assert!(err.to_string().contains("endpont"), "{err}");
+    }
+
     #[test]
     fn rejects_an_unavailable_status_that_is_not_an_http_code() {
         let text = r#"
@@ -5874,7 +6257,7 @@ driver = "memory"
 
         // The example documents these two as commented-out defaults, so the check is that the
         // documentation of them survives an edit rather than that they are enabled in it.
-        for table in ["# [metrics]", "# [status]"] {
+        for table in ["# [metrics]", "# [status]", "# [telemetry]"] {
             assert!(
                 text.contains(table),
                 "{} no longer documents {table}",

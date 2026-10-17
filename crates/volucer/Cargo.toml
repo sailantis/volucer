@@ -27,6 +27,7 @@ volucer-observe.workspace = true
 # adds; see its manifest for why the exposition encoder is written by hand.
 volucer-metrics.workspace = true
 volucer-server.workspace = true
+volucer-otlp.workspace = true
 # The ACME engine, so a configured `[server.acme]` actually issues rather than merely validating.
 volucer-acme.workspace = true
 clap.workspace = true

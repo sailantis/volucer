@@ -1932,6 +1932,7 @@ dependencies = [
  "volucer-http",
  "volucer-metrics",
  "volucer-observe",
+ "volucer-otlp",
  "volucer-server",
  "x509-parser",
 ]
@@ -2042,6 +2043,22 @@ dependencies = [
  "httpdate",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "volucer-otlp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "volucer-core",
+ "volucer-observe",
+ "volucer-upstream",
 ]
 
 [[package]]

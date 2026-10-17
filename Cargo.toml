@@ -12,6 +12,7 @@ members = [
     "crates/volucer-kv",
     "crates/volucer-lock",
     "crates/volucer-jobs",
+    "crates/volucer-otlp",
     "crates/volucer-acme",
     "crates/volucer-upstream",
     "crates/volucer",
@@ -47,6 +48,11 @@ volucer-metrics = { version = "0.1.0", path = "crates/volucer-metrics" }
 volucer-kv = { version = "0.1.0", path = "crates/volucer-kv" }
 volucer-lock = { version = "0.1.0", path = "crates/volucer-lock" }
 volucer-jobs = { version = "0.1.0", path = "crates/volucer-jobs" }
+# The OTLP/HTTP trace exporter. A crate of its own for the same reason `volucer-upstream` is: it is
+# the second user of the *client* half of `hyper`, and a deployment with no `[telemetry]` table must
+# not link it. It depends on `volucer-upstream` rather than re-implementing a connector, which is
+# also why it adds **no new package** to this workspace's lockfile.
+volucer-otlp = { version = "0.1.0", path = "crates/volucer-otlp" }
 # The Redis client, **optional** and behind a feature. A deployment using the in-memory store must not
 # link a Redis to get it, which is the rule `docs/plugins.md` §5 states for every driver. Default
 # features are off — they pull in `num-bigint` for big-number support a KV store does not use — and

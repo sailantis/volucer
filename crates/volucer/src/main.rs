@@ -138,32 +138,125 @@ fn main() -> ExitCode {
 /// reports an unopenable file once at runtime, from the only place that knows whether the file could
 /// actually be created, and a second weaker check here would be a warning that fires on a directory
 /// that exists but is not writable — which teaches an operator to ignore it.
-fn build_observability(config: &Config, config_path: &Path) -> volucer_observe::Observability {
-    let Some(log) = &config.server.access_log else {
-        return volucer_observe::Observability::disabled();
+/// The exporter handle, kept alive by the caller for as long as the server serves.
+///
+/// Dropping it stops the thread and flushes the last batch, so it must **not** be dropped at the end
+/// of a builder — which is exactly what returning it here rather than storing it in the
+/// `Observability` prevents, since that would put an `Arc` cycle or a hidden lifetime in a type whose
+/// whole job is identity.
+pub struct Telemetry {
+    exporter: Option<Arc<volucer_otlp::Exporter>>,
+}
+
+impl Telemetry {
+    /// Whether spans are being exported.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.exporter.is_some()
+    }
+
+    /// The endpoint, for the startup line and the shutdown summary.
+    #[must_use]
+    pub fn endpoint(&self) -> Option<&str> {
+        self.exporter.as_ref().map(|e| e.endpoint())
+    }
+
+    /// What the exporter did, at shutdown.
+    #[must_use]
+    pub fn counts(&self) -> Option<volucer_otlp::ExportCounts> {
+        self.exporter.as_ref().map(|e| e.counts())
+    }
+
+    /// Stop the exporter and flush the last batch.
+    ///
+    /// Called at shutdown *before* the summary is printed, so the summary can report what the
+    /// exporter did — the numbers are only final once the final flush has finished.
+    pub fn stop(&self) {
+        if let Some(exporter) = self.exporter.as_ref() {
+            exporter.stop();
+        }
+    }
+}
+
+/// Build the process's observability handle **and** its trace exporter.
+///
+/// One function rather than two, because the two halves have to agree on one thing: the exporter's
+/// recorder must be installed in the same `Observability` the front-ends are handed. Building them
+/// separately would make "spans are configured but nothing records them" a state that compiles.
+fn build_observability_with_exporter(
+    config: &Config,
+    config_path: &Path,
+) -> (volucer_observe::Observability, Telemetry) {
+    let mut observe = match &config.server.access_log {
+        Some(log) => {
+            let config_dir = config_path.parent().unwrap_or_else(|| Path::new(""));
+            let path = resolve_access_log_path(&log.path, config_dir);
+            let format = match log.format {
+                AccessLogFormat::Combined => volucer_observe::access_log::Format::Combined,
+                AccessLogFormat::Json => volucer_observe::access_log::Format::Json,
+            };
+            // An empty header means "never adopt", which is nginx's `$request_id` behaviour and is
+            // reachable by emptying one string rather than by a second boolean that could disagree
+            // with this one.
+            let header = match log.request_id_header.trim() {
+                "" => None,
+                name => Some(name.to_string()),
+            };
+            tracing::info!(
+                path = %path.display(),
+                format = ?log.format,
+                adopt = header.as_deref().unwrap_or("(never)"),
+                "access logging enabled"
+            );
+            volucer_observe::Observability::new(
+                volucer_observe::access_log::AccessLog::open(&path, format),
+                header,
+            )
+        }
+        // Not `disabled()` and then patched: a deployment with spans and no access log is a
+        // supported shape, and this is where that is expressed.
+        None => volucer_observe::Observability::disabled(),
     };
-    let config_dir = config_path.parent().unwrap_or_else(|| Path::new(""));
-    let path = resolve_access_log_path(&log.path, config_dir);
-    let format = match log.format {
-        AccessLogFormat::Combined => volucer_observe::access_log::Format::Combined,
-        AccessLogFormat::Json => volucer_observe::access_log::Format::Json,
+
+    let Some(telemetry) = &config.telemetry else {
+        return (observe, Telemetry { exporter: None });
     };
-    // An empty header means "never adopt", which is nginx's `$request_id` behaviour and is reachable
-    // by emptying one string rather than by a second boolean that could disagree with this one.
-    let header = match log.request_id_header.trim() {
-        "" => None,
-        name => Some(name.to_string()),
-    };
-    tracing::info!(
-        path = %path.display(),
-        format = ?log.format,
-        adopt = header.as_deref().unwrap_or("(never)"),
-        "access logging enabled"
-    );
-    volucer_observe::Observability::new(
-        volucer_observe::access_log::AccessLog::open(&path, format),
-        header,
-    )
+
+    match volucer_otlp::Exporter::start(telemetry) {
+        Ok(exporter) => {
+            let exporter = std::sync::Arc::new(exporter);
+            tracing::info!(
+                endpoint = exporter.endpoint(),
+                service = %telemetry.service_name,
+                batch_size = telemetry.batch_size,
+                interval_ms = telemetry.interval_ms,
+                "trace export enabled"
+            );
+            observe = observe.with_spans(exporter.recorder());
+            (
+                observe,
+                Telemetry {
+                    // Kept as an `Arc` rather than unwrapped: the recorder the front-ends hold is a
+                    // second reference to this same allocation, so `try_unwrap` would always fail.
+                    // The `Arc` is also what lets `Telemetry::stop(&self)` reach the thread.
+                    exporter: Some(exporter),
+                },
+            )
+        }
+        // **A bad endpoint is reported, not fatal.** The alternative is a server that refuses to
+        // start because its telemetry collector is misconfigured — which inverts the priority the
+        // access log already states: a deployment whose log directory is missing logs that fact and
+        // serves anyway. Traces are the least important thing this process does.
+        Err(err) => {
+            tracing::error!(
+                endpoint = %telemetry.endpoint,
+                %err,
+                "trace export could not start, so no spans will be exported; the server is \
+                 unaffected"
+            );
+            (observe, Telemetry { exporter: None })
+        }
+    }
 }
 
 /// `version` prints what is running, and what that build can do.
@@ -194,6 +287,10 @@ fn version() {
     // W3C header a client or an nginx in front would send, and an operator comparing against
     // another server needs to know which spelling this one reads.
     println!("  observability:    access log (combined or json), W3C tracecontext");
+    // OTLP is advertised as *available* for the same reason ACME and the access log are: whether it
+    // is in use is a property of the configuration. The endpoint is named because the port is the
+    // one fact an operator needs to compare against their collector's own configuration.
+    println!("  traces:           OTLP/HTTP export (POST /v1/traces, default port 4318)");
 }
 
 fn init_tracing(verbosity: u8) {
@@ -704,9 +801,17 @@ fn serve(
     // runs both front-ends, so two access logs would put one application's requests in two files
     // depending on which protocol received them, and two id sources would make the same request
     // carry different ids on the two hops. Building it here is also what makes "off by default"
-    // true — `Observability::disabled` is what a config without `[server.access_log]` produces, and
-    // every path below then costs one `is_enabled` check per request.
-    let observe = Arc::new(build_observability(&config, path));
+    // true — `Observability::disabled` is what a config with neither table produces, and every path
+    // below then costs one `is_active` check per request.
+    //
+    // The exporter comes back with it and is held for the rest of the run: dropping it stops the
+    // thread, and its last flush is what puts the final seconds of a deployment's traffic into its
+    // traces. `telemetry` is therefore deliberately *not* a local of a helper.
+    let (observe, telemetry) = build_observability_with_exporter(&config, path);
+    let observe = Arc::new(observe);
+    if let Some(endpoint) = telemetry.endpoint() {
+        println!("  telemetry:        {endpoint}");
+    }
 
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
@@ -1136,6 +1241,18 @@ fn serve(
     // looks at.
     if let Some(status) = status {
         status.stop();
+    }
+
+    // And the trace exporter last of all, **before** the summary is printed below. That order is the
+    // point: stopping it joins the thread and flushes the final batch, so the numbers a reader is
+    // about to see are final. A summary that reported the counts before the flush would understate
+    // every run by up to one batch — and understate exactly the runs that ended cleanly.
+    telemetry.stop();
+    if let Some(counts) = telemetry.counts() {
+        println!(
+            "telemetry: {} span(s) exported, {} lost to the collector, {} dropped at the queue",
+            counts.exported, counts.failed, counts.dropped
+        );
     }
 
     // Printed rather than traced: a load test wants this line in the same log as
@@ -2098,6 +2215,29 @@ fn check(
     // `HTTP_TRACEPARENT` and no strip list contains it — so PHP sees it without any key to set.
     // Printed so an operator can confirm that without reading the source.
     println!("  trace context: W3C traceparent is read, continued, and forwarded to backends");
+    // The exporter, and the endpoint as written, which is the key a misconfiguration hides in — the
+    // silent-reader rule again. Note it is reported even when the endpoint cannot be dialled:
+    // `check` reports what was configured, and `serve` reports whether the exporter started.
+    match &config.telemetry {
+        Some(telemetry) => {
+            println!("  telemetry:");
+            println!("    endpoint:     {}", telemetry.endpoint);
+            println!("    service.name: {}", telemetry.service_name);
+            println!(
+                "    batching:     {} span(s), or every {} ms",
+                telemetry.batch_size, telemetry.interval_ms
+            );
+            println!("    timeout:      {} ms per export", telemetry.timeout_ms);
+            if !telemetry.headers.is_empty() {
+                // Names only. A value here is a credential — the same rule the Redis URLs follow —
+                // and printing one would put a secret in a diagnostic an operator pastes into a
+                // ticket.
+                let names: Vec<&str> = telemetry.headers.keys().map(String::as_str).collect();
+                println!("    headers:      {} (values redacted)", names.join(", "));
+            }
+        }
+        None => println!("  telemetry: none (telemetry is unset)"),
+    }
 
     println!("  PHP binaries:");
     if found.is_empty() {

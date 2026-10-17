@@ -382,6 +382,37 @@ base_port = 19001
 # unavailable_status_code = 503   # some load balancers expect 503 specifically
 
 # ---------------------------------------------------------------------------
+# Where spans are exported. Absent means none are, and this is a *push*:
+# unlike the `[metrics]` scrape above, an exporter that cannot reach its
+# collector keeps trying for as long as traffic lasts, so the two tables are
+# separate on purpose and a deployment may reasonably have either alone.
+#
+# `endpoint` is required and is the collector's base address -- the `/v1/traces`
+# path is the protocol's, not yours, and is appended. Write it with no path, or
+# paste a full URL including `/v1/traces`: both are accepted.
+#
+# The `traceparent` this exports is the one this server already sends to PHP
+# (and to any `upstream` origin), so a backend's spans and this server's span
+# are one trace rather than two. Nothing in a backend has to change.
+#
+# A batch fills up and is sent, or waits `interval_ms` and is sent anyway --
+# which is what makes a service handling one request a minute still produce
+# traces. A collector that is down costs dropped batches and one warning, never
+# a failed request: the same rule the access log follows for a full disk.
+# ---------------------------------------------------------------------------
+# [telemetry]
+# endpoint = "http://127.0.0.1:4318"
+# service_name = "volucer"
+# timeout_ms = 10000        # per export request, not a total budget
+# batch_size = 512
+# interval_ms = 5000        # send a partly-filled batch after this long
+#
+# Headers are sent with every export, for a hosted collector that wants a key.
+# The values are redacted by `volucer check` and `config.describe`.
+# [telemetry.headers]
+# "x-honeycomb-team" = "..."
+
+# ---------------------------------------------------------------------------
 # Key-value storages, by name. Absent means none, and then a worker cannot
 # call `kv.*` at all -- the same rule every service follows: what a worker can
 # reach is what its backend's `services` list names, and nothing else.

@@ -43,8 +43,11 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 pub mod access_log;
+pub mod span;
 
 use std::time::Instant;
 
@@ -59,6 +62,13 @@ pub struct Observability {
     access_log: access_log::AccessLog,
     /// The header to adopt and echo, or `None` to always mint our own.
     id_header: Option<String>,
+    /// Where finished spans go, or `None` when no `[telemetry]` table asked for them.
+    ///
+    /// An `Option` rather than an always-present no-op recorder, and the reason is the same one that
+    /// makes [`access_log::AccessLog::disabled`] a value rather than an `Option`: the field is read
+    /// on the request path, and a `None` check is one predictable branch while a trait object call
+    /// is not.
+    spans: Option<Arc<dyn span::SpanRecorder>>,
 }
 
 impl Observability {
@@ -68,7 +78,25 @@ impl Observability {
         Self {
             access_log,
             id_header,
+            spans: None,
         }
+    }
+
+    /// Also export spans to `recorder`.
+    ///
+    /// A builder method rather than a third argument to [`Observability::new`], because the two are
+    /// genuinely independent: a deployment may have an access log and no tracing, tracing and no
+    /// access log, both, or neither — and four constructors would be four ways to spell that.
+    #[must_use]
+    pub fn with_spans(mut self, recorder: Arc<dyn span::SpanRecorder>) -> Self {
+        self.spans = Some(recorder);
+        self
+    }
+
+    /// Whether spans are being exported.
+    #[must_use]
+    pub fn has_spans(&self) -> bool {
+        self.spans.is_some()
     }
 
     /// The configuration with no logging at all, which is the default.
@@ -79,6 +107,7 @@ impl Observability {
             // No header means no adoption *and* no echo: a deployment that has not asked for an id
             // should not have one appear on its responses, because a client may act on it.
             id_header: None,
+            spans: None,
         }
     }
 
@@ -104,6 +133,18 @@ impl Observability {
         self.access_log.is_enabled()
     }
 
+    /// Whether *anything* is recorded — the access log or a span.
+    ///
+    /// **The guard a front-end should use before building a request record**, and the distinction
+    /// from [`Observability::is_enabled`] is not cosmetic: tracing and access logging are separately
+    /// configured, and a front-end that skipped its record on `is_enabled` alone would export no
+    /// spans at all in a deployment that configured `[telemetry]` without `[server.access_log]` —
+    /// which is the ordinary way to try tracing first.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.access_log.is_enabled() || self.spans.is_some()
+    }
+
     /// Resolve the identity of an inbound request.
     ///
     /// **The one place adoption, generation and trace continuation are decided.** Both front-ends
@@ -124,7 +165,12 @@ impl Observability {
                 .unwrap_or_else(RequestId::generate),
             None => RequestId::generate(),
         };
-        let trace = match client_traceparent.and_then(TraceContext::parse) {
+        // Parsed once, and kept, because two things are needed from it: the trace to continue, and
+        // the *caller's* span id, which is the parent this hop hangs from. Keeping only the trace
+        // would discard the parent — and an exported span would then claim to be a root, breaking
+        // the trace at the very hop it exists to show.
+        let client_trace = client_traceparent.and_then(TraceContext::parse);
+        let trace = match client_trace {
             // The client's trace, our own span — see `TraceContext::continuing`. Its sampling
             // decision is respected rather than overridden: whether to record a trace is the
             // originating service's call, and a proxy that flipped the bit would make every span
@@ -137,12 +183,97 @@ impl Observability {
             // it costs.
             None => TraceContext::new(false),
         };
+        // `None` when there was no usable inbound traceparent, which is exactly OTLP's "this is a
+        // root span".
+        let parent_span_id = client_trace.map(|client| *client.span_id());
         RequestContext {
             id,
             trace,
+            parent_span_id,
+            started_at: SystemTime::now(),
             started: Instant::now(),
         }
     }
+
+    /// Record the server span for one finished request, if spans are being exported.
+    ///
+    /// **This is the only place the attribute vocabulary is written down**, and that is the point:
+    /// every key is a `&'static str` chosen here, so no request can invent one. The same rule the
+    /// metric registry enforces with its series cap — a label, or here an attribute, whose *key*
+    /// comes from a request is how a backend's index grows without bound.
+    ///
+    /// The ids are taken from `context`, so the span this produces carries **the span id the request
+    /// already sent onward as its `traceparent`**. That is the whole reason the export is driven
+    /// from here rather than from a `tracing` layer: a backend's child span names this id as its
+    /// parent, and an exporter that minted a different one would leave that child pointing at
+    /// nothing.
+    ///
+    /// Does nothing when no `[telemetry]` table is configured, and costs one `Option` check to
+    /// discover that.
+    pub fn record_server_span(
+        &self,
+        context: &RequestContext,
+        started: SystemTime,
+        ended: SystemTime,
+        attributes: ServerSpanAttributes<'_>,
+    ) {
+        let Some(recorder) = &self.spans else {
+            return;
+        };
+        let mut pairs: Vec<(&'static str, span::Attribute)> =
+            Vec::with_capacity(4 + attributes.extra.len());
+        pairs.push(("http.request.method", attributes.method.into()));
+        // The **method**, not the target: OTLP has a separate attribute for the route, and putting a
+        // raw path in `http.target` is how a backend ends up with a series per path. A deployment
+        // that wants per-route attribution sets `http.route` from its own routing, which this server
+        // cannot know.
+        pairs.push(("url.path", attributes.path.into()));
+        if let Some(host) = attributes.host {
+            pairs.push(("server.address", host.into()));
+        }
+        pairs.push((
+            "http.response.status_code",
+            span::Attribute::Int(i64::from(attributes.status)),
+        ));
+        // Appended last so a caller cannot shadow one of the five above by passing a duplicate key.
+        pairs.extend(attributes.extra.iter().cloned());
+        recorder.record(span::Span {
+            trace_id: context.trace.trace_id(),
+            span_id: *context.trace.span_id(),
+            parent_span_id: context.parent_span_id,
+            name: attributes.name,
+            kind: span::SpanKind::Server,
+            start: started,
+            end: ended,
+            attributes: pairs,
+            status: span::SpanStatus::from_http_status(attributes.status),
+            status_message: attributes.status_message.map(str::to_string),
+        });
+    }
+}
+
+/// What a finished request tells its server span.
+///
+/// A struct rather than seven arguments, because the call sites are three front-ends and a
+/// positional list of `&str`s is one transposition away from a log that lies. Borrowed, because
+/// everything in it is already in hand at the call site and this is built once per request.
+pub struct ServerSpanAttributes<'a> {
+    /// `GET`, `POST`, …
+    pub method: &'a str,
+    /// The request's path. **Not the query string**: a query is unbounded and often a secret, and
+    /// OTLP's `url.query` is deliberately not set here.
+    pub path: &'a str,
+    /// The `Host`, when the request carried one.
+    pub host: Option<&'a str>,
+    /// The status sent.
+    pub status: u16,
+    /// The span's name, e.g. `"GET /about"`. A `&'static str` set by the front-end rather than
+    /// formatted per request, because a name built from the path is the cardinality hazard again.
+    pub name: &'static str,
+    /// A failure description, when there was one.
+    pub status_message: Option<&'a str>,
+    /// Anything a front-end adds that is its own. Closed by construction at each call site.
+    pub extra: &'a [(&'static str, span::Attribute)],
 }
 
 impl std::fmt::Debug for Observability {
@@ -151,12 +282,12 @@ impl std::fmt::Debug for Observability {
             .debug_struct("Observability")
             .field("access_log", &self.access_log)
             .field("id_header", &self.id_header)
+            .field("spans", &self.spans.is_some())
             .finish()
     }
 }
 
-/// A request's identity, resolved once at the top of whichever front-end received it.
-///
+/// A request's identity, resolved once at the top of whichever front-end received it.///
 /// The `Instant` is here rather than taken by the caller so that "when did this request start" has
 /// one answer — the same reason the id does. `Timing` in the FastCGI front-end already measured this
 /// for the HTTP front-end's equivalent, and this supersedes it by being shared.
@@ -165,6 +296,25 @@ pub struct RequestContext {
     pub id: RequestId,
     /// The trace to propagate.
     pub trace: TraceContext,
+    /// The caller's span id, when the request carried a usable `traceparent`.
+    ///
+    /// Kept because it is the *parent* an exported span hangs from: [`TraceContext`] deliberately
+    /// replaces the span id with this hop's own, so the value it replaced is the only thing that can
+    /// say where this hop sits in the caller's trace. `None` means this is a root span, which is
+    /// what OTLP expresses with an absent `parent_span_id` rather than an all-zero one.
+    ///
+    /// A request that was never traced does not get a synthetic parent, and that is deliberate: a
+    /// trace this server starts is not a continuation of anything, and inventing a parent would
+    /// attach every untraced request to one fictional span.
+    pub parent_span_id: Option<[u8; 8]>,
+    /// When the request arrived, as wall-clock time.
+    ///
+    /// A second clock beside `started` and not a duplicate of it, because the two answer different
+    /// questions and neither can be derived from the other: a span's timestamp must be UNIX epoch
+    /// nanoseconds, which an `Instant` has no defined relation to, while a *duration* must come from
+    /// a monotonic clock, because wall-clock time jumps when NTP corrects it. Taking both here, in
+    /// the one call that says "this request has begun", is what keeps them from disagreeing.
+    pub started_at: SystemTime,
     started: Instant,
 }
 

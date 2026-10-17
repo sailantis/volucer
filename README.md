@@ -979,22 +979,63 @@ It is **forwarded to backends with no configuration at all**: `traceparent` beco
 `HTTP_TRACEPARENT` for PHP and is in neither strip list, so a correlation id already reaches the
 application today. A malformed `traceparent` starts a fresh trace rather than returning an error.
 
+### Exporting traces (OTLP/HTTP)
+
+**Off by default**, like the access log, and for the same reason. `[telemetry]` turns it on:
+
+```toml
+[telemetry]
+endpoint = "http://127.0.0.1:4318"   # the collector; /v1/traces is appended
+service_name = "myapp"               # the `service.name` resource attribute
+# timeout_ms = 10000                 # per export request
+# batch_size = 512
+# interval_ms = 5000                 # send a partly-filled batch after this long
+
+[telemetry.headers]                  # for a hosted collector; redacted by `volucer check`
+"x-honeycomb-team" = "..."
+```
+
+`POST /v1/traces` with a hand-written OTLP/JSON body, over the same pooled HTTP client the
+`upstream` backend uses — so **it adds no dependency to the build**, and `https:` works with the
+TLS configuration the rest of the server already has.
+
+**The exported span carries the ids the request already has.** This server mints a trace id and a
+span id per request and puts *that* `traceparent` on the request it hands a backend, so a PHP
+worker's own span — or an origin's — names this server's span as its parent, and the trace is one
+tree rather than two. Nothing in an application has to change to be part of a trace.
+
+What an exported server span contains: `http.request.method`, `url.path` (**not** the query string,
+which is unbounded and often a secret), `server.address`, and `http.response.status_code`. A 5xx
+sets the span's status to error; a 4xx does not, because marking a client's mistake as a server
+fault is how an error-rate alert becomes noise.
+
+Two rules it follows that are worth knowing before turning it on, both inherited from the access
+log's reasoning:
+
+- **A request never waits on the collector.** Recording a span is a queue send; sending happens on
+  the exporter's own thread. A collector that is slow, refusing, or absent costs spans and never
+  latency — and it is said out loud: the first failure of an outage is logged, the recovery is
+  logged, and the shutdown summary prints how many spans were exported, lost, and dropped at the
+  queue.
+- **A batch is dropped, never retried.** A retry queue is what turns a collector outage into an
+  application outage, by growing without bound in the process's memory.
+
 ### What is not built yet
 
-**No OTLP export, no span trees, no metrics endpoint, and no sampling.** OpenTelemetry arrives as an
-exporter layer on top of the above — `tracing-opentelemetry` plus `opentelemetry-otlp` over
-**OTLP/HTTP** (port 4318, which avoids `tonic` and `prost` entirely; the lockfile contains neither,
-and RoadRunner defaults to the same transport for the same reason). Doing it in that order is what
-makes it a layer rather than a rewrite.
+**No span trees from the queues, and no sampling.** A job's `traceparent` is already carried and
+exported, but nothing yet emits a producer span at the push or a consumer span at the reserve, so a
+trace stops at the queue boundary in one direction. And every request that is traced is recorded:
+there is no sampler, which for a busy deployment means the `batch_size` and `interval_ms` are the
+only knobs — see `docs/plugins.md` §6.7 for what was measured and what is deliberately left out.
 
 There is also **no external services yet beyond KV, locks and queues**: no gRPC, and no way to
 tell a running server anything other than a signal. A worker can now reach a **key-value storage**
 (`[kv.<name>]`, memory or Redis), a **lock backend** (`[lock]`, memory or Redis), and the
-**queues** (`[jobs]`, memory) through the call plane, which is the `CALL`/`RETURN` pair on the worker
-channel — a frame a worker writes *unprompted*, mid-request, and the server answers. All of them are
-off until a backend's `services` list names them, so the default deployment's workers can reach
-nothing.
-[docs/plugins.md](./docs/plugins.md) is the design for the rest — metrics, gRPC, and a
+**queues** (`[jobs]`, memory or Redis) through the call plane, which is the `CALL`/`RETURN` pair on
+the worker channel — a frame a worker writes *unprompted*, mid-request, and the server answers. All
+of them are off until a backend's `services` list names them, so the default deployment's workers
+can reach nothing.
+[docs/plugins.md](./docs/plugins.md) is the design for the rest — gRPC, and a
 separate, cheaper track for running Django and Rails as supervised HTTP origins — and its step table
 records what is built.
 

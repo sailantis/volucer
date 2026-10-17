@@ -336,24 +336,57 @@ fn record_fastcgi(
     bytes_sent: u64,
     elapsed: std::time::Duration,
 ) {
+    // The server span first, and from the same values the record below uses, so the two cannot
+    // describe different requests. `elapsed` is a monotonic duration and the span needs a wall-clock
+    // end, so the end is derived from the elapsed time rather than read again — which keeps the
+    // span's duration and the log's `request_time` the *same number* instead of two readings of a
+    // clock that can step between them.
+    //
+    // Recorded here rather than only on the success path so a 502 appears as an error span; an
+    // exporter that only saw successful requests would be blind to exactly the traffic an operator
+    // opens a trace view to find.
     let params = request.params.as_slice();
+    observe.record_server_span(
+        context,
+        context.started_at,
+        context.started_at + elapsed,
+        volucer_observe::ServerSpanAttributes {
+            method: param(params, b"REQUEST_METHOD").unwrap_or("-"),
+            path: param(params, b"REQUEST_URI")
+                .unwrap_or("-")
+                .split('?')
+                .next()
+                .unwrap_or("-"),
+            host: param(params, b"HTTP_HOST").or_else(|| param(params, b"SERVER_NAME")),
+            status,
+            name: "http.request",
+            status_message: None,
+            extra: &[],
+        },
+    );
+
     let id = context.id.as_str();
-    observe.access_log().record(&Record {
-        id: &id,
-        method: param(params, b"REQUEST_METHOD").unwrap_or("-"),
-        target: param(params, b"REQUEST_URI").unwrap_or("-"),
-        protocol: param(params, b"SERVER_PROTOCOL").unwrap_or("-"),
-        peer: param(params, b"REMOTE_ADDR").and_then(|value| value.parse().ok()),
-        host: param(params, b"HTTP_HOST").or_else(|| param(params, b"SERVER_NAME")),
-        user_agent: param(params, b"HTTP_USER_AGENT"),
-        referer: param(params, b"HTTP_REFERER"),
-        status,
-        total_seconds: elapsed.as_secs_f64(),
-        // FastCGI has no separately-timed origin: the backend *is* the origin, and PHP's own
-        // duration arrives in the worker protocol's `END` frame rather than as a header here.
-        origin_seconds: None,
-        bytes_sent,
-    });
+    // The access log is separately configured, so it is written only when *it* is on: a deployment
+    // with `[telemetry]` and no `[server.access_log]` must get spans and no log file, and
+    // `AccessLog::record` on a disabled log is a lock and a match for nothing.
+    if observe.is_enabled() {
+        observe.access_log().record(&Record {
+            id: &id,
+            method: param(params, b"REQUEST_METHOD").unwrap_or("-"),
+            target: param(params, b"REQUEST_URI").unwrap_or("-"),
+            protocol: param(params, b"SERVER_PROTOCOL").unwrap_or("-"),
+            peer: param(params, b"REMOTE_ADDR").and_then(|value| value.parse().ok()),
+            host: param(params, b"HTTP_HOST").or_else(|| param(params, b"SERVER_NAME")),
+            user_agent: param(params, b"HTTP_USER_AGENT"),
+            referer: param(params, b"HTTP_REFERER"),
+            status,
+            total_seconds: elapsed.as_secs_f64(),
+            // FastCGI has no separately-timed origin: the backend *is* the origin, and PHP's own
+            // duration arrives in the worker protocol's `END` frame rather than as a header here.
+            origin_seconds: None,
+            bytes_sent,
+        });
+    }
 }
 
 /// Serve requests on one connection until the peer closes or keep-alive ends.
@@ -490,7 +523,7 @@ fn serve_connection(
                 // contradicts, and the write is the part that can fail. The status is the one the
                 // backend actually sent — the same `parse` this front-end relies on, so the log
                 // cannot disagree with what the client was told.
-                if observe.is_enabled() {
+                if observe.is_active() {
                     let (status, _, body) = response.parse();
                     record_fastcgi(
                         &observe,
@@ -508,7 +541,7 @@ fn serve_connection(
                 // A failed request is logged too, and with the status the *client* will see. An
                 // access log that only records successes is the one an operator needs least: the
                 // 502s are why they are reading it.
-                if observe.is_enabled() {
+                if observe.is_active() {
                     record_fastcgi(
                         &observe,
                         &context,
