@@ -45,8 +45,8 @@ pub use header::{
     PROTOCOL_VERSION,
 };
 pub use message::{
-    Call, Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
-    RequestHeader, ResponseHead, Return,
+    Call, Codec, Control, ErrorReport, Hello, HelloAck, JobHeader, JobOutcome, Json, LogRecord,
+    MetricRecord, RequestEnd, RequestHeader, ResponseHead, Return,
 };
 
 /// The request id a worker uses for unsolicited frames.

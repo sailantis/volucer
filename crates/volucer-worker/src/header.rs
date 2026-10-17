@@ -126,6 +126,23 @@ pub enum MessageType {
     /// Correlated by the call's own id, which comes from the opposite end of the range to request ids
     /// — see [`crate::FIRST_CALL_ID`].
     Return = 16,
+    /// Server → worker: here is a job to run.
+    ///
+    /// **Not a `REQUEST` with a different URI.** A `REQUEST` is an HTTP request and carries the CGI
+    /// environment a front-end built; a `JOB` carries a queue's task name, payload and headers. The
+    /// difference the protocol has to be able to express is the one a worker acts on: a request's state
+    /// is reset at the start of every request and a job's is not, because a consumer is expected to keep
+    /// whatever it booted — a database connection, a container — across the jobs it handles. A frame type
+    /// is what lets a worker tell them apart *before* it decides what to do with its state.
+    ///
+    /// `REQUEST` itself is unchanged by this; the two are sibling exchanges, not one with a flag.
+    Job = 17,
+    /// Worker → server: how a job went.
+    ///
+    /// The terminal frame for a `JOB`, correlated by the job's own request id, and the only frame in
+    /// this protocol whose payload decides something the server *does* rather than something it reports:
+    /// see [`crate::JobOutcome`].
+    Ack = 18,
 }
 
 impl MessageType {
@@ -148,6 +165,8 @@ impl MessageType {
             14 => MessageType::Error,
             15 => MessageType::Call,
             16 => MessageType::Return,
+            17 => MessageType::Job,
+            18 => MessageType::Ack,
             other => return Err(WorkerError::UnknownMessageType(other)),
         })
     }
@@ -175,6 +194,8 @@ impl MessageType {
             MessageType::Error => "ERROR",
             MessageType::Call => "CALL",
             MessageType::Return => "RETURN",
+            MessageType::Job => "JOB",
+            MessageType::Ack => "ACK",
         }
     }
 
@@ -614,6 +635,8 @@ mod tests {
         assert!(MessageType::Request.is_correlated());
         assert!(MessageType::Body.is_correlated());
         assert!(MessageType::End.is_correlated());
+        assert!(MessageType::Job.is_correlated());
+        assert!(MessageType::Ack.is_correlated());
         assert!(!MessageType::Log.is_correlated());
         assert!(!MessageType::Control.is_correlated());
         assert!(!MessageType::Ping.is_correlated());

@@ -120,6 +120,8 @@ fn every_message_type_encodes_to_its_frozen_wire_number() {
         (MessageType::Error, 14),
         (MessageType::Call, 15),
         (MessageType::Return, 16),
+        (MessageType::Job, 17),
+        (MessageType::Ack, 18),
     ];
 
     for (message_type, number) in frozen {
@@ -134,10 +136,10 @@ fn every_message_type_encodes_to_its_frozen_wire_number() {
         );
     }
 
-    // The table is 1..=16 with no gaps, so "type + 1" is the next type.
-    assert_eq!(frozen.len(), 16);
+    // The table is 1..=18 with no gaps, so "type + 1" is the next type.
+    assert_eq!(frozen.len(), 18);
     assert!(MessageType::from_u8(0).is_err(), "0 is not a message type");
-    assert!(MessageType::from_u8(17).is_err(), "17 is not defined");
+    assert!(MessageType::from_u8(19).is_err(), "19 is not defined");
 }
 
 /// A call and its answer round-trip through the codec, and the answer says which of the three

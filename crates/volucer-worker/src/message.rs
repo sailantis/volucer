@@ -335,6 +335,133 @@ impl Return {
     }
 }
 
+/// A job handed to a consumer, for the payload of a [`crate::MessageType::Job`].
+///
+/// # Why this is not a `RequestHeader`
+///
+/// The two look alike — an id, a name, a body — and sharing one struct would have saved this type. It
+/// would also have made "is this an HTTP request or a job?" a question answered by which fields happen
+/// to be non-empty, which is exactly the ambiguity [`crate::MessageType::Job`] exists to remove. The
+/// three fields below are the ones RoadRunner's own consumer receives: a task name, a string header
+/// bag, and an opaque payload.
+///
+/// **The payload travels in `BODY` frames, not here**, exactly as a request body does and for the same
+/// reason: base64 inside JSON inflates an upload by a third and makes the runtime do work per byte.
+/// `body_len` is the declaration that lets the consumer size its read before a byte of it arrives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobHeader {
+    /// The pipeline this job came from, so a consumer can tell two queues apart in a log.
+    pub pipeline: String,
+    /// The driver's id for the job, unique within its pipeline.
+    ///
+    /// Worth sending separately from the task name because it is what an application writes down when
+    /// it wants to find this job again in a dashboard, and because the reservation that acknowledges it
+    /// is *not* derivable from it — see [`crate::MessageType::Ack`].
+    pub id: String,
+    /// The application's task name, e.g. `App\Jobs\SendEmail`. Opaque to the server.
+    pub task: String,
+    /// Application metadata, in the order the driver stored it. **String values only.**
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    /// How many times this job has been reserved, counting this one.
+    ///
+    /// The number an application's retry policy reads. The server neither sets a limit nor acts on it:
+    /// see `docs/plugins.md` §6.4 for why retry, backoff and dead-lettering stay the application's.
+    #[serde(default)]
+    pub attempts: u32,
+    /// How many payload bytes follow in `BODY` frames.
+    #[serde(default)]
+    pub body_len: u64,
+    /// The `traceparent` this job belongs to, so a job's span continues the producer's trace.
+    ///
+    /// A field rather than a reserved header, because headers are the *application's* and a server that
+    /// wrote a key into them would be one rename away from corrupting an application that used it. Same
+    /// argument as [`Call::traceparent`], and the same field name so both directions read alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+}
+
+impl JobHeader {
+    /// Look up a header case-insensitively.
+    ///
+    /// Case-insensitive because these are PSR-7-shaped headers and the SDK exposes them that way, so
+    /// a consumer that reads `X-Retry` and a producer that wrote `x-retry` must agree.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// What a consumer decided about a job: the payload of a [`crate::MessageType::Ack`].
+///
+/// # Why this is one frame and not three
+///
+/// RoadRunner's consumer protocol has five answer types — `NoError`, `Error`, `ACK`, `NACK`, `REQUEUE`
+/// — and three of them are the same decision written differently. What the queue can actually do with
+/// an answer is exactly three things, so this is a three-variant enum and the frame type says which:
+///
+/// - [`JobOutcome::Ack`] — done, forget it. The server acknowledges the reservation.
+/// - [`JobOutcome::Requeue`] — not done, and it should be tried again. The server negatively
+///   acknowledges, which returns the job to its pipeline.
+/// - [`JobOutcome::Reject`] — not done, and it should **not** be tried again. The server acknowledges
+///   the reservation without a failure, because the alternative is a job that comes back for ever.
+///
+/// # Why the outcome is not the `ok` of a `Return`
+///
+/// Because "the consumer failed" and "the job failed" are different facts and the queue only acts on
+/// the second. A consumer whose handler threw has produced a failure *result*; whether the job should
+/// run again is a decision only the application can make — the same reason the server imposes no retry
+/// policy at all. The two are separate fields here so that a consumer can report a reason without the
+/// reason implying a requeue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum JobOutcome {
+    /// The job was handled. The reservation is acknowledged.
+    Ack,
+    /// The job was not handled and should be handed out again.
+    ///
+    /// **The server does not delay it.** A retry delay is the application's — RoadRunner's consumer can
+    /// say `withDelay`, and the honest way to offer that here is for the application to push a new job
+    /// rather than for the server to hold a reservation open, because a held reservation is
+    /// indistinguishable from a consumer that crashed.
+    Requeue {
+        /// Why it was requeued, for the log. Free-form, and read by a human.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The job failed and must not be retried. The reservation is acknowledged rather than nacked,
+    /// because a job that has been decided against is not a job that is waiting.
+    Reject {
+        /// Why, for the log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl JobOutcome {
+    /// The name of this outcome, as the protocol document and the SDK spell it.
+    ///
+    /// An associated function rather than a `Display` impl, so a log line can name an outcome as a
+    /// `&'static str` without allocating.
+    pub fn name(&self) -> &'static str {
+        match self {
+            JobOutcome::Ack => "ack",
+            JobOutcome::Requeue { .. } => "requeue",
+            JobOutcome::Reject { .. } => "reject",
+        }
+    }
+
+    /// The reason, if the consumer gave one.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            JobOutcome::Ack => None,
+            JobOutcome::Requeue { reason } | JobOutcome::Reject { reason } => reason.as_deref(),
+        }
+    }
+}
+
 /// A description of a failure, used in `Error` frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorReport {
@@ -446,6 +573,50 @@ mod tests {
         assert_eq!(String::from_utf8(encoded).unwrap(), r#"{"kind":"drain"}"#);
         let decoded: Control = Json::decode(br#"{"kind":"reload"}"#).unwrap();
         assert_eq!(decoded, Control::Reload);
+    }
+
+    #[test]
+    fn a_job_header_round_trips_and_finds_headers_case_insensitively() {
+        let head = JobHeader {
+            pipeline: "emails".to_string(),
+            id: "1a-2".to_string(),
+            task: "App\\Jobs\\SendEmail".to_string(),
+            headers: vec![("traceparent".to_string(), "00-abc-01".to_string())],
+            attempts: 3,
+            body_len: 12,
+            traceparent: Some("00-abc-01".to_string()),
+        };
+        let decoded: JobHeader = Json::decode(&Json::encode(&head).unwrap()).unwrap();
+        assert_eq!(decoded, head);
+        assert_eq!(decoded.header("TraceParent"), Some("00-abc-01"));
+        assert_eq!(decoded.header("nope"), None);
+    }
+
+    #[test]
+    fn a_job_outcome_is_tagged_by_outcome_and_spells_its_three_names() {
+        let encoded = Json::encode(&JobOutcome::Ack).unwrap();
+        assert_eq!(String::from_utf8(encoded).unwrap(), r#"{"outcome":"ack"}"#);
+        let decoded: JobOutcome =
+            Json::decode(br#"{"outcome":"reject","reason":"bad payload"}"#).unwrap();
+        assert_eq!(
+            decoded,
+            JobOutcome::Reject {
+                reason: Some("bad payload".to_string())
+            }
+        );
+        assert_eq!(decoded.name(), "reject");
+        assert_eq!(decoded.reason(), Some("bad payload"));
+        assert_eq!(JobOutcome::Ack.name(), "ack");
+        assert_eq!(JobOutcome::Ack.reason(), None);
+    }
+
+    #[test]
+    fn a_job_outcome_without_a_reason_omits_the_field() {
+        assert_eq!(
+            String::from_utf8(Json::encode(&JobOutcome::Requeue { reason: None }).unwrap())
+                .unwrap(),
+            r#"{"outcome":"requeue"}"#
+        );
     }
 
     #[test]

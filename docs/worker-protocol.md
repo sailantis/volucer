@@ -44,7 +44,7 @@ Every frame is a 16-byte header followed by exactly `payload_len` payload bytes.
 offset  size  field
 0       4     payload_len        payload bytes, excluding this header
 4       1     protocol_version   must be 1
-5       1     message_type       1..=16, see below
+5       1     message_type       1..=18, see below
 6       2     flags              see below
 8       4     request_id         0 = unsolicited / control
 12      4     crc32c(payload)    CRC-32C, see below
@@ -100,22 +100,24 @@ The numbering is part of the protocol. These values must never be reordered or r
 | 14 | `ERROR` | either direction | no | `message`, `request_id`, `recoverable` |
 | 15 | `CALL` | server → worker | yes | `method`, JSON params. A call to the *application*, asked while a request is in flight |
 | 16 | `RETURN` | worker → server | yes | `ok`, and a JSON result or an error |
+| 17 | `JOB` | server → worker | yes | `pipeline`, `id`, `task`, `headers`, `attempts`, `body_len`. The payload follows in `BODY` frames |
+| 18 | `ACK` | worker → server | yes | `outcome` (`ack`, `requeue`, `reject`) and an optional `reason` |
 
 An unknown type number is rejected rather than skipped: skipping it would silently misalign the
 reader from the sender's expectations.
 
 ### Which types each side may receive
 
-A worker handles `HELLO`, `REQUEST`, `PING`, `CONTROL` and `RETURN`, and acts on each. A worker
-**originates** `CALL` and never receives one. It does not handle `RESPONSE`, `BODY`, `END`,
+A worker handles `HELLO`, `REQUEST`, `JOB`, `PING`, `CONTROL` and `RETURN`, and acts on each. A worker
+**originates** `CALL`, `ACK` and never receives one. It does not handle `RESPONSE`, `BODY`, `END`,
 `HELLO_ACK`, `CONTROL_ACK`, `PONG` or `ERROR` — a server sending any of those is a protocol error,
 and both the Rust codec and the PHP SDK refuse them rather than guessing. `LOG`, `METRIC` and `EVENT`
 are absorbed and ignored wherever they appear, because a peer echoing telemetry back must not derail
 the loop.
 
 The server is the mirror image, and the asymmetry is the part that is easy to get backwards: it
-**originates** `REQUEST`, `HELLO`, `CONTROL` and `PING`, **answers** `CALL` with a `RETURN`, and
-treats a `CALL` arriving *at* it as a protocol error. The one sentence to remember is that a call
+**originates** `REQUEST`, `JOB`, `HELLO`, `CONTROL` and `PING`, **answers** `CALL` with a `RETURN`,
+and treats a `CALL` arriving *at* it as a protocol error. The one sentence to remember is that a call
 travels from the side that has a question to the side that has the answer, and in this protocol the
 application is the side with the questions.
 
@@ -147,10 +149,45 @@ the call range it allocated.
 In the other direction, work *arriving* for a worker (a job, a gRPC message) is a second *exchange*,
 not a call, and is deliberately not part of this mechanism.
 
+### Jobs, and why they are not requests
+
+```
+server  ──JOB (id, pipeline, task, headers, body_len)──►  worker
+        ──BODY (id, chunk)*─────────────────────────────►
+        ◄─ACK (id, outcome, reason?)────────────────────────
+```
+
+A job is a **separate exchange with its own frame type**, and the reason is the one thing a consumer
+and a request handler must not share: **per-request state reset.** A worker serving HTTP requests is
+expected to reset what the last request left behind — the SDK's adapters do it, and the CGI environment
+they rebuild is what makes an application written for PHP-FPM work unchanged. A consumer is expected to
+do the *opposite*: boot once, keep its connection pool, its container, its warm caches, and handle job
+after job without re-running the bootstrap.
+
+That difference cannot be expressed by a flag on `REQUEST` without making "is this a request or a job?"
+a question each implementation answers for itself, which is how one of them gets it wrong. It is one
+frame type, so a worker decides from the header before it touches any state.
+
+`ACK` is the terminal frame and the only place in this protocol where a payload **decides something the
+server does** rather than something it reports. `ack` acknowledges the reservation, `requeue`
+negatively acknowledges it so the job is handed out again, and `reject` acknowledges it *without*
+recording a failure — because a job an application has decided against is not a job that is waiting, and
+nacking it would bring it back for ever. The server imposes no retry count, no backoff and no
+dead-lettering; see `docs/plugins.md` §6.4.
+
+A job's `BODY` frames are raw bytes and are **not** parsed, exactly as a request's are not: the payload
+belongs to the application, the server never serializes it, and the `body_len` in the head is what lets
+a consumer size its read before a byte arrives.
+
+The reservation is deliberately **not** the job id. The server holds the reservation and sends only the
+job; `ACK` correlates by the frame's `request_id`, which is the same mechanism every other exchange in
+this protocol uses. That is what keeps a worker whose lease expired from acknowledging the job that has
+since been handed to somebody else — the server checks its own reservation, which the worker never saw.
+
 ### Correlation
 
-`request_id` is meaningful for `REQUEST`, `RESPONSE`, `BODY`, `END`, `CALL` and `RETURN`. Every
-other type is unsolicited and **must** carry `request_id = 0`.
+`request_id` is meaningful for `REQUEST`, `RESPONSE`, `BODY`, `END`, `CALL`, `RETURN`, `JOB` and `ACK`.
+Every other type is unsolicited and **must** carry `request_id = 0`.
 
 Request ids are allocated by the server, start at **1**, and increment per request. **`0` is
 reserved** and never used as a request id, so a correlation bug is visible instead of silently
@@ -477,7 +514,8 @@ know it ignores it, which is why `HelloAck::runtime` and the call metadata can b
 version bump.
 
 `CALL` and `RETURN` were added as types 15 and 16 in the same way: a new *number* in an existing
-range, not a new framing. That was only safe because nothing was released — an SDK that does not
+range, not a new framing. `JOB` and `ACK` followed as 17 and 18. That was only safe because nothing was
+released — an SDK that does not
 know a type number refuses it as fatal rather than skipping it (see *Errors and their
 consequences*), so adding a type after a release would have required upgrading every worker before
 the server that talks to it. The rule for the future is therefore: with deployed workers, a new

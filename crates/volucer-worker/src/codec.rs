@@ -21,8 +21,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crate::error::{Result, WorkerError};
 use crate::header::{flags, write_frame, Checksum, Header, MessageType};
 use crate::message::{
-    Call, Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
-    RequestHeader, ResponseHead, Return,
+    Call, Codec, Control, ErrorReport, Hello, HelloAck, JobHeader, JobOutcome, Json, LogRecord,
+    MetricRecord, RequestEnd, RequestHeader, ResponseHead, Return,
 };
 
 /// The largest body slice sent in one frame.
@@ -151,6 +151,21 @@ impl BoundedChannel {
         on_stage: impl FnMut(RequestStage),
     ) -> Result<WorkerResponse> {
         self.channel.request_encoded(head, body, on_stage)
+    }
+
+    /// Hand one job to a consumer and wait for its terminal answer.
+    ///
+    /// The consumer side's counterpart of `request_encoded`, and the reason it takes an owned
+    /// [`JobHeader`] where the request path borrows: nothing on this side encodes the head into bytes
+    /// the channel cannot build, because the job's fields come from a driver's `Reserved` rather than
+    /// from a CGI environment with a lifetime.
+    pub fn job(
+        &mut self,
+        head: JobHeader,
+        body: &[u8],
+        on_stage: impl FnMut(RequestStage),
+    ) -> Result<JobOutcome> {
+        self.channel.job(head, body, on_stage)
     }
 
     /// Write one frame from a payload that is already encoded.
@@ -506,6 +521,48 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     /// unblocks the read on every platform.
     pub fn request(&mut self, request: &RequestHeader, body: &[u8]) -> Result<WorkerResponse> {
         self.request_staged(request, body, |_| {})
+    }
+
+    /// Send one job and collect the consumer's terminal answer.
+    ///
+    /// The mirror of [`WorkerChannel::request_encoded`] and deliberately not that function with a
+    /// different frame type. Three things differ, and each is the reason this exists:
+    ///
+    /// - **Nothing is collected but the terminal frame.** A request's answer is a head, a body and an
+    ///   `END`; a job's is one `ACK`, because a consumer's output is a log line rather than a response
+    ///   body and a job has no HTTP status to report.
+    /// - **`LOG` and `METRIC` are absorbed, not attached.** They still accumulate on the channel for a
+    ///   scrape, but there is no response object to hang them on, and inventing one would make a job
+    ///   look like a request that happened to have no body.
+    /// - **An `ERROR` frame is not fatal when it is recoverable**, which it already is not for a
+    ///   request — the arm below is shared for that reason.
+    ///
+    /// The stage reporting is the same mechanism a request uses, and for the same reason: a failure
+    /// while writing means the job never reached the consumer and the server may requeue it, while a
+    /// failure while reading means the consumer may be running it right now and only the lease can
+    /// resolve that. See `docs/worker-protocol.md`'s *server's side of the contract*.
+    pub fn job(
+        &mut self,
+        head: JobHeader,
+        body: &[u8],
+        mut on_stage: impl FnMut(RequestStage),
+    ) -> Result<JobOutcome> {
+        let request_id = self.take_request_id();
+        // The length is stamped from the bytes about to be framed, so the declaration and the frames
+        // cannot disagree — the same rule `send_request` follows, and for the same reason: a caller that
+        // could set this could set it wrong, and the consumer would then read the wrong number of bytes.
+        let head = JobHeader {
+            body_len: body.len() as u64,
+            ..head
+        };
+        let payload = Json::encode(&head)?;
+
+        on_stage(RequestStage::Sending);
+        self.send_frame(MessageType::Job, request_id, &payload, 0)?;
+        self.send_body(request_id, body)?;
+
+        on_stage(RequestStage::Reading);
+        self.collect_job(request_id)
     }
 
     /// Allocate a request id, reserving 0 for unsolicited frames.
@@ -868,6 +925,102 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         response.logs = self.logs[log_mark..].to_vec();
         response.metrics = self.metrics[metric_mark..].to_vec();
         Ok(response)
+    }
+
+    /// Read frames until a job's terminal `ACK` arrives.
+    ///
+    /// A separate loop from [`WorkerChannel::read_response`] rather than a mode of it, because the two
+    /// accept different frames and refusing a frame is the whole point of having the loop: a `RESPONSE`
+    /// arriving while a job is in flight means the worker has confused two exchanges, and the honest
+    /// answer is a fatal protocol error rather than a guess about which it meant.
+    ///
+    /// The frame buffer is taken and put back on every path, exactly as `collect_response` does, so a
+    /// failed job does not cost the next one its capacity.
+    fn collect_job(&mut self, request_id: u32) -> Result<JobOutcome> {
+        let mut frame_buffer = std::mem::take(&mut self.scratch);
+        let outcome = self.read_job(request_id, &mut frame_buffer);
+        self.scratch = frame_buffer;
+        outcome
+    }
+
+    /// The read loop of [`WorkerChannel::collect_job`].
+    fn read_job(&mut self, request_id: u32, frame_buffer: &mut Vec<u8>) -> Result<JobOutcome> {
+        loop {
+            let policy = self.checksum;
+            let Some((header, len)) =
+                Header::read_into_with(&mut self.reader, frame_buffer, policy)?
+            else {
+                return Err(WorkerError::Closed(format!(
+                    "the worker closed its output while answering job {request_id}"
+                )));
+            };
+            let payload = &frame_buffer[..len];
+
+            match header.message_type {
+                MessageType::Ack => {
+                    if header.request_id != request_id {
+                        return Err(WorkerError::WrongRequestId {
+                            expected: request_id,
+                            actual: header.request_id,
+                        });
+                    }
+                    return Json::decode(payload);
+                }
+                // Telemetry is absorbed wherever it appears, and is *not* attached to anything: a job
+                // has no response object, and a scrape reads the channel's lifetime buffers anyway.
+                MessageType::Log => self.absorb_log(payload),
+                MessageType::Metric => self.absorb_metric(payload),
+                MessageType::Event => {
+                    tracing::trace!(request_id = header.request_id, "worker sent an event");
+                }
+                // A call is served here for the same reason it is served during a request: the handler
+                // runs on the exchange thread, and a consumer mid-job is as entitled to reach the
+                // server as a request handler is. Without this arm a consumer that cached something
+                // while handling a job would deadlock until its lease ran out.
+                MessageType::Call => {
+                    let call: Call = Json::decode(payload)?;
+                    let answer = match &self.call_handler {
+                        Some(handler) if header.request_id >= crate::FIRST_CALL_ID_HALF => {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handler(&call)
+                            }))
+                            .unwrap_or_else(|_| {
+                                tracing::error!(
+                                    call = %call.name,
+                                    "a call handler panicked; the call is refused"
+                                );
+                                Return::refused("the call handler panicked")
+                            })
+                        }
+                        Some(_) => Return::refused(format!(
+                            "call {} arrived with request id {}, which is a request's range",
+                            call.name, header.request_id
+                        )),
+                        None => Return::refused(format!(
+                            "no call handler is installed, so {} cannot be served",
+                            call.name
+                        )),
+                    };
+                    self.send_json(MessageType::Return, header.request_id, &answer, 0)?;
+                }
+                MessageType::Error => {
+                    let report: ErrorReport = Json::decode(payload)?;
+                    if report.recoverable {
+                        tracing::warn!(%report.message, "worker reported a recoverable error");
+                    } else {
+                        return Err(WorkerError::Remote {
+                            message: report.message,
+                        });
+                    }
+                }
+                other => {
+                    return Err(WorkerError::NotA {
+                        expected: "a job acknowledgement",
+                        actual: other,
+                    })
+                }
+            }
+        }
     }
 
     /// Send the body as `Body` frames, flagging the last one.
@@ -1912,6 +2065,192 @@ mod tests {
             .request(&RequestHeader::default(), b"")
             .expect("an unchecked but well-formed reply must be read");
         assert_eq!(response.body, b"ok");
+    }
+
+    #[test]
+    fn a_job_and_its_acknowledgement_round_trip_over_one_channel() {
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::Ack,
+            1,
+            &JobOutcome::Requeue {
+                reason: Some("the mail server was down".to_string()),
+            },
+        );
+        let mut channel = script.channel();
+
+        let head = JobHeader {
+            pipeline: "emails".to_string(),
+            id: "abc-1".to_string(),
+            task: "App\\Jobs\\SendEmail".to_string(),
+            headers: vec![("traceparent".to_string(), "00-abc-01".to_string())],
+            attempts: 2,
+            // Deliberately wrong: the channel stamps the real length from the bytes it frames, so a
+            // caller cannot make the declaration and the frames disagree.
+            body_len: 9999,
+            traceparent: None,
+        };
+        let outcome = channel
+            .job(head, b"{\"to\":\"a@b\"}", |_| {})
+            .expect("a well-formed job exchange must succeed");
+
+        assert_eq!(
+            outcome,
+            JobOutcome::Requeue {
+                reason: Some("the mail server was down".to_string())
+            }
+        );
+
+        let frames = sent_frames(&channel.writer);
+        assert_eq!(frames[0].0.message_type, MessageType::Job);
+        assert_eq!(frames[0].0.request_id, 1);
+        let sent: JobHeader = Json::decode(&frames[0].1).unwrap();
+        assert_eq!(sent.task, "App\\Jobs\\SendEmail");
+        assert_eq!(sent.pipeline, "emails");
+        assert_eq!(sent.attempts, 2);
+        assert_eq!(sent.header("TraceParent"), Some("00-abc-01"));
+        assert_eq!(
+            sent.body_len,
+            b"{\"to\":\"a@b\"}".len() as u64,
+            "the declared length is the bytes actually framed, not what the caller claimed"
+        );
+        // The payload travels as raw bytes, never base64 inside the JSON: the frame after the head is
+        // the body, and its bytes are the payload itself.
+        assert_eq!(frames[1].0.message_type, MessageType::Body);
+        assert_eq!(frames[1].1, b"{\"to\":\"a@b\"}");
+        assert_ne!(frames[1].0.flags & flags::LAST, 0);
+    }
+
+    #[test]
+    fn a_job_exchange_reports_the_send_phase_before_the_read_phase() {
+        let mut script = WorkerScript::default();
+        script.json(MessageType::Ack, 1, &JobOutcome::Ack);
+        let mut channel = script.channel();
+
+        let mut stages = Vec::new();
+        channel
+            .job(JobHeader::default(), b"", |stage| stages.push(stage))
+            .unwrap();
+
+        assert_eq!(stages, vec![RequestStage::Sending, RequestStage::Reading]);
+    }
+
+    #[test]
+    fn a_call_made_while_a_job_is_in_flight_is_answered() {
+        // The consumer side needs this as much as the request side does: an application that caches
+        // something while handling a job would otherwise block until its lease ran out.
+        let mut script = WorkerScript::default();
+        script
+            .json(
+                MessageType::Call,
+                crate::FIRST_CALL_ID,
+                &Call {
+                    name: "kv.get".to_string(),
+                    params: serde_json::json!({"key": "a"}),
+                    traceparent: None,
+                },
+            )
+            .json(MessageType::Ack, 1, &JobOutcome::Ack);
+        let mut channel = script.channel();
+        channel.set_call_handler(Box::new(|call: &Call| {
+            assert_eq!(call.name, "kv.get");
+            Return::ok(serde_json::json!(null))
+        }));
+
+        let outcome = channel.job(JobHeader::default(), b"", |_| {}).unwrap();
+        assert_eq!(outcome, JobOutcome::Ack);
+
+        let frames = sent_frames(&channel.writer);
+        assert_eq!(frames[0].0.message_type, MessageType::Job);
+        assert_eq!(frames[1].0.message_type, MessageType::Return);
+        assert_eq!(
+            frames[1].0.request_id,
+            crate::FIRST_CALL_ID,
+            "the answer goes back under the call's own id, not the job's"
+        );
+    }
+
+    #[test]
+    fn a_response_frame_arriving_for_a_job_is_a_protocol_error() {
+        // The distinction the two frame types exist to draw. A worker that answered a job with a
+        // `RESPONSE` has confused the two exchanges, and a server that guessed which it meant would be
+        // guessing about whether the application's per-request state reset had run.
+        let mut script = WorkerScript::default();
+        script.head(1, 200, 0);
+        let mut channel = script.channel();
+
+        let error = channel
+            .job(JobHeader::default(), b"", |_| {})
+            .expect_err("a response to a job is a protocol failure");
+        assert!(
+            error.to_string().contains("a job acknowledgement"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_job_whose_consumer_closes_is_reported_as_closed() {
+        // The consumer died mid-job. `Closed` rather than a timeout, and the distinction is what tells
+        // the pool whether the *worker* is gone (replace it) or merely slow (kill it).
+        let mut channel = WorkerScript::default().channel();
+        let error = channel
+            .job(JobHeader::default(), b"", |_| {})
+            .expect_err("a consumer that vanished cannot answer");
+        assert!(matches!(error, WorkerError::Closed(_)), "{error}");
+    }
+
+    #[test]
+    fn a_job_ack_under_the_wrong_id_is_rejected_but_leaves_the_stream_usable() {
+        let mut script = WorkerScript::default();
+        script.json(MessageType::Ack, 7, &JobOutcome::Ack);
+        let mut channel = script.channel();
+
+        let error = channel
+            .job(JobHeader::default(), b"", |_| {})
+            .expect_err("an answer for another job is a correlation failure");
+        assert!(
+            matches!(error, WorkerError::WrongRequestId { .. }),
+            "{error}"
+        );
+        assert!(
+            !error.is_fatal(),
+            "a wrong id leaves the stream aligned, so the worker is worth keeping"
+        );
+    }
+
+    #[test]
+    fn telemetry_during_a_job_is_absorbed_rather_than_failing_it() {
+        let mut script = WorkerScript::default();
+        script
+            .json(
+                MessageType::Log,
+                crate::UNSOLICITED,
+                &LogRecord {
+                    level: "info".to_string(),
+                    message: "handled".to_string(),
+                    request_id: 1,
+                },
+            )
+            .json(
+                MessageType::Metric,
+                crate::UNSOLICITED,
+                &MetricRecord {
+                    name: "jobs.handled".to_string(),
+                    value: 1.0,
+                    unit: "count".to_string(),
+                },
+            )
+            .json(MessageType::Ack, 1, &JobOutcome::Ack);
+        let mut channel = script.channel();
+
+        assert_eq!(
+            channel.job(JobHeader::default(), b"", |_| {}).unwrap(),
+            JobOutcome::Ack
+        );
+        // Kept on the channel, because a job has no response object to attach them to and a scrape
+        // reads the lifetime buffers.
+        assert_eq!(channel.logs().len(), 1);
+        assert_eq!(channel.metrics().len(), 1);
     }
 
     #[test]
