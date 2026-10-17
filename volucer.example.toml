@@ -496,7 +496,26 @@ base_port = 19001
 # `driver = "memory"` keeps jobs in this process, and **a restart loses
 # everything** -- including jobs that were handed to a consumer and not yet
 # acknowledged. It is for work that can be regenerated. A queue that has to
-# survive a restart needs a driver with a server behind it.
+# survive a restart needs a driver with a server behind it, which is `redis`:
+#
+# [jobs.pipelines.emails]
+# driver = "redis"
+# url = "redis://127.0.0.1:6379"
+# pool_size = 16                     # connections, round-robin
+# read_timeout_ms = 5000
+#
+# A Redis pipeline and a Redis KV storage do **not** share a connection pool,
+# unlike two KV storages, which do. Two storages on one server share a namespace
+# and pooling them is free; two pipelines are two independent queues whose only
+# relationship is the host, and one pipeline's slow command holding a connection
+# another pipeline's reserve needed is head-of-line blocking across queues that
+# have nothing to do with each other.
+#
+# One limit is the driver's rather than the queue's: a job's payload must be
+# valid UTF-8, because a Redis hash field is a string. A push carrying anything
+# else is refused by name at the push rather than mangled at the reserve -- a
+# queue that silently corrupted an application's bytes would be one that hands a
+# consumer work it cannot possibly interpret.
 #
 # jobs.pool configures the consumers. The command is a *consumer*, which is the
 # consumer example in the PHP SDK rather than a request worker: it boots once and

@@ -43,7 +43,13 @@ use std::time::{Duration, SystemTime};
 
 pub mod memory;
 
+#[cfg(feature = "redis")]
+pub mod redis;
+
 pub use memory::MemoryDriver;
+
+#[cfg(feature = "redis")]
+pub use redis::RedisDriver;
 
 /// A job, as a driver stores it.
 ///

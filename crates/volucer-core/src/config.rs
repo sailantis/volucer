@@ -154,10 +154,6 @@ pub struct RedisKvConfig {
     pub pool_size: usize,
 }
 
-fn default_redis_pool_size() -> usize {
-    16
-}
-
 /// `[kv.<name>] driver = "memory"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -255,6 +251,15 @@ pub struct RedisLockConfig {
     pub read_timeout_ms: u64,
 }
 
+/// How many connections a Redis client holds unless configured otherwise.
+///
+/// One per worker is the natural size for every Redis driver here — the KV store's, the lock backend's and
+/// a queue's — and the reason is the same in all three: each operation blocks the caller that issued it,
+/// so a pool smaller than the number of concurrent callers is a pool that queues behind itself.
+fn default_redis_pool_size() -> usize {
+    16
+}
+
 fn default_lock_read_timeout_ms() -> u64 {
     // Five seconds, which is what RoadRunner's own Redis lock configuration defaults to and what the
     // worker protocol's request timeout already is — so a lock command cannot outlive the request that
@@ -328,18 +333,57 @@ pub struct JobsConfig {
 pub enum PipelineConfig {
     /// Jobs in this process's memory. Lost on restart — see the driver's documentation.
     Memory(MemoryPipelineConfig),
+
+    /// Jobs in Redis, shared between processes and surviving a restart of this one.
+    ///
+    /// The honest multi-node default, and the same client the KV store and the lock backend use. Its
+    /// `pool_size` and `read_timeout_ms` are the lock backend's settings under the same names, because
+    /// the constraint is the same one: a command that blocks a poller.
+    #[cfg(feature = "redis")]
+    Redis(RedisPipelineConfig),
 }
 
 /// `[jobs.pipelines.<name>] driver = "memory"`.
+///
+/// Every memory pipeline is its own queue — the driver is built per pipeline — so there is nothing to
+/// configure here. `driver` is the whole table, and the type exists so that a second key is a parse error
+/// naming it rather than a key that is accepted and ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryPipelineConfig {}
 
+/// `[jobs.pipelines.<name>] driver = "redis"`.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisPipelineConfig {
+    /// The Redis URL, e.g. `redis://127.0.0.1:6379`.
+    pub url: String,
+
+    /// How many connections to hold. One per worker is the natural size, and the driver takes them
+    /// round-robin.
+    #[serde(default = "default_redis_pool_size")]
+    pub pool_size: usize,
+
+    /// How long one command may take before it is treated as failed, in milliseconds.
+    ///
+    /// Defaults to the same five seconds the lock backend uses, and for the same reason: a driver command
+    /// is on a *poll* path, where this bounds how long a stalled poller stalls rather than how long a
+    /// request may take.
+    #[serde(default = "default_lock_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+}
+
 impl PipelineConfig {
     /// The driver's name, as it is written in configuration.
+    ///
+    /// An associated function rather than a field, because the tag *is* the driver: a value that could
+    /// disagree with the tag it parsed from would be a `config.describe` that lied about what is running.
     pub fn driver(&self) -> &'static str {
         match self {
             PipelineConfig::Memory(_) => "memory",
+            #[cfg(feature = "redis")]
+            PipelineConfig::Redis(_) => "redis",
         }
     }
 }
@@ -2698,6 +2742,24 @@ impl Config {
                         "a [jobs.pipelines.<name>] table has an empty name, so no producer could name it"
                             .to_string(),
                     ));
+                }
+                // Checked for the same reason a KV storage's Redis URL is: `volucer check` must not
+                // require the server to be up, so a URL that parses is all the configuration can vouch
+                // for — but a URL that *does not* parse is a mistake that would otherwise surface as a
+                // queue that could not be built at startup, with the message buried in a connect error.
+                #[cfg(feature = "redis")]
+                if let PipelineConfig::Redis(redis) = pipeline {
+                    validate_redis(
+                        &format!("jobs.pipelines.{name}"),
+                        &redis.url,
+                        redis.pool_size,
+                    )?;
+                    if redis.read_timeout_ms == 0 {
+                        return Err(Error::Config(format!(
+                            "[jobs.pipelines.{name}] sets read_timeout_ms = 0, which would make every \
+                             command time out the instant it was sent; leave it out for the default"
+                        )));
+                    }
                 }
                 let _ = pipeline.driver();
             }
@@ -5292,6 +5354,65 @@ driver = "memory"
             .and_then(|jobs| jobs.pipelines.get("emails"))
             .expect("emails is configured");
         assert_eq!(pipeline.driver(), "memory");
+    }
+
+    /// A Redis pipeline is checked for the same things a Redis lock and a Redis KV storage are, and the
+    /// `read_timeout_ms = 0` case is the one that is this driver's own.
+    ///
+    /// A zero here would make every reserve time out the instant it was sent — a consumer that reports a
+    /// backend failure on every poll and never consumes anything, with a configuration that validates.
+    /// The lock backend refuses the same value for the same reason.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_redis_pipeline_is_checked_for_shape_and_for_a_zero_command_deadline() {
+        let with = |extra: &str| {
+            let text = format!(
+                r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs.pipelines.emails]
+driver = "redis"
+url = "redis://127.0.0.1:6379"
+{extra}
+"#
+            );
+            Config::from_toml(&text)
+                .expect("the file parses")
+                .validate()
+        };
+
+        with("").expect("a URL and nothing else is the whole configuration");
+        with("pool_size = 4\nread_timeout_ms = 250")
+            .expect("and both optional keys are read rather than ignored");
+
+        let err = with("read_timeout_ms = 0").expect_err("a zero deadline is not a deadline");
+        assert!(err.to_string().contains("read_timeout_ms"), "{err}");
+
+        // A misspelled driver is refused by name rather than read as the default. Written as its own
+        // document because TOML forbids a duplicate key, and `with` already writes `driver`.
+        let err = Config::from_toml(
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[jobs.pipelines.emails]\ndriver = \"redys\"\n",
+        )
+        .expect_err("a misspelled driver is refused by name, not read as the default");
+        let message = err.to_string();
+        assert!(message.contains("unknown variant `redys`"), "{message}");
+        assert!(
+            message.contains("`memory`"),
+            "and list what this build does have: {message}"
+        );
+
+        // A credential over a plaintext connection is refused here for the same reason it is on every
+        // other Redis table: a password on the wire in the clear is the one mistake where a divergent
+        // check between two tables would matter. Its own document again, because `with` writes `url`.
+        let err = Config::from_toml(
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[jobs.pipelines.emails]\ndriver = \"redis\"\n\
+             url = \"redis://user:secret@127.0.0.1:6379\"\n",
+        )
+        .expect("the file parses")
+        .validate()
+        .expect_err("a password over `redis://` is refused");
+        let message = err.to_string();
+        assert!(message.contains("rediss"), "{message}");
     }
 
     /// A `[kv.*]` table whose driver is misspelled is refused, naming the key it did not understand.

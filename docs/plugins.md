@@ -720,9 +720,7 @@ the cost actually lives:
 | `redis` | `redis-rs` (shared with §6.2/§6.3) | **ship** — the honest multi-node default, with a Lua script for reserve/ack atomicity |
 | `file` | embedded store | probably, for durability without a broker |
 | `amqp` | `lapin` | later |
-| `sqs`, `kafka`, `nats`, `beanstalk`, `nsq`, `google_pub_sub` | one large client each | **not in this plan** — see §9.4 |
-
-**The engine** is driver-independent and is the part worth designing carefully. It copies RR's:
+| `sqs`, `kafka`, `nats`, `beanstalk`, `nsq`, `google_pub_sub` | one large client each | **not in this plan** — see §9.4 |**The engine** is driver-independent and is the part worth designing carefully. It copies RR's:
 
 - **one internal priority queue** shared by all pipelines, of bounded `pipeline_size`, with
   `num_pollers` tasks pulling from it — and with the limitation **stated in the config
@@ -800,6 +798,37 @@ the contract*). So:
   inside a frame. What differs is only where the bytes go — a job has no response body, so they go to
   the server's log rather than to a client.
 
+
+**Both drivers are now built, and the Redis one is where three of this section's own predictions were
+wrong** — which is worth recording, because two of them were the kind a test finds and one was the kind
+only a *deployment* would have:
+
+- **The first script was a stack, not a queue.** It pushed with `RPUSH` and popped with `RPOP`, which is
+  LIFO: the newest job would have been handed out first. Nothing about that looks like a failure until an
+  application depends on ordering, and the FIFO test failed on its first run. `RPUSH` in, `LPOP` out — and
+  both reclaim and requeue use `LPUSH`, which is the *head*, so a job whose consumer died is the very next
+  one handed out.
+- **A reservation has to be two values, not one.** The map is keyed by the job id and holds
+  `"<id>|<nonce>"`, where the nonce is fresh per reservation. The first version wrote the job id as *both*
+  — which makes the settle's check "does the map hold what you say?" always true, and the check is the only
+  thing that stops a worker whose lease expired from acknowledging the job a second consumer is running.
+  §6.4 predicted the check; it did not predict that the check needs a value the caller *cannot* derive.
+- **A payload that is not valid UTF-8 cannot make the round trip, and the driver says so at the push.** A
+  Redis hash field is a string. Accepting the push and mangling the bytes would surface as a
+  deserialization error in the application days later and nowhere near the cause, so the refusal is at the
+  push, by name. The memory driver takes the same bytes happily — this is a *driver* limit, not a rule the
+  trait imposes, which is why the test asserts both halves.
+- **A Redis pipeline gets its own connection pool, unlike a KV storage.** Two storages on one Redis share a
+  server and a namespace, so sharing connections is free. Two pipelines are two independent queues whose
+  only relationship is the host, so pooling them would be head-of-line blocking across queues that have
+  nothing to do with each other.
+- **Reclamation rides on the reserve, and it is before the pop, not after.** A reclaim that ran afterwards
+  would return the job to the ready list and leave it there until the *next* reserve — a consumer idling
+  for a poll interval on a job that is ready right now. Same shape as the memory driver's correction, and
+  the test fails either way, which is what a shared rule is for.
+- **Redis Cluster is not supported and is not claimed to be.** The keys of one pipeline share no hash tag,
+  so the reserve script spans keys a cluster would refuse to co-locate. `docs/plugins.md` §9.4 records that
+  as a decision.
 
 **PHP integration is the point of the feature for this organisation.** `sailantis/azera-queue`
 already defines `Backend\Contract\ReservableQueueInterface`, a `Worker\Worker`, a
@@ -1124,7 +1153,7 @@ progress on something earlier look bigger.
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |
-| 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **5a–5c done** (engine, producer, consumer); the `redis` driver is still open. Biggest item; the consumer-side exchange is the interesting part |
+| 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **Done.** Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | Reuses the in-flight request, so it does not touch the one-request invariant |
@@ -1203,28 +1232,37 @@ methods cost more than S because of the third answer — every verb now has to d
 failure it is reporting, and `update_lease` returning `false` is a second "no" that means the opposite
 of contention.
 
-**Step 5 is done for the memory driver — engine, producer and consumer — and it was three commits'
-worth of one design question.** `crates/volucer-jobs/` (the `Driver` trait and `MemoryDriver`), the
-`jobs` namespace and `[jobs]`/`[jobs.pipelines]` (the producer half), then `JOB`/`ACK`, the `job`
-exchange, `[jobs.pool]` and `crates/volucer-server/src/jobs.rs` (the consumer half, whose full list of
-consequences is in §6.4 above rather than repeated here). The `redis` driver is the one part of step 5
-still open.
+**Step 5 is done, both drivers, and it was three commits' worth of one design question plus a fourth for
+the second driver.** `crates/volucer-jobs/` (the `Driver` trait and `MemoryDriver`), the `jobs` namespace
+and `[jobs]`/`[jobs.pipelines]` (the producer half), then `JOB`/`ACK`, the `job` exchange, `[jobs.pool]`
+and `crates/volucer-server/src/jobs.rs` (the consumer half, whose full list of consequences is in §6.4
+above rather than repeated here), and finally `RedisDriver` behind the same feature the KV store and the
+lock backend use.
 
 The thing this step should be remembered for is not any of those items but the size of the gap the
-*last* one closed. Every layer was tested and correct: the driver's ack/nack against the driver, the
-pool's `job` against a channel, the SDK's `consume` against a fixture. **What no test covered was
-whether the three agreed** — and the three failure modes are all silent. A `Requeue` treated as an
-`Ack` loses work an application asked to retry; an `Ack` treated as a `Requeue` runs every job twice;
-a `Reject` nacked rather than acked brings a poisoned job back for ever. None of them is an error
-anywhere; they are a queue that behaves oddly. So the end-to-end test for this step asserts on the
-*queue* — `size` and `in_flight` after each outcome — rather than on the answer frame, because the
-reservation is what the policy is about.
+*consumer* commit closed. Every layer was tested and correct: the driver's ack/nack against the driver, the
+pool's `job` against a channel, the SDK's `consume` against a fixture. **What no test covered was whether
+the three agreed** — and the three failure modes are all silent. A `Requeue` treated as an `Ack` loses work
+an application asked to retry; an `Ack` treated as a `Requeue` runs every job twice; a `Reject` nacked
+rather than acked brings a poisoned job back for ever. None of them is an error anywhere; they are a queue
+that behaves oddly. So the end-to-end test for this step asserts on the *queue* — `size` and `in_flight`
+after each outcome — rather than on the answer frame, because the reservation is what the policy is about.
 
 That is the seam pattern's fifth instance, and this one generalises it: what sits between two tested
-things is not always a `build_*` function. Here it was a **policy**, and the test that finds a policy
-bug is one that runs the whole path a deployment runs and then asks the durable state what happened.
+things is not always a `build_*` function. Here it was a **policy**, and the test that finds a policy bug is
+one that runs the whole path a deployment runs and then asks the durable state what happened.
 
-Two smaller things worth recording, both found this way rather than by reasoning:
+The fourth commit produced a second kind of evidence. `RedisDriver`'s tests found two bugs that reading
+could not have — the reserve script was a stack rather than a queue, and the reservation had to be two
+values rather than one for the settle's check to mean anything — and both are recorded in §6.4. **A driver
+is where a design's assumptions about the storage engine get tested**, which is why §6.4's own table
+predicted the Redis driver would be where the cost lives and was right.
+
+**Three Redis drivers now share one client and one feature** — `volucer-kv`'s store, `volucer-lock`'s
+locks, and now `volucer-jobs`' queue — which is the answer §10 item 6 was asking for: one `redis` crate, one
+feature, three sets of semantics over it. What the fourth driver would cost is now known: a `PipelineConfig`
+variant, a `build_queues` arm, and a test file. Two smaller things worth recording, both found this way
+rather than by reasoning:
 
 - **`max_jobs` and `max_requests` are one threshold under two names, and `WorkerPool::start_consumers`
   is where that is written down.** A consumer serves one job at a time, so "requests served" and "jobs

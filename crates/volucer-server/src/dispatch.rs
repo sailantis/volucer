@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, Weak};
+#[cfg(feature = "redis")]
+use std::time::Duration;
 
 use volucer_core::config::{
     BackendConfig, Config, KvStorageConfig, LockConfig, PipelineConfig, RouteConfig,
@@ -235,6 +237,27 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
             // storage: two memory pipelines are two independent queues, and sharing one driver between
             // them would make a push to either appear in both.
             PipelineConfig::Memory(_) => Arc::new(volucer_jobs::MemoryDriver::single(name.clone())),
+            #[cfg(feature = "redis")]
+            PipelineConfig::Redis(redis) => {
+                // A **separate connection pool per Redis pipeline**, unlike the KV store's shared one,
+                // and the difference is a property of the thing rather than a shortcut: two KV storages
+                // on one Redis share a server and a namespace, so sharing connections is free, while two
+                // pipelines are two *independent queues* on that server whose only relationship is the
+                // host. Pooling them would also mean one pipeline's slow command occupying a connection
+                // another pipeline's reserve needed, which is head-of-line blocking across queues that
+                // have nothing to do with each other.
+                let driver = volucer_jobs::RedisDriver::connect(
+                    &redis.url,
+                    redis.pool_size,
+                    Duration::from_millis(redis.read_timeout_ms),
+                    [name.clone()],
+                )
+                .map_err(|err| ServerError::Misconfigured {
+                    backend: format!("jobs.pipelines.{name}"),
+                    reason: err.to_string(),
+                })?;
+                Arc::new(driver)
+            }
         };
         tracing::info!(
             pipeline = %name,
