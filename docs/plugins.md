@@ -215,8 +215,11 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
   useful half (§6.7) without the SDK; **`informer`/`resetter`** are the first row of this table;
   **`status`**, **`rpc`**, **`metrics`**, **`kv`**, **`lock`**, **`jobs`**, **`grpc`** are §6; **`logger`**
   and **`app-logger`** are the access log plus the worker `LOG` frame.
-- **`protoreg`** — see §10 item 2. It exists to feed reflection, which is declined, and it is the
-  `protox` cost moved into a plugin.
+- **`protoreg`** — see §10 item 2 and §6.6's RR comparison. It exists to feed reflection, which is
+  declined, and it is the `protox` cost moved into a plugin. Having now read it, the cost is larger
+  than that sentence suggested: it pulls `jhump/protoreflect` (both v1 and the v2 beta) and compiles
+  every file *and its imports* recursively, which is a descriptor compiler and not a parser. §6.6
+  records what it buys and what its absence costs.
 - **`plugin-abis`** — a compile-time DI container in Go, so there is no ABI to copy; `plan.md` item 39
   already refuses it.
 
@@ -1137,6 +1140,118 @@ reflection itself, which buys a `grpcurl` user a `.proto` file they can already 
 it keeps the graph free of `prost`, `prost-types` and `protox`, which `Cargo.lock` can confirm by
 their absence rather than by intention.
 
+#### How RoadRunner's plugin resolves the same three tiers, read from its source
+
+This was checked against `roadrunner-server/grpc` v6.0.0 and `roadrunner-server/protoreg` v6.0.0
+directly rather than from the plugin's documentation, because two things in this section are claims
+about what a *server* has to do and RR is the only working implementation of the tier-B shape to
+compare against. Four facts, each with its own consequence.
+
+**1. RR parses `.proto` files with a syntax parser, and never compiles them.** `parser/parse.go`
+walks the file with `emicklei/proto` and builds this struct, reproduced as the file has it:
+
+```go
+type Method struct {
+	// Name is a method name.
+	Name string
+
+	// StreamsRequest defines if the method accepts stream input.
+	StreamsRequest bool
+
+	// RequestType defines the message name (from the same package) of method input.
+	RequestType string
+
+	// StreamsReturns defines if method streams result.
+	StreamsReturns bool
+
+	// ReturnsType defines the message name (from the same package) of the method return value.
+	ReturnsType string
+}
+```
+
+Of those five fields **the plugin reads one**. `RegisterMethod` is called with `m.Name` only
+(`server.go:79`) and everything downstream switches on that string; `RequestType` and `ReturnsType`
+are populated by the parser, documented in its own comments, and referenced nowhere else in the
+repository. So the request type and the response type — the two things a descriptor exists to
+describe — are parsed and dropped. That is the strongest available evidence for this section's
+central claim: the method *name* is all a server needs, and the message types are dead weight even
+when they are lying right there in a struct. RR is schema-aware and still schema-blind on the request
+path.
+
+Its *config* is where the rest of the schema surface shows up, and it is worth naming because it
+looks like the descriptor feature and is not: `grpc.proto` takes a **list of globs**
+(`doublestar.FilepathGlob`, `config.go:81`) and `parser.File` recurses into each file's `import`s
+looking for a sibling at `importPath+"/"+i.Filename` (`parse.go:96`) — a naive join that only
+resolves imports that sit next to the file that named them. So the parser reaches into imports to
+find *more service definitions*, not to resolve message types. It is a service *discovery* mechanism,
+and the glob is what makes a multi-file application work without a generated registry.
+
+**2. There is no transcoding anywhere in RR's gRPC plugin.** `grep -ri` over the plugin for
+`gateway`, `transcod`, `jsonpb` and `protojson` returns nothing — the same grep returns five hits
+for `RegisterService`, so it is finding things; the only `grpc-gateway` in `roadrunner/go.mod` is an
+`// indirect` entry the plugin never imports. So the answer to *"does RR transcode?"* is no — it is a
+pure gRPC server for the tiers A and B shape, exactly as this section describes volucer's.
+Transcoding in RR's ecosystem is a second process the operator adds, and §10 item 11 is the same
+conclusion reached here. (It has no descriptor compiler *either*: compiling is `protoreg`'s job, and
+the plugin's own `jhump/protoreflect` usage is a single import in `api/interfaces.go:8` — the
+`*protoresolve.Registry` *interface type* that protoreg is injected through. Its `go.mod` names
+`protoreflect/v2` for that type alone; there is no `protoparse` call anywhere in the plugin.)
+
+**3. RR's server-side health check is a *service*, not a built-in, and that settles a question this
+section left implicit.** `plugin.go:171` installs `grpc_health_v1.RegisterHealthServer` against
+`health_server.go`, which is a real `Health/Watch/List` implementation that reports the server's own
+up/down status and nothing about the application. The application's own health is a *separate*
+service in the fixture: `tests/php_test_files/grpc/src/HealthService.php` implements
+`HealthInterface` — a `.proto`-generated interface with `Check` and `Watch` — and is registered by
+the test worker beside the echo service. **So RR answers the protocol-level health question itself,
+because that answer is about the pool, and expects the application to answer the
+application-level one through an ordinary service.** That distinction is the one volucer needs when
+a health route is ever added: `grpc.health.v1.Health` belongs in `grpc_services` with everything else,
+and its reply is a protobuf message the application encodes, which is the one thing this server
+declines to do. There is no version of this where the server builds a `HealthCheckResponse`.
+
+**4. RR bypasses protobuf encoding in the *server* with a codec, and the application decodes anyway.**
+`codec/codec.go` registers itself under the name `"proto"` — displacing protobuf's own codec — and
+its `Marshal`/`Unmarshal` short-circuit on a `RawMessage` type alias for `[]byte`. The `invoke` body
+in `proxy/proxy.go` then decodes the request into `&codec.RawMessage{}`, hands those raw bytes to the
+worker, and returns `codec.RawMessage(r.Body)` as the response. The server never builds or reads a
+message. So far it is the same design as tier B.
+
+**The half that differs is on the other side of the worker protocol, and it is the answer to the
+original question.** `spiral/roadrunner-grpc`'s `Invoker` — the application-side SDK, which the
+fixture requires as `"spiral/roadrunner-grpc": "^3.0"` — does
+`$in->mergeFromString($body)` and `$message->serializeToString()`, against a class from
+`$method->getInputType()`. That type comes from a **generated PHP service interface**, produced by
+this repository's own `protoc_plugins/protoc-gen-php-grpc`. **So RR answered "static or dynamic
+`.proto`" by taking both, in separate places: codegen in the application, and a runtime syntax
+parser used only to build the routing table and the reflection registry.** The dynamic parse never
+touches a message; the typed decode never touches the server. That is the split §6.6 argues for,
+implemented, and it means the `RequestType`/`ReturnsType` fields above are dead *in the server*
+precisely because the codegen already put the same information into the worker.
+
+Two consequences worth carrying:
+
+- **The build step is real and required.** An RR gRPC application cannot start without
+  `protoc-gen-php-grpc` having generated its interfaces, which is why the plugin ships the generator.
+  volucer's tier B needs nothing generated, because the SDK's contract is two response headers and
+  the payload is opaque — a weaker coupling, bought by the application writing its own framing.
+- **The framing differs, and this settles it as a deliberate choice rather than an oversight.** RR's
+  worker receives the **message alone** — gRPC's length prefix is consumed by the framework, which
+  re-frames on the way out — so `mergeFromString` can be called on the bytes directly. volucer hands
+  the worker the prefix along with the message: the tier-B test posts `\x00\x00\x00\x00\x05hello` and
+  asserts those bytes come back (`crates/volucer-http/tests/frontend.rs`), and
+  `GrpcResponse::message()`'s "a compression flag, a big-endian length, then the message" is the SDK
+  saying so. Both are schema-free; the trade is that volucer's SDK author writes five bytes they
+  could otherwise ignore, in exchange for a server that has no framing opinion at all.
+
+**The one thing RR has that this section deliberately gives up is reflection.** `protoreg` compiles
+the protos properly (`jhump/protoreflect`'s `protoparse` → `protoresolve.Registry`), the gRPC plugin
+consumes it through an `api.Registry` dependency (`plugin.go:307`), and `registerReflection` feeds it
+to `reflection.ServerOptions.DescriptorResolver` so `grpcurl` gets real file descriptors. Its own
+comment concedes the fallback: without `protoreg`, "the global protobuf registry … only exposes
+service/method names for the proxies". That is the cost of §10 item 2's decision, stated by the
+implementation that pays it, and it is the shape to copy if the decision is ever reversed.
+
 #### The decision, restated as two independent ones
 
 Replace *"static or dynamic `.proto`"* with:
@@ -1740,6 +1855,13 @@ machine that parses what arrives. This server never parses a frame; hyper does.
    it is a transcoding feature and belongs in item 11 below, not in a descriptor question. Everything
    else on the wire is length-delimited: one compression-flag byte, a big-endian `u32` length, then
    exactly that many bytes.
+
+   **RoadRunner is a working implementation of this decision, and reading its source supports it
+   rather than complicating it** — §6.6 has the citations. Its server parses `.proto` files with a
+   syntax parser, uses the result only to build a routing table, and never reads the two fields that
+   name the request and the response message; its reply path is a raw-bytes codec. Its *application*
+   SDK is what decodes, against interfaces a `protoc` plugin generated. So the schema work happens,
+   and it happens entirely on the application's side of the wire.
 3. **How a plaintext gRPC origin says it speaks h2.** **Settled, and the answer was the explicit
    key**: `protocol = "h2c"` on an `http://` or `unix:` origin, refused beside `https://` where ALPN
    is the answer. `UpstreamProtocol` has one variant and no `Http1`, so HTTP/1.1 is the absence of the
