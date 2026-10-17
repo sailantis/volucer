@@ -126,3 +126,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.dev]
+debug = "line-tables-only"   # keeps file:line in backtraces, drops local/type info
