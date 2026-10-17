@@ -11,6 +11,7 @@ use volucer_fcgi::{Endpoint, Request, Response};
 use crate::calls::MethodRegistry;
 use crate::error::{Result, ServerError};
 use crate::pool::CgiPool;
+use crate::upstream_pool::Supervisor;
 use crate::worker_pool::WorkerPool;
 
 /// How many idle connections to an external backend to hold open.
@@ -186,6 +187,15 @@ pub enum Backend {
     Upstream {
         name: String,
         client: volucer_upstream::UpstreamClient<UpstreamBody>,
+        /// The origin's process, when this backend was asked to start one.
+        ///
+        /// Behind a `Mutex` for the reason the supervisor's own watcher needs one: the process has
+        /// to be killable from `shutdown` while a watcher thread is polling it. Boxed because a
+        /// `Supervisor` is a thread handle and a process table entry, and inlining it would make
+        /// this variant — and therefore *every* `Backend`, including the three that start nothing —
+        /// that much larger. `None` is the original shape of an upstream: somebody else's process,
+        /// which is nginx's or systemd's job, and still the common case.
+        supervisor: Option<Mutex<Box<Supervisor>>>,
     },
 }
 
@@ -268,9 +278,20 @@ impl Backend {
                             reason: source.to_string(),
                         }
                     })?;
+                // Started *after* the client, so a `command` that cannot be resolved is reported
+                // rather than leaving a running process behind a failure, and *before* the backend
+                // is returned, so the readiness gate is inside startup — a deployment is not serving
+                // until its origin answers.
+                let supervisor = match &upstream.command {
+                    Some(_) => Some(Mutex::new(Box::new(Supervisor::start(
+                        name, upstream, &spec,
+                    )?))),
+                    None => None,
+                };
                 Ok(Backend::Upstream {
                     name: name.to_string(),
                     client,
+                    supervisor,
                 })
             }
         }
@@ -487,9 +508,17 @@ impl Backend {
                     ),
                 }
             }
-            Backend::Upstream { .. } => {
-                // Nothing was started — the origin is somebody else's process — so there is nothing
-                // to stop. The pooled connections this backend will hold are dropped with it.
+            Backend::Upstream { supervisor, .. } => {
+                // Nothing was started unless a `command` asked for it, and then what was started is
+                // ours to stop: the readiness gate has already been passed, so the process is
+                // running and would otherwise hold the socket until the machine rebooted on a
+                // platform where the lifecycle guard does nothing (which is every Unix).
+                if let Some(supervisor) = supervisor {
+                    supervisor
+                        .get_mut()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .shutdown();
+                }
             }
             Backend::External { pool, .. } => {
                 // Nothing was started, so there is nothing to stop; closing the

@@ -284,6 +284,55 @@ socket = "unix:/run/php/php-fpm.sock"
 # [backends.node.tls]
 # ca = "/etc/ssl/internal-ca.pem"   # absent = the public roots
 # sni = "node.internal"             # optional; defaults to the origin's host
+#
+# ---------------------------------------------------------------------------
+# Supervising the origin, for a runtime whose own server volucer should start.
+#
+# Every Python and Ruby application server already implements "boot once, serve
+# many" and already speaks HTTP over a unix socket: `gunicorn --preload --bind
+# unix:/run/app.sock`, Puma's `preload_app!`, uvicorn, granian. With `command`
+# volucer starts that process, waits until it answers, restarts it if it dies,
+# and makes sure it does not outlive the server.
+#
+# There is deliberately no `kind = "python"`: HTTP framing is a real cost, and it
+# is the cost every Rails and Django deployment already pays. What was missing
+# was supervision, not a protocol.
+#
+# Paths are written in single quotes. A TOML basic string ("...") needs every
+# backslash doubled, so a Windows path is a parse error in one and unchanged in
+# the other.
+# ---------------------------------------------------------------------------
+# command = 'gunicorn myapp.wsgi --bind unix:/run/app.sock --workers 4'
+#
+# Where the application expects to be started. `manage.py` and `config.ru` are
+# found relative to this, so guessing here is a boot failure the operator reads
+# as a volucer bug.
+# working_dir = '/srv/app'
+#
+# DJANGO_SETTINGS_MODULE, RAILS_ENV, and the rest. The socket path itself is not
+# overridden here: it is the configuration's, and moving it in the environment
+# would point the supervisor at one address and the client at another.
+# env = { DJANGO_SETTINGS_MODULE = "myapp.settings" }
+#
+# What to do when the process exits. `on_failure` (the default) starts it again
+# only after a *non-zero* exit: a `gunicorn` that exited 0 was stopped by
+# somebody, and restarting it would fight them.
+# restart = "on_failure"          # "never" | "on_failure" | "always"
+#
+# How many *consecutive* failures to restart through, and the delay before each,
+# which doubles per failure up to 60 s. A limit rather than a loop because a
+# command that cannot start -- a typo in a module name, a missing virtualenv --
+# exits in milliseconds, and an unbounded restarter is a core burned and a log
+# filled while the backend answers nothing. A run that stayed up a minute resets
+# the count, so this is not a lifetime restart budget.
+# restart_limit = 3
+# restart_backoff_ms = 1000
+#
+# How long the origin has to answer before startup gives up. The readiness gate,
+# and the reason it is 30 s rather than the CGI pool's 10: a Django app under
+# `gunicorn` is not listening the instant it is spawned. Without this the first
+# requests after a deploy are 502s from an origin that is merely still booting.
+# ready_timeout_ms = 30000
 
 # ---------------------------------------------------------------------------
 # Routes. The most specific matching route wins: a route stating both a host and

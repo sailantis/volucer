@@ -30,6 +30,16 @@ impl Warning {
         }
     }
 
+    /// A warning with nothing to act on — stated so a deployment can see what volucer is doing.
+    ///
+    /// The same constructor as [`Warning::new`], named for a reader rather than a compiler: the
+    /// other warnings in this file all carry a hint because each one is something to *change*, and
+    /// this one is something to *know*. Keeping the distinction in the call sites is what stops the
+    /// next reader from adding a hint that does not exist.
+    fn plain(message: impl Into<String>) -> Self {
+        Warning::new(message)
+    }
+
     fn with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Warning {
             message: message.into(),
@@ -352,6 +362,18 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                         "use `https://` if this hop crosses a network you do not control; \
                          `http://` is fine for a loopback address or a unix socket",
                     ));
+                }
+                // A supervised origin, reported because it is the one backend whose process volucer
+                // owns and the one thing this file can say that the configuration cannot: the
+                // command was resolved and started, and what `restart` will do about it.
+                if let Some(command) = &upstream.command {
+                    warnings.push(Warning::plain(format!(
+                        "backends.{name}: volucer starts {:?}, waits up to {} ms for it to answer, \
+                         and restarts it {}",
+                        command,
+                        upstream.ready_timeout_ms,
+                        upstream.restart_policy()
+                    )));
                 }
             }
         }

@@ -14,6 +14,7 @@ pub mod lifecycle;
 pub mod listener;
 pub mod params;
 pub mod pool;
+pub mod upstream_pool;
 pub mod worker_pool;
 
 pub use backend::{Backend, Contention};
@@ -31,4 +32,5 @@ pub use lifecycle::LifecycleGuard;
 pub use listener::{FastCgiListener, Limits, ShutdownHandle, Stats};
 pub use params::{decode_base64, encode_base64, Params};
 pub use pool::CgiPool;
+pub use upstream_pool::Supervisor;
 pub use worker_pool::WorkerPool;

@@ -1694,10 +1694,10 @@ fn upstream_config(origin: &Origin) -> Config {
         },
         backends: [(
             "node".to_string(),
-            BackendConfig::Upstream(volucer_core::config::UpstreamConfig {
-                origin: format!("http://{}", origin.address),
-                tls: None,
-            }),
+            BackendConfig::Upstream(volucer_core::config::UpstreamConfig::new(format!(
+                "http://{}",
+                origin.address
+            ))),
         )]
         .into_iter()
         .collect(),
@@ -1917,4 +1917,146 @@ fn a_slow_origin_is_served_concurrently_rather_than_thread_at_a_time() {
          which is the shape of a front-end that parks a runtime thread per request (about 2000 ms) \
          rather than one that awaits (about 400 ms)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A supervised origin: the origin's *process* is volucer's.
+//
+// The seam pattern `docs/plugins.md` §8 records applies here in its original form: every layer of
+// this — the config, the supervisor, the readiness gate, the client — was tested on its own, and
+// none of those tests could see that the dispatcher was building a `Supervisor` at all. So this one
+// goes through the entry point a *deployment* uses: a `Config` built from TOML, a `Dispatcher`, a
+// `Server`, and an HTTP request that reaches the process volucer started.
+// ---------------------------------------------------------------------------
+
+/// The port a config-only origin will use, chosen as free first.
+fn free_origin_port() -> u16 {
+    let listener = OriginListener::bind("127.0.0.1:0").expect("bind a probe port");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    port
+}
+
+/// A `python -m http.server` command that answers `GET /` with a directory listing.
+///
+/// Deliberately a *real* server rather than a fixture: the point of this test is that volucer starts
+/// a command it was given and waits for it to answer, so the command has to behave like the thing a
+/// deployment would name. `python -m http.server` is present on every machine this project builds
+/// on, binds a port, and answers a request.
+///
+/// The directory is quoted because `split_command` is deliberately not a shell: a space in the path
+/// would otherwise split into two arguments. The config *literal* it is written into matters too,
+/// and this test found that the hard way — a Windows path in a TOML **basic** string needs its
+/// backslashes doubled, so `command = "…\Temp\x"` is a TOML parse error at `\T`. Single quotes make
+/// it a literal string and leave the path alone, which is the spelling the example configuration
+/// uses for every path for the same reason.
+fn python_http_server(port: u16, dir: &Path) -> String {
+    format!(
+        "python -m http.server {port} --bind 127.0.0.1 --directory \"{}\"",
+        dir.display()
+    )
+}
+
+/// **A configured `command` is started, waited for, reached and stopped.**
+///
+/// Four assertions, and each is a different way for supervision to be silently absent:
+///
+/// 1. the process is running and reached the *point of answering* before `Server::start` returned —
+///    which is the readiness gate, and without it the first request is a 502;
+/// 2. a request actually reaches it, so the supervisor did not merely spawn something unrelated to
+///    the backend's origin;
+/// 3. dropping the server stops it — the orphan hazard, and the one that is invisible until a
+///    deploy leaves a `gunicorn` holding a socket;
+/// 4. the origin's *own* output is forwarded (asserted by the log rather than here, because it is a
+///    `tracing` concern; what is asserted here is that its pipes did not fill up and block it).
+#[test]
+fn a_configured_origin_command_is_started_waited_for_reached_and_stopped() {
+    let Some(_) = find_python() else {
+        eprintln!("skipping: no python binary on PATH");
+        return;
+    };
+
+    let port = free_origin_port();
+    let root =
+        std::env::temp_dir().join(format!("volucer-supervised-origin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(root.join("served.txt"), "from the supervised origin").expect("write a file");
+
+    let text = format!(
+        r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:0"
+[backends.app]
+kind = "upstream"
+origin = "http://127.0.0.1:{port}"
+command = '{}'
+ready_timeout_ms = 20000
+"#,
+        python_http_server(port, &root)
+    );
+    let config = Config::from_toml(&text).expect("a supervised origin parses");
+    let routing = front_controller_routing();
+    // The readiness gate is inside `from_config`, so this returning at all is assertion (1): if the
+    // supervisor did not wait, the first request below would race the interpreter's start.
+    let dispatcher = Dispatcher::from_config(&config, routing.clone())
+        .expect("the origin starts and answers before this returns");
+    let Some(server) = Server::start(
+        dispatcher,
+        routing,
+        HttpLimits::default(),
+        volucer_core::config::StaticConfig::default(),
+    ) else {
+        panic!("the listener must start");
+    };
+
+    let address = server.address.clone();
+    let answer = get(&address, "/served.txt");
+    assert_eq!(answer.status, 200, "{answer:?}");
+    assert!(
+        answer.text().contains("from the supervised origin"),
+        "the request must be served by the process volucer started: {:?}",
+        answer.text()
+    );
+
+    // Assertion (3): the process is gone after shutdown, not merely unreachable. The port is the
+    // observable — nothing is left holding it — which is what a leaked `gunicorn` would do.
+    drop(server);
+    let mut bound = false;
+    for _ in 0..40 {
+        match OriginListener::bind(("127.0.0.1", port)) {
+            Ok(_) => {
+                bound = true;
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    assert!(
+        bound,
+        "the supervised origin was still holding port {port} after the server was dropped, so it \
+         outlived the process that started it"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Find `python` on `PATH`, for the one test whose origin is not a fixture.
+fn find_python() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let names: &[&str] = &["python.exe", "python3.exe", "python", "python3"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["python3", "python"];
+
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }

@@ -1131,6 +1131,9 @@ questions, and Tier 1 is what lets Tier 2 be judged on evidence.
 
 ### 7.1 Tier 1 — supervise their own server, which already exists
 
+**Done.** `UpstreamConfig::command` and `crates/volucer-server/src/upstream_pool.rs`; the
+per-runtime guidance below is what the plan said, and §8 records what the code corrected.
+
 Every Python and Ruby application server already implements "boot once, serve many" and already
 speaks HTTP over a **Unix socket**:
 
@@ -1149,9 +1152,10 @@ section. So the runtime request is not "add a protocol"; it is **"supervise the 
 [backends.django]
 kind    = "upstream"
 origin  = "unix:/run/app.sock"
-command = "gunicorn myapp.wsgi --bind unix:/run/app.sock --workers 4"
+command = 'gunicorn myapp.wsgi --bind unix:/run/app.sock --workers 4'
+working_dir = '/srv/app'
 # readiness probe: volucer waits for the socket to answer before serving
-ready_timeout = "30s"
+ready_timeout_ms = 30000
 ```
 
 That is a new field on an existing backend rather than a new backend, and it is worth doing even
@@ -1167,6 +1171,12 @@ if Tier 2 lands, because it is also how a Node, Go or Rust origin gets supervise
 
 **Cost: S–M per runtime, and mostly in the supervisor, not the runtime.** And it is honest: HTTP
 framing is a real cost, and it is the cost every Rails and Django deployment already pays.
+
+**Built, and four of the plan's own details changed in the writing — see §8 for the full list.**
+The two worth stating here: the key is `ready_timeout_ms` (milliseconds, matching every other
+timeout in this configuration) rather than the `ready_timeout = "30s"` above, and the restart policy
+defaults to `on_failure` rather than to "always", because a `gunicorn` that exited **0** was stopped
+by somebody and starting it again would fight them.
 
 ### 7.2 Tier 2 — a native worker protocol for another language
 
@@ -1253,7 +1263,7 @@ progress on something earlier look bigger.
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | Reuses the in-flight request, so it does not touch the one-request invariant |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | The only descriptor consumer; may legitimately be "not yet" |
-| — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | Independent of 1–9 and can run in parallel. Highest value per unit of work in this document |
+| — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
 
 Steps 1–2 are the ones worth doing regardless of how much of the rest is ever built: a metrics
@@ -1372,6 +1382,43 @@ Note the shape of the end of the list. gRPC is **no longer one XL item behind a 
 items of S–M each, the first of which needs no schema, no worker and no new listener. The XL item
 that remains — work delivered to a busy worker — is real and is §10 item 8, but nothing above it
 depends on it.
+
+**The last independent row landed before step 7 rather than beside it, and the dependency column is
+what said so.** §7.1's supervision was listed as parallel work; step 7 lists it as a *dependency*,
+and that is the correct reading — tier A routes `application/grpc` to a Unix-socket origin, which is
+the same origin §7.1 teaches volucer to start and wait for. So it is done, and five things about it
+are worth more than the status line:
+
+- **The seam pattern's sixth instance, in its original form.** `UpstreamConfig::command` is read by
+  `Backend::from_config`, and nothing in the config layer, the supervisor's own tests, or the
+  front-end could see whether the dispatcher built a `Supervisor` at all. The end-to-end test went
+  through `Config::from_toml` → `Dispatcher` → `Server` → an HTTP request, and it **was falsified
+  properly**: making the construction a no-op fails it with `502 … the origin is unreachable`,
+  which is what an unsupervised `command` looks like in production.
+- **`restart` had to be an `Option`, and the first version was a serde default.** A default of
+  `on_failure` made an *unsupervised* origin indistinguishable from one that had asked to be
+  restarted, so the validator could not tell "this key does nothing" from "this key is set" — and it
+  rejected every plain `kind = "upstream"` file in the tree. Two tests caught it. The rule that
+  generalises: **a serde default and a validator that asks "was this key set" are not compatible**,
+  and only a test that parses the ordinary configuration sees the disagreement.
+- **Every path out of startup that fails has to kill the child itself.** On Unix `LifecycleGuard` is
+  a deliberate no-op — the process group only helps when *we* are signalled — so the readiness
+  timeout, where the process is running and `start` returns an error, would have left a `gunicorn`
+  holding the socket until the machine rebooted. The test that found it asserts the *port is free*
+  rather than counting processes, which would be platform-specific.
+- **`restart_limit` had to acquire a meaning it did not have.** Written as a total budget it is a
+  limit on a service's lifetime restarts: a crash once a week plus three consecutive failures would
+  abandon an otherwise healthy origin. A run that outlived `STABLE_RUN` (a minute) now resets the
+  count, which is what "consecutive" has to mean to be useful.
+- **A zero `restart_backoff_ms` is refused, and the refusal is conditional.** With a limit above one
+  it is a bounded-looking restart loop that runs back to back; with no restarts to space out it
+  describes nothing and is allowed. A validator that refused it unconditionally would be refusing a
+  harmless value, which is how a check earns being worked around.
+
+The other smaller correction is worth recording because it cost a test run: **a Windows path in a
+TOML basic string needs its backslashes doubled**, so `command = "…\Temp\x"` is a parse error at
+`\T`. The example configuration and the integration test both write paths in single quotes, which
+is the spelling that survives being copied to either platform.
 
 ---
 

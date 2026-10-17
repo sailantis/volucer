@@ -1456,10 +1456,9 @@ url = "redis://127.0.0.1:6379"
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
         let port = listener.local_addr().expect("address").port();
         drop(listener);
-        BackendConfig::Upstream(volucer_core::config::UpstreamConfig {
-            origin: format!("http://127.0.0.1:{port}"),
-            tls: None,
-        })
+        BackendConfig::Upstream(volucer_core::config::UpstreamConfig::new(format!(
+            "http://127.0.0.1:{port}"
+        )))
     }
 
     #[test]
@@ -1494,10 +1493,7 @@ url = "redis://127.0.0.1:6379"
         let config = config_with(
             &[(
                 "node",
-                BackendConfig::Upstream(volucer_core::config::UpstreamConfig {
-                    origin: "not-an-origin".to_string(),
-                    tls: None,
-                }),
+                BackendConfig::Upstream(volucer_core::config::UpstreamConfig::new("not-an-origin")),
             )],
             "node",
         );
@@ -1514,14 +1510,16 @@ url = "redis://127.0.0.1:6379"
         let config = config_with(
             &[(
                 "node",
-                BackendConfig::Upstream(volucer_core::config::UpstreamConfig {
-                    origin: "https://node.internal:8443".to_string(),
-                    tls: Some(volucer_core::config::UpstreamTlsConfig {
+                BackendConfig::Upstream({
+                    let mut upstream =
+                        volucer_core::config::UpstreamConfig::new("https://node.internal:8443");
+                    upstream.tls = Some(volucer_core::config::UpstreamTlsConfig {
                         ca: Some(std::path::PathBuf::from(
                             "/definitely/not/a/ca-certificate.pem",
                         )),
                         sni: None,
-                    }),
+                    });
+                    upstream
                 }),
             )],
             "node",

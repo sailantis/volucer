@@ -2198,7 +2198,176 @@ pub struct UpstreamConfig {
     /// handshake for it to describe.
     #[serde(default)]
     pub tls: Option<UpstreamTlsConfig>,
+
+    /// Command line that starts the origin, e.g.
+    /// `gunicorn myapp.wsgi --bind unix:/run/app.sock`.
+    ///
+    /// **Absent means the origin is somebody else's process**, which is what an upstream was
+    /// before this key existed and remains the common case: nginx, php-fpm, a Node service under
+    /// systemd. When it is present volucer starts the process, waits for the origin to answer,
+    /// restarts it if it dies, and makes sure it does not outlive the server.
+    ///
+    /// This is the whole of what a runtime like Django or Rails needs to run behind volucer —
+    /// see `docs/plugins.md` §7.1. It is deliberately **not** a `kind = "python"` backend: HTTP
+    /// framing is a real cost and it is the cost every Rails and Django deployment already pays,
+    /// so there is nothing for a new backend kind to do that this key does not.
+    ///
+    /// Split and resolved by the same tokenizer a worker's `command` uses
+    /// ([`crate::program::split_command`]), which is deliberately not a shell: no variables, no
+    /// globs, no operators. A deployment that needs shell syntax writes a script and names it.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// Working directory for the started process.
+    ///
+    /// Defaults to the process's own, the same rule [`WorkerConfig::working_dir`] follows. A
+    /// Django or Rails app almost always needs this set — `manage.py` and `config.ru` are found
+    /// relative to it — so a supervisor that guessed would start the process somewhere the
+    /// application cannot boot, with an error the operator would read as a volucer bug.
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+
+    /// Extra environment variables for the started process.
+    ///
+    /// The same key a worker has, and it is how a Django `DJANGO_SETTINGS_MODULE` or a Rails
+    /// `RAILS_ENV` is passed without a wrapper script. An `origin` naming a unix socket is
+    /// **not** overridden here: the socket path is the configuration's, and letting the
+    /// environment move it would point the supervisor at one address and the client at another.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// When to restart the started process after it exits.
+    ///
+    /// **An `Option` rather than a defaulted enum, and this is the one place in this struct where
+    /// that is deliberate.** A default of [`UpstreamRestart::OnFailure`] would make an origin with
+    /// *no* command — the common case, somebody else's process — indistinguishable from one that
+    /// asked to be restarted, so `validate` could not tell "this key does nothing" from "this key is
+    /// set". Absent means `on_failure` for a supervised origin and is refused outright for an
+    /// unsupervised one; [`UpstreamConfig::restart_policy`] is the resolution, in one place.
+    #[serde(default)]
+    pub restart: Option<UpstreamRestart>,
+
+    /// How many consecutive restarts to attempt before giving up, per start attempt.
+    ///
+    /// **A limit rather than a loop, because a command that cannot start must not become a busy
+    /// loop.** An origin whose command exits instantly — a typo in an import, a missing
+    /// virtualenv — fails in milliseconds, and an unbounded restarter would spin a core and fill
+    /// the log while the backend answers nothing. `0` means never restart, which is
+    /// [`UpstreamRestart::Never`] said with a number.
+    #[serde(default = "default_upstream_restart_limit")]
+    pub restart_limit: u32,
+
+    /// How long to wait before each restart, and it is a *base* rather than a fixed delay.
+    ///
+    /// It doubles per consecutive failure, up to [`UPSTREAM_RESTART_BACKOFF_CAP_MS`]. A fixed
+    /// delay is either short enough to hammer a service that is genuinely broken or long enough
+    /// to turn a one-second blip into ten seconds of 502s; doubling is the shape that is neither.
+    #[serde(default = "default_upstream_restart_backoff_ms")]
+    pub restart_backoff_ms: u64,
+
+    /// How long the origin has to answer before startup gives up.
+    ///
+    /// The readiness gate, and the reason this matters more for a supervised origin than for any
+    /// other backend: a Django app under `gunicorn` is not listening the instant it is spawned —
+    /// it imports, it connects to its database, it may migrate. Without this the first requests
+    /// after a deploy get 502s from an origin that is merely still booting, which is the failure
+    /// the plan calls out by name.
+    ///
+    /// Longer than the CGI pool's ten seconds because the reason it exists is a boot that takes
+    /// seconds rather than milliseconds: Django and Rails both do real work before they listen.
+    #[serde(default = "default_upstream_ready_timeout_ms")]
+    pub ready_timeout_ms: u64,
 }
+
+/// When a supervised upstream origin is started again after it exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamRestart {
+    /// Never. The process is started once, and if it exits the backend answers 502 from then on.
+    Never,
+    /// Restart only after a failure, which is any exit status other than a clean zero.
+    ///
+    /// The default for a supervised origin, and deliberately *not* "always": a `gunicorn` that
+    /// received `SIGTERM` and exited 0 has been shut down by somebody, and starting it again would
+    /// fight the operator. A process that died on an uncaught exception exited non-zero and is
+    /// exactly the case this is for.
+    OnFailure,
+    /// Restart whatever the exit status.
+    Always,
+}
+
+impl UpstreamRestart {
+    /// The name this is written as in configuration.
+    ///
+    /// So a message about it reads as the key the operator typed rather than as Rust's `Debug`:
+    /// `restart = "on_failure"` and `OnFailure` are the same value and only one of them is
+    /// searchable in the file that set it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpstreamRestart::Never => "never",
+            UpstreamRestart::OnFailure => "on_failure",
+            UpstreamRestart::Always => "always",
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl UpstreamConfig {
+    /// An origin that is somebody else's process, with no supervisor keys set.
+    ///
+    /// The shape a programmatic configuration wants and the shape every fixture in this tree builds:
+    /// an origin, and nothing that describes a process nobody starts. `Config::from_toml` reaches it
+    /// too — every supervisor key is absent, which is what `validate` requires without a `command` —
+    /// so there is one answer to "what does an unsupervised origin look like" rather than one per
+    /// call site.
+    pub fn new(origin: impl Into<String>) -> Self {
+        UpstreamConfig {
+            origin: origin.into(),
+            tls: None,
+            command: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            restart: None,
+            restart_limit: default_upstream_restart_limit(),
+            restart_backoff_ms: default_upstream_restart_backoff_ms(),
+            ready_timeout_ms: default_upstream_ready_timeout_ms(),
+        }
+    }
+
+    /// When this origin's process is restarted.
+    ///
+    /// The one resolution of [`UpstreamConfig::restart`]'s `None`, so the supervisor and `check`
+    /// cannot disagree about what an absent key means. Only meaningful when `command` is set, which
+    /// `Config::validate` enforces.
+    pub fn restart_policy(&self) -> UpstreamRestart {
+        self.restart.unwrap_or(UpstreamRestart::OnFailure)
+    }
+}
+
+fn default_upstream_restart_limit() -> u32 {
+    3
+}
+
+fn default_upstream_restart_backoff_ms() -> u64 {
+    1_000
+}
+
+fn default_upstream_ready_timeout_ms() -> u64 {
+    30_000
+}
+
+/// The longest a restart backoff grows to.
+///
+/// A cap rather than unbounded doubling because the point of the backoff is to stop *hammering*,
+/// not to stop *recovering*: a twenty-minute delay turns a transient failure into an outage
+/// nobody connects to it. One minute is longer than any restart that is going to work and shorter
+/// than an operator's patience.
+pub const UPSTREAM_RESTART_BACKOFF_CAP_MS: u64 = 60_000;
 
 /// How an `https:` origin is verified.
 ///
@@ -3695,6 +3864,90 @@ impl Config {
                 // already refused the combination that does not. `origin` is kept in scope rather
                 // than discarded so the rule is readable here: `sni` and `ca` are only reachable
                 // for a `https:` origin.
+
+                // The supervisor's three knobs, checked here because every one of them is a
+                // setting whose wrong value is silent rather than loud at runtime.
+                if let Some(command) = &u.command {
+                    if command.trim().is_empty() {
+                        return bad(format!(
+                            "backends.{name}.command is empty; remove the key to let this origin be \
+                             somebody else's process, or name the program that serves it"
+                        ));
+                    }
+                    if u.restart == Some(UpstreamRestart::Never) && u.restart_limit > 0 {
+                        // Not contradictory — `never` wins — but the pair says two different things,
+                        // which is how an operator comes to believe a limit is in force when no
+                        // restart will ever happen.
+                        return bad(format!(
+                            "backends.{name} sets restart = \"never\" and restart_limit = {}, which \
+                             cannot both be meant; remove restart_limit or say restart = \"on_failure\"",
+                            u.restart_limit
+                        ));
+                    }
+                    if u.restart_limit > 0 && u.restart_backoff_ms == 0 {
+                        // A zero backoff with a limit above 1 is a restart loop that looks bounded
+                        // and is not: `restart_limit` counts *consecutive* failures, and a command
+                        // that exits instantly with no delay between attempts is a spin for as long
+                        // as the limit is high.
+                        return bad(format!(
+                            "backends.{name}.restart_backoff_ms is 0, so {} restarts of an origin \
+                             that exits immediately would run back to back with nothing between them",
+                            u.restart_limit
+                        ));
+                    }
+                    if u.restart_backoff_ms > UPSTREAM_RESTART_BACKOFF_CAP_MS {
+                        // Refused rather than silently capped, so a deployment that wrote an hour
+                        // learns that it is an hour *because this limit exists* rather than
+                        // discovering a minute at runtime.
+                        return bad(format!(
+                            "backends.{name}.restart_backoff_ms is {}, above the {} ms cap; the \
+                             delay doubles per failure, and a first delay longer than the cap would \
+                             be reduced by the doubling rather than grow from it",
+                            u.restart_backoff_ms, UPSTREAM_RESTART_BACKOFF_CAP_MS
+                        ));
+                    }
+                    if u.ready_timeout_ms == 0 {
+                        // The readiness gate is the whole point of supervising an origin here —
+                        // see `UpstreamConfig::ready_timeout_ms`. Zero would mean "do not wait",
+                        // which is the 502-on-first-request this key exists to prevent.
+                        return bad(format!(
+                            "backends.{name}.ready_timeout_ms is 0, so startup would not wait for \
+                             the origin to answer at all; that is the 502 the readiness gate exists \
+                             to prevent"
+                        ));
+                    }
+                } else {
+                    // The three supervisor keys without a `command` describe a process nobody
+                    // starts. Each would be silently ignored, and the operator would believe they
+                    // had configured a supervisor.
+                    let mut orphans: Vec<&str> = Vec::new();
+                    if u.working_dir.is_some() {
+                        orphans.push("working_dir");
+                    }
+                    if !u.env.is_empty() {
+                        orphans.push("env");
+                    }
+                    if u.restart.is_some() {
+                        orphans.push("restart");
+                    }
+                    if u.restart_limit != default_upstream_restart_limit() {
+                        orphans.push("restart_limit");
+                    }
+                    if u.restart_backoff_ms != default_upstream_restart_backoff_ms() {
+                        orphans.push("restart_backoff_ms");
+                    }
+                    if u.ready_timeout_ms != default_upstream_ready_timeout_ms() {
+                        orphans.push("ready_timeout_ms");
+                    }
+                    if !orphans.is_empty() {
+                        return bad(format!(
+                            "backends.{name} sets {} but no `command`, so there is no process for \
+                             them to describe; add the command that starts the origin, or remove \
+                             them",
+                            orphans.join(", ")
+                        ));
+                    }
+                }
 
                 if let Some(tls) = origin.tls() {
                     if let Some(ca) = &tls.ca {
@@ -8118,18 +8371,135 @@ binary = "/usr/bin/php-cgi"
     #[test]
     fn the_removed_keys_of_other_backends_are_still_refused() {
         // `deny_unknown_fields`, checked for the new arm specifically: a `kind = "upstream"` file
-        // carrying `command` or `workers` is a copy-paste from another backend, and it should be a
+        // carrying `workers` or `binary` is a copy-paste from another backend, and it should be a
         // parse error rather than a key that is silently ignored.
-        for key in [
-            "command = \"php worker.php\"",
-            "workers = 4",
-            "binary = \"/usr/bin/php\"",
-        ] {
+        //
+        // `command` is deliberately **not** in this list any more: §7.1 made it the key that
+        // supervises the origin, so it is this backend's own. What it must not do is arrive without
+        // anything it describes, which is the test below.
+        for key in ["workers = 4", "binary = \"/usr/bin/php\""] {
             let text = upstream_config(&format!("origin = \"http://127.0.0.1:3000\"\n{key}"));
             assert!(
                 Config::from_toml(&text).is_err(),
                 "{key} must not be accepted by an upstream backend"
             );
         }
+    }
+
+    #[test]
+    fn a_supervisor_key_without_a_command_is_refused_rather_than_ignored() {
+        // The failure this prevents is silent rather than loud: each of these keys describes a
+        // process nobody starts, so the deployment would believe it had configured a supervisor.
+        //
+        // `.validate()` and not merely `.from_toml()`: `deny_unknown_fields` catches a *misspelled*
+        // key, which says nothing about whether a correct key is doing anything. Only validation can
+        // answer that, and a test without it would pass against a validator that never ran.
+        for key in [
+            "working_dir = \"/srv/app\"",
+            "restart = \"always\"",
+            "restart_limit = 9",
+            "restart_backoff_ms = 250",
+            "ready_timeout_ms = 1000",
+        ] {
+            let text = upstream_config(&format!("origin = \"http://127.0.0.1:3000\"\n{key}"));
+            let err = Config::from_toml(&text)
+                .expect("the file parses")
+                .validate()
+                .expect_err(&format!("{key} has nothing to describe"));
+            assert!(err.to_string().contains("no `command`"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_supervised_origin_that_is_configured_sensibly_is_accepted() {
+        // The control for the test above: the same keys *with* a command must be accepted, or the
+        // rule would be refusing the feature rather than the mistake.
+        Config::from_toml(&upstream_config(
+            "origin = \"http://127.0.0.1:3000\"\ncommand = \"gunicorn app.wsgi\"\n\
+             working_dir = \"/srv/app\"\nrestart = \"always\"\nrestart_limit = 9\n\
+             restart_backoff_ms = 250\nready_timeout_ms = 1000",
+        ))
+        .expect("the file parses")
+        .validate()
+        .expect("a supervised origin with all its keys set is the whole configuration");
+    }
+
+    #[test]
+    fn a_supervisor_value_that_would_spin_or_never_wait_is_refused() {
+        let with = |extra: &str| {
+            Config::from_toml(&upstream_config(&format!(
+                "origin = \"http://127.0.0.1:3000\"\ncommand = \"gunicorn app.wsgi\"\n{extra}"
+            )))
+            .expect("the file parses")
+            .validate()
+        };
+
+        // A zero backoff with a restart limit above one is a bounded-looking restart loop that
+        // runs back to back: `restart_limit` counts *consecutive* failures.
+        let err = with("restart_backoff_ms = 0").expect_err("a zero backoff is a spin");
+        assert!(err.to_string().contains("restart_backoff_ms"), "{err}");
+
+        // The same zero is fine when no restart will happen, because there is nothing to space out.
+        // Without this the rule would be refusing a harmless value, which is how a check earns being
+        // worked around.
+        with("restart = \"never\"\nrestart_limit = 0\nrestart_backoff_ms = 0")
+            .expect("a zero backoff beside no restarts describes nothing");
+
+        // A zero readiness gate is "do not wait for the origin", which is the 502 the key exists to
+        // prevent.
+        let err = with("ready_timeout_ms = 0").expect_err("a zero gate is not a gate");
+        assert!(err.to_string().contains("ready_timeout_ms"), "{err}");
+
+        // `never` and a limit say two different things, and the operator believes the limit.
+        let err = with("restart = \"never\"\nrestart_limit = 5").expect_err("contradictory");
+        assert!(err.to_string().contains("restart_limit"), "{err}");
+
+        // Above the cap the delay would be *reduced* by the doubling rather than grow from it.
+        let err = with("restart_backoff_ms = 600001").expect_err("above the cap");
+        assert!(err.to_string().contains("cap"), "{err}");
+
+        // And a command that is only whitespace is not a command.
+        let err = Config::from_toml(&upstream_config(
+            "origin = \"http://127.0.0.1:3000\"\ncommand = \"   \"",
+        ))
+        .expect("the file parses")
+        .validate()
+        .expect_err("whitespace is not a command");
+        assert!(err.to_string().contains("command"), "{err}");
+    }
+
+    #[test]
+    fn a_supervised_origin_defaults_to_restarting_on_failure_and_waiting_thirty_seconds() {
+        // The defaults are the interesting part: `always` would fight an operator who stopped the
+        // service, `never` would leave a crashed origin dead for ever, and a short gate would race a
+        // Django boot.
+        let config = Config::from_toml(&upstream_config(
+            "origin = \"http://127.0.0.1:3000\"\ncommand = \"gunicorn app.wsgi\"",
+        ))
+        .expect("parses");
+        let Some(BackendConfig::Upstream(upstream)) = config.backends.get("node") else {
+            panic!("the backend is an upstream");
+        };
+        assert_eq!(upstream.restart_policy(), UpstreamRestart::OnFailure);
+        assert_eq!(upstream.restart_limit, 3);
+        assert_eq!(upstream.restart_backoff_ms, 1_000);
+        assert_eq!(upstream.ready_timeout_ms, 30_000);
+
+        // An origin with no command keeps the same numbers while meaning none of them, which is why
+        // `validate` refuses them to be *set* rather than refusing the defaults.
+        let plain = Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\""))
+            .expect("an unsupervised origin still parses");
+        plain
+            .validate()
+            .expect("and with no supervisor keys it is valid, which is the regression this covers");
+        let Some(BackendConfig::Upstream(upstream)) = plain.backends.get("node") else {
+            panic!("the backend is an upstream");
+        };
+        assert!(upstream.command.is_none());
+        assert!(
+            upstream.restart.is_none(),
+            "an absent key must stay absent, or `validate` could not tell it from one that is set"
+        );
+        assert!(upstream.working_dir.is_none());
     }
 }

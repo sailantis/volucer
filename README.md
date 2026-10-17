@@ -81,7 +81,7 @@ itself. Several `Host` names can be served from one process, each with its own d
 | `worker`    | Persistent PHP process speaking volucer's framed protocol over pipes | No — the application clears its own request scope | all                          |
 | `external`  | An already-running `php-fpm` (systemd-managed)                       | Yes, by php-fpm's SAPI                            | Linux, macOS                 |
 | `spawn_cgi` | N `php-cgi` processes on N ports                                     | Yes, by php-cgi's SAPI                            | all, **required on Windows** |
-| `upstream`  | An HTTP origin that owns its own HTTP loop (Node, ASGI, Go)          | n/a — the origin's runtime is its own business     | all                          |
+| `upstream`  | An HTTP origin that owns its own HTTP loop (Node, ASGI, Go, Python, Ruby) | n/a — the origin's runtime is its own business     | all                          |
 
 A fourth kind, `spawn_fpm`, was accepted by the parser and refused at startup — `version`
 advertised it while `Backend::from_config` rejected it. It is **gone** rather than implemented:
@@ -151,6 +151,64 @@ What is different from the CGI-shaped backends, and worth knowing before deployi
 - **WebSockets are not built.** The connection pool keeps the capability — `hyper-util`'s client can
   hand a connection back after an upgrade — but the hop-by-hop filter drops `Connection` and
   `Upgrade`, which is what a WebSocket handshake needs to survive. SSE works; a WebSocket does not.
+
+### Supervising an origin: running Django, Rails, Node or Go behind volucer
+
+An `upstream` origin can be **volucer's process** rather than systemd's, which is what makes a
+Python or Ruby application runnable behind volucer without a new protocol or a new backend kind:
+
+```toml
+[backends.django]
+kind = "upstream"
+origin = "unix:/run/app.sock"
+command = 'gunicorn myapp.wsgi --bind unix:/run/app.sock --workers 4'
+working_dir = '/srv/app'
+ready_timeout_ms = 30000
+```
+
+Every Python and Ruby application server already implements *boot once, serve many* and already
+speaks HTTP over a unix socket — `gunicorn --preload`, uvicorn, hypercorn, granian; Puma's
+`preload_app!`, Falcon, Pitchfork, Unicorn. Django's boot-once handle is `get_wsgi_application()`
+and Rails' is `Rails.application`, a Rack app whose `call(env)` returns `[status, headers, body]`.
+So there is deliberately **no `kind = "python"`**: HTTP framing is a real cost and it is the cost
+every Rails and Django deployment already pays. What was missing was supervision, not a protocol.
+
+What `command` adds, and each is a way for this to be quietly absent:
+
+| Key | Default | Why it exists |
+| --- | --- | --- |
+| `command` | absent — the origin is somebody else's process | Start it, and make it volucer's to stop |
+| `working_dir` | the server's own | `manage.py` and `config.ru` are found relative to it |
+| `env` | empty | `DJANGO_SETTINGS_MODULE`, `RAILS_ENV` — without a wrapper script |
+| `restart` | `on_failure` | A `gunicorn` that exited **0** was stopped by somebody; restarting it fights them |
+| `restart_limit` | `3` | A command that cannot start exits in milliseconds — a limit, not a loop |
+| `restart_backoff_ms` | `1000`, doubling to a 60 s cap | A fixed delay is either a hammer or an outage |
+| `ready_timeout_ms` | `30000` | The readiness gate; without it a deploy is a burst of 502s from an origin still booting |
+
+Four things that are decisions rather than defaults:
+
+- **The readiness gate is inside startup.** `volucer` does not begin serving until the origin
+  accepts a connection, so the first request after a deploy is not a 502. The probe connects to the
+  origin's own address — the same one the client will use — and no TLS handshake is attempted: an
+  origin listening for TLS answers a TCP connection, and verifying a certificate there would be
+  testing `[backends.<n>.tls]` rather than the origin's start.
+- **A command that cannot start is a startup failure, not a timeout.** A program that does not exist
+  is reported by name before anything is spawned; a process that exits immediately reports its exit
+  status rather than waiting out `ready_timeout_ms`, because "slow" is what an operator would read.
+- **`restart_limit` counts *consecutive* failures**, not a lifetime budget. An origin that stayed up
+  a minute resets the count — otherwise a service that crashes once a week would be abandoned after
+  three weeks of otherwise perfect service.
+- **An orphan is worse than a crash.** The process is adopted into the same job object (Windows) or
+  process group (Unix) the CGI pool uses, and every path out of startup that does not return a
+  running supervisor kills the child it started — including the readiness timeout, where the process
+  *is* running and would otherwise hold the socket. On Unix the lifecycle guard alone is a no-op,
+  so relying on it there would be relying on nothing.
+- **The origin's own `stdout` and `stderr` are drained and logged.** `gunicorn` puts its access log
+  on one and its tracebacks on the other, so dropping either drops the half of the story that
+  explains a 502 it caused — and a process whose pipe fills up blocks for ever on its next write.
+
+Supervising an origin is also how a Node, Go or Rust service gets run without systemd, which is why
+it is worth having even where Tier 2 of `docs/plugins.md` §7.2 lands.
 
 `spawn_cgi` is implemented: the pool starts the processes, assigns ports, health-checks each
 slot, restarts one that died, and recycles on `max_requests` — the equivalent of php-fpm's
