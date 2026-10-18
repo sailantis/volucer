@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -123,6 +123,13 @@ impl Format {
 /// same call that produces it.
 pub struct AccessLog {
     format: Format,
+    /// Where the file lives, so it can be reopened without the configuration.
+    ///
+    /// **Held here rather than passed down from the reload**, because a reopen is a property of *this
+    /// log*, not of the file on disk: `SIGHUP` closes and reopens the same path whether or not the
+    /// deployment edited anything, which is what makes `logrotate` work. The reload has no reason to
+    /// know a path, and giving it one would be a second place the path could be wrong.
+    path: Option<PathBuf>,
     sink: Mutex<Sink>,
     /// Set once, so a broken sink warns once rather than per request.
     ///
@@ -132,12 +139,21 @@ pub struct AccessLog {
     reported: AtomicBool,
 }
 
-/// Where records go: a file, or nowhere.
+/// Where records go: a file, nowhere on purpose, or nowhere because something failed.
+///
+/// **`Nowhere` and `Broken` are separate variants rather than a `Broken(String)` whose meaning
+/// depends on whether logging is configured**, because the two answer opposite questions at a
+/// reopen: a disabled log must *stay* disabled, and a broken one must be retried. An earlier version
+/// carried the distinction in `reported` instead, and `is_enabled` could not tell them apart — which
+/// made "reopen on `SIGHUP`" either a reopen that resurrected a disabled log or one that never
+/// retried a broken one, depending on which the operator would rather have had.
 enum Sink {
     File(BufWriter<File>),
-    /// Configured, but the file could not be opened. Records are dropped until a reload fixes it,
+    /// Configured, but the file could not be opened. Records are dropped until a reopen fixes it,
     /// and the reason is reported once.
     Broken(String),
+    /// Logging is not configured at all. Nothing to reopen, ever.
+    Nowhere,
 }
 
 impl AccessLog {
@@ -150,13 +166,14 @@ impl AccessLog {
     /// certificate, because a certificate is required for correctness and a log is not.
     #[must_use]
     pub fn open(path: &Path, format: Format) -> Self {
-        let sink = match File::options().create(true).append(true).open(path) {
-            Ok(file) => Sink::File(BufWriter::new(file)),
-            Err(err) => Sink::Broken(format!("{}: {err}", path.display())),
+        let sink = match Self::open_sink(path) {
+            Ok(file) => Sink::File(file),
+            Err(reason) => Sink::Broken(reason),
         };
         let broken = matches!(sink, Sink::Broken(_));
         let log = Self {
             format,
+            path: Some(path.to_path_buf()),
             sink: Mutex::new(sink),
             reported: AtomicBool::new(false),
         };
@@ -176,10 +193,92 @@ impl AccessLog {
     pub fn disabled() -> Self {
         Self {
             format: Format::Combined,
-            sink: Mutex::new(Sink::Broken(String::new())),
+            // No path, so `reopen` has nothing to do: this is the one state a `SIGHUP` must not
+            // change, because a deployment that configured no access log must not acquire one.
+            path: None,
+            sink: Mutex::new(Sink::Nowhere),
             // Already reported as far as anything downstream cares: a disabled log is not a fault.
             reported: AtomicBool::new(true),
         }
+    }
+
+    /// Close the current file and open the path again, for `logrotate`.
+    ///
+    /// # Why this exists, and why it is not optional
+    ///
+    /// `logrotate` renames the log and tells the process to reopen. A process that does not, keeps
+    /// writing to the **unlinked inode for ever**: the file it was writing to has a new name that no
+    /// longer receives anything, a fresh empty file sits at the old path, and `lsof` shows one
+    /// deleted file holding a deployment's whole log. Nothing about it is visible from the server's
+    /// side — every write succeeds — so it is discovered when somebody reads the log and finds it
+    /// empty, which is during an incident.
+    ///
+    /// It is a `SIGHUP` action for the reason nginx does the same: the signal already means "re-read
+    /// the world", and a rotation is a change in the world that requires re-reading. The failure
+    /// message this module has always printed says "fix the path and send SIGHUP", so the promise
+    /// was made before the feature was.
+    ///
+    /// **Three states, three answers**, which is what [`Sink::Nowhere`] exists for:
+    ///
+    /// - a file is open → flush it, close it, open the path again;
+    /// - the sink is broken → try the path again, because a `logrotate` script that ran before a
+    ///   directory was created is exactly the case an operator retries with a signal;
+    /// - logging is not configured → do nothing, because a deployment that asked for no log must not
+    ///   get one.
+    ///
+    /// Returns whether a file is open afterwards, so a caller can report it.
+    pub fn reopen(&self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*sink, Sink::Nowhere) {
+            return false;
+        }
+
+        // Flushed before the handle is dropped, so the last records reach the file that is about to be
+        // rotated rather than being lost with the buffer. `BufWriter`'s own `Drop` would flush too,
+        // but its errors are swallowed — and a flush that failed is the one thing this method is in a
+        // position to notice.
+        let flushed = match &mut *sink {
+            Sink::File(file) => file.flush().is_ok(),
+            _ => false,
+        };
+
+        match Self::open_sink(path) {
+            Ok(file) => {
+                *sink = Sink::File(file);
+                // Reset, so a *later* failure is reported once again. Without this a log that broke
+                // once, was repaired by a rotation, and broke again would be silent from the second
+                // time on — the warning budget having been spent on the first.
+                self.reported.store(false, Ordering::SeqCst);
+                true
+            }
+            Err(reason) => {
+                // The old handle is already closed, which is the honest outcome: the file it named was
+                // most likely renamed away, and keeping it open would go on writing into an unlinked
+                // inode — the exact failure this method exists to end. So the sink becomes broken and
+                // the operator is told, once.
+                *sink = Sink::Broken(reason);
+                self.reported.store(false, Ordering::SeqCst);
+                drop(sink);
+                self.report_once();
+                flushed
+            }
+        }
+    }
+
+    /// Open the file at `path`, or say why not.
+    ///
+    /// One place, so the startup path and [`AccessLog::reopen`] cannot disagree about the options —
+    /// an `open` here that forgot `append` would truncate a log on every rotation.
+    fn open_sink(path: &Path) -> Result<BufWriter<File>, String> {
+        File::options()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(BufWriter::new)
+            .map_err(|err| format!("{}: {err}", path.display()))
     }
 
     /// Whether this log writes anywhere.
@@ -231,12 +330,15 @@ impl AccessLog {
         }
         let reason = match &*self.sink.lock().unwrap_or_else(|e| e.into_inner()) {
             Sink::Broken(reason) => reason.clone(),
-            Sink::File(_) => return,
+            // A disabled log and a working one both have nothing to say. `Nowhere` reaching this
+            // point would mean a caller reported a log nobody asked for.
+            Sink::File(_) | Sink::Nowhere => return,
         };
         tracing::error!(
             reason = %reason,
             "the access log could not be written and requests are being served without it; this is \
-             reported once, not per request. Fix the path and send SIGHUP, or restart"
+             reported once, not per request. Fix the path and send SIGHUP, which closes and reopens \
+             it, or restart"
         );
     }
 }
@@ -246,10 +348,12 @@ impl std::fmt::Debug for AccessLog {
         let sink = match &*self.sink.lock().unwrap_or_else(|e| e.into_inner()) {
             Sink::File(_) => "file",
             Sink::Broken(_) => "broken",
+            Sink::Nowhere => "nowhere",
         };
         formatter
             .debug_struct("AccessLog")
             .field("format", &self.format)
+            .field("path", &self.path)
             .field("sink", &sink)
             .finish()
     }
@@ -678,5 +782,101 @@ mod tests {
         assert_eq!(Format::parse("clf"), None);
         assert_eq!(Format::parse(""), None);
         assert_eq!(Format::NAMES.len(), 2);
+    }
+
+    /// A reopen follows a rotation: the records after it land in the file at the path, not in the
+    /// renamed inode.
+    ///
+    /// **The defect this pins is the one `logrotate` produces**, and it is silent from the server's
+    /// side: every write succeeds into a file nobody will read again. So the assertion is on the
+    /// *new* path's contents, and the rotated file's line count is the control — a reopen that did
+    /// nothing would put the second record in the rotated file and leave the fresh one empty.
+    #[test]
+    fn a_reopen_follows_a_rotation_rather_than_writing_to_the_renamed_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "volucer-observe-reopen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the directory");
+        let path = dir.join("access.log");
+
+        let log = AccessLog::open(&path, Format::Combined);
+        assert!(log.is_enabled(), "the directory is writable");
+        log.record(&record());
+        log.flush();
+
+        // `logrotate`'s rename step. The server now holds a handle to a file called `access.log.1`.
+        let rotated = dir.join("access.log.1");
+        std::fs::rename(&path, &rotated).expect("rename the log");
+
+        assert!(
+            log.reopen(),
+            "the path is writable, so a reopen must succeed"
+        );
+        log.record(&record());
+        log.flush();
+
+        let rotated_text = std::fs::read_to_string(&rotated).expect("the rotated file is readable");
+        assert_eq!(
+            rotated_text.lines().count(),
+            1,
+            "exactly the record written before the rotation: {rotated_text}"
+        );
+        let fresh = std::fs::read_to_string(&path)
+            .expect("the reopened path exists, which is the whole point of a reopen");
+        assert_eq!(
+            fresh.lines().count(),
+            1,
+            "and the record after it lands in the new file: {fresh}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A broken log is retried by a reopen, which is what makes `logrotate` repair a missing
+    /// directory.
+    #[test]
+    fn a_reopen_retries_a_path_that_could_not_be_opened() {
+        let dir = std::env::temp_dir().join(format!(
+            "volucer-observe-repair-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("access.log");
+
+        // The directory does not exist yet, so the log is broken.
+        let log = AccessLog::open(&path, Format::Combined);
+        assert!(!log.is_enabled());
+        log.record(&record());
+
+        // The operator creates it — which is what the failure message tells them to do — and rotates.
+        std::fs::create_dir_all(&dir).expect("create the directory");
+        assert!(
+            log.reopen(),
+            "a reopen must retry rather than stay broken for ever"
+        );
+        assert!(log.is_enabled(), "and the sink must now be a file");
+        log.record(&record());
+        log.flush();
+
+        let text = std::fs::read_to_string(&path).expect("the record reached the new file");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disabled log stays disabled across a reopen.
+    ///
+    /// The state `Sink::Nowhere` exists for: a deployment that configured no access log must not
+    /// acquire one because somebody sent a signal. Without the separate variant this is the case
+    /// that would quietly start logging — the same shape of mistake as a trust list that began
+    /// believing headers after a reload.
+    #[test]
+    fn a_reopen_does_not_resurrect_a_disabled_log() {
+        let log = AccessLog::disabled();
+        assert!(!log.reopen(), "there is no path to reopen");
+        assert!(!log.is_enabled(), "and it must still write nowhere");
     }
 }

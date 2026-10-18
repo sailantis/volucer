@@ -1219,6 +1219,7 @@ fn serve(
         fastcgi.as_ref().map(|l| l.shutdown_handle()),
         Arc::clone(&registry),
         tls_state.clone(),
+        Arc::clone(&observe),
         path.to_path_buf(),
         document_root_flag.map(Path::to_path_buf),
         front_controller_flag.map(str::to_string),
@@ -1627,6 +1628,16 @@ struct Reloader {
     /// keeps the reload's decision from drifting away from the serving path. The engine itself
     /// cannot be held here — `AcmeState` is not `Sync`, so it cannot move into the signal thread.
     tls: Option<Arc<volucer_http::SniResolver>>,
+    /// Request identity and the access log, so a `SIGHUP` closes and reopens the log.
+    ///
+    /// **Held as the same `Arc` both front-ends carry**, which is what makes the reopen visible to
+    /// them: the sink lives behind a `Mutex` inside this value, so reopening moves the file every
+    /// front-end is writing through rather than installing a second log they do not read.
+    ///
+    /// A `SIGHUP` action rather than a separate signal because that is nginx's convention and the
+    /// one `logrotate`'s default `postrotate` script sends. See
+    /// [`volucer_observe::access_log::AccessLog::reopen`].
+    observe: Arc<volucer_observe::Observability>,
 }
 
 impl Reloader {
@@ -1642,6 +1653,26 @@ impl Reloader {
     /// operator who edited one learns it here rather than from behaviour.
     #[cfg_attr(windows, allow(dead_code))]
     fn reload(&self) {
+        // **The access log is reopened first, and unconditionally — before the file is even read.**
+        //
+        // Before, because the two are independent: a rotation is a change to the *filesystem*, and a
+        // configuration that fails to parse must not leave the log writing into a renamed inode for
+        // another day. An operator who sends a `SIGHUP` after `logrotate` and edits the file in the
+        // same breath would otherwise get the error they can act on and not the repair they needed.
+        //
+        // Unconditionally, because a reopen is idempotent and cheap (one close, one open): asking
+        // "did the path change" would need the old configuration, and the answer this must give for
+        // an *unchanged* path is exactly the one `logrotate` requires.
+        //
+        // No branch on the result here: `false` means "no file is open", which is either a
+        // deployment with no access log — ordinary, and not worth a line on every reload — or a
+        // reopen that failed, which `AccessLog::reopen` has already reported at `error` with the
+        // reason. A summary here would be the second line saying the same thing, or a misleading
+        // one.
+        if self.observe.reopen_access_log() {
+            tracing::info!("access log reopened for a rotation");
+        }
+
         let config = match Config::load(&self.config_path) {
             Ok(config) => config,
             Err(err) => {
@@ -1717,6 +1748,7 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
         "a reload does not change: [server.rate_limit] (the buckets are live state, so replacing the policy would reset every caller's allowance)",
+        "a reload does not change: [server.access_log] path, format and request_id_header (SIGHUP closes and reopens the log a rotation moved, but the destination is chosen at startup)",
     ]
 }
 
@@ -1748,6 +1780,7 @@ fn install_shutdown_handler(
     shutdown: Option<volucer_server::ShutdownHandle>,
     registry: Arc<volucer_http::Registry>,
     tls: Option<Arc<volucer_http::SniResolver>>,
+    observe: Arc<volucer_observe::Observability>,
     config_path: PathBuf,
     document_root_flag: Option<PathBuf>,
     front_controller_flag: Option<String>,
@@ -1781,6 +1814,7 @@ fn install_shutdown_handler(
         front_controller_flag,
         registry,
         tls,
+        observe,
     };
 
     if let Err(err) = signals::install(stop, reloader) {
@@ -2582,6 +2616,7 @@ document_root = "/from/file"
             "min_version",
             "server.proxy",
             "server.rate_limit",
+            "server.access_log",
         ] {
             assert!(
                 joined.contains(required),

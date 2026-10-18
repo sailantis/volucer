@@ -124,6 +124,18 @@ impl Observability {
         self.id_header.as_deref()
     }
 
+    /// Close and reopen the access log, for `logrotate`. See [`access_log::AccessLog::reopen`].
+    ///
+    /// A forwarder rather than the reload reaching into [`Observability::access_log`], because the
+    /// reload holds this value and not the log: one call says what the *process* is doing, and the
+    /// three-state decision (file, broken, not configured) stays inside the module that holds the
+    /// states.
+    ///
+    /// Returns whether a file is open afterwards.
+    pub fn reopen_access_log(&self) -> bool {
+        self.access_log.reopen()
+    }
+
     /// Whether anything will be recorded.
     ///
     /// A front-end uses this to skip the work — including the `Cow::Owned` a generated id

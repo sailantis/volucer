@@ -2972,6 +2972,110 @@ format = "combined"
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `SIGHUP` reopens the access log, so a `logrotate` actually rotates.
+///
+/// **The defect this pins is silent from the server's side**, which is why it needs a real process and
+/// a real rename rather than a unit test: after `logrotate` renames the file, a server that does not
+/// reopen keeps writing to the unlinked inode. Every write succeeds, the path holds a fresh empty
+/// file, and the log is discovered to be empty during the incident it was needed for.
+///
+/// The shape is `logrotate`'s: rename, then signal. The assertions are on **both** files, and the
+/// rotated one is the control — a reopen that did nothing would put the second record there instead,
+/// so an assertion that only checked the fresh file had a line would pass against a server that
+/// created it and then wrote elsewhere.
+#[cfg(unix)]
+#[test]
+fn sighup_reopens_the_access_log_after_a_rotation() {
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-logrotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = "."
+static_files = false
+
+[server.access_log]
+path = "access.log"
+format = "combined"
+"#,
+    )
+    .expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start with an access log configured");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+    let log_path = root.join("access.log");
+
+    // A request, so there is something in the file before the rotation — and a line count to compare
+    // against afterwards.
+    let _ = http_get(&address, "/before");
+    let before = std::fs::read_to_string(&log_path).expect("the access log was written");
+    assert_eq!(before.lines().count(), 1, "{before}");
+
+    // `logrotate`'s rename. The server now holds a handle to a file called `access.log.1`.
+    let rotated = root.join("access.log.1");
+    std::fs::rename(&log_path, &rotated).expect("rename the log");
+    assert!(
+        !log_path.exists(),
+        "the rename must leave no file at the path, or the test proves nothing"
+    );
+
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        return;
+    };
+
+    // Polled rather than slept on: the signal is asynchronous, and the file appearing at the path is
+    // the observable. A reopen that never happened leaves nothing there.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !log_path.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        log_path.exists(),
+        "SIGHUP must close and reopen the log, which recreates it at its path; without that \
+         logrotate leaves the server writing into an unlinked inode for ever"
+    );
+
+    // A request after the reopen, and it must land in the **new** file.
+    let _ = http_get(&address, "/after");
+    let fresh = std::fs::read_to_string(&log_path).expect("the reopened log is readable");
+    assert_eq!(
+        fresh.lines().count(),
+        1,
+        "the record written after the rotation belongs in the new file, not the rotated one: {fresh}"
+    );
+    assert!(fresh.contains("/after"), "{fresh}");
+
+    // The control: the rotated file still holds exactly the record from before, so a reopen that
+    // wrote to both or to neither is visible here.
+    let rotated_text = std::fs::read_to_string(&rotated).expect("the rotated log is readable");
+    assert_eq!(
+        rotated_text.lines().count(),
+        1,
+        "the rotated file must not have grown: {rotated_text}"
+    );
+    assert!(rotated_text.contains("/before"), "{rotated_text}");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A deployment with no `[server.access_log]` writes nothing and still serves.
 ///
 /// The control for "off by default changes nothing", asserted as a request rather than as a config
