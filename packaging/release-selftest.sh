@@ -57,7 +57,11 @@ if [ ! -f "$binary" ]; then
 fi
 
 out="$(mktemp -d)"
-trap 'rm -rf "$out"' EXIT
+# `relative_out` is created later, but named here so a failing run removes it too: the first
+# version of this case left `selftest-relative-<pid>/` behind on exactly the failure it exists to
+# catch, which is the sort of litter that ends up in `git status`.
+relative_out="selftest-relative-$$"
+trap 'rm -rf "$out" "$relative_out"' EXIT
 
 echo "== staging ${target} (${archive})"
 TARGET="$target" \
@@ -98,6 +102,37 @@ echo "== smoke-testing"
     cd "$out"
     ARCHIVE="$archive" bash "${here}/smoke-test-archive.sh"
 )
+
+# A relative `OUT_DIR`, which is the default (`.`) and is what `release.yml` uses.
+#
+# This is here because the first real release failed on it: the zip branch `cd`s into the staging
+# directory to archive the top-level directory rather than its contents, so a relative archive path
+# resolved *inside* staging, and the exit trap deleted it. The Windows build then died at
+# `sha256sum: ...: No such file or directory` while the tarballs were unaffected, because `tar -C`
+# takes an absolute `-f`. Every other case here passes `OUT_DIR` as an absolute `mktemp -d`, so
+# none of them could ever have caught it.
+echo "== a relative OUT_DIR puts the archive where the workflow looks for it"
+rm -rf "$relative_out"
+(
+    cd "$repo"
+    TARGET="$target" \
+        ARCHIVE="$archive" \
+        EXE_SUFFIX="$exe" \
+        GITHUB_REF_NAME="v0.1.0" \
+        BIN="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")" \
+        OUT_DIR="$relative_out" \
+        bash packaging/stage-archive.sh
+)
+if [ ! -f "${relative_out}/${expected}" ]; then
+    echo "a relative OUT_DIR produced no archive at ${relative_out}/${expected}" >&2
+    exit 1
+fi
+if [ ! -s "${relative_out}/${expected}.sha256" ]; then
+    echo "a relative OUT_DIR produced no checksum beside ${expected}" >&2
+    exit 1
+fi
+rm -rf "$relative_out"
+echo "   ok: ${expected} landed in the relative directory"
 
 # The negative case, because a smoke test that passes on anything proves nothing. A corrupted
 # archive must be *refused* by the checksum rather than run.

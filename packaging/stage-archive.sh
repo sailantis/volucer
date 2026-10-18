@@ -40,6 +40,18 @@ cp "$binary" "${staging}/${name}/"
 cp README.md LICENSE "${staging}/${name}/"
 cp packaging/systemd/volucer.service "${staging}/${name}/packaging/systemd/"
 
+mkdir -p "$OUT_DIR"
+
+# **Absolute, and this is not cosmetic.** The zip branch below `cd`s into `$staging` to archive the
+# top-level directory rather than its contents, so a relative `$archive` resolves inside the staging
+# directory -- which the `trap` then deletes. The Windows release job died on exactly that with
+# `sha256sum: volucer-0.1.0-x86_64-pc-windows-msvc.zip: No such file or directory`, while the zip
+# sat in a temp directory that was removed a moment later. `tar -C` takes an absolute `-f` fine, so
+# only the zip path was ever affected, and only when `OUT_DIR` was relative (its default, `.`).
+case "$OUT_DIR" in
+    /* | [A-Za-z]:[\\/]*) ;;
+    *) OUT_DIR="$(pwd)/${OUT_DIR}" ;;
+esac
 archive="${OUT_DIR}/${name}.${ARCHIVE}"
 if [ "$ARCHIVE" = "zip" ]; then
     # `7z` is on the Windows image but is not reachable as `7z` under Git Bash, so it is resolved
