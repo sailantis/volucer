@@ -300,6 +300,7 @@ fn matching_a_forbidden_extension_does_not_scale_with_the_configured_count() {
                     }
                 })
                 .collect(),
+            script_extensions: volucer_core::ScriptExtensions::default(),
         };
 
         let (count, _) = allocations(|| {

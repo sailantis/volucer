@@ -225,14 +225,15 @@ fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
         return Plan::NotAFile;
     }
 
-    // A file PHP is meant to execute is never served from disk: sending
+    // A file a backend is meant to execute is never served from disk: sending
     // `index.php` as a file discloses its source, and `<?php …` is a valid
     // response body, so nothing downstream would notice. It goes to the
-    // backend, which is also what makes `/index.php/foo` work. This is why
-    // `has_php_extension` is shared with the routing layer rather than
-    // duplicated: two lists of "what is a script" would drift, and the one that
-    // drifted would be the one that serves source code.
-    if volucer_fcgi::cgi::has_php_extension(path) {
+    // backend, which is also what makes `/index.php/foo` work. This reads the
+    // *site's* list rather than PHP's constant, which is why `ScriptExtensions`
+    // is shared with the routing layer instead of duplicated: two lists of "what
+    // is a script" would drift, and the one that drifted would be the one that
+    // serves source code.
+    if files.script_extensions.matches(path) {
         return Plan::NotAFile;
     }
 
@@ -1027,6 +1028,7 @@ mod tests {
             },
             document_root: root.to_path_buf(),
             server_port: 8080,
+            script_extensions: volucer_core::ScriptExtensions::default(),
         }
     }
 
@@ -1219,6 +1221,7 @@ mod tests {
                 },
                 document_root: root.clone(),
                 server_port: 8080,
+                script_extensions: volucer_core::ScriptExtensions::default(),
             };
 
             let mut headers = HeaderMap::new();
@@ -1509,6 +1512,60 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A script the *site's* list names must never come from this layer either.
+    ///
+    /// Step 38's security half. Widening the router alone would make `/app.py` routable and then
+    /// this layer would serve it from disk — sending a Python program's source to the client,
+    /// which is the same disclosure `index.php` was, in a language whose files are far more likely
+    /// to carry credentials. The list is the site's, so the deployment that widened the router is
+    /// the one that widened this.
+    #[test]
+    fn a_widened_script_extension_is_never_served_as_a_file() {
+        let root = fixture(
+            "widenedguard",
+            &[
+                ("app.py", "SECRET = 'shhh'\n"),
+                ("worker.rb", "SECRET = 'shhh'\n"),
+                ("index.php", "<?php echo 'secret';"),
+                ("public/app.js", "console.log('fine')"),
+            ],
+        );
+        let mut files = layer(&root, true);
+        files.script_extensions =
+            volucer_core::ScriptExtensions::from_config(&["py".to_string()], "test")
+                .expect("valid");
+        let headers = no_headers();
+
+        assert_eq!(
+            name_of(&plan(&owned("/app.py", &headers), &files)),
+            "not a file",
+            "a Python script must go to the backend, never to the client"
+        );
+        assert_eq!(
+            name_of(&plan(&owned("/APP.PY", &headers), &files)),
+            "not a file",
+            "the comparison is case-insensitive, like the router's"
+        );
+        // The list is the whole list: naming `py` stops `.php` being a script, which is what lets
+        // a site say "this tree is Python and nothing else".
+        assert_eq!(
+            name_of(&plan(&owned("/worker.rb", &headers), &files)),
+            "a file",
+            "an extension the site did not name is an ordinary file"
+        );
+        assert_eq!(
+            name_of(&plan(&owned("/index.php", &headers), &files)),
+            "a file",
+            "the site replaced the list rather than adding to it"
+        );
+        assert_eq!(
+            name_of(&plan(&owned("/public/app.js", &headers), &files)),
+            "a file"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_directory_without_a_slash_redirects_rather_than_serving() {
         let root = fixture("dir", &[("docs/index.html", "docs")]);
@@ -1534,6 +1591,7 @@ mod tests {
             },
             document_root: root.clone(),
             server_port: 8080,
+            script_extensions: volucer_core::ScriptExtensions::default(),
         };
         let headers = no_headers();
 
@@ -1687,6 +1745,7 @@ mod tests {
                 },
                 document_root: root.clone(),
                 server_port: 8080,
+                script_extensions: volucer_core::ScriptExtensions::default(),
             };
             let plain = layer(&root, true);
 
@@ -1749,6 +1808,7 @@ mod tests {
                 },
                 document_root: root.clone(),
                 server_port: 8080,
+                script_extensions: volucer_core::ScriptExtensions::default(),
             };
 
             let mut headers = HeaderMap::new();

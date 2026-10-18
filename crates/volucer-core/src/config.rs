@@ -1027,6 +1027,18 @@ pub struct SiteConfig {
     #[serde(default)]
     pub front_controller: Option<FrontController>,
 
+    /// This site's script extensions; see [`ServerConfig::script_extensions`].
+    ///
+    /// Absent inherits the `[server]` list. A site serving a Django app beside a
+    /// PHP one is the shape this exists for: the site with the Python worker
+    /// names `["py"]`, and the site with the PHP front controller keeps the
+    /// default. Listing the extension an *entry point* has rather than every
+    /// file the application imports is the rule — the same rule as
+    /// `path_suffix`, since a path the router does not recognise reaches the
+    /// front controller as application input either way.
+    #[serde(default)]
+    pub script_extensions: Option<Vec<String>>,
+
     /// Backend used when a request to this site matches no route.
     #[serde(default)]
     pub default_backend: Option<String>,
@@ -1439,11 +1451,20 @@ pub fn select_route<'a>(
 /// removable.
 ///
 /// The removable one is removable exactly when the pattern already pins a script
-/// extension: then the file can only be PHP, and its absence is PHP's own 404. That is a
+/// extension: then the file can only be a script, and its absence is PHP's own 404. That is a
 /// static property of the configuration, so it is decided once at startup rather than
 /// per request — and never written by hand, because the decision belongs with the code
 /// that knows why it is safe.
-pub fn skip_stat(route: &RouteConfig, backend_interprets_path: bool) -> bool {
+///
+/// `extensions` is the site's list rather than a constant. Before step 38 this function compared
+/// against `["php", "php3", "phtml"]` directly, so a site that widened the router's list would
+/// have had its `.py` routes quietly keep the `stat` — safe, but a second spelling of one rule
+/// that could drift in the other direction too.
+pub fn skip_stat(
+    route: &RouteConfig,
+    backend_interprets_path: bool,
+    extensions: &crate::script::ScriptExtensions,
+) -> bool {
     // A backend that does not interpret the path never reads the file it names, so there is
     // nothing for the stat to protect. That covers two kinds for two different reasons: a worker
     // reads `script_filename` as metadata and routes on `REQUEST_URI`, and an upstream is handed
@@ -1452,28 +1473,25 @@ pub fn skip_stat(route: &RouteConfig, backend_interprets_path: bool) -> bool {
         return true;
     }
     // A suffix that pins a script extension, e.g. `.php`. Compared with the same
-    // case-insensitive rule `has_php_extension` uses, so the two cannot disagree about
-    // `/upload.PHP`.
+    // case-insensitive rule the router uses, so the two cannot disagree about `/upload.PHP`.
     route
         .path_suffix
         .as_deref()
-        .is_some_and(is_script_extension)
+        .is_some_and(|suffix| is_script_extension(suffix, extensions))
 }
 
 /// Whether a `path_suffix` names a script extension, and nothing but one.
 ///
 /// `".php"` and `"/entry.php"` do; `".json"` and `".css"` do not. A prefix says nothing
 /// about the extension at all, which is why only a suffix can make this claim.
-fn is_script_extension(suffix: &str) -> bool {
+fn is_script_extension(suffix: &str, extensions: &crate::script::ScriptExtensions) -> bool {
     // The last `.`-separated part of the suffix is the extension it pins, so a suffix
     // carrying a path (`/api/entry.php`) is judged by its end rather than rejected.
     match suffix.rsplit_once('.') {
-        Some((_, extension)) => {
-            const SCRIPT_EXTENSIONS: [&str; 3] = ["php", "php3", "phtml"];
-            SCRIPT_EXTENSIONS
-                .iter()
-                .any(|known| extension.eq_ignore_ascii_case(known))
-        }
+        Some((_, extension)) => extensions
+            .as_slice()
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known)),
         None => false,
     }
 }
@@ -1584,6 +1602,28 @@ pub struct ServerConfig {
     /// decides, and failing that `index.php`.
     #[serde(default)]
     pub front_controller: Option<String>,
+
+    /// Which extensions name a script a backend is asked to execute.
+    ///
+    /// Defaults to `["php", "php3", "phtml"]`, which is what the server has
+    /// always accepted. Widening it is what makes a non-PHP worker reachable at
+    /// all: `path_suffix` can *route* `/app.py`, but this list is what decides
+    /// that `/app.py` resolves as a script rather than arriving at the front
+    /// controller as `PATH_INFO`.
+    ///
+    /// **It is deliberately one list rather than two.** The same answer is used
+    /// by the router (what to hand a backend), by the static layer (what must
+    /// never be served from disk, because that discloses source) and by
+    /// `skip_stat` (whether a route has already proved its path names a script).
+    /// Widening the router alone would turn every newly-routable extension into
+    /// a source disclosure, so the three move together by construction.
+    ///
+    /// A leading dot is accepted (`".php"` and `"php"` are the same entry) and
+    /// the comparison is case-insensitive, matching PHP's own behaviour. An
+    /// empty list is refused: it would silently send every script path to the
+    /// front controller as `PATH_INFO`. See [`crate::script`].
+    #[serde(default)]
+    pub script_extensions: Option<Vec<String>>,
 
     /// Serving files from the document root, without a backend.
     ///
@@ -1857,6 +1897,21 @@ impl ServerConfig {
             enabled: true,
             ..StaticConfig::default()
         })
+    }
+
+    /// The script extensions in effect, with the default resolved.
+    ///
+    /// Unset means [`crate::script::DEFAULT_SCRIPT_EXTENSIONS`], which is what every release
+    /// before this key accepted. [`Config::validate`] refuses a list this cannot parse — an empty
+    /// one, or an entry naming a path — so falling back to the default here is only the shape a
+    /// caller sees if it skipped validation, never a configuration being silently reinterpreted.
+    pub fn script_extensions(&self) -> crate::script::ScriptExtensions {
+        self.script_extensions
+            .as_deref()
+            .and_then(|list| {
+                crate::script::ScriptExtensions::from_config(list, "server.script_extensions").ok()
+            })
+            .unwrap_or_default()
     }
 
     /// The largest body either front-end will accept, with the default resolved.
@@ -3955,6 +4010,13 @@ impl Config {
                     .to_string(),
             ));
         }
+        // Parsed rather than only checked, because the same list decides three things — what the
+        // router hands a backend, what the static layer refuses to serve from disk, and whether a
+        // route may skip the router's `stat`. A list that is refused here can therefore never be
+        // half-applied: there is one parse and one value.
+        if let Some(extensions) = &self.server.script_extensions {
+            crate::script::ScriptExtensions::from_config(extensions, "server.script_extensions")?;
+        }
         if self.server.front_controller.as_ref().is_some_and(|front| {
             let front = front.trim_start();
             front.starts_with('/')
@@ -4412,6 +4474,13 @@ impl Config {
 
             if let Some(front) = &site.front_controller {
                 validate_front_controller(front, &format!("sites.{name}.front_controller"))?;
+            }
+
+            if let Some(extensions) = &site.script_extensions {
+                crate::script::ScriptExtensions::from_config(
+                    extensions,
+                    &format!("sites.{name}.script_extensions"),
+                )?;
             }
 
             if let Some(routes) = &site.routes {
@@ -9974,7 +10043,11 @@ binary = "/usr/bin/php-cgi"
                 path_suffix: None,
                 backend: name.to_string(),
             };
-            skip_stat(&route, config.backends[name].interprets_path())
+            skip_stat(
+                &route,
+                config.backends[name].interprets_path(),
+                &config.server.script_extensions(),
+            )
         };
 
         assert!(
@@ -9985,6 +10058,136 @@ binary = "/usr/bin/php-cgi"
         assert!(
             !prefix(&cgi, "cgi"),
             "php-cgi emits the file it is pointed at, so the stat is the guard"
+        );
+    }
+
+    #[test]
+    fn script_extensions_default_to_php_and_a_site_may_replace_them() {
+        // Step 38 at the configuration level: absent means PHP's three, a site may name its own,
+        // and the site table carries the resolved value so the router and the static layer cannot
+        // read two different answers.
+        let config = Config::from_toml(
+            r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+script_extensions = [".py", "rb"]
+
+[backends.app]
+kind = "worker"
+command = "./app.py"
+
+[sites.php]
+hosts = ["php.example"]
+document_root = "/srv/php"
+
+[sites.python]
+hosts = ["py.example"]
+document_root = "/srv/py"
+script_extensions = ["py"]
+"#,
+        )
+        .expect("parses");
+        config.validate().expect("validates");
+
+        let sites = crate::Sites::from_config(&config, std::path::Path::new("/srv/default"));
+        // The default site takes the server's list, and `.py` is normalised to `py`.
+        assert_eq!(
+            sites.default_site().script_extensions.as_slice(),
+            &["py", "rb"]
+        );
+        // A site that says nothing inherits it.
+        assert_eq!(
+            sites.named()["php"].script_extensions.as_slice(),
+            &["py", "rb"]
+        );
+        // A site that names its own replaces it rather than adding to it.
+        assert_eq!(
+            sites.named()["python"].script_extensions.as_slice(),
+            &["py"]
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_deployment_still_treats_php_files_as_scripts() {
+        let config = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+"#,
+        )
+        .expect("parses");
+        config.validate().expect("validates");
+
+        let extensions = config.server.script_extensions();
+        assert!(extensions.is_default());
+        assert!(extensions.matches("/index.php"));
+        assert!(!extensions.matches("/app.py"));
+    }
+
+    #[test]
+    fn an_empty_script_list_is_refused_at_the_key_that_wrote_it() {
+        let server = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+script_extensions = []
+"#,
+        )
+        .expect("parses");
+        let err = server.validate().expect_err("an empty list is refused");
+        assert!(
+            err.to_string().contains("server.script_extensions"),
+            "{err}"
+        );
+
+        let site = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+
+[sites.py]
+hosts = ["py.example"]
+document_root = "/srv/py"
+script_extensions = []
+"#,
+        )
+        .expect("parses");
+        let err = site.validate().expect_err("an empty list is refused");
+        assert!(
+            err.to_string().contains("sites.py.script_extensions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn skip_stat_reads_the_sites_list_rather_than_a_constant() {
+        // The third place that asks "is this a script". Naming `py` on a worker makes a `.py`
+        // suffix provable, so the router stops `stat`ing — which is only safe because the static
+        // layer refuses to serve it, and that test is in `volucer-http`.
+        let php = crate::script::ScriptExtensions::default();
+        let python = crate::script::ScriptExtensions::from_config(&["py".to_string()], "test")
+            .expect("valid");
+
+        let route = |suffix: &str| RouteConfig {
+            host: None,
+            path_prefix: None,
+            path_suffix: Some(suffix.to_string()),
+            backend: "app".to_string(),
+        };
+
+        assert!(skip_stat(&route(".php"), false, &php));
+        // A worker never reads the path, so the stat is always skippable there.
+        assert!(skip_stat(&route(".json"), false, &php));
+        // A backend that *does* read the path is the interesting case.
+        assert!(!skip_stat(&route(".json"), true, &php));
+        assert!(!skip_stat(&route(".py"), true, &php), "not PHP's list");
+        assert!(skip_stat(&route(".py"), true, &python));
+        assert!(
+            !skip_stat(&route(".php"), true, &python),
+            "the list replaced it"
         );
     }
 

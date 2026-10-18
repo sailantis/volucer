@@ -325,10 +325,16 @@ fn load_and_validate(path: &Path) -> Result<Config, ServerError> {
     Ok(config)
 }
 
-fn routing_for(document_root: &Path, front_controller: Option<&str>) -> Routing {
+/// Build the routing for a site from the site table.
+///
+/// One place rather than a literal per call site, because the `script_extensions` a site resolves
+/// has to reach both the router and the dispatcher: a `Routing` rebuilt from `[server]` at one of
+/// them is how a widened list would be honoured by one and not the other.
+fn routing_of(site: &volucer_core::ResolvedSite) -> Routing {
     Routing {
-        document_root: document_root.to_path_buf(),
-        front_controller: front_controller.map(str::to_string),
+        document_root: site.document_root.clone(),
+        front_controller: site.front_controller.clone(),
+        script_extensions: site.script_extensions.clone(),
         ..Routing::default()
     }
 }
@@ -722,7 +728,10 @@ fn serve(
     // so two requests to two workers run at the same time.
     let dispatcher = Dispatcher::from_config_in(
         &config,
-        routing_for(&document_root, front_controller.as_deref()),
+        // The default site's routing, taken from the table rather than rebuilt: a widened
+        // `[server]` list has to reach the dispatch path, and rebuilding the value here is how
+        // one of the two would quietly get the default list instead.
+        routing_of(sites.default_site()),
         path.parent().unwrap_or_else(|| Path::new("")),
     )?;
     for name in dispatcher.backend_names() {
@@ -2241,6 +2250,17 @@ fn check(
         }
         None => println!("    front controller: (none: only real .php files)"),
     }
+    // Printed only when it was configured, and as the normalised list: an operator who wrote
+    // `".py"` should see that the server compares `py`, and one who wrote nothing should not have
+    // to read a line describing the default. The list decides three things at once — routing, the
+    // static layer's source guard, and `skip_stat` — so it is worth being able to see.
+    let server_extensions = config.server.script_extensions();
+    if !server_extensions.is_default() {
+        println!(
+            "    script extensions: {}",
+            server_extensions.as_slice().join(", ")
+        );
+    }
 
     println!("  backends:");
     if config.backends.is_empty() {
@@ -2290,16 +2310,18 @@ fn check(
     // A route is printed as the three matchers it can state, with `skip_stat` where it
     // applies — the saving is real and an operator should be able to see where the
     // router is still checking the filesystem and where it has stopped.
-    let print_route =
-        |route: &volucer_core::config::RouteConfig, interprets_path: bool, indent: &str| {
-            let host = route.host.as_deref().unwrap_or("*");
-            let prefix = route.path_prefix.as_deref().unwrap_or("*");
-            let suffix = route.path_suffix.as_deref().unwrap_or("*");
-            println!("{indent}{host}{prefix}…{suffix} -> {}", route.backend);
-            if volucer_core::config::skip_stat(route, interprets_path) {
-                println!("{indent}  stat: skipped (the pattern proves the extension)");
-            }
-        };
+    let print_route = |route: &volucer_core::config::RouteConfig,
+                       interprets_path: bool,
+                       extensions: &volucer_core::ScriptExtensions,
+                       indent: &str| {
+        let host = route.host.as_deref().unwrap_or("*");
+        let prefix = route.path_prefix.as_deref().unwrap_or("*");
+        let suffix = route.path_suffix.as_deref().unwrap_or("*");
+        println!("{indent}{host}{prefix}…{suffix} -> {}", route.backend);
+        if volucer_core::config::skip_stat(route, interprets_path, extensions) {
+            println!("{indent}  stat: skipped (the pattern proves the extension)");
+        }
+    };
     // Whether the backend reads the path as a file to execute. A worker does not, and neither does
     // an upstream — so both skip the router's `stat`, which is why this asks the question that way
     // round rather than asking "is it a worker". A name that selects nothing is treated as
@@ -2310,13 +2332,24 @@ fn check(
             .get(name)
             .is_none_or(volucer_core::config::BackendConfig::interprets_path)
     };
+    // The list a route's `skip_stat` is judged against. `check` asks the site table for it rather
+    // than reading `[server]` directly, so a site that widened the list is reported against the
+    // list that site will actually route with.
+    let sites =
+        volucer_core::Sites::from_config_with(&config, &document_root, front_controller.as_deref());
 
     println!("  routes:");
     if config.routes.is_empty() {
         println!("    (none: every request goes to the default backend)");
     }
+    let default_extensions = sites.default_site().script_extensions.clone();
     for route in &config.routes {
-        print_route(route, interprets_path(&route.backend), "    ");
+        print_route(
+            route,
+            interprets_path(&route.backend),
+            &default_extensions,
+            "    ",
+        );
     }
 
     println!("  sites:");
@@ -2338,10 +2371,30 @@ fn check(
         if let Some(serve_only) = site.serve_only {
             println!("      serve only:       {serve_only}");
         }
+        if let Some(extensions) = sites.named().get(name) {
+            if !extensions.script_extensions.is_default() {
+                println!(
+                    "      script extensions: {}",
+                    extensions.script_extensions.as_slice().join(", ")
+                );
+            }
+        }
         if let Some(routes) = &site.routes {
             println!("      routes:");
+            // The site's own list, resolved from the same table `serve` builds, so `check`
+            // reports the `stat` decision the request path will actually make.
+            let extensions = sites
+                .named()
+                .get(name)
+                .map(|resolved| &resolved.script_extensions)
+                .unwrap_or(&default_extensions);
             for route in routes {
-                print_route(route, interprets_path(&route.backend), "        ");
+                print_route(
+                    route,
+                    interprets_path(&route.backend),
+                    extensions,
+                    "        ",
+                );
             }
         }
         if let Some(backend) = &site.default_backend {
@@ -2561,9 +2614,23 @@ mod tests {
 
     #[test]
     fn routing_uses_a_front_controller_by_default() {
-        let routing = routing_for(Path::new("/srv/app"), Some("index.php"));
+        let site = volucer_core::ResolvedSite {
+            name: "<default>".to_string(),
+            document_root: PathBuf::from("/srv/app"),
+            front_controller: Some("index.php".to_string()),
+            script_extensions: volucer_core::ScriptExtensions::default(),
+            serve_only: volucer_core::config::ServeOnly::All,
+            static_files: volucer_core::config::StaticConfig::default(),
+            routes: Vec::new(),
+            default_backend: None,
+        };
+        let routing = routing_of(&site);
         assert_eq!(routing.front_controller.as_deref(), Some("index.php"));
         assert_eq!(routing.document_root, PathBuf::from("/srv/app"));
+        assert_eq!(
+            routing.script_extensions,
+            volucer_core::ScriptExtensions::default()
+        );
     }
 
     #[test]
@@ -2590,8 +2657,17 @@ document_root = "/from/file"
 
     #[test]
     fn an_empty_front_controller_means_files_only() {
-        let routing = routing_for(Path::new("."), None);
-        assert_eq!(routing.front_controller, None);
+        let site = volucer_core::ResolvedSite {
+            name: "<default>".to_string(),
+            document_root: PathBuf::from("."),
+            front_controller: None,
+            script_extensions: volucer_core::ScriptExtensions::default(),
+            serve_only: volucer_core::config::ServeOnly::All,
+            static_files: volucer_core::config::StaticConfig::default(),
+            routes: Vec::new(),
+            default_backend: None,
+        };
+        assert_eq!(routing_of(&site).front_controller, None);
     }
 
     /// Days left are reported in the units the decision is made in, and each band says something

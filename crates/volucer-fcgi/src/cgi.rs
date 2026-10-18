@@ -30,6 +30,16 @@ pub struct Routing {
     pub front_controller: Option<String>,
     /// Paths to reject outright, mirroring nginx's `forbid`.
     pub forbidden_extensions: Vec<String>,
+    /// Which extensions name something a backend is asked to execute.
+    ///
+    /// The default is PHP's own three. A site widens it to reach a non-PHP worker —
+    /// `/app.py` has to resolve as a *script* before a route naming it can be dispatched,
+    /// or the path arrives at the front controller as `PATH_INFO` instead.
+    ///
+    /// Shared rather than duplicated: the static layer asks the same question of the same
+    /// value, because a file that is a script must never be served from disk — that sends
+    /// its source to the client. See `volucer_core::script`.
+    pub script_extensions: volucer_core::ScriptExtensions,
 }
 
 impl Default for Routing {
@@ -38,6 +48,7 @@ impl Default for Routing {
             document_root: PathBuf::from("."),
             front_controller: Some("index.php".to_string()),
             forbidden_extensions: vec![".htaccess".to_string()],
+            script_extensions: volucer_core::ScriptExtensions::default(),
         }
     }
 }
@@ -100,12 +111,10 @@ pub fn route(path: &str, routing: &Routing) -> Route {
 
     let relative = decoded.trim_start_matches('/');
 
-    // The extension is tested *before* the path is built and stat'ed. The two are pure
-    // predicates so the answer is the same either way, but the order is what decides
-    // whether a request pays a `stat` syscall at all: with a front controller configured,
-    // a path naming no script is the common case, and testing for `.php` first means it
-    // never reaches `is_file`.
-    if has_php_extension(relative) {
+    // Whether this path names a script. The list is the site's, so a site serving a Python
+    // worker resolves `/app.py` here rather than handing it to the front controller as
+    // `PATH_INFO` — which is the whole point of step 38.
+    if routing.script_extensions.matches(relative) {
         let candidate = routing.document_root.join(relative);
         if candidate.is_file() {
             return Route::Script {
@@ -151,19 +160,18 @@ pub fn route(path: &str, routing: &Routing) -> Route {
 
 /// Find the longest leading path segment sequence that names an existing script.
 ///
-/// The `has_php_extension` check is the whole point. Without it this matches any
-/// file, and php-cgi does not verify that a script is PHP: given a file it cannot
-/// parse it emits the file verbatim with a 200. So a front-controller deployment
-/// would hand `/config.json` and `/.env` to PHP and return their contents.
-/// Requiring the extension means PHP is only ever asked to run something it is
-/// meant to run, and every other path falls through to the front controller as
-/// application input.
+/// The extension check is the whole point. Without it this matches any file, and
+/// php-cgi does not verify that a script is PHP: given a file it cannot parse it emits
+/// the file verbatim with a 200. So a front-controller deployment would hand
+/// `/config.json` and `/.env` to PHP and return their contents. Requiring the extension
+/// means a backend is only ever asked to run something it is meant to run, and every
+/// other path falls through to the front controller as application input.
 ///
 /// Boundaries are walked rather than collected into a `Vec`, and each candidate is
 /// tested on the bytes: the collection allocated once per request, and the old
 /// `has_php_extension(&head)` lowercased the candidate prefix, so a path of *n* segments
 /// allocated *n* times with each allocation proportional to its prefix. Asking the
-/// *suffixes* first means only a boundary that can actually be a PHP script goes on to
+/// *suffixes* first means only a boundary that can actually be a script goes on to
 /// build a path and call `is_file`, which is the expensive part.
 fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, &'a str)> {
     let bytes = relative.as_bytes();
@@ -172,7 +180,7 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
         if head.is_empty() {
             continue;
         }
-        if !php_extension_of(&bytes[..boundary]) {
+        if !routing.script_extensions.matches_bytes(&bytes[..boundary]) {
             continue;
         }
         let candidate = routing.document_root.join(head);
@@ -183,7 +191,7 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
     }
 
     // The whole path as one candidate, which is the bare `/index.php` case.
-    if !relative.is_empty() && php_extension_of(bytes) {
+    if !relative.is_empty() && routing.script_extensions.matches_bytes(bytes) {
         let candidate = routing.document_root.join(relative);
         if candidate.is_file() {
             return Some((relative.to_string(), ""));
@@ -192,7 +200,12 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
     None
 }
 
-/// Whether a path names something PHP is expected to execute.
+/// Whether a path names something PHP is expected to execute, using PHP's own list.
+///
+/// Kept as the default-list spelling because it is what a caller with no site in hand means,
+/// and because the tests that pin PHP's behaviour read better with it. A caller that has a
+/// site's [`Routing`] must use [`Routing::script_extensions`] instead — that list is the one
+/// the site will actually route with.
 ///
 /// Shared with the static layer, which must not serve one of these as a file:
 /// serving `index.php` from disk sends its *source* to the client.
@@ -206,7 +219,7 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
 /// panics. A path with non-ASCII bytes in it must still be answerable, so callers pass
 /// the bytes and no boundary is ever needed.
 pub fn has_php_extension(path: &str) -> bool {
-    php_extension_of(path.as_bytes())
+    volucer_core::ScriptExtensions::default().matches(path)
 }
 
 /// Whether a percent-decoded path climbs out of the document root.
@@ -270,7 +283,11 @@ pub fn route_or_dispatch(path: &str, routing: &Routing) -> Route {
     }
 }
 
-/// What to do with a path no script resolved.
+/// [`route_or_dispatch`]'s fallback, with the *site's* script list.
+///
+/// Split from [`dispatch_fallback`] so the reason is visible: the answer here is "which script
+/// does this backend get", and for a widened list the script may be `/app.py` rather than
+/// `/index.php`.
 fn dispatch_fallback(path: &str, routing: &Routing) -> Route {
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let decoded = percent_decode_cow(path);
@@ -289,7 +306,7 @@ fn dispatch_fallback(path: &str, routing: &Routing) -> Route {
         };
     }
 
-    if has_php_extension(relative) {
+    if routing.script_extensions.matches(relative) {
         return Route::Script {
             script_filename: routing.document_root.join(relative),
             script_name: format!("/{relative}"),
@@ -298,17 +315,6 @@ fn dispatch_fallback(path: &str, routing: &Routing) -> Route {
     }
 
     Route::NotFound
-}
-
-/// PHP extensions this server will execute, as ASCII bytes for a case-insensitive
-/// suffix comparison.
-const PHP_EXTENSIONS: [&[u8]; 3] = [b".php", b".php3", b".phtml"];
-
-/// Whether a byte slice ends with one of [`PHP_EXTENSIONS`], case-insensitively.
-fn php_extension_of(bytes: &[u8]) -> bool {
-    PHP_EXTENSIONS.iter().any(|ext| {
-        bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext)
-    })
 }
 
 /// Percent-decode a URL path.
@@ -1185,5 +1191,122 @@ mod tests {
         assert!(is_executable_script(Path::new("/srv/index.PHP")));
         assert!(!is_executable_script(Path::new("/srv/index.txt")));
         assert!(!is_executable_script(Path::new("/srv/index")));
+    }
+    #[test]
+    fn a_widened_list_routes_a_python_entry_point_to_the_backend() {
+        // Step 38's whole purpose, at the router. Without the widened list `/app.py` reaches the
+        // front controller as `PATH_INFO` — which is a routing change nobody wrote down — so this
+        // asserts the file is resolved as a script instead.
+        let root = std::env::temp_dir().join(format!("volucer-py-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("app.py"), b"print('hi')\n").expect("script");
+
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            script_extensions: volucer_core::ScriptExtensions::from_config(
+                &["php".to_string(), "py".to_string()],
+                "test",
+            )
+            .expect("valid"),
+            ..Routing::default()
+        };
+
+        match route("/app.py", &routing) {
+            Route::Script {
+                script_filename,
+                script_name,
+                path_info,
+            } => {
+                assert_eq!(script_filename, root.join("app.py"));
+                assert_eq!(script_name, "/app.py");
+                assert!(path_info.is_empty());
+            }
+            other => panic!("/app.py must resolve as a script, got {other:?}"),
+        }
+
+        // And the default list still sends it to the front controller, which is the behaviour a
+        // deployment that did not widen anything keeps.
+        let default = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+        assert!(
+            matches!(
+                route("/app.py", &default),
+                Route::Script { ref path_info, .. } if path_info == "/app.py"
+            ),
+            "without the widened list the path is application input"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_widened_list_splits_at_the_script_boundary() {
+        // `/app.py/extra` has to split the way `/index.php/foo` does, or a Python application
+        // cannot use path info — and `split_at_script` is a second place that asks the question.
+        let root = std::env::temp_dir().join(format!("volucer-py-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("app.py"), b"print('hi')\n").expect("script");
+
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: None,
+            script_extensions: volucer_core::ScriptExtensions::from_config(
+                &["py".to_string()],
+                "test",
+            )
+            .expect("valid"),
+            ..Routing::default()
+        };
+
+        match route("/app.py/extra", &routing) {
+            Route::Script {
+                script_name,
+                path_info,
+                ..
+            } => {
+                assert_eq!(script_name, "/app.py");
+                assert_eq!(path_info, "/extra");
+            }
+            other => panic!("the boundary must be found, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_list_does_not_widen_only_the_extension_that_was_named() {
+        // A site naming `py` must stop treating `.php` as a script — otherwise "widening" would be
+        // "adding", and a deployment that meant "this site serves Python and nothing else" would
+        // still hand `.php` to a Python worker.
+        let root = std::env::temp_dir().join(format!("volucer-py-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("legacy.php"), b"<?php echo 1;").expect("script");
+
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("app.py".to_string()),
+            script_extensions: volucer_core::ScriptExtensions::from_config(
+                &["py".to_string()],
+                "test",
+            )
+            .expect("valid"),
+            ..Routing::default()
+        };
+
+        match route("/legacy.php", &routing) {
+            Route::Script { path_info, .. } => {
+                assert_eq!(path_info, "/legacy.php", "it is application input now");
+            }
+            other => panic!("expected the front controller, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

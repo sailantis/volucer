@@ -36,6 +36,13 @@ pub struct ResolvedSite {
     pub document_root: PathBuf,
     /// The front controller, or `None` for "serve only real files".
     pub front_controller: Option<String>,
+    /// The extensions this site treats as scripts.
+    ///
+    /// Carried on the site rather than read from the configuration at the call site, because the
+    /// three decisions that depend on it — routing, the static layer's refusal, and `skip_stat` —
+    /// all happen per request against *this* site. A list read from `[server]` at those points
+    /// would be a second answer for a site that widened it.
+    pub script_extensions: crate::script::ScriptExtensions,
     /// What this site serves.
     pub serve_only: ServeOnly,
     /// The static layer, with inheritance already applied.
@@ -91,12 +98,14 @@ impl Sites {
         let default_front = config
             .server
             .resolve_front_controller(front_controller_override);
+        let default_extensions = config.server.script_extensions();
         let default_statics = config.server.statics();
 
         let default = ResolvedSite {
             name: "<default>".to_string(),
             document_root: document_root.to_path_buf(),
             front_controller: default_front.clone(),
+            script_extensions: default_extensions.clone(),
             serve_only: config.server.serve_only,
             static_files: default_statics.clone(),
             routes: config.routes.clone(),
@@ -111,6 +120,7 @@ impl Sites {
                 name,
                 site,
                 default_front.as_deref(),
+                &default_extensions,
                 config.server.serve_only,
                 &default_statics,
                 &config.routes,
@@ -188,6 +198,7 @@ fn resolve_site(
     name: &str,
     site: &SiteConfig,
     default_front: Option<&str>,
+    default_extensions: &crate::script::ScriptExtensions,
     default_serve_only: ServeOnly,
     default_statics: &StaticConfig,
     default_routes: &[RouteConfig],
@@ -196,6 +207,18 @@ fn resolve_site(
     let front_controller = match &site.front_controller {
         Some(controller) => controller.as_path().map(str::to_string),
         None => default_front.map(str::to_string),
+    };
+
+    // Parsed against the site's own key rather than the server's, so a site that widens the list
+    // says so in its own error message. Validation has already refused a bad list; the fallback
+    // here is the inherited one rather than the default, which is what "absent inherits" means.
+    let script_extensions = match &site.script_extensions {
+        Some(extensions) => crate::script::ScriptExtensions::from_config(
+            extensions,
+            &format!("sites.{name}.script_extensions"),
+        )
+        .unwrap_or_else(|_| default_extensions.clone()),
+        None => default_extensions.clone(),
     };
 
     let static_files = match &site.static_files {
@@ -209,6 +232,7 @@ fn resolve_site(
         name: name.to_string(),
         document_root: site.document_root.clone(),
         front_controller,
+        script_extensions,
         serve_only: site.serve_only.unwrap_or(default_serve_only),
         static_files,
         routes: site

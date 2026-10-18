@@ -1599,23 +1599,34 @@ Later, and deliberately not part of Phase 8:
     one repository each. Nothing blocks them: `HelloAck` carries a free-form `runtime` and the
     handshake checks the *protocol* version, not the language, so a non-PHP worker handshakes
     today. What each needs is its own answer to "how does this process report its RSS", because
-    the recycling contract is otherwise silently unenforced. **Order changed after step 68 was
-    written:** `script-extensions` (38) comes *first*, and the first client should be **Go**, which
-    is the one language that is also a measurement — RoadRunner is a Go worker server, so a Go
-    client compares the two on the same runtime with no language confound.
-38. `script-extensions` — make "what counts as a script" configurable per site instead of the
-    hardcoded `[".php", ".php3", ".phtml"]`. Required before a non-PHP worker can serve `.py` or
-    `.rb`: `path_suffix` can *route* such a path, but `has_php_extension` decides what resolves as a
-    script, so today `/foo.rb` reaches the front controller as `PATH_INFO` instead. **It is step
-    37's prerequisite and must land first.** There are **three** hardcoded lists, and the third is a
-    security rule rather than a routing one: `cgi::has_php_extension`
-    (`crates/volucer-fcgi/src/cgi.rs:208`) and its `PHP_EXTENSIONS` table (`:305`), the mirror in
-    `is_script_extension` (`crates/volucer-core/src/config.rs:518`) — which exists because two lists
-    of "what is a script" must not be able to disagree — and the static layer's refusal to serve a
-    script from disk (`crates/volucer-http/src/static_files.rs:235`), whose comment says why:
-    serving `index.php` from disk *"sends its source to the client"*. Widening the first two without
-    the third turns every newly-routable extension into a source disclosure, so the three move
-    together or the step is not done.
+    the recycling contract is otherwise silently unenforced. **`script-extensions` (38) landed
+    first**, because a client for `.py` or `.rb` cannot be routed until the extension table is
+    configurable.
+38. `script-extensions` — **done.** `ScriptExtensions` in `crates/volucer-core/src/script.rs`, reached
+    from `server.script_extensions` and carried per site on `ResolvedSite`, so "what counts as a
+    script" is configuration rather than the hardcoded `[".php", ".php3", ".phtml"]`. Required
+    before a non-PHP worker can serve `.py` or `.rb`: `path_suffix` can *route* such a path, but the
+    extension list decides what resolves as a script, so `/foo.rb` used to reach the front
+    controller as `PATH_INFO` instead.
+    - **All three places move together, and that is the design rather than a coincidence.** The
+      router (`cgi::route`, `route_or_dispatch`, `split_at_script`), the static layer's refusal
+      (`static_files`), and `skip_stat`'s proof now read one value. The first two were a shared
+      `PHP_EXTENSIONS` constant and the third had its own copy; a `const` cannot carry a per-site
+      list, which is why this could not be done by widening the constant.
+    - **The security half is the assertion, not the routing half.** Widening the router alone turns
+      every newly-routable extension into a source disclosure — `app.py` is served from disk,
+      credentials and all, with a 200 — so
+      `widening_the_script_list_stops_the_static_layer_serving_the_source` asserts *both* arms end
+      to end: default serves the file, widened refuses it and reaches the backend.
+    - **A site's list replaces the server's rather than adding to it.** A deployment saying "this
+      tree is Python" must stop handing `.php` to a Python worker, which is the same rule
+      `path_suffix` follows. Asserted at the router (`the_list_does_not_widen_only_the_extension_
+      that_was_named`), at the static layer, and at the site table.
+    - **An empty list is refused at the key that wrote it.** Accepted as "no scripts", it would
+      silently send every script path to the front controller as `PATH_INFO`; the error names
+      `server.script_extensions` or `sites.<name>.script_extensions`, whichever was written.
+    - **`check` prints the list only when it is not the default**, and prints it normalised, so an
+      operator who wrote `".py"` sees that the server compares `py`.
 39. `plugin-abis` — only if a real need appears. RoadRunner's "plugins" are statically linked Go
     packages resolved by a compile-time DI container (`container/plugins.go`; there is no
     `plugin.Open` anywhere), so the enum backend kind stays the extension point.

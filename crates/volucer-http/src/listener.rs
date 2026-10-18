@@ -1471,7 +1471,11 @@ async fn prepare(
 
     // A route that proves its pattern names a script may skip the router's own `stat`:
     let skips_stat = route.is_some_and(|route| {
-        volucer_core::config::skip_stat(route, front_end.dispatcher.interprets_path(&route.backend))
+        volucer_core::config::skip_stat(
+            route,
+            front_end.dispatcher.interprets_path(&route.backend),
+            &site.script_extensions,
+        )
     });
 
     // Everything from here on blocks: routing stats the filesystem to resolve
@@ -2038,6 +2042,7 @@ mod tests {
             document_root: PathBuf::from("."),
             front_controller: Some("index.php".to_string()),
             forbidden_extensions: vec![".htaccess".to_string()],
+            ..Routing::default()
         }
     }
 
@@ -2176,6 +2181,7 @@ mod tests {
             document_root: PathBuf::from("a-directory-that-does-not-exist"),
             front_controller: None,
             forbidden_extensions: Vec::new(),
+            ..Routing::default()
         };
         let err = to_cgi(
             &parts("GET", "/nope.php", Some("example.test")),
@@ -2195,6 +2201,7 @@ mod tests {
             document_root: PathBuf::from("a-directory-that-does-not-exist"),
             front_controller: Some("index.php".to_string()),
             forbidden_extensions: vec![".htaccess".to_string()],
+            ..Routing::default()
         };
         let err = to_cgi(
             &parts("GET", "/.htaccess", Some("example.test")),

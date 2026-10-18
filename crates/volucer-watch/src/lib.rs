@@ -192,6 +192,12 @@ pub struct StaticFiles {
     /// Fixed for the life of a listener — the socket is already bound — so a reload cannot
     /// change it, and it is passed in rather than stored with the table.
     pub server_port: u16,
+    /// The extensions this site treats as scripts, so a file that is one is never served
+    /// from disk.
+    ///
+    /// The same value the router uses. See `volucer_core::script` for why this is one list
+    /// rather than two.
+    pub script_extensions: volucer_core::ScriptExtensions,
 }
 
 /// Everything a front-end derives from the shared site table, as one replaceable value.
@@ -248,6 +254,7 @@ impl Reloaded {
                 Routing {
                     document_root: site.document_root.clone(),
                     front_controller: site.front_controller.clone(),
+                    script_extensions: site.script_extensions.clone(),
                     ..Routing::default()
                 },
             );
@@ -257,6 +264,7 @@ impl Reloaded {
                     config: site.static_files.clone(),
                     document_root: site.document_root.clone(),
                     server_port,
+                    script_extensions: site.script_extensions.clone(),
                 },
             );
         }

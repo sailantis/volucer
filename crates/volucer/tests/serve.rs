@@ -1550,7 +1550,109 @@ origin = {origin}
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// **`[server.proxy]` reaches the request path, and the trust decision is what decides.**
+/// **Step 38's security half, end to end: widening the list changes whether a file is served.**
+///
+/// This is the pairing that has to be asserted, and neither half alone is evidence:
+///
+/// - With the default list, `/app.py` is an ordinary file, so the static layer serves it — the
+///   program's source, to the client, with a 200. That is the disclosure that made "just widen the
+///   router" unsafe.
+/// - With the list naming `py`, the same file is a script, so the static layer refuses it and the
+///   request reaches the backend instead.
+///
+/// The backend is an upstream rather than a worker so the test needs no SDK, and it records what it
+/// was sent — which is how "the request reached the backend" is told apart from "the front
+/// controller answered".
+#[test]
+fn widening_the_script_list_stops_the_static_layer_serving_the_source() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-py-static-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+    std::fs::write(root.join("app.py"), "# a secret the client must not read\n")
+        .expect("write the entry point");
+    std::fs::write(root.join("front.php"), "<?php\n").expect("write the front controller");
+
+    let origin = TestOrigin::start(
+        "HTTP/1.1 200 OK\r\n\
+         X-Served-By: origin\r\n\
+         Content-Length: 2\r\n\
+         \r\n\
+         ok",
+    );
+
+    let start = |name: &str, extensions: &str| -> Option<Server> {
+        let config_path = root.join(format!("volucer-{name}.toml"));
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:0"
+document_root = {root}
+front_controller = "front.php"
+static_files = true
+{extensions}
+
+[backends.app]
+kind = "upstream"
+origin = {origin}
+"#,
+                root = toml_string(&root.display().to_string()),
+                origin = toml_string(&origin.origin_url()),
+                extensions = extensions,
+            ),
+        )
+        .expect("write the config");
+        Server::start(&binary, &config_path)
+    };
+
+    // The default list: `app.py` is a file, so the layer serves it. The assertion is on the *body*
+    // rather than on a header, because the disclosure is the body.
+    let Some(default) = start("default", "") else {
+        panic!("the server did not start with the default list");
+    };
+    let address = default
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+    let answer = http_get(&address, "/app.py");
+    assert_eq!(answer.status, 200, "{answer:?}");
+    assert!(
+        answer.text().contains("a secret the client must not read"),
+        "with the default list an unknown extension is an ordinary file, so the static layer \
+         serves it — this is the behaviour widening is meant to replace: {answer:?}"
+    );
+    drop(default);
+
+    // With `py` named, the same path is a script: refused by the static layer, handed to the
+    // backend.
+    let Some(widened) = start("widened", "script_extensions = [\"php\", \"py\"]") else {
+        panic!("the server did not start with a widened list");
+    };
+    let address = widened
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+    let answer = http_get(&address, "/app.py");
+    assert_eq!(answer.status, 200, "{answer:?}");
+    assert!(
+        !answer.text().contains("a secret the client must not read"),
+        "a script must never be served from disk: {answer:?}"
+    );
+    assert_eq!(
+        answer.header("x-served-by"),
+        Some("origin"),
+        "the request must reach the backend instead: {answer:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
 ///
 /// The defect this closes is invisible from the client's side, which is why it is asserted at the
 /// origin rather than in the answer: behind a proxy, the address the *backend* is told is the
