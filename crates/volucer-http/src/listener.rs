@@ -255,6 +255,13 @@ struct FrontEnd {
     /// front-ends share — and because the two are read at the same point in the request path: the
     /// address that is logged is the address the policy resolved.
     client_ip: Arc<volucer_core::ClientIpPolicy>,
+    /// The rate limit, when the deployment asked for one.
+    ///
+    /// **One instance for the process**, shared with the FastCGI front-end: two limiters would give
+    /// a client twice the configured allowance depending on which protocol took the request. It is
+    /// `None` — not a policy that allows everything — when no `[server.rate_limit]` table exists, so
+    /// the request path does one `Option` check and touches no map, no clock and no lock.
+    rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
 }
 
 impl FrontEnd {
@@ -315,6 +322,14 @@ pub struct ReloadHandles {
     ///
     /// Defaults to off, so every existing caller keeps resolving to the peer address.
     pub client_ip: Arc<volucer_core::ClientIpPolicy>,
+    /// The rate limit, when the deployment asked for one.
+    ///
+    /// Here for the same reason `client_ip` is: it is a process-wide decision both front-ends must
+    /// share. **Not reloadable**, and that is forced rather than chosen — the buckets are live
+    /// state, so replacing the policy would silently reset every caller's allowance on a `SIGHUP`,
+    /// which is a limit that can be escaped by asking the operator to reload. `restart_only` names
+    /// it.
+    pub rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
 }
 
 impl ReloadHandles {
@@ -326,6 +341,7 @@ impl ReloadHandles {
             tls: None,
             observe: Arc::new(volucer_observe::Observability::disabled()),
             client_ip: Arc::new(volucer_core::ClientIpPolicy::off()),
+            rate_limit: None,
         }
     }
 
@@ -347,6 +363,16 @@ impl ReloadHandles {
         self
     }
 
+    /// The same, with a rate limit both front-ends share.
+    ///
+    /// A builder beside [`ReloadHandles::with_client_ip`] for the same reason: every existing caller
+    /// constructs these handles without a limiter and must keep costing nothing.
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_limit: Arc<volucer_core::RateLimitPolicy>) -> Self {
+        self.rate_limit = Some(rate_limit);
+        self
+    }
+
     /// The same, for a listener that speaks TLS.
     #[must_use]
     pub fn with_tls(mut self, resolver: Arc<crate::tls::SniResolver>) -> Self {
@@ -359,6 +385,7 @@ impl std::fmt::Debug for ReloadHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReloadHandles")
             .field("tls", &self.tls.is_some())
+            .field("rate_limit", &self.rate_limit.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -807,6 +834,7 @@ impl HttpListener {
                 https_port: Some(https_port),
                 observe: Arc::clone(&handles.observe),
                 client_ip: Arc::clone(&handles.client_ip),
+                rate_limit: handles.rate_limit.clone(),
             }),
             tls: acceptor,
             accept_plain,
@@ -1027,11 +1055,11 @@ where
             // separately is how the two come to disagree, which is a log that contradicts what the
             // application was told. It is inside the closure rather than outside because the headers
             // are what it reads.
-            let remote_addr = front_end
+            let resolved = front_end
                 .client_ip
-                .resolve(peer_ip, &HttpHeaders(request.headers()))
-                .to_string();
-            Ok::<_, Infallible>(handle(request, front_end, remote_addr, cleartext).await)
+                .resolve(peer_ip, &HttpHeaders(request.headers()));
+            let remote_addr = resolved.to_string();
+            Ok::<_, Infallible>(handle(request, front_end, remote_addr, resolved, cleartext).await)
         }
     });
 
@@ -1062,6 +1090,7 @@ async fn handle(
     request: Request<Incoming>,
     front_end: Arc<FrontEnd>,
     remote_addr: String,
+    resolved_peer: std::net::IpAddr,
     cleartext: bool,
 ) -> Response<ResponseBody> {
     // Identity first, before anything can fail. A request that is rejected, redirected or 404s
@@ -1085,17 +1114,18 @@ async fn handle(
     let referer = header_str(request.headers(), "referer").map(str::to_owned);
     let peer: Option<std::net::IpAddr> = remote_addr.parse().ok();
 
-    let mut response = match prepare(request, &front_end, remote_addr, cleartext).await {
-        Ok(response) => {
-            front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
-            response
-        }
-        Err(err) => {
-            front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(status = err.status(), %err, "http request failed");
-            error_response(&err)
-        }
-    };
+    let mut response =
+        match prepare(request, &front_end, remote_addr, resolved_peer, cleartext).await {
+            Ok(response) => {
+                front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
+                response
+            }
+            Err(err) => {
+                front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(status = err.status(), %err, "http request failed");
+                error_response(&err)
+            }
+        };
 
     // **The id is echoed on every answer, including error pages.** A client that sends an id and
     // cannot find it on the response has no way to quote it, and an error is the case where they
@@ -1243,9 +1273,60 @@ async fn prepare(
     request: Request<Incoming>,
     front_end: &Arc<FrontEnd>,
     remote_addr: String,
+    resolved_peer: std::net::IpAddr,
     cleartext: bool,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
+
+    // **The rate limit is the first thing consulted, and before anything that costs work.**
+    // Before the redirect, before the site table, before the static layer's `stat`, and above all
+    // before the body is read: a limited request must cost a map lookup and a clock read, not a
+    // file lookup or a buffered body. The whole purpose of the feature is to stop a caller
+    // spending the server's work, so a check that ran after some of that work would be a limit on
+    // the *remainder*.
+    //
+    // `resolved_peer` and not `remote_addr`: the identity is the address `[server.proxy]`
+    // resolved, which is why that table was built before this one. A limit keyed on the socket peer
+    // behind nginx would throttle the proxy and could not tell two clients apart.
+    if let Some(limit) = &front_end.rate_limit {
+        let identity = match limit.key() {
+            volucer_core::KeyMode::Global => volucer_core::Identity::Global,
+            volucer_core::KeyMode::Ip => volucer_core::Identity::Address(resolved_peer),
+            volucer_core::KeyMode::Header => volucer_core::Identity::Header(
+                limit
+                    .header()
+                    .and_then(|name| header_str(&parts.headers, name))
+                    .unwrap_or_default(),
+            ),
+        };
+        if let volucer_core::Verdict::Limited { retry_after, .. } =
+            limit.check(identity, Instant::now())
+        {
+            // **A limited gRPC call is refused as a gRPC failure, not as an HTTP 429.** The protocol
+            // is known here and cannot be recovered later — `error_response` sees only the error,
+            // and the request has been consumed by this point — so the branch is decided while the
+            // headers are still in hand. `RESOURCE_EXHAUSTED` is the specification's retryable
+            // code, which is the same instruction the HTTP side's `Retry-After` carries; a 429 is
+            // unreadable to a gRPC client, which reports "unexpected HTTP status" and never retries.
+            //
+            // `Retry-After` has no gRPC equivalent and is not lost: it is written to the log with
+            // the rest of the failure, where the operator reads it.
+            if volucer_upstream::is_grpc(&parts.headers) {
+                return Err(HttpError::Grpc {
+                    status: volucer_upstream::GrpcStatus::ResourceExhausted,
+                    reason: format!(
+                        "the {} rate limit refused this call; retry in {}s",
+                        limit.key().as_str(),
+                        retry_after.as_secs().max(1)
+                    ),
+                });
+            }
+            return Err(HttpError::RateLimited {
+                key: limit.key(),
+                retry_after,
+            });
+        }
+    }
 
     // A plaintext listener may redirect before anything else looks at the request. Done here
     // rather than in the accept path because it needs the `Host` and the path, and it is checked
@@ -1783,10 +1864,21 @@ fn error_response(err: &HttpError) -> Response<ResponseBody> {
     }
 
     let body = format!("{}\n", err);
-    Response::builder()
+    let mut builder = Response::builder()
         .status(err.status())
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(CONTENT_LENGTH, body.len())
+        // **`no-store`, for the same reason RoadRunner sets it.** A 429 is the one response a cache
+        // must never keep: a shared proxy that stored it would serve the refusal to every other
+        // client of the same URL, which turns one caller's limit into an outage.
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .header(CONTENT_LENGTH, body.len());
+    // `Retry-After` in whole seconds, which is the only form RFC 9110 §10.2.3 defines for a delay.
+    // Carried from the limiter's own arithmetic so the number the client is told is the number the
+    // bucket will honour.
+    if let HttpError::RateLimited { retry_after, .. } = err {
+        builder = builder.header(hyper::header::RETRY_AFTER, retry_after.as_secs().max(1));
+    }
+    builder
         .body(body_of(Bytes::from(body)))
         .expect("a plain-text error page is a valid response")
 }

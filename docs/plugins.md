@@ -179,7 +179,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 | **`volucer workers` / `volucer reset`** (§4.6, §4.7) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S–M**, and not the **S** this was first called. The methods exist and are tested; what is missing is a way *in* from a second process, which is a listener rather than a client. Route it on the `[status]` listener that already exists — see §4.7 | §4.6 promises it and the promise was false in a way worth keeping written down: the channel the registry travels on is held by the pool and the child, so it has no second-process half. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing. **It also makes two subcommands optional**, which is why it is the endpoints rather than the CLI: `curl -f -XPOST .../workers/3/reset` is the whole command |
 | **`http.trusted_subnets` + forwarded headers** — **built, §6.8** | `proxy_ip_parser` | **S–M**, and it was S–M. A CIDR check against the peer, then the first parsable of an ordered header list, hand-rolled rather than a crate | **Not a convenience — a correctness bug, and the only defect in this table.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Both places already took an address, which is why the change is small |
 | **`metrics.observe`** — **built, §6.1** | `metrics.collect` | **S**, and it was **not** S. The estimate said "one registry entry and one namespace arm"; the real work was a declared-kind dispatch (`Registry::record`), a validation that runs *before* a series exists, a name rule, and fixing the SDK's own examples, which used dots and could never have rendered | `emitMetric` rode the wire and landed in a `Vec` nobody read (`codec.rs:1136`), which §6.1 called the first thing to fix. **That was fixed and the feature still did not work**: a registry refuses an undeclared name, so every real sample was dropped while three tests passed by declaring their own metric. The table was the feature, not an upgrade to it |
-| **Rate limiting** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
+| **Rate limiting** — **built, §6.10** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above — which is the half the estimate got right. The bucket *is* a page of arithmetic; what was not S was deciding what a refusal means on **two** front-ends and **two** protocols, and finding that RoadRunner answers a full table with a 503 | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
 
 #### Worth considering — real value, but it duplicates or complicates something that exists
 
@@ -1680,6 +1680,97 @@ fixture that builds the input for the assertion can hide the assertion, and the 
 that the test *fails* when the code under test is broken — which it now does, verified by ignoring
 the configured limit and watching the 413 become a 502.
 
+### 6.10 Rate limiting: a refusal is a statement about the caller
+
+**Built, and the first row of §1.4 whose estimate held.** "The token bucket is a page of arithmetic"
+was true; what the estimate did not see is that the arithmetic is the *small* half. The work was
+deciding what a refusal means when there are two front-ends, two protocols, and a table that has to
+say what happens when it is full.
+
+#### Six decisions, each of which could reasonably have gone the other way
+
+1. **`429`, not `503`.** RoadRunner answers a full key table with `503 Service Unavailable`. That is
+   the one status a load balancer *acts* on: it takes the node out of rotation. One client that
+   varies a header would then get the deployment removed from its pool, which is an outage caused by
+   the thing the limit exists to survive. `429 Too Many Requests` is a statement about the caller and
+   the process stays in rotation. A new variant, `HttpError::RateLimited`, exists for exactly this and
+   a test pins that it never shares a status with `Overloaded`.
+2. **`Retry-After`, always, in whole seconds, floored at one.** Its absence is what makes a client
+   retry immediately against a bucket that is still empty. The number comes from the limiter's own
+   arithmetic so the promise and the bucket cannot disagree.
+3. **The `burst` default is `rate`, not `1`.** RoadRunner defaults it to one, which turns
+   `rate: 60, interval: 1m` into "one request, then one per second" — a limit nobody writing that
+   line meant. Defaulting to `rate` is the ordinary reading of "60 a minute".
+4. **Refilling is continuous, not windowed.** nginx's `limit_req` is a fixed-window counter, and a
+   client can spend one window at `t = interval − 1ms` and the next at `t = interval + 1ms`, doubling
+   the instantaneous rate. A bucket has no boundary to exploit: it cannot hold more than `burst`.
+5. **A full table evicts only what costs nothing to lose.** A bucket that has refilled to `burst` is
+   indistinguishable from an absent one, so reclaiming it is lossless. A *depleted* bucket is not:
+   evicting it hands that caller a fresh allowance, which is exactly what the limit exists to refuse.
+   So a full table of depleted buckets refuses the newcomer, and the sweep runs when the table is
+   full rather than on RoadRunner's one-minute timer — the only moment it can change an answer.
+6. **Header keys are hashed, not stored.** A header value is attacker-chosen and unbounded; storing it
+   verbatim would let an unauthenticated client make the process hold an arbitrary amount per bucket.
+   `std`'s `RandomState` is a seeded SipHash, so it is also not precomputable by a client trying to
+   fill the table deliberately — and it adds no dependency, which SHA-256 would.
+
+#### The two front-ends, and why the identity is not the same on both
+
+One `Arc<RateLimitPolicy>` reaches both, exactly as one `Arc<ClientIpPolicy>` does, because two
+policies would give a client twice the configured allowance depending on which protocol received its
+request — invisible to any test that exercises one front-end. The **identity**, though, is resolved
+differently on each, and §6.8 already established why:
+
+- **HTTP** keys on the address `[server.proxy]` resolved.
+- **FastCGI** keys on `REMOTE_ADDR`, which is the param nginx sets from `$remote_addr` — the client,
+  already resolved by nginx's own `real_ip`. Applying the trust list here would replace a value the
+  *proxy* established with one the client merely asserted, which is the same asymmetry §6.8 found.
+
+A request with neither (no `REMOTE_ADDR` at all) gets **no bucket** rather than a shared one:
+bucketing every such request together would make the limit a global one that reads as per-caller.
+
+#### Where the check runs, and the test that proves it
+
+In `prepare`, before the redirect, before the site table, before the static layer's `stat`, and
+before the body is read. The purpose of the feature is to stop a caller spending the server's work,
+so a check that ran after some of that work would limit only the remainder.
+
+That is not assertable by the status alone, so the test changes the world: the burst is spent on a
+real file, the file is **deleted**, and the next request must still be a `429`. A limiter behind the
+static layer answers `502` there, because the path fell through to a deliberately unreachable front
+controller. Verified by moving the check and watching it fail with `left: 502`.
+
+#### gRPC
+
+A limited gRPC call is `RESOURCE_EXHAUSTED` in the trailers, not a `429`. A gRPC client reads its
+outcome from the trailer section and reports "unexpected HTTP status" for anything else, so the retry
+the caller should perform would never happen. `GrpcStatus` gained a fourth variant for this, and the
+branch is decided **in `prepare`** rather than in `error_response` because that is the last point at
+which the request's headers still exist — `error_response` sees only the error.
+
+#### What is deliberately not here
+
+Route-level and per-site limits. A bucket's identity is (who, *which limit*), so two policies over one
+client are two buckets and a route table would need the policy's name in the key. RoadRunner has the
+same restriction. **No timer and no background thread** either: the sweep runs when the table is full.
+
+`[server.rate_limit]` is **restart-only**, and `restart_only()` names it. The buckets are live state,
+so replacing the policy on a `SIGHUP` would reset every caller's allowance — a limit escapable by
+asking the operator to reload.
+
+#### Verified
+
+- 12 unit tests over the bucket: the burst boundary, a token returning exactly on time and not a
+  millisecond early, refilling capped at `burst` rather than banked, two clients not sharing, a
+  v4-mapped address sharing its v4 bucket, both halves of the sweep, a blank header value refused
+  rather than bucketed, and a `Retry-After` that is never zero or fractional.
+- **Both front-ends end to end.** HTTP: a `429` with `Retry-After: 3600` and `no-store` over a real
+  socket. FastCGI: the same over a real FastCGI connection, on **one** connection with keep-alive, so
+  "the refusal does not close it" is asserted rather than assumed — plus a second address on that same
+  connection that is *not* throttled, which is what makes the key mode real.
+- gRPC: a limited call carries `grpc-status: 8` and no `429`.
+- Falsified twice: moving the check behind the static layer, and removing it from the FastCGI path.
+  Both times the relevant test failed with the answer the request became instead.
 ---
 
 ## 7. Python/Django and Ruby/Rails
@@ -1823,6 +1914,7 @@ progress on something earlier look bigger.
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | **Done.** `grpc_services` on a backend, `UNIMPLEMENTED` for anything else, and the application's status moved into the trailers. The application states its outcome in two response headers; the server never parses a message. Five of this section's own premises were corrected on contact, and the largest is that routing to a *worker* became protocol-aware |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | **Settled: not built**, and §10 item 2 is the decision. The only descriptor consumer turned out to be the service itself — a reply is already-framed bytes the server never decodes — so no other use could justify loading a schema either |
 | — | **`http.trusted_subnets` + forwarded headers** — §6.8 | — | S–M | **Done.** Independent of 1–9, and the only item in §1.4 that was a *defect* rather than a missing feature: behind nginx the access log and any future rate limit both keyed on the proxy. Restart-only, and deliberately not applied on the FastCGI path |
+| — | **Rate limiting** — §6.10 | 1, §6.8's resolved address | S | **Done.** The bucket is a page of arithmetic as §1.4 said; the work was the two front-ends and two protocols. 429 (not RoadRunner's 503, which would remove the node from a load balancer), Retry-After, and RESOURCE_EXHAUSTED for a gRPC call. Restart-only, because the buckets are live state |
 | — | **`volucer workers` / `volucer reset`** — §4.7 | 1, 2, and §6.1's `[status]` listener | S–M | **Not built, and it is the operator's only lever on a running pool.** §4.6 called it a client; it is an endpoint, because the registry's channel has no second-process half. Routes on the listener `[status]` already brings up, behind an off-by-default key |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
@@ -2227,3 +2319,14 @@ machine that parses what arrives. This server never parses a frame; hyper does.
     `X-Forwarded-*`'s specified behaviour — but a deployment where the origin *trusts* that header and
     volucer is the last hop would want the claim dropped instead. Recorded, not changed: no origin in
     this tree reads it.
+
+    **Settled for the rate-limit step, and the answer is that it is still not needed.** §6.10 keys
+    the limiter on the address `[server.proxy]` already resolves — the same one `REMOTE_ADDR` and the
+    access log use — because the chain walk only changes an answer when the chain mixes trusted and
+    untrusted hops. In the shape this table is for (one proxy whose address the deployment names),
+    the single resolved address *is* the rightmost untrusted one, so a backwards walk would return the
+    same address with more parsing. A deployment nested two proxies deep is the case it would fix, and
+    that deployment can name both ranges in `trusted_subnets` to get the same effect today.
+    RoadRunner's `proxy_ip_parser` does not walk the chain either. So the decision is *deferred with
+    its trigger stated*: build it when a deployment's configuration cannot express its topology,
+    which is also when an operator would be able to describe the chain it wants.

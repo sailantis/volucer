@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::ratelimit::KeyMode;
 
 const DEFAULT_WORKERS: u32 = 0; // 0 = number of logical CPUs
 
@@ -1594,6 +1595,86 @@ pub struct ServerConfig {
     /// than ignoring it — and a trust statement should have to be written down and named.
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+
+    /// Refuse callers over a configured rate. **Absent is what turns it off**, and that is the
+    /// default.
+    ///
+    /// The same convention as [`Config::metrics`] and [`ServerConfig::tls`]: the presence of the
+    /// table is the enable switch, because an `enabled` flag beside a `rate` is two statements
+    /// about one thing and they can disagree.
+    ///
+    /// It is keyed on the identity `[server.proxy]` resolves, which is the whole reason that table
+    /// was built first: behind nginx a limit keyed on the peer throttles the proxy and cannot tell
+    /// two clients apart at all. See [`Self::rate_limiter`].
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+/// One rate-limit policy, applied by every front-end.
+///
+/// The names are RoadRunner's (`http.rate_limiter`) with the same three key modes, because an
+/// operator who has written an `rr.yaml` block already knows what they mean. Two things depart from
+/// it deliberately, and both are in [`ServerConfig::rate_limiter`]'s documentation: `burst` defaults
+/// to `rate` rather than to `1`, and a full table answers a 429 rather than a 503.
+///
+/// # One policy per process, which is a limitation rather than a design
+///
+/// Route-level and per-site limits are the obvious next question, and the answer is no for a
+/// reason worth recording: a bucket's identity is (who, *which limit*), so two policies over one
+/// client are two buckets, and a route table would need the policy's name in the key. RoadRunner
+/// has the same restriction and states it. A deployment that needs several limits puts a second
+/// proxy in front, or waits for this to grow a route table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Who a bucket belongs to: `"ip"` (the default), `"header"`, or `"global"`.
+    #[serde(default)]
+    pub key: KeyMode,
+
+    /// The header whose value names the caller, when `key = "header"`.
+    ///
+    /// Required in that mode and refused in the other two: a header named beside a key that does
+    /// not read one is a line that believes it limits that header, and RoadRunner's own schema
+    /// makes the same call.
+    ///
+    /// **Not an authenticated identity.** A client chooses the value, so a client that varies it
+    /// gets one bucket per request until the table fills. Its use is a value the *proxy* sets — a
+    /// tenant it routed, a key it vouched for.
+    #[serde(default)]
+    pub header: Option<String>,
+
+    /// Requests allowed per `interval`. Required, because a rate limit with no rate is a table
+    /// that appears to protect something and does not.
+    pub rate: u32,
+
+    /// How long `rate` requests take to accrue, in milliseconds.
+    ///
+    /// Named `interval_ms` rather than RoadRunner's `interval` (a Go duration string), following
+    /// `[telemetry].interval_ms` and `[backends.pool].ready_timeout_ms`: a number with its unit in
+    /// the key cannot be misread, and a duration syntax is a parser this file does not have.
+    #[serde(default = "default_rate_interval_ms")]
+    pub interval_ms: u64,
+
+    /// How many requests may be spent at once, and how many a bucket holds.
+    ///
+    /// **Defaults to `rate`, not to 1.** RoadRunner defaults it to one, which turns
+    /// `rate = 60, interval_ms = 60000` into "one request, then one per second" — a limit nobody
+    /// writing that line meant. Defaulting to `rate` is the ordinary reading of "60 requests a
+    /// minute": the allowance may be spent at once and it returns over the minute.
+    #[serde(default)]
+    pub burst: Option<u32>,
+
+    /// How many identities one process tracks before it stops admitting new ones.
+    ///
+    /// Defaults to [`DEFAULT_MAX_ENTRIES`]. A full table that is only full of *depleted* buckets
+    /// refuses the newcomer with a 429 rather than evicting somebody's allowance; see
+    /// [`volucer_core::ratelimit`](crate::ratelimit) for why that is the lossless direction.
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+}
+
+fn default_rate_interval_ms() -> u64 {
+    1000
 }
 
 /// Which peers may assert a client address, and through which headers.
@@ -1768,6 +1849,32 @@ impl ServerConfig {
         };
         crate::clientip::ClientIpPolicy::new(&proxy.trusted_subnets, &proxy.trusted_headers)
             .map_err(|reason| format!("server.proxy.trusted_subnets: {reason}"))
+    }
+
+    /// The rate-limit policy this deployment asks for, or the reason it is not usable.
+    ///
+    /// `Ok(None)` when there is no `[server.rate_limit]` table, which is the default and means no
+    /// limiter is consulted at all — not a limiter configured to allow everything.
+    ///
+    /// **Built once and shared by both front-ends.** Two policies would give a client twice the
+    /// configured allowance depending on which protocol received the request, which is the same
+    /// one-front-end-only failure the shared site table exists to prevent.
+    pub fn rate_limiter(
+        &self,
+    ) -> std::result::Result<Option<crate::ratelimit::RateLimitPolicy>, String> {
+        let Some(limit) = &self.rate_limit else {
+            return Ok(None);
+        };
+        crate::ratelimit::RateLimitPolicy::new(
+            limit.key,
+            limit.header.as_deref(),
+            limit.rate,
+            std::time::Duration::from_millis(limit.interval_ms),
+            limit.burst,
+            limit.max_entries,
+        )
+        .map(Some)
+        .map_err(|reason| format!("server.rate_limit: {reason}"))
     }
 }
 
@@ -3788,6 +3895,12 @@ impl Config {
                  value or remove the key — an unset key means the 32 MiB default"
                     .to_string(),
             ));
+        }
+        // Checked through the same constructor the server uses, so a file the CLI accepts is a file
+        // a listener can apply. The alternative is a validation that repeats the arithmetic and a
+        // server that disagrees with it.
+        if let Err(reason) = self.server.rate_limiter() {
+            return Err(Error::Config(reason));
         }
         // `serve_only = "backend"` and an enabled static layer are contradictory:
         // one says the static layer never runs, the other says it must. Which wins
@@ -7497,6 +7610,27 @@ driver = "memory"
              `php <file>`, and the difference is the one thing a reader has to know here",
             path.display()
         );
+        // And the rate limit, where the two things a reader has to find *before* configuring it are
+        // that `key = "header"` is not an authenticated identity and that the ip key follows
+        // `[server.proxy]` rather than the socket peer. Both are mistakes that produce a limit that
+        // reads as configured and limits the wrong thing.
+        assert!(
+            text.contains("# [server.rate_limit]"),
+            "{} no longer documents the [server.rate_limit] table",
+            path.display()
+        );
+        assert!(
+            text.contains("an authenticated identity"),
+            "{} no longer warns that a header key is not an authenticated identity: a client \
+             chooses that value, so the warning is the whole safety of the mode",
+            path.display()
+        );
+        assert!(
+            text.contains("NOT the socket peer"),
+            "{} no longer says that the ip key follows [server.proxy] rather than the socket peer, \
+             which is the difference between limiting a client and limiting nginx",
+            path.display()
+        );
     }
 
     #[test]
@@ -7660,6 +7794,128 @@ max_request_size = 256
 "#;
         let err = Config::from_toml(text).expect_err("an unknown key must be refused");
         assert!(err.to_string().contains("max_request_size"), "{err}");
+    }
+
+    #[test]
+    fn a_rate_limit_table_that_is_absent_is_an_off_limiter() {
+        // Off is `None`, not a policy that allows everything: a front-end with no policy does one
+        // `Option` check and never touches a map or a clock.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert!(config.server.rate_limiter().expect("valid").is_none());
+        config.validate().expect("an absent table is valid");
+    }
+
+    #[test]
+    fn a_stated_rate_limit_resolves_its_defaults() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[server.rate_limit]
+rate = 60
+interval_ms = 60000
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+        let limiter = config
+            .server
+            .rate_limiter()
+            .expect("valid")
+            .expect("a table is a limiter");
+
+        // Defaults, asserted together because each is a departure from either RoadRunner or the
+        // obvious reading, and a future edit could change any of them silently.
+        assert_eq!(limiter.key(), crate::ratelimit::KeyMode::Ip);
+        assert_eq!(limiter.burst(), 60, "the burst defaults to the rate");
+        assert_eq!(limiter.max_entries(), crate::ratelimit::DEFAULT_MAX_ENTRIES);
+        assert_eq!(limiter.per_second(), 1.0, "60 requests per 60 seconds");
+
+        // And the default interval is one second, so `rate` alone means "per second".
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[server.rate_limit]
+rate = 5
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert_eq!(
+            config
+                .server
+                .rate_limiter()
+                .expect("valid")
+                .expect("a limiter")
+                .per_second(),
+            5.0
+        );
+    }
+
+    #[test]
+    fn an_unusable_rate_limit_is_refused_by_the_same_constructor_the_server_uses() {
+        // `validate` calls `rate_limiter()`, so these four assertions are about the file being
+        // refused *and* about the reason reaching the operator — not about a second copy of the
+        // rules that could drift from the one the listener applies.
+        let cases = [
+            // A rate of zero, which is the shape a template renders when a variable is empty.
+            ("[server.rate_limit]\nrate = 0\n", "rate"),
+            // A header named beside a key that does not read one.
+            (
+                "[server.rate_limit]\nrate = 1\nheader = \"X-Client-Id\"\n",
+                "header",
+            ),
+            // A header key with no name, where the name is the identity.
+            (
+                "[server.rate_limit]\nrate = 1\nkey = \"header\"\n",
+                "header",
+            ),
+        ];
+        for (table, needle) in cases {
+            let text = format!("[server]\nhttp = \"127.0.0.1:8080\"\n{table}");
+            let parsed = Config::from_toml(&text).expect("the TOML itself is well-formed");
+            let err = parsed.validate().expect_err("must fail");
+            assert!(
+                err.to_string().contains(needle),
+                "the refusal must name {needle:?}: {err}"
+            );
+            assert!(
+                err.to_string().contains("server.rate_limit"),
+                "and the table it came from: {err}"
+            );
+        }
+
+        // A table with no `rate` at all is refused by the deserializer rather than by `validate`,
+        // because `rate` has no default: a rate limit whose rate defaulted would be a table that
+        // appears to protect something. It is asserted here because it is the same question — a
+        // table that is all defaults must not silently mean "no limit" — with a different half of
+        // the code answering it.
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n[server.rate_limit]\n";
+        let err = Config::from_toml(text).expect_err("a rate is required");
+        assert!(err.to_string().contains("rate"), "{err}");
+    }
+
+    #[test]
+    fn a_rate_limit_key_mode_is_parsed_strictly() {
+        // A typo must not silently choose a mode: `key = "ip "` or `key = "address"` would
+        // otherwise limit something the operator did not write, and a per-caller limit that
+        // became a global one is the failure that matters here.
+        for bad in ["ip ", "address", "IP_HEADER", ""] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[server.rate_limit]\nrate = 1\nkey = {bad:?}\n"
+            );
+            assert!(
+                Config::from_toml(&text).is_err(),
+                "key = {bad:?} must not parse"
+            );
+        }
+
+        // RoadRunner's `header` mode is the one value that is not a default, and it is accepted
+        // with the key it requires.
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n[server.rate_limit]\nrate = 1\n\
+                    key = \"header\"\nheader = \"X-Client-Id\"\n";
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
     }
 
     #[test]

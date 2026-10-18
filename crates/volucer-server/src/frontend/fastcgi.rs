@@ -303,14 +303,60 @@ where
 /// what failed. **Except for a body that was too large**, which is a 413 — the reason decides the
 /// status line, because the `Status:` line is how this front-end says anything to the client and
 /// blaming the gateway for a limit the client exceeded would send an operator to look at PHP.
+///
+/// A **rate-limited** refusal also carries a `Retry-After`, which no other kind can: only this one
+/// has a number to give the client. It goes through [`write_rate_limited`] so that the header and
+/// the status line cannot be written by two callers that disagree.
 pub fn write_error<W: Write>(
     writer: &mut W,
     request_id: u16,
     message: &str,
     reason: ServerErrorKind,
 ) -> Result<()> {
+    write_error_with(writer, request_id, message, reason, None)
+}
+
+/// A refusal that tells the client when to come back.
+///
+/// Separate from [`write_error`] rather than an argument on it, because only one kind of refusal has
+/// an answer to "when": passing `None` from the five callers that do not would be a parameter every
+/// future caller has to think about for a case only this one reaches.
+pub fn write_rate_limited<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    message: &str,
+    retry_after_secs: u64,
+) -> Result<()> {
+    write_error_with(
+        writer,
+        request_id,
+        message,
+        ServerErrorKind::RateLimited,
+        Some(retry_after_secs.max(1)),
+    )
+}
+
+fn write_error_with<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    message: &str,
+    reason: ServerErrorKind,
+    retry_after_secs: Option<u64>,
+) -> Result<()> {
+    // `no-store` on both of the refuse-with-a-status kinds, and it is not decoration: a shared
+    // cache that stored a 429 or a 413 would serve it to every other client of the same URL, which
+    // turns one caller's problem into everybody's. RoadRunner sets it for the same reason.
+    let extra = match (&reason, retry_after_secs) {
+        (ServerErrorKind::RateLimited, Some(seconds)) => {
+            format!("Cache-Control: no-store\r\nRetry-After: {seconds}\r\n")
+        }
+        (ServerErrorKind::BodyTooLarge | ServerErrorKind::RateLimited, _) => {
+            "Cache-Control: no-store\r\n".to_string()
+        }
+        _ => String::new(),
+    };
     let body = format!(
-        "Status: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nvolucer: {message}\r\n",
+        "Status: {}\r\nContent-Type: text/plain; charset=utf-8\r\n{extra}\r\nvolucer: {message}\r\n",
         reason.status_line()
     );
 
@@ -322,7 +368,6 @@ pub fn write_error<W: Write>(
         app_status: 0,
         protocol_status: reason.protocol_status(),
     };
-
     write_assembled(writer, |out| {
         record::append_records(out, RecordType::Stdout, request_id, body.as_bytes(), true);
         record::append_records(
@@ -349,6 +394,18 @@ pub enum ServerErrorKind {
     NoMultiplexing,
     /// The body was over `server.max_body_bytes`.
     BodyTooLarge,
+    /// The caller has spent its rate-limit allowance.
+    ///
+    /// Its own kind rather than a reuse of [`ServerErrorKind::Overloaded`], because the two must not
+    /// share a status line: `Overloaded` is a 503 — "this server has no capacity" — while a rate
+    /// limit is a 429, which is a statement about the caller. nginx relays whichever `Status:` line
+    /// arrives, so the difference reaches the client.
+    ///
+    /// The protocol status stays `RequestComplete` for the same reason [`ServerErrorKind::BodyTooLarge`]'s
+    /// does: the request was read in full and refused by policy, so nothing about the *connection*
+    /// went wrong. `Overloaded` would tell nginx to retry elsewhere, and a rate-limited caller is
+    /// rate-limited at every worker.
+    RateLimited,
 }
 
 impl ServerErrorKind {
@@ -362,6 +419,7 @@ impl ServerErrorKind {
             // 404 is `RequestComplete`. `Overloaded` would tell nginx to try elsewhere, and an
             // oversized body is oversized at every worker.
             ServerErrorKind::BodyTooLarge => ProtocolStatus::RequestComplete,
+            ServerErrorKind::RateLimited => ProtocolStatus::RequestComplete,
         }
     }
 
@@ -375,6 +433,7 @@ impl ServerErrorKind {
             // **413, not 502.** The gateway did not fail; the client sent a body over the limit,
             // and `413 Content Too Large` is the answer nginx itself gives for the same reason.
             ServerErrorKind::BodyTooLarge => "413 Content Too Large",
+            ServerErrorKind::RateLimited => "429 Too Many Requests",
             _ => "502 Bad Gateway",
         }
     }
@@ -730,6 +789,75 @@ mod tests {
             .unwrap()
             .protocol_status
             .is_complete());
+    }
+
+    #[test]
+    fn a_rate_limited_request_is_a_429_with_a_retry_after_and_a_completed_request() {
+        // Three things have to agree, and each was a separate decision:
+        //
+        // 1. The `Status:` line is 429, not the 502 every other kind defaults to — the gateway did
+        //    not fail, the caller has no allowance.
+        // 2. `Retry-After` is present and exact, because its absence is what turns a limit into a
+        //    request that is retried immediately, for ever.
+        // 3. The protocol status is `RequestComplete`, so nginx does **not** try another worker: a
+        //    rate-limited caller is rate-limited at every one of them, and `Overloaded` would put
+        //    nginx into a retry loop the limit exists to prevent.
+        let mut wire = Vec::new();
+        write_rate_limited(&mut wire, 1, "the ip rate limit refused this request", 42).unwrap();
+
+        let mut cursor = wire.as_slice();
+        let stdout = next_non_empty(&mut cursor).unwrap();
+        let text = String::from_utf8_lossy(&stdout.content);
+        assert!(text.starts_with("Status: 429 Too Many Requests"), "{text}");
+        assert!(text.contains("Retry-After: 42"), "{text}");
+        assert!(text.contains("Cache-Control: no-store"), "{text}");
+        assert!(
+            !text.contains("502"),
+            "a rate limit is not a gateway failure: {text}"
+        );
+        assert!(
+            !text.contains("503"),
+            "a 503 would tell a load balancer this node is unhealthy: {text}"
+        );
+
+        let _ = next_non_empty(&mut cursor).unwrap();
+        let end = next_non_empty(&mut cursor).unwrap();
+        assert!(
+            EndRequest::decode(&end.content)
+                .unwrap()
+                .protocol_status
+                .is_complete(),
+            "the connection was fine, so nginx must not retry elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_zero_second_retry_after_is_floored_at_one() {
+        // `Retry-After: 0` invites an immediate retry against a bucket that is still empty, so the
+        // floor lives in the writer rather than in each caller. The limiter already refuses to
+        // report zero; this is the second half of the same promise.
+        let mut wire = Vec::new();
+        write_rate_limited(&mut wire, 1, "limited", 0).unwrap();
+
+        let mut cursor = wire.as_slice();
+        let stdout = next_non_empty(&mut cursor).unwrap();
+        let text = String::from_utf8_lossy(&stdout.content);
+        assert!(text.contains("Retry-After: 1"), "{text}");
+    }
+
+    #[test]
+    fn an_oversized_body_still_says_no_store_and_still_has_no_retry_after() {
+        // The shared writer is what the 413 now goes through, so the header that was added for the
+        // 429 must not have leaked onto it: there is no meaningful "try again" for a body that is
+        // too large, and a `Retry-After` there would be an invented number.
+        let mut wire = Vec::new();
+        write_error(&mut wire, 1, "too large", ServerErrorKind::BodyTooLarge).unwrap();
+
+        let mut cursor = wire.as_slice();
+        let stdout = next_non_empty(&mut cursor).unwrap();
+        let text = String::from_utf8_lossy(&stdout.content);
+        assert!(text.contains("Cache-Control: no-store"), "{text}");
+        assert!(!text.contains("Retry-After"), "{text}");
     }
 
     #[test]

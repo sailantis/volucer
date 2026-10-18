@@ -101,6 +101,29 @@ pub enum HttpError {
         /// Why, in full, for the log.
         reason: String,
     },
+
+    /// The caller has spent its allowance: a `429`, with a `Retry-After`.
+    ///
+    /// Its own variant rather than a [`HttpError::Overloaded`], and the distinction is the point:
+    /// `Overloaded` is a 503, which a load balancer reads as "this node is unhealthy" and acts on
+    /// by taking it out of rotation. A rate limit is a statement about *the caller*, not about the
+    /// server — the process is healthy and will serve the next request, from somebody else,
+    /// immediately. Answering 503 would turn one misbehaving client into an outage.
+    ///
+    /// `Retry-After` is carried on the variant rather than recomputed by the response builder,
+    /// because it is the limiter's own arithmetic: the number the client is told has to be the
+    /// number the bucket will actually honour.
+    ///
+    /// **A gRPC call is refused differently and by the same mechanism.** `error_response` turns
+    /// this variant into `RESOURCE_EXHAUSTED` in the trailers for a gRPC request, because a gRPC
+    /// client cannot read a 429. Both are "wait and try again", which is what the code means.
+    #[error("too many requests: the {key} rate limit refused this request")]
+    RateLimited {
+        /// The key mode that refused, for the page and the log.
+        key: volucer_core::KeyMode,
+        /// When the caller may try again.
+        retry_after: std::time::Duration,
+    },
 }
 
 impl HttpError {
@@ -114,6 +137,10 @@ impl HttpError {
             HttpError::BadGateway(_) => 502,
             HttpError::Overloaded => 503,
             HttpError::GatewayTimeout(_) => 504,
+            // **429, not 503**, and the distinction is the whole reason this variant exists: a
+            // 503 takes the node out of a load balancer's rotation, which is an outage caused by
+            // one client. "Too Many Requests" says exactly what happened and what to do.
+            HttpError::RateLimited { .. } => 429,
             // None of these reaches a client: they stop the listener before it accepts anything, or
             // they are the listener failing to be served at all. Reported as a 500 rather than
             // panicking.
@@ -135,6 +162,7 @@ impl HttpError {
             403 => "Forbidden",
             404 => "Not Found",
             413 => "Content Too Large",
+            429 => "Too Many Requests",
             502 => "Bad Gateway",
             503 => "Service Unavailable",
             504 => "Gateway Timeout",
@@ -161,6 +189,26 @@ mod tests {
         assert_eq!(HttpError::BadGateway("x".into()).status(), 502);
         assert_eq!(HttpError::Overloaded.status(), 503);
         assert_eq!(HttpError::GatewayTimeout("x".into()).status(), 504);
+    }
+
+    #[test]
+    fn a_rate_limit_is_a_429_and_not_the_503_a_full_pool_gets() {
+        // The distinction this variant exists for. `Overloaded` is a 503 because the *server* has
+        // no capacity; a rate limit is a 429 because the *caller* has none. A load balancer acts on
+        // the two differently — it takes a node out of rotation for the first — so collapsing them
+        // turns one client's abuse into an outage.
+        let limited = HttpError::RateLimited {
+            key: volucer_core::KeyMode::Ip,
+            retry_after: std::time::Duration::from_secs(7),
+        };
+        assert_eq!(limited.status(), 429);
+        assert_eq!(limited.reason(), "Too Many Requests");
+        assert!(limited.to_string().contains("ip"), "{limited}");
+        assert_ne!(
+            limited.status(),
+            HttpError::Overloaded.status(),
+            "these two must never share a status"
+        );
     }
 
     #[test]

@@ -286,6 +286,72 @@ fastcgi = "127.0.0.1:9080"
 #   `2001:db8::1`, `203.0.113.7:51234` and `[2001:db8::1]:51234`.
 
 # ---------------------------------------------------------------------------
+# Rate limiting: refuse a caller that has spent its allowance.
+#
+# OFF unless this table is present, and that is the same convention `[metrics]`
+# and `[server.tls]` follow: an `enabled` flag beside a `rate` is two statements
+# about one thing, and two statements can disagree.
+#
+# A token bucket that refills CONTINUOUSLY, not a windowed counter. nginx's
+# `limit_req` resets its count at a window boundary, so a client can spend one
+# window's allowance just before the boundary and the next just after, doubling
+# the instantaneous rate. A bucket cannot hold more than `burst` and refills at
+# a fixed rate, so there is no boundary to exploit.
+#
+# `key = "ip"` uses the address `[server.proxy]` resolves, NOT the socket peer.
+# Behind nginx without that table every request is charged to the proxy and no
+# two clients can be told apart -- which is why the row above was built first.
+#
+# A refusal is `429` with `Retry-After`, and `Cache-Control: no-store` so a shared
+# cache cannot serve one client's refusal to another. RoadRunner answers a full
+# key table with `503`, which a load balancer reads as "this node is unhealthy"
+# and acts on by taking it out of rotation; one client varying a header would then
+# cause an outage. A gRPC call is refused as `RESOURCE_EXHAUSTED` in the trailers,
+# because a gRPC client cannot read a `429` at all.
+#
+# Restart-only: the buckets are live state, so swapping the policy on a `SIGHUP`
+# would reset every caller's allowance. A limit a reload clears is not a limit.
+# ---------------------------------------------------------------------------
+# [server.rate_limit]
+# key = "ip"
+#   "ip" (the default) -- one bucket per client address, as `[server.proxy]`
+#                        resolves it;
+#   "header"           -- one bucket per value of `header`, and that value is NOT
+#                        an authenticated identity: a client chooses it, so a
+#                        client that varies it gets a fresh bucket per request
+#                        until `max_entries` fills. Use it for a header the proxy
+#                        sets, not one the client asserts. Values are hashed
+#                        rather than stored, so a long value costs one entry;
+#   "global"           -- one bucket for the whole process. Useful as a circuit
+#                        breaker, useless for telling two clients apart.
+#
+# rate = 60
+#   Requests allowed per `interval_ms`. Required, and must be at least 1: a rate
+#   limit with no rate is a table that appears to protect something and does not.
+#
+# interval_ms = 60000
+#   How long `rate` requests take to accrue. Defaults to 1000 (one second), so
+#   `rate = 5` alone means five per second. The unit is in the name, following
+#   `[telemetry].interval_ms` and `[backends.pool].ready_timeout_ms`.
+#
+# burst = 60
+#   How many requests may be spent at once, and the capacity of one bucket.
+#   Defaults to `rate` -- NOT to RoadRunner's 1, which turns `rate = 60,
+#   interval_ms = 60000` into "one request, then one per second": a limit nobody
+#   writing that line meant.
+#
+# max_entries = 10000
+#   How many identities one process tracks. A table that is full of DEPLETED
+#   buckets refuses a new identity with a `429` rather than evicting somebody's
+#   allowance -- a bucket that has refilled is indistinguishable from an absent
+#   one, so only those are reclaimed, and the sweep runs when the table is full
+#   rather than on a timer.
+#
+# header = "X-Client-Id"
+#   Required when `key = "header"`, and refused beside the other two modes: a
+#   header named next to a key that does not read one is a line that believes it
+#   limits that header.
+# ---------------------------------------------------------------------------
 # Persistent worker pool: the PHP process boots the application once and stays
 # resident. volucer talks to it over the child's stdin/stdout pipes using its
 # own framed protocol. State is NOT reset by PHP per request, so the

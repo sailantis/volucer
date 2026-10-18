@@ -212,17 +212,33 @@ impl Server {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Option<Server> {
+        let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+            volucer_http::SharedState::new((*sites).clone()),
+        )));
+        Server::start_with_handles(dispatcher, limits, handles)
+    }
+
+    /// Start a listener around handles a test has built, for the rate-limit tests.
+    ///
+    /// `bind_with_resolver` is the production path — `serve` builds its handles and passes them in
+    /// — so a test that needs a limiter uses it rather than a side door that only tests can reach.
+    fn start_with_handles(
+        dispatcher: Dispatcher,
+        limits: HttpLimits,
+        handles: volucer_http::ReloadHandles,
+    ) -> Option<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("a tokio runtime");
 
-        let listener = runtime.block_on(HttpListener::bind(
+        let listener = runtime.block_on(HttpListener::bind_with_resolver(
             "127.0.0.1:0",
             Arc::new(dispatcher),
-            sites,
+            handles,
             limits,
+            volucer_http::ListenerSettings::default(),
         ));
         let listener = match listener {
             Ok(listener) => listener,
@@ -2571,4 +2587,156 @@ fn find_python() -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ------------------------------------------------------------ rate limiting
+//
+// The limiter is shared with the FastCGI front-end, so these tests are about the *HTTP* half: that
+// a limited request is refused before any work is done, that the answer is a 429 with a
+// `Retry-After` a client can act on, and that a gRPC call gets the trailer a gRPC client can read
+// instead. A test that only asserted the 429 would pass against a limiter that ran after the static
+// layer and buffered a body first, which is the mistake this placement exists to avoid.
+
+/// A server whose requests are answered by the static layer, with a rate limit in front of it.
+///
+/// The static layer is deliberate: it answers without PHP, so the refusal cannot be confused with a
+/// backend failure, and a request that reaches it is observable as a 200.
+fn rate_limited_server(limit: volucer_core::RateLimitPolicy) -> Option<Server> {
+    let root = static_root("rate-limit");
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_rate_limit(Arc::new(limit));
+
+    Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+}
+
+/// A policy of `burst` requests, refilling slowly enough that a test cannot outlast it.
+fn slow_limit(burst: u32) -> volucer_core::RateLimitPolicy {
+    volucer_core::RateLimitPolicy::new(
+        volucer_core::KeyMode::Ip,
+        None,
+        1,
+        Duration::from_secs(3600),
+        Some(burst),
+        None,
+    )
+    .expect("the test's policy is valid")
+}
+
+#[test]
+fn a_request_over_the_rate_limit_is_a_429_with_a_retry_after() {
+    let Some(server) = rate_limited_server(slow_limit(2)) else {
+        return;
+    };
+
+    // Two requests inside the burst, and both reach the static layer.
+    for n in 0..2 {
+        let response = get(&server.address, "/assets/app.css");
+        assert_eq!(response.status, 200, "request {n}: {response:?}");
+    }
+
+    let refused = get(&server.address, "/assets/app.css");
+    assert_eq!(refused.status, 429, "{refused:?}");
+    assert_eq!(refused.reason, "Too Many Requests");
+    // **`Retry-After` is the whole reason a client can act on a 429.** Its absence is what turns a
+    // rate limit into a request that is retried immediately, for ever. One hour is the configured
+    // interval, so the number is the limiter's own arithmetic rather than a constant.
+    assert_eq!(refused.header("retry-after"), Some("3600"), "{refused:?}");
+    assert_eq!(
+        refused.header("cache-control"),
+        Some("no-store"),
+        "a cacheable 429 would be served to every other client: {refused:?}"
+    );
+    assert!(
+        refused.text().contains("rate limit"),
+        "the page has to say what happened: {}",
+        refused.text()
+    );
+}
+
+#[test]
+fn a_rate_limit_is_checked_before_the_static_layer_or_a_backend_does_any_work() {
+    // The placement test, and the reason it is a separate assertion: a limiter that ran after
+    // `static_files::respond` would still answer a 429 eventually — but only after every refused
+    // request had already cost a filesystem `stat`, and after a path naming no file had fallen
+    // through to a backend the test deliberately made unreachable. What distinguishes the two
+    // placements is therefore the status a *missing* file earns: refused first is a 429, and refused
+    // later is whatever the request became next — a 404 on a files-only site, or a 502 here.
+    //
+    // Verified by moving the check behind the static layer and watching this assertion fail with
+    // `left: 502`, which is the answer a request that reached the front controller gets.
+    let root = static_root("rate-limit-placement");
+    let Some(server) = rate_limited_server_for_root(&root, slow_limit(1)) else {
+        return;
+    };
+
+    // The file must exist for the first request to be served by the static layer, which is what
+    // spends the burst. It is then deleted, so a check that runs *after* the layer sees a path
+    // naming no file — and one that runs before it never looks.
+    assert_eq!(get(&server.address, "/assets/app.css").status, 200);
+    std::fs::remove_file(root.join("assets/app.css")).expect("remove the file");
+
+    let refused = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        refused.status, 429,
+        "anything else here means the static layer ran before the limit: {refused:?}"
+    );
+}
+
+/// [`rate_limited_server`] around a root the caller owns, so a test can change the files mid-run.
+fn rate_limited_server_for_root(
+    root: &Path,
+    limit: volucer_core::RateLimitPolicy,
+) -> Option<Server> {
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_rate_limit(Arc::new(limit));
+
+    Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+}
+
+#[test]
+fn a_rate_limited_grpc_call_is_resource_exhausted_rather_than_a_429() {
+    // A gRPC client reads its outcome from the trailer section and has no status code to branch on,
+    // so a 429 reaches it as "unexpected HTTP status" and the retry never happens. The answer has to
+    // be the gRPC spelling of the same instruction — `RESOURCE_EXHAUSTED`, HTTP 200.
+    let Some(server) = rate_limited_server(slow_limit(1)) else {
+        return;
+    };
+
+    // The single allowed request: refused for not being a granted service, which is *after* the
+    // limiter and therefore spends the token — that is what makes the second one limited.
+    let spent = post_grpc(&server.address, "/pkg.Service/Method");
+    assert!(
+        spent.contains("grpc-status: 12"),
+        "the first call is UNIMPLEMENTED, not limited: {spent}"
+    );
+
+    let limited = post_grpc(&server.address, "/pkg.Service/Method");
+    assert!(
+        limited.contains("grpc-status: 8"),
+        "a limited gRPC call must be RESOURCE_EXHAUSTED: {limited}"
+    );
+    assert!(
+        !limited.contains("429"),
+        "a gRPC failure must not use an HTTP error status: {limited}"
+    );
 }

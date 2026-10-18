@@ -120,6 +120,12 @@ pub struct FastCgiListener {
     /// depending on which front-end received them. Defaults to disabled so every existing caller
     /// and test is unchanged — the "off by default costs nothing" rule, made structural.
     observe: Arc<volucer_observe::Observability>,
+    /// The rate limit, when the deployment asked for one.
+    ///
+    /// The **same `Arc` the HTTP front-end holds**, so a client's allowance does not depend on which
+    /// protocol received its request. `None` when no `[server.rate_limit]` table exists, so an
+    /// unconfigured deployment's request path does one `Option` check.
+    rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
 }
 
 impl FastCgiListener {
@@ -176,6 +182,7 @@ impl FastCgiListener {
             stats: Arc::new(Stats::default()),
             limits,
             observe: Arc::new(volucer_observe::Observability::disabled()),
+            rate_limit: None,
         })
     }
 
@@ -188,6 +195,17 @@ impl FastCgiListener {
     #[must_use]
     pub fn with_observability(mut self, observe: Arc<volucer_observe::Observability>) -> Self {
         self.observe = observe;
+        self
+    }
+
+    /// The same listener with a rate limit.
+    ///
+    /// Builder-shaped for the same reason [`FastCgiListener::with_observability`] is, and it takes
+    /// the `Arc` the HTTP listener was given rather than building one: two policies would be two
+    /// allowances for one client.
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_limit: Arc<volucer_core::RateLimitPolicy>) -> Self {
+        self.rate_limit = Some(rate_limit);
         self
     }
 
@@ -255,11 +273,17 @@ impl FastCgiListener {
                     let shutdown = Arc::clone(&self.shutdown);
                     let limits = self.limits;
                     let observe = Arc::clone(&self.observe);
+                    let rate_limit = self.rate_limit.clone();
+                    let shared = Shared {
+                        dispatcher,
+                        sites,
+                        stats,
+                        shutdown,
+                        observe,
+                    };
                     handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
                     handlers.push(std::thread::spawn(move || {
-                        if let Err(err) = serve_connection(
-                            stream, dispatcher, sites, stats, shutdown, limits, observe,
-                        ) {
+                        if let Err(err) = serve_connection(stream, shared, limits, rate_limit) {
                             tracing::debug!(%peer, %err, "connection ended");
                         }
                     }));
@@ -409,16 +433,35 @@ fn record_fastcgi(
     }
 }
 
-/// Serve requests on one connection until the peer closes or keep-alive ends.
-fn serve_connection(
-    stream: std::net::TcpStream,
+/// What every connection on one listener shares.
+///
+/// Grouped rather than passed as five parameters, and the grouping is not cosmetic: `serve_connection`
+/// had reached eight arguments when the rate limit was added, and the compiler's seven-argument limit
+/// is a fair signal that the list had become "everything the listener owns". These are exactly the
+/// handles cloned per accepted connection — all of them `Arc`s that outlive it — so they travel
+/// together.
+struct Shared {
     dispatcher: Arc<Dispatcher>,
     sites: SharedState,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
-    limits: Limits,
     observe: Arc<volucer_observe::Observability>,
+}
+
+/// Serve requests on one connection until the peer closes or keep-alive ends.
+fn serve_connection(
+    stream: std::net::TcpStream,
+    shared: Shared,
+    limits: Limits,
+    rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
 ) -> Result<()> {
+    let Shared {
+        dispatcher,
+        sites,
+        stats,
+        shutdown,
+        observe,
+    } = shared;
     // On Windows an accepted socket inherits the listener's non-blocking mode,
     // so this must be reset explicitly. Without it every read returns
     // WSAEWOULDBLOCK immediately and the connection is dropped right after the
@@ -540,6 +583,73 @@ fn serve_connection(
             param(request.params.as_slice(), b"HTTP_TRACEPARENT"),
         );
         let started = Instant::now();
+
+        // **The rate limit, before the site is resolved and before any backend is reached.** It is
+        // deliberately later than on the HTTP path — a `PARAMS` block has to arrive before a request
+        // exists at all, so this is the earliest point — but it is still before the dispatch, which
+        // is the work the limit exists to protect.
+        //
+        // The identity is `REMOTE_ADDR`, **not** the socket peer and not a forwarded header, and §6.8
+        // is why: nginx sets `REMOTE_ADDR = $remote_addr`, the address *it* saw the client at and
+        // already resolved through its own `real_ip` handling, while the `HTTP_*` params beside it are
+        // the client's unvouched-for claims. So the param is the client, even though the socket
+        // belongs to nginx — the same asymmetry §6.8 found and left alone rather than "fixing" it.
+        //
+        // A request with no `REMOTE_ADDR` at all (a front-end that forwards raw FastCGI without
+        // setting it) resolves to `None`, and gets no bucket rather than a shared one: bucketing
+        // every such request together would make the limit a global one that reads as per-caller.
+        if let Some(limit) = &rate_limit {
+            let address = param(request.params.as_slice(), b"REMOTE_ADDR")
+                .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok());
+            let identity = match limit.key() {
+                volucer_core::KeyMode::Global => Some(volucer_core::Identity::Global),
+                volucer_core::KeyMode::Ip => address.map(volucer_core::Identity::Address),
+                volucer_core::KeyMode::Header => {
+                    // The CGI environment carries a request header as `HTTP_` + the name with `-`
+                    // replaced by `_` and upper-cased, which is the transformation nginx's own
+                    // `fastcgi_params` performs. Built here rather than stored so the policy holds
+                    // one spelling of the name rather than two.
+                    let name = limit
+                        .header()
+                        .unwrap_or_default()
+                        .to_ascii_uppercase()
+                        .replace('-', "_");
+                    param(request.params.as_slice(), format!("HTTP_{name}").as_bytes())
+                        .map(volucer_core::Identity::Header)
+                }
+            };
+            if let Some(identity) = identity {
+                if let volucer_core::Verdict::Limited { retry_after, .. } =
+                    limit.check(identity, Instant::now())
+                {
+                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    let reason = format!(
+                        "the {} rate limit refused this request; retry in {}s",
+                        limit.key().as_str(),
+                        retry_after.as_secs().max(1)
+                    );
+                    tracing::debug!(%reason, "refusing a request");
+                    // Logged with the status the client will see, like every other refusal — and the
+                    // record is written *before* the answer here rather than after, because there is
+                    // no backend answer to wait for and the alternative is a request an operator can
+                    // see arrive and never see answered.
+                    if observe.is_active() {
+                        record_fastcgi(&observe, &context, &request, 429, 0, started.elapsed());
+                    }
+                    fastcgi::write_rate_limited(
+                        stream.get_mut(),
+                        request_id,
+                        &reason,
+                        retry_after.as_secs().max(1),
+                    )?;
+                    if !keep_conn {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        }
+
         let response = dispatcher.dispatch_with_routes(&site.routes, &request);
         match response {
             Ok(response) => {

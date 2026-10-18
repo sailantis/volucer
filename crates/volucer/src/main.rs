@@ -813,6 +813,17 @@ fn serve(
         println!("  telemetry:        {endpoint}");
     }
 
+    // The rate limit, when the deployment asked for one. Built here — before either front-end —
+    // because one instance has to reach **both**. Two would give a client twice the configured
+    // allowance depending on which protocol received its request, which no single-front-end test can
+    // see. Restart-only, and the buckets are why: replacing the policy on a `SIGHUP` would reset every
+    // caller's allowance, which is a limit that can be escaped by asking the operator to reload.
+    let rate_limit = config
+        .server
+        .rate_limiter()
+        .map_err(|reason| ServerError::Listener { reason })?
+        .map(Arc::new);
+
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
     // before the runtime is built.
@@ -828,6 +839,10 @@ fn serve(
                 },
             )?
             .with_observability(Arc::clone(&observe));
+            let listener = match rate_limit.as_ref() {
+                Some(limit) => listener.with_rate_limit(Arc::clone(limit)),
+                None => listener,
+            };
             println!("  fastcgi:          {}", listener.local_addr()?);
             Some(listener)
         }
@@ -1070,6 +1085,10 @@ fn serve(
         let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry))
             .with_observability(Arc::clone(&observe))
             .with_client_ip(Arc::clone(&client_ip));
+        let handles = match rate_limit.as_ref() {
+            Some(limit) => handles.with_rate_limit(Arc::clone(limit)),
+            None => handles,
+        };
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
             _ => handles,
@@ -1685,6 +1704,7 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: backends, their commands and worker counts (the processes are running)",
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
+        "a reload does not change: [server.rate_limit] (the buckets are live state, so replacing the policy would reset every caller's allowance)",
     ]
 }
 
@@ -1864,6 +1884,47 @@ fn check(
         config.server.max_body_bytes(),
         config.server.max_body_bytes() / (1024 * 1024)
     );
+
+    // The rate limit, or the absence of one stated out loud. The *absence* is what this prints in
+    // the off case rather than printing nothing, because "no limit" and "a limit I configured
+    // wrongly" look identical from a deployment's behaviour and only one of them is intended.
+    match config.server.rate_limit.as_ref() {
+        Some(limit) => {
+            let limiter = config
+                .server
+                .rate_limiter()
+                .map_err(volucer_core::Error::Config)?
+                .expect("a stated table builds a policy");
+            println!("    rate limit:");
+            println!(
+                "      key:      {}",
+                match limiter.key() {
+                    volucer_core::KeyMode::Ip => {
+                        "ip (the address [server.proxy] resolves)".to_string()
+                    }
+                    volucer_core::KeyMode::Global =>
+                        "global (one bucket for the process)".to_string(),
+                    volucer_core::KeyMode::Header => format!(
+                        "header {:?} -- not an authenticated identity; a client chooses it",
+                        limiter.header().unwrap_or_default()
+                    ),
+                }
+            );
+            println!(
+                "      rate:     {:.4} request(s)/second ({} per {} ms), burst {}",
+                limiter.per_second(),
+                limit.rate,
+                limit.interval_ms,
+                limiter.burst()
+            );
+            println!(
+                "      entries:  {} (a full table of depleted buckets refuses new callers with a \
+                 429)",
+                limiter.max_entries()
+            );
+        }
+        None => println!("    rate limit: none (server.rate_limit is unset; nothing is throttled)"),
+    }
 
     // TLS, and which paths were actually resolved. The resolution is printed rather than
     // assumed because a certificate path is the one setting whose *file* the reader cannot
@@ -2507,6 +2568,7 @@ document_root = "/from/file"
             "backends",
             "min_version",
             "server.proxy",
+            "server.rate_limit",
         ] {
             assert!(
                 joined.contains(required),

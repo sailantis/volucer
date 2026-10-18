@@ -974,7 +974,9 @@ implementation cannot honour should be _stated_, or the operator finds out from 
   acceptor holds, and rustls does not let that be rebuilt in place;
 - `[server.proxy]` — whose forwarded headers are believed is a statement about this deployment's
   topology rather than about a request, and it is deliberately the same kind of setting as `alpn`
-  rather than the same kind as the site table.
+  rather than the same kind as the site table;
+- `[server.rate_limit]` — the token buckets are live state, so swapping the policy would reset
+  every caller's allowance. A limit that a `SIGHUP` clears is not a limit.
 
 **A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
 a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
@@ -1113,6 +1115,43 @@ would let a client forge whole log records, and a space would break the field co
 rejected and a fresh id is minted. A client's malformed header must not become a client's failed
 request.
 
+### Rate limiting
+
+**Off by default**, and off is `None` rather than a limiter configured to allow everything: an
+unconfigured request path does one `Option` check and touches no map, no clock and no lock.
+
+```toml
+[server.rate_limit]
+key = "ip"            # "ip" (default), "header", or "global"
+rate = 60             # requests allowed per interval_ms
+interval_ms = 60000   # how long `rate` requests take to accrue
+# burst = 60          # how many may be spent at once; defaults to `rate`
+# max_entries = 10000 # identities tracked before new ones are refused
+```
+
+A **token bucket that refills continuously**, not a windowed counter: a `limit_req`-style counter lets
+a client spend one window's allowance just before a boundary and the next just after, doubling the
+instantaneous rate. A bucket cannot hold more than `burst` and refills at a fixed rate.
+
+`burst` defaults to `rate` rather than to RoadRunner's `1`, because `rate = 60, interval_ms = 60000`
+reads as "60 a minute" — the allowance is spendable at once and returns over the minute.
+
+`key = "header"` needs a `header` name, and **that value is not an authenticated identity**: a client
+chooses it, so a client that varies it gets one bucket per request until the table fills. Its use is a
+header the *proxy* sets. Values are hashed rather than stored, so a long value costs one entry.
+
+**A refusal is `429` with `Retry-After`**, and `Cache-Control: no-store` so a shared cache cannot
+serve one client's refusal to another. RoadRunner answers a full table with `503`, which a load
+balancer reads as an unhealthy node — one client that varies a header would then remove the deployment
+from rotation. A **gRPC** call is refused as `RESOURCE_EXHAUSTED` in the trailers instead, because a
+gRPC client cannot read a `429` at all.
+
+The `ip` keys on the address `[server.proxy]` resolves, **not** the socket peer — behind nginx
+without that table every request would be charged to the proxy and no two clients could be told
+apart. On the FastCGI listener the key is `REMOTE_ADDR`, which nginx already resolved.
+
+One policy per process, shared by both front-ends, and it does not distinguish routes or sites: a
+bucket's identity is (who, *which limit*), so two policies over one client are two buckets.
 ### Trace context
 
 The W3C `traceparent` header is parsed and continued: the trace id is the client's, and this server

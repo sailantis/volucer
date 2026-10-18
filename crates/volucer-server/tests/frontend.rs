@@ -802,3 +802,157 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
     shutdown.shutdown();
     let _ = handle.join();
 }
+
+/// One FastCGI request carrying a `REMOTE_ADDR`, sent on an existing connection.
+///
+/// The params are the minimum a rate limit needs: nginx sets `REMOTE_ADDR = $remote_addr`, so this
+/// is what the limiter keys on when `key = "ip"`.
+fn request_from(
+    reader: &mut std::io::BufReader<TcpStream>,
+    request_id: u16,
+    remote_addr: &str,
+    uri: &str,
+) -> String {
+    let params = [
+        (b"REQUEST_METHOD".as_slice(), b"GET".as_slice()),
+        (b"REQUEST_URI".as_slice(), uri.as_bytes()),
+        (b"SCRIPT_FILENAME".as_slice(), uri.as_bytes()),
+        (b"SERVER_PROTOCOL".as_slice(), b"HTTP/1.1".as_slice()),
+        (b"REMOTE_ADDR".as_slice(), remote_addr.as_bytes()),
+    ];
+    let mut wire = Vec::new();
+    let begin = BeginRequest::responder(true);
+    record::Header::new(RecordType::BeginRequest, request_id, 8)
+        .write(&mut wire)
+        .expect("write BEGIN_REQUEST");
+    wire.write_all(&begin.encode()).expect("write begin body");
+    let payload = nvpair::encode_pairs(params);
+    record::write_records(&mut wire, RecordType::Params, request_id, &payload, true)
+        .expect("write params");
+    record::write_records(&mut wire, RecordType::Stdin, request_id, b"", true)
+        .expect("write stdin");
+    reader.get_mut().write_all(&wire).expect("send the request");
+    reader.get_mut().flush().expect("flush");
+
+    let mut out = Vec::new();
+    loop {
+        let record = match record::read_record(reader) {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(err) => panic!("the front-end sent a malformed record: {err}"),
+        };
+        let end = record.record_type() == RecordType::EndRequest;
+        out.extend_from_slice(&record.content);
+        if end {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn a_rate_limited_fastcgi_request_is_a_429_with_a_retry_after_and_keeps_the_connection() {
+    // The FastCGI half of the rate limit, and **the same policy instance** the HTTP front-end would
+    // hold — this test builds one the way `serve` does and hands it to this listener, so the
+    // assertion covers the sharing rather than a second limiter with the same settings.
+    //
+    // The backend is deliberately unreachable: a refusal cannot then be confused with a backend
+    // failure, and a *permitted* request is observable as a 502 from the front controller rather
+    // than as a 200 that some PHP script happened to produce.
+    let root = std::env::temp_dir().join(format!("volucer-fcgi-rate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let text = format!(
+        r#"
+default_backend = "unreachable"
+
+[server]
+fastcgi = "127.0.0.1:0"
+document_root = {root:?}
+"#,
+        root = root.to_string_lossy(),
+    );
+    let config = Config::from_toml(&text).expect("config parses");
+    // No backends declared: `Config::validate` refuses a `default_backend` naming none, which is a
+    // fact about this fixture rather than about the limiter, so it is asserted rather than ignored —
+    // a fixture that quietly stopped parsing would make the test below pass for the wrong reason.
+    assert!(
+        config.validate().is_err(),
+        "this fixture deliberately names a backend it does not declare"
+    );
+
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let sites = SharedState::new(Sites::from_config(&config, &root));
+    let registry = Arc::new(Registry::new(sites));
+    let limiter = Arc::new(
+        volucer_core::RateLimitPolicy::new(
+            volucer_core::KeyMode::Ip,
+            None,
+            1,
+            Duration::from_secs(3600),
+            Some(1),
+            None,
+        )
+        .expect("the policy is valid"),
+    );
+
+    let listener = FastCgiListener::bind_registered(
+        "127.0.0.1:0",
+        Arc::clone(&dispatcher),
+        Arc::clone(&registry),
+        Limits::default(),
+    )
+    .expect("bind the fastcgi listener")
+    .with_rate_limit(Arc::clone(&limiter));
+    let address = listener.local_addr().expect("bound address");
+    let shutdown = listener.shutdown_handle();
+    let handle = std::thread::spawn(move || listener.run());
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut connection = fastcgi_connection(address);
+
+    // The one permitted request reaches the backend, which cannot be reached — a 502 rather than a
+    // 429, which is what makes the next assertion attributable to the limit.
+    let permitted = request_from(&mut connection, 1, "203.0.113.7", "/index.php");
+    assert!(
+        permitted.contains("Status: 502") || permitted.contains("Status: 200"),
+        "the first request must be allowed through to the backend: {permitted}"
+    );
+    assert!(
+        !permitted.contains("429"),
+        "the first request is inside the burst: {permitted}"
+    );
+
+    // The same connection, and the second request is refused. **`continue` rather than `close`** is
+    // the property this pins: an over-limit request is refused *and the connection survives*, so
+    // nginx can send the next one — which is what it does for any other 4xx.
+    let refused = request_from(&mut connection, 2, "203.0.113.7", "/index.php");
+    assert!(
+        refused.contains("Status: 429 Too Many Requests"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused.matches("Retry-After: 3600").count(),
+        1,
+        "the header has to carry the limiter's own number, exactly once: {refused}"
+    );
+    assert!(
+        refused.contains("no-store"),
+        "a cacheable 429 would be served to every other client: {refused}"
+    );
+
+    // And a *different* address on the same connection is not throttled, which is the whole point
+    // of `key = "ip"`: a limiter keyed on something every request shared would fail here.
+    let other = request_from(&mut connection, 3, "203.0.113.8", "/index.php");
+    assert!(
+        !other.contains("429"),
+        "another client has its own bucket: {other}"
+    );
+
+    shutdown.shutdown();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&root);
+}

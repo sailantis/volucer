@@ -537,6 +537,13 @@ pub enum GrpcStatus {
     /// The route resolved to a backend that is not an upstream, or the origin's reply was not
     /// gRPC at all.
     Unimplemented,
+    /// The caller has no allowance left: gRPC's `RESOURCE_EXHAUSTED`.
+    ///
+    /// The gRPC spelling of the HTTP `429` beside it, and the specification defines it as
+    /// *retryable* — which is exactly the instruction a `Retry-After` carries on the HTTP side. A
+    /// gRPC client cannot read a 429 at all, so without this a rate-limited call would reach a
+    /// client as "unexpected HTTP status" and the retry would never happen.
+    ResourceExhausted,
 }
 
 impl GrpcStatus {
@@ -546,6 +553,7 @@ impl GrpcStatus {
             GrpcStatus::Unimplemented => 12,
             GrpcStatus::Internal => 13,
             GrpcStatus::Unavailable => 14,
+            GrpcStatus::ResourceExhausted => 8,
         }
     }
 
@@ -555,6 +563,7 @@ impl GrpcStatus {
             GrpcStatus::Unimplemented => "UNIMPLEMENTED",
             GrpcStatus::Internal => "INTERNAL",
             GrpcStatus::Unavailable => "UNAVAILABLE",
+            GrpcStatus::ResourceExhausted => "RESOURCE_EXHAUSTED",
         }
     }
 
@@ -572,6 +581,9 @@ impl GrpcStatus {
             GrpcStatus::Unavailable => "the origin is unreachable",
             GrpcStatus::Internal => "the origin failed the call",
             GrpcStatus::Unimplemented => "this route is not served by a gRPC origin",
+            // The one message a client is meant to *act* on rather than read, which is what the
+            // specification asks for with a retryable code.
+            GrpcStatus::ResourceExhausted => "the caller is over its rate limit",
         }
     }
 }
