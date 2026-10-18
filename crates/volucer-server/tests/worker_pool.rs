@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use volucer_core::config::{
-    BackendConfig, Config, KvStorageConfig, LockConfig, MemoryKvConfig, MemoryLockConfig,
-    WorkerConfig,
+    BackendConfig, Config, FileKvConfig, KvStorageConfig, LockConfig, MemoryKvConfig,
+    MemoryLockConfig, WorkerConfig,
 };
 use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
 use volucer_server::{Consumers, Dispatcher, WorkerPool};
@@ -2659,5 +2659,115 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
 
     // **No scrape, deliberately.** Reaching this line with the numbers above is the whole test: a
     // `publish_metrics` call here would drain the queue and hide the defect it exists to catch.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file-backed storage keeps what a worker wrote across a **restart of the dispatcher**.
+///
+/// This is the whole claim of the `file` driver and the only test that can make it: the memory
+/// driver would pass every other assertion in this file, because it is a cache that works — it just
+/// forgets. So the test builds a dispatcher, has a real PHP worker store a value through `kv.set`,
+/// **drops it entirely**, and builds a second dispatcher on the same directory with a second pool of
+/// real processes. A value the second one reads was on disk rather than in a map.
+///
+/// It goes through `from_config_in` rather than `from_config`, because a relative `path` resolving
+/// against the configuration file's directory is part of what a deployment relies on and the
+/// resolution has exactly one production caller.
+#[test]
+fn a_file_store_keeps_a_workers_value_across_a_restart() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-kv-file-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    // Written as a *relative* path on purpose: the configuration directory is the root, so the store
+    // lands under `dir/cache`, and a resolver that used the working directory instead would put it
+    // somewhere the assertion below would not find.
+    let cache = dir.join("cache");
+
+    let script = dir.join("kv-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$kv = $worker->kv('sessions');
+$worker->run(static function (Request $request, Worker $worker) use ($kv): Response|null {{
+    $path = (string) parse_url($request->uri, PHP_URL_PATH);
+    if ($path === '/write') {{
+        $kv->set('greeting', 'hello from the first process', 600);
+        return Response::json(['written' => true]);
+    }}
+    $found = null;
+    $value = $kv->get('greeting', $found);
+    return Response::json(['value' => $value, 'found' => $found]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let build = || {
+        let backend = BackendConfig::Worker(WorkerConfig {
+            command: format!("php \"{}\"", script.display()),
+            workers: 1,
+            services: vec!["kv.sessions".to_string()],
+            ..config(1)
+        });
+        let mut configured = Config {
+            backends: [("app".to_string(), backend)].into_iter().collect(),
+            default_backend: Some("app".to_string()),
+            ..Config::default()
+        };
+        configured.kv.insert(
+            "sessions".to_string(),
+            KvStorageConfig::File(FileKvConfig {
+                path: std::path::PathBuf::from("cache"),
+                max_bytes: 1 << 20,
+            }),
+        );
+        configured
+    };
+
+    {
+        let dispatcher = Dispatcher::from_config_in(&build(), Routing::default(), &dir)
+            .expect("the first dispatcher starts");
+        let written = json_body(
+            &dispatcher
+                .dispatch(&get("/write"))
+                .expect("the write is served"),
+        );
+        assert_eq!(written["written"], true, "{written}");
+        assert!(
+            cache.is_dir(),
+            "a relative kv path resolves against the configuration's directory, so the store is \
+             at {}",
+            cache.display()
+        );
+        // Dropped here rather than at the end of the test, so the second dispatcher's processes are
+        // a genuine second run — the value it reads cannot be in this one's memory.
+    }
+
+    // A different dispatcher, a different worker process, the same directory.
+    let dispatcher = Dispatcher::from_config_in(&build(), Routing::default(), &dir)
+        .expect("the second dispatcher starts");
+    let read = json_body(
+        &dispatcher
+            .dispatch(&get("/read"))
+            .expect("the read is served"),
+    );
+    assert_eq!(
+        read["value"], "hello from the first process",
+        "a file store that did not survive a restart is the memory driver with extra steps: {read}"
+    );
+    assert_eq!(read["found"], true, "{read}");
+
+    drop(dispatcher);
     let _ = std::fs::remove_dir_all(&dir);
 }

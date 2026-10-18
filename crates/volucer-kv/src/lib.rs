@@ -38,12 +38,14 @@
 //! refuses and says so, because a refusal is visible in a log and a counter whereas an eviction is
 //! a cache miss that looks like the application's bug.
 
+pub mod file;
 pub mod memory;
 #[cfg(feature = "redis")]
 pub mod redis_store;
 
 use std::time::Duration;
 
+pub use file::FileStore;
 pub use memory::MemoryStore;
 #[cfg(feature = "redis")]
 pub use redis_store::RedisStore;

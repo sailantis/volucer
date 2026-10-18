@@ -190,7 +190,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 
 | What | RR's shape | What it costs here | The argument against, and what would beat it |
 | --- | --- | --- | --- |
-| **`file` KV driver** | `boltdb` | **S–M**: an embedded store, or a directory of files | Already §6.2's next driver, so it is here only to be counted. Note what a filesystem buys that boltdb does not: a cache survives a restart **without a dependency**, which is the whole reason it beats `memcached` in this order |
+| **`file` KV driver** — **built, §6.2** | `boltdb` | **S–M**: an embedded store, or a directory of files | Already §6.2's next driver, so it is here only to be counted. Note what a filesystem buys that boltdb does not: a cache survives a restart **without a dependency**, which is the whole reason it beats `memcached` in this order. Built as the directory rather than the embedded store, for the reason §6.2 gives |
 | **`server.access_log` rotation** — **reopen built, §6.12** | `app-logger` is request logs *out of the application*; RR does not rotate either | **S**, and the *estimate* was right for once while the **claim** was not: "the signal is already wired" is true, and the reopen still did not exist. The message printed on a broken log had promised it for as long as the log has existed | A log an unprivileged server cannot reopen survives exactly one `logrotate` and then writes to a deleted inode for ever, silently. Size-based rotation is still where it becomes a subsystem, and `logrotate` already exists — so **only the reopen half is built** |
 | **`max_request_size`** | `http.max_request_size` | **S, and the estimate was wrong again** — built as `server.max_body_bytes`; the FastCGI front-end had no bound at all, so the "one `HttpLimits` field" reading was half the work | The limit existed and only its configurability was missing — but only on one protocol. Behind nginx the only bound was `client_max_body_size` on somebody else's configuration, while `read_next` extended a `Vec` for as long as `STDIN` records arrived. See §6.9 |
 
@@ -884,14 +884,41 @@ the server, because that is where the E2E-encryption case lives. `deleteMultiple
 `getMultiple` and `setMultiple` exist because they are one call where the loop is many, and a delete
 of n keys is n cheap calls whose batched form would buy a round trip and cost a wire format.
 
-**Drivers, in order.** `memory` (**done**) → `redis` (**done**, behind the `redis` feature) → `file` (an
-embedded store; see the hazard below) → `memcached` (a small text-protocol client; the weakest of the four
-because RR's own memcached driver cannot report TTL, so it is last and optional).
+**Drivers, in order.** `memory` (**done**) → `redis` (**done**, behind the `redis` feature) → `file` (a
+directory of files; **done**, and what a restart without a dependency buys) → `memcached` (a small
+text-protocol client; the weakest of the four because RR's own memcached driver cannot report TTL, so
+it is last and optional).
+
+**The `file` driver, and the three decisions that shaped it.** It exists for one deployment: a single
+node that has a disk and no Redis, where the memory driver's contents would be emptied by every
+deploy. That is a session store, and losing it is every user logged out.
+
+- **One file per key, named by a hash of the key.** The alternative is a single file, which means a
+  record format, a free list, an on-disk index and a compaction pass — `boltdb` reimplemented badly,
+  which is the thing this driver exists instead of. A directory uses the kernel's own index, and
+  `get` is one `open`. The name is a hash because a key is arbitrary bytes (§6.2's opaque-value
+  rule) and a filesystem name is not: a key containing `..` would otherwise be a traversal, which is
+  the one bug this design cannot have.
+- **The hash is written here, not `DefaultHasher`.** This names a file, so it has to be the same
+  value in every process *and across a Rust release* — and `std`'s default hasher explicitly promises
+  neither. A changed algorithm would silently orphan every cached file on an upgrade, which is the
+  cache-losing deploy this driver was built to prevent. So it is FNV-1a on 128 bits, with a literal
+  in a test.
+- **`0600` per file.** This is the hazard the section records above, and the fix is asserted on a
+  unix run rather than trusted: a cached session readable by the group is the outcome the warning is
+  about.
+
+Expiry is an **absolute** deadline in the file's own two-line header, because a duration read from
+disk after a restart cannot know how long it has been lying there. What it deliberately does not do
+is stated in the driver rather than implied: no fsync (a cache that fsyncs is ten times slower for a
+guarantee nothing asked for), no compaction, and **no coordination between two processes sharing a
+directory** — which is what Redis is for.
 
 **Hazard.** RR's boltdb driver has a `permissions: 0755` default on a *database file*, which is
-world-readable where it should not be. If volucer ships a file-backed driver, the default is `0600`
-and the check is on the file rather than on the directory — the same rule plan.md hazard 73 settled
-for certificates.
+world-readable where it should not be. volucer's file driver defaults to **`0600` per file** and
+`0700` on the directory — the directory as well, because its mode governs `readdir` and a
+world-executable one lets a stranger learn how many keys there are. The check is on the file rather
+than on the directory, the same rule plan.md hazard 73 settled for certificates.
 
 **What the `redis` feature costs, measured rather than assumed.** Thirty-one crates, almost all of them
 ICU through the `url` parser the client uses for its connection string — `icu_normalizer`, `zerotrie`,
@@ -2106,7 +2133,7 @@ progress on something earlier look bigger.
 | --- | --- | --- | --- | --- |
 | 1 | **Metrics + status** | — | S–M | **Done**, and the `[metrics.collect]` half landed last (see §6.1): without it every `emitMetric` was refused as undeclared. No calls, no driver, no protocol change; makes everything after it observable |
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
-| 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
+| 3 | **KV: `memory`, then `redis`, then `file`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4. `file` came last and is the driver a single node with a disk was waiting for — see §6.2 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | **Done.** Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | **Done.** Not the layer the plan named: measured, `http-proto` needs `prost`, and a layer cannot carry the span id PHP already has. Hand-written OTLP/JSON over the existing client — **0 new packages** |

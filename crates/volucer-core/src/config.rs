@@ -267,6 +267,14 @@ pub enum KvStorageConfig {
     /// and not a plugin.
     #[cfg(feature = "redis")]
     Redis(RedisKvConfig),
+
+    /// A directory of files, one per key. Survives a restart, needs no server.
+    ///
+    /// The driver for a single node that has a disk and no Redis, which is the deployment whose session
+    /// store would otherwise be emptied by every deploy. See `volucer-kv`'s `file` module for what a
+    /// directory costs and what it deliberately does not do — no fsync, no compaction, no cross-process
+    /// coordination.
+    File(FileKvConfig),
 }
 
 /// `[kv.<name>] driver = "redis"`.
@@ -307,6 +315,31 @@ pub struct MemoryKvConfig {
     pub max_bytes: usize,
 }
 
+/// `[kv.<name>] driver = "file"`.
+///
+/// Unlike [`RedisKvConfig`], the path is **not** a credential, so `config.describe` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileKvConfig {
+    /// The directory the store owns.
+    ///
+    /// **Required, rather than defaulting to somewhere under `/tmp`.** A cache that writes to a
+    /// temporary location by default is one that silently loses its contents on the reboot an
+    /// operator least expected, and a default is exactly the kind of value nobody reads. A relative
+    /// path resolves against the configuration file's directory, like `[server.access_log]`'s does
+    /// and for the same reason: what it is relative to should be a property of the deployment, not
+    /// of wherever somebody happened to run the binary.
+    pub path: std::path::PathBuf,
+
+    /// How many bytes of stored values the directory may hold, before an insert is refused.
+    ///
+    /// Defaults to 64 MiB, the same number and the same meaning as [`MemoryKvConfig::max_bytes`] —
+    /// one setting an operator learns once. Counted from what is already on disk when the store
+    /// opens, so a restart does not double the space a cache uses.
+    #[serde(default = "default_kv_max_bytes")]
+    pub max_bytes: usize,
+}
+
 fn default_kv_max_bytes() -> usize {
     // Written out rather than referring to `volucer-kv`'s constant, because this crate is the leaf
     // that everything depends on and taking a dependency on a *driver* to name a default would
@@ -324,6 +357,7 @@ impl KvStorageConfig {
             KvStorageConfig::Memory(_) => "memory",
             #[cfg(feature = "redis")]
             KvStorageConfig::Redis(_) => "redis",
+            KvStorageConfig::File(_) => "file",
         }
     }
 }
@@ -3692,6 +3726,27 @@ impl Config {
                     // find the line by grep.
                     validate_redis(&format!("kv.{name}"), &redis.url, redis.pool_size)?;
                 }
+                KvStorageConfig::File(file) => {
+                    // An empty path is refused rather than resolved to "", which would make the store's
+                    // directory the process's working directory — a cache that scatters hashed files
+                    // beside the application's own files is the worst of both worlds, and it is what
+                    // `Path::new("")` would build.
+                    if file.path.as_os_str().is_empty() {
+                        return Err(Error::Config(format!(
+                            "kv.{name}.path is empty; give the store a directory of its own"
+                        )));
+                    }
+                    // The same argument as `max_bytes` on the memory driver: zero is refused rather than
+                    // read as "unbounded", because an unbounded cache is what the bound exists to
+                    // prevent and an operator who wrote it meant something this will not do.
+                    if file.max_bytes == 0 {
+                        return Err(Error::Config(format!(
+                            "kv.{name}.max_bytes is 0, which would refuse every value; set a limit \
+                             or remove the key for the {default} byte default",
+                            default = default_kv_max_bytes()
+                        )));
+                    }
+                }
             }
         }
 
@@ -4658,6 +4713,20 @@ impl Config {
 /// cannot print different paths for one deployment — `check` reports what this returns.
 #[must_use]
 pub fn resolve_access_log_path(path: &Path, config_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    }
+}
+
+/// A `[kv.<name>]` file store's directory, resolved against the directory holding the config file.
+///
+/// The same rule [`resolve_access_log_path`] follows, and a separate function rather than a shared
+/// one with a rename: the two settings are resolved at different times by different callers, and a
+/// generic `resolve_path` would be a name that says nothing about which setting it is resolving.
+#[must_use]
+pub fn resolve_kv_path(path: &Path, config_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -7773,6 +7842,97 @@ driver = "memory"
             "{} no longer says that the worker routes are unauthenticated, which is the reason the \
              flag is off by default",
             path.display()
+        );
+        // And the file driver, whose two facts a reader must find *before* choosing it: that a
+        // relative path resolves against the config file, and that it does not share a directory
+        // between two processes. Both are mistakes that read as configured and fail silently.
+        assert!(
+            text.contains("# driver = \"file\""),
+            "{} no longer documents the file KV driver",
+            path.display()
+        );
+        assert!(
+            text.contains("beside the deployment"),
+            "{} no longer says that a relative kv path resolves against this file's directory",
+            path.display()
+        );
+        assert!(
+            text.contains("share a directory between two"),
+            "{} no longer says that two processes must not share a file store's directory, which \
+             is the one deployment it silently misbehaves in",
+            path.display()
+        );
+    }
+
+    /// A `[kv.*]` file store parses, resolves its default bound, and refuses two things.
+    ///
+    /// The refusals are the interesting half: an empty path would make the store's directory the
+    /// process's working directory — hashed cache files scattered beside the application's own — and
+    /// a zero bound is the same statement the memory driver refuses.
+    #[test]
+    fn a_file_store_is_parsed_and_its_two_unusable_shapes_are_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[kv.sessions]
+driver = "file"
+path = "var/kv/sessions"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+        let storage = config.kv.get("sessions").expect("the storage is there");
+        assert_eq!(storage.driver(), "file");
+        match storage {
+            KvStorageConfig::File(file) => {
+                assert_eq!(
+                    file.max_bytes,
+                    64 * 1024 * 1024,
+                    "an omitted bound takes the memory driver's default, so one number is learned"
+                );
+                assert_eq!(file.path, Path::new("var/kv/sessions"));
+            }
+            other => panic!("expected a file store, got {}", other.driver()),
+        }
+
+        // An empty path.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[kv.sessions]
+driver = "file"
+path = ""
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("an empty path is refused");
+        assert!(err.to_string().contains("path is empty"), "{err}");
+
+        // A zero bound.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[kv.sessions]
+driver = "file"
+path = "var/kv"
+max_bytes = 0
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("a zero bound is refused");
+        assert!(err.to_string().contains("max_bytes is 0"), "{err}");
+    }
+
+    /// A relative `path` resolves against the config file's directory, exactly as the access log's
+    /// does — the rule that makes a deployment's file layout a property of the file rather than of
+    /// wherever the process was started.
+    #[test]
+    fn a_relative_kv_path_resolves_against_the_config_directory() {
+        assert_eq!(
+            resolve_kv_path(Path::new("var/kv"), Path::new("/etc/volucer")),
+            Path::new("/etc/volucer/var/kv")
+        );
+        assert_eq!(
+            resolve_kv_path(Path::new("/srv/kv"), Path::new("/etc/volucer")),
+            Path::new("/srv/kv"),
+            "an absolute path is left alone"
         );
     }
 

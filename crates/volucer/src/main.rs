@@ -720,9 +720,10 @@ fn serve(
     // reported before a port is occupied. One dispatcher serves both front-ends,
     // shared without a lock because each backend slot synchronises internally —
     // so two requests to two workers run at the same time.
-    let dispatcher = Dispatcher::from_config(
+    let dispatcher = Dispatcher::from_config_in(
         &config,
         routing_for(&document_root, front_controller.as_deref()),
+        path.parent().unwrap_or_else(|| Path::new("")),
     )?;
     for name in dispatcher.backend_names() {
         tracing::info!(backend = %name, "backend ready");
@@ -2261,6 +2262,29 @@ fn check(
         // went away with the same commit that added the request path below it. Both existed so that
         // `check` could not answer "configuration OK" for a kind `serve` refused, and both were
         // removed together for the same reason.
+    }
+
+    // The KV storages, with a file store's *resolved* directory. The resolved value is the one that
+    // matters: `path = "kv"` is relative to the configuration file, and an operator reading `check`
+    // needs to see where the files will actually be before a directory appears in the wrong place.
+    if !config.kv.is_empty() {
+        println!("  kv:");
+        for (name, storage) in &config.kv {
+            match storage {
+                volucer_core::config::KvStorageConfig::File(file) => {
+                    let resolved = volucer_core::config::resolve_kv_path(
+                        &file.path,
+                        path.parent().unwrap_or_else(|| Path::new("")),
+                    );
+                    println!("    {name}: file, {}", resolved.display());
+                    println!(
+                        "      bound:            {} MiB, counted from what is already there",
+                        file.max_bytes / (1024 * 1024)
+                    );
+                }
+                other => println!("    {name}: {}", other.driver()),
+            }
+        }
     }
 
     // A route is printed as the three matchers it can state, with `skip_stat` where it

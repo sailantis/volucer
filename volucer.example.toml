@@ -706,10 +706,14 @@ base_port = 19001
 # call `kv.*` at all -- the same rule every service follows: what a worker can
 # reach is what its backend's `services` list names, and nothing else.
 #
-# `driver = "memory"` is the only driver today. It lives in this process: the
-# map is shared by every worker, which is the point, since a PHP static is
-# per-worker and a pool of 8 workers gives an application cache a hit rate of
-# 1/8 with no way to invalidate.
+# Three drivers, and the choice is about where the cache lives.
+#
+# `memory` is in this process: the map is shared by every worker, which is the
+# point, since a PHP static is per-worker and a pool of 8 workers gives an
+# application cache a hit rate of 1/8 with no way to invalidate. It is lost on
+# restart.
+#
+# `file` is the same sharing across a restart, and `redis` across processes.
 #
 # max_bytes bounds the *values* stored, not the process's heap -- the hash map
 # holding them costs roughly two to three times as much again, so 64 MiB here
@@ -734,6 +738,25 @@ base_port = 19001
 # Every key this storage writes is prefixed `volucer:kv:<name>:`, which is what lets two storages
 # share one server -- a `clear` on one cannot empty the other. That prefix is also what to search
 # for when clearing a stale cache by hand.
+# A directory of files, one per key. Survives a restart and needs no server -- the driver for a
+# single node that has a disk and no Redis, which is the deployment whose session store would
+# otherwise be emptied by every deploy.
+#
+# One file per key, named by a hash of the key, so no key can name a path outside the directory.
+# 0600 per file: a cache holds session ids and fragments of authenticated pages. `path` is
+# required rather than defaulting to somewhere under /tmp, because a cache that loses its
+# contents on an unexpected reboot is the failure a default would cause silently. A relative
+# path resolves against this file's directory, so the store lands beside the deployment.
+#
+# `max_bytes` means what it means on the memory driver, and the count starts from what is
+# already on disk -- a store that started at zero would let a restart double the space it uses.
+# Expiry is an absolute deadline in the file, so time keeps passing while the process is not
+# running. What it deliberately does not do: fsync, compaction, or share a directory between two
+# processes. A deployment that needs any of those wants Redis.
+# [kv.sessions-file]
+# driver = "file"
+# path = "var/kv/sessions"
+# max_bytes = 67108864           # 64 MiB; the default
 # [kv.shared]
 # driver = "redis"
 # url = "redis://127.0.0.1:6379"

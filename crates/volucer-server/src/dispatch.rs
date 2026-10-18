@@ -5,6 +5,7 @@
 //! more elaborate belongs with the front-ends, where the request is understood.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, OnceLock, Weak};
 #[cfg(feature = "redis")]
 use std::time::Duration;
@@ -137,12 +138,30 @@ impl PoolDirectory {
 /// failure, exactly as an unreachable worker command is, rather than a 500 on the first request that reads
 /// a cache. The worker pool follows the same rule for the same reason: a misconfiguration belongs where the
 /// configuration is read.
-fn build_stores(config: &Config) -> Result<BTreeMap<String, Arc<dyn volucer_kv::Store>>> {
+fn build_stores(
+    config: &Config,
+    config_dir: &Path,
+) -> Result<BTreeMap<String, Arc<dyn volucer_kv::Store>>> {
     let mut stores: BTreeMap<String, Arc<dyn volucer_kv::Store>> = BTreeMap::new();
     for (name, storage) in &config.kv {
         let store: Arc<dyn volucer_kv::Store> = match storage {
             KvStorageConfig::Memory(memory) => {
                 Arc::new(volucer_kv::MemoryStore::with_max_bytes(memory.max_bytes))
+            }
+            // Opened here rather than lazily on the first call, for the reason the Redis arm
+            // connects here: a directory that cannot be created is a startup failure rather than a
+            // cache where every `get` is a miss and nothing reports why. `open` also does the one
+            // full walk this driver ever does, so the bound is right from the first insert — and it
+            // removes what the previous run left expired.
+            KvStorageConfig::File(file) => {
+                let path = volucer_core::config::resolve_kv_path(&file.path, config_dir);
+                let store = volucer_kv::FileStore::open(&path, file.max_bytes).map_err(|err| {
+                    ServerError::Misconfigured {
+                        backend: format!("kv.{name}"),
+                        reason: err.to_string(),
+                    }
+                })?;
+                Arc::new(store)
             }
             #[cfg(feature = "redis")]
             KvStorageConfig::Redis(redis) => {
@@ -559,6 +578,19 @@ impl Dispatcher {
     /// reported at startup instead of on the first request that happens to hit
     /// the broken one.
     pub fn from_config(config: &Config, routing: cgi::Routing) -> Result<Self> {
+        Self::from_config_in(config, routing, Path::new(""))
+    }
+
+    /// [`Dispatcher::from_config`], with the directory a relative `[kv.*]` path resolves against.
+    ///
+    /// A second entry point rather than an added parameter, because the parameter has exactly one
+    /// production caller and would otherwise be a `Path::new("")` written into sixty tests —
+    /// which is how a test ends up asserting that a cache lives in the process's working directory.
+    pub fn from_config_in(
+        config: &Config,
+        routing: cgi::Routing,
+        config_dir: &Path,
+    ) -> Result<Self> {
         // The directory is built first and installed on every worker channel as its pool boots, because
         // a channel needs its handler before the handshake and the handshake is inside
         // `WorkerPool::start`. It reaches the pools through a `Weak` filled in at the end of this
@@ -572,7 +604,7 @@ impl Dispatcher {
         // granted `kv.sessions` has to find the store already there. Built once and shared, so two
         // backends granted the same storage share one map rather than getting a private copy that
         // silently diverges — which would be the worst possible bug in a cache, since both would work.
-        let stores = build_stores(config)?;
+        let stores = build_stores(config, config_dir)?;
         // And the lock backend, for the same reason: a worker granted `lock` has to find it already
         // there, and the registry is built per backend while the backend itself is built once.
         let locks = build_locks(config)?;
@@ -1005,6 +1037,17 @@ mod tests {
         BackendConfig, Config, ExternalConfig, MemoryKvConfig, ServerConfig,
     };
 
+    /// A `[kv.*]` file store for a test, with the given relative path.
+    ///
+    /// A helper rather than a literal at the one call site because a `FileKvConfig` is about to grow
+    /// its third field and every test that states the other two should not have to.
+    fn file_kv(path: &str) -> volucer_core::config::FileKvConfig {
+        volucer_core::config::FileKvConfig {
+            path: std::path::PathBuf::from(path),
+            max_bytes: 1 << 20,
+        }
+    }
+
     /// A call with parameters, for the registry tests.
     fn call_with(name: &str, params: serde_json::Value) -> volucer_worker::Call {
         volucer_worker::Call {
@@ -1108,7 +1151,7 @@ mod tests {
     fn a_granted_namespace_reaches_the_registry_and_nothing_else_does() {
         let config = config_with(&[("app", unreachable_backend())], "app");
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config).expect("no storage needs a server");
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
         assert!(
             worker_registry(&[], &config, &directory, &stores, &None, &None).is_empty(),
             "no services must mean no namespaces"
@@ -1148,6 +1191,38 @@ mod tests {
         }
     }
 
+    /// A `[kv.*]` file store is **built** from the configuration, which is the seam §8 keeps finding.
+    ///
+    /// The fourth instance of the pattern, and it is asserted the way the first three taught: through
+    /// the function a deployment uses rather than through a store the test built by hand. What it
+    /// catches is a `build_stores` arm that was added to the config and forgotten here — the
+    /// deployment then has a storage that validates, is granted to a worker, and answers "no storage
+    /// configured" on every call.
+    #[test]
+    fn a_file_storage_is_built_from_the_configuration() {
+        let dir =
+            std::env::temp_dir().join(format!("volucer-dispatch-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+
+        let mut config = config_with(&[("app", unreachable_backend())], "app");
+        config.kv.insert(
+            "sessions".to_string(),
+            KvStorageConfig::File(file_kv("cache")),
+        );
+
+        let stores = build_stores(&config, &dir).expect("the store builds");
+        let store = stores.get("sessions").expect("the storage is there");
+        assert_eq!(store.name(), "file");
+        assert!(
+            dir.join("cache").is_dir(),
+            "the store's directory is created under the config directory, which is what a \
+             relative path promises"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A granted `lock` service reaches the registry, and it is reachable as a *call*.
     ///
     /// This is the `build_locks` seam — the third time in this document's history that a wiring function
@@ -1163,7 +1238,7 @@ mod tests {
         ));
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config).expect("no storage needs a server");
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
         let locks = build_locks(&config)
             .expect("the memory driver needs no server")
             .expect("a [lock] table builds a backend");
@@ -1213,7 +1288,7 @@ mod tests {
         assert!(config.lock.is_none());
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config).expect("no storage needs a server");
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
         assert!(
             build_locks(&config).expect("nothing to build").is_none(),
             "an absent [lock] table must not produce a backend"
@@ -1282,7 +1357,7 @@ url = "redis://127.0.0.1:6379"
         );
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config).expect("no storage needs a server");
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
         let registry = worker_registry(
             &["kv.sessions".to_string(), "kv.cache".to_string()],
             &config,
@@ -1339,7 +1414,7 @@ url = "redis://127.0.0.1:6379"
         }
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config).expect("no storage needs a server");
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
         let registry = worker_registry(
             &["kv.sessions".to_string(), "kv.cache".to_string()],
             &config,
@@ -1382,7 +1457,7 @@ url = "redis://127.0.0.1:6379"
         }
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config).expect("no storage needs a server");
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
         let registry = worker_registry(
             &["kv.sessions".to_string()],
             &config,

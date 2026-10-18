@@ -1273,7 +1273,8 @@ only knobs — see `docs/plugins.md` §6.7 for what was measured and what is del
 There is also **no external services yet beyond KV, locks, queues and gRPC**: the only way to tell a
 running server anything is a signal, or — for workers specifically — the two routes described below. A
 worker can reach a **key-value storage**
-(`[kv.<name>]`, memory or Redis), a **lock backend** (`[lock]`, memory or Redis), and the
+(`[kv.<name>]`, memory, Redis, or a directory of files), a **lock backend** (`[lock]`, memory or
+Redis), and the
 **queues** (`[jobs]`, memory or Redis) through the call plane, which is the `CALL`/`RETURN` pair on
 the worker channel — a frame a worker writes *unprompted*, mid-request, and the server answers. All
 of them are off until a backend's `services` list names them, so the default deployment's workers
