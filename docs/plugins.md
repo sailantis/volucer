@@ -2090,7 +2090,7 @@ handshake have nothing PHP-specific in them; what is PHP-specific is *metadata a
 | `RequestHeader` | `script_filename` is a CGI notion meaning "the absolute script routing chose" | rename to `entrypoint`, documented as "routing metadata, not a file to execute" — Django and Rails must not treat it as a path |
 | `RequestEnd` | `peak_memory_bytes` from `memory_get_peak_usage(true)` | optional; `0` means "this runtime does not report it", and the pool must not recycle on a value it did not get |
 | `RESPONSE` | `body_len` declared before the body, so responses are **buffered** | acceptable for v1; a chunked/unknown-length response is a protocol change and is listed in §10 |
-| per-request reset | the adapter clears `$_COOKIE`, sessions, request scope | runtime-specific by nature: Django needs `close_old_connections()` and transaction cleanup; Rails needs `Rails.application.executor.wrap` (which also returns ActiveRecord connections to the pool) |
+| per-request reset | the adapter clears `$_COOKIE`, sessions, request scope | runtime-specific by nature — **and, measured, both of these are already done by the framework**: Django connects `close_old_connections` to `request_started`/`request_finished` in `django/db/__init__.py`; Rails puts `ActionDispatch::Executor` in its default stack, so `app.call` *is* `executor.wrap`. See plan step 73 |
 | stdout | is the protocol channel, so the SDK captures `echo` | Python and Ruby must do the same: any print/puts to stdout corrupts framing. This is the single highest-risk adapter mistake and belongs in both SDKs' READMEs. |
 
 **The two concrete protocol changes are additive and backward-compatible** — an optional JSON field
@@ -2116,9 +2116,14 @@ exchange" rule, and `VOLUCER_WORKER_SOCKET` support so Windows gets the socket t
   is not a small extension**: concurrency inside one worker needs multiplexed requests on one
   connection, which is a protocol change (§10), so do not promise it in the first release.
 - **Ruby**: `to_rack_env()` must produce a `Rack::Lint`-compliant env, including `rack.input`
-  responding to `gets`/`each`/`read`/`rewind` and a body responding to `each`; and every dispatch
-  must be wrapped in `Rails.application.executor.wrap` (or the `Reloader` in development, so code
-  reload keeps working) or the connection pool is exhausted.
+  responding to `gets`/`each`/`read`/`rewind` and a body responding to `each`. **The `executor.wrap`
+  this bullet used to demand is not needed for a Rails app**: `ActionDispatch::Executor` is in the
+  default middleware stack, so `Rails.application.call(env)` is already wrapped. It is still the
+  right advice for a bare Rack app that shares a connection pool, and for a caller driving the app
+  outside Rack.
+
+Both were built and neither needed the adapter this section predicted — see plan step 73 for what
+was measured, including the two claims above that turned out to be false.
 
 **Precedent, honestly stated.** Nobody has done this for volucer's protocol, and the nearest thing
 is negative evidence: `pygoridge` is a Python Goridge client that exists and is **archived**, and
@@ -2131,6 +2136,13 @@ CPython via FFI while volucer's whole design is to spawn it.
 
 **Sizing.** Protocol change: S. Each SDK: M. Each adapter: M, and the Django and Rails ones are
 where the framework knowledge is.
+
+**Sizing, as revised by building it: the adapter estimate was wrong in the same direction both
+times.** Each SDK was M as predicted. The **adapters were zero** — not S, not small: both
+frameworks already provide the per-request reset this section attributed to an adapter, and the
+remaining work is a one-line worker file and a `script_extensions` key. The M that the estimate was
+reaching for belongs to the *deployment* (a `manage.py`-less entry point, a `config.ru`, a
+`DATABASE_URL`), which is packaging rather than protocol. See plan step 73.
 
 ### 7.3 What not to do
 

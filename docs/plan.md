@@ -1603,8 +1603,9 @@ Later, and deliberately not part of Phase 8:
       which 2 are end-to-end against a real `volucer` binary. WSGI only; ASGI is a protocol change
       rather than an adapter, and the README says so.
     - **`sailantis/volucer-ruby-sdk`** — `Volucer::Worker.connect.run(&Volucer::Rack.handler(app))`,
-      57 tests of which 2 are end-to-end. Rack; Rails needs its own `executor.wrap` around each
-      dispatch, which is what the framework bridge is for (steps 72–74) rather than this gem.
+      57 tests of which 2 are end-to-end. Rack, and **Rails needs no adapter at all** — measured,
+      see step 73; an earlier revision of this line said Rails needed its own `executor.wrap`, and
+      that is false for a plain `app.call(env)`.
     - **Both report the same frozen wire bytes as the Rust and PHP tests**, so four
       implementations cannot drift apart silently. That is the property the step was really for.
     - **The RSS question was not answered the same way in either, and that is the honest result.**
@@ -2237,6 +2238,53 @@ the workflow is the same one, but it finally has an output, so it stops being de
     - **Not attempted: Slim/Mezzio/custom PSR-15.** It is the cheapest of the four and would
       validate the SDK against a framework with no boot-cost story to protect, which is exactly why
       it can wait: it has nothing to prove that the three above did not.
+
+73. `django-and-rails` — **done, and both needed no adapter, which was not the expected answer.**
+    The plan carried Django and Rails as "the real work" of a native worker, with per-runtime
+    reset code to write (the table in `docs/plugins.md` §7.2 says Django needs
+    `close_old_connections()` and transaction cleanup, and Rails needs
+    `Rails.application.executor.wrap`). **Both claims are false for a plain application call**,
+    and this step exists because a prediction in a plan is not evidence.
+    - **What was built and run:** a real Django 6.1.2 project and a real Rails 8.1.4 application,
+      each served by its own SDK from a real `volucer` binary over the worker channel. The whole
+      integration in both cases is one line beside the framework's own boot:
+      `Worker.connect().run(wsgi.call(get_wsgi_application()))` and
+      `Volucer::Worker.connect.run(&Volucer::Rack.handler(Rails.application))`.
+    - **Django does its own cleanup, at a place the plan did not look.** `django/db/__init__.py`
+      connects `close_old_connections` to **both** `request_started` and `request_finished`, and
+      `WSGIHandler.__call__` fires both around every request. So the connection hygiene the plan
+      wanted the adapter to own is already a property of calling a Django app correctly. Falsified
+      by writing a view that leaves a transaction open and asserting on the *next* request's
+      connection: `autocommit` is back to `True`, no transaction is open, and the connection still
+      answers.
+    - **Rails does its own cleanup too, in middleware.** `ActionDispatch::Executor` is in
+      `Rails::Application`'s **default** middleware stack, so `app.call(env)` is already
+      `executor.wrap`. Asserted the way the framework reports it: a request that queries the
+      database sees `checked_out = 1` on the pool *during* the request and the *next* independent
+      call sees `checked_out = 0` — the connection went back to the pool without the adapter
+      touching it. `executor.wrap` is therefore the answer for a **non-Rails** Rack app, or for a
+      caller driving the app outside Rack; it is not something the volucer path needs.
+    - **What each framework genuinely needed, both from the deployment rather than the protocol:**
+      `script_extensions = ["py"]` / `["rb"]`, because a path is only routed as a script if its
+      extension is in the list (step 38) — without it the entry point arrives as `PATH_INFO`.
+      Everything else the SDK already did.
+    - **Sessions worked through the channel without a `WorkerSession`-shaped helper**, which is
+      the useful negative result: both frameworks emit `Set-Cookie` as an ordinary response header,
+      and the SDKs carry response headers, so the PHP-specific problem (a SAPI that cannot deliver
+      `setcookie()`) has no counterpart here. Django's cookie round-trips and a **cookieless client
+      correctly gets no session** rather than inheriting the previous client's — the failure mode
+      `docs/worker-protocol.md` warns about.
+    - **`script_filename` leaks nothing.** Both SDKs expose it as `volucer.script_filename`, never
+      `SCRIPT_FILENAME`, so a Python or Ruby application cannot mistake routing metadata for a file
+      to open — the concern the plan raised for exactly these two runtimes is handled in the SDK
+      rather than in a per-framework adapter.
+    - **Two things still belong to the application, and the READMEs say so:** per-request state a
+      framework keeps *outside* its own request cycle (Django's module-level caches, a Rails
+      initializer's memoised globals), and `multipart/form-data`, which no bridge parses. Both are
+      the same answers the three PHP bridges give.
+    - **This is the cheapest of the four framework tracks by a wide margin** — the whole of it is
+      a one-line worker file plus a configuration key — and it is the argument for treating the
+      PHP bridges as the hard case rather than the representative one.
 
 **What this phase does not do.** No PHP extension (FrankenPHP's model, priced by hazard 53 and
 rejected for isolation). No multiplexed FastCGI — the specification has it (§1: *"the protocol
