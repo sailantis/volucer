@@ -69,6 +69,11 @@ ctrlc = "3"
 # ends up in someone's deployment.
 rcgen = "0.13"
 
+# For reading the JSON the `[status]` worker routes answer. Already in the graph through
+# `volucer-server`, which encodes `workers.list` with it — so a test parses the very document the
+# worker channel carries rather than a second encoding of the same fields.
+serde_json.workspace = true
+
 # For `an_acme_configured_server_serves_its_cached_certificate`: writing a cached certificate
 # through the crate's own `CertCache` trait, so the file name (a hash of the names and the
 # directory URL) is the one the engine will look for. A test that wrote the file by hand would pass

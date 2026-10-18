@@ -2482,9 +2482,72 @@ pub trait PoolLookup: Send + Sync {
 
     /// Restart one worker by its index in [`PoolLookup::workers`].
     ///
-    /// Returns why it could not, rather than a `Result`, because the caller's only use for the failure is
-    /// to put it in a `Return`.
-    fn restart(&self, index: usize) -> std::result::Result<(), String>;
+    /// Returns [`ResetRefusal`] rather than a `String`, because the caller is not always a `Return`:
+    /// the `[status]` listener answers a refusal with a **status code**, and it can only do that if
+    /// the reason survives as a type. `curl -f` has to fail on "no such worker" without the caller
+    /// parsing a document to find out, and a `String` would force exactly that.
+    fn restart(&self, index: usize) -> std::result::Result<(), ResetRefusal>;
+}
+
+/// Why a `worker.reset` did not happen.
+///
+/// Three variants and no catch-all, because the three have three different callers' answers: an index
+/// that does not exist is the *caller's* mistake and retrying it changes nothing, a slot that is
+/// serving a request is a temporary condition worth retrying, and a worker that could not be booted
+/// is the deployment's problem. Collapsing them would make the status code the listener picks a
+/// guess.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResetRefusal {
+    /// No worker has this index, across every pool.
+    #[error(
+        "worker index {index} does not exist; there are {workers} workers, and the list gives the \
+         index to use"
+    )]
+    NoSuchWorker { index: usize, workers: usize },
+
+    /// The slot is serving a request, and replacing it would lose that request.
+    #[error("worker {index} is serving a request; try again when it is idle")]
+    Busy { index: usize },
+
+    /// The replacement could not be booted. The slot is **empty** now, so this is not a transient
+    /// failure the caller can retry against the same worker.
+    #[error("worker {index} could not be replaced: {reason}")]
+    Failed { index: usize, reason: String },
+}
+
+impl ResetRefusal {
+    /// The index this refusal is about, for a message that has to name it.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        match self {
+            ResetRefusal::NoSuchWorker { index, .. }
+            | ResetRefusal::Busy { index }
+            | ResetRefusal::Failed { index, .. } => *index,
+        }
+    }
+
+    /// Translate a pool-local index into the caller's global one.
+    ///
+    /// A pool is asked about `index - offset` and answers about that number, so every refusal has to
+    /// travel back through the same subtraction. Applied here rather than at the call site because
+    /// `dispatch.rs` is the only place that knows an offset exists, and a caller that had to remember
+    /// would eventually be a second implementation of the one rule `worker.reset` exists to get right.
+    #[must_use]
+    pub fn rebased(self, offset: usize) -> Self {
+        match self {
+            ResetRefusal::NoSuchWorker { index, workers } => ResetRefusal::NoSuchWorker {
+                index: index + offset,
+                workers: workers + offset,
+            },
+            ResetRefusal::Busy { index } => ResetRefusal::Busy {
+                index: index + offset,
+            },
+            ResetRefusal::Failed { index, reason } => ResetRefusal::Failed {
+                index: index + offset,
+                reason,
+            },
+        }
+    }
 }
 
 /// One worker, as `workers.list` describes it.
@@ -2492,8 +2555,13 @@ pub trait PoolLookup: Send + Sync {
 pub struct WorkerStatus {
     /// The backend the pool belongs to, e.g. `app`.
     pub backend: String,
-    /// The worker's index within its pool, which is what `worker.reset` takes.
+    /// The worker's index **across every pool**, which is what `worker.reset` takes.
     pub index: usize,
+    /// The worker's index **within its own pool**, which is what its supervisor calls it.
+    ///
+    /// Reported as well as [`WorkerStatus::index`] because the two are different numbers whenever a
+    /// deployment has two backends, and an operator reading a pool's own log needs the second.
+    pub slot: usize,
     /// The process id, for correlating with `ps`.
     pub pid: u32,
     /// Whether the slot is free.
@@ -2549,7 +2617,7 @@ impl Namespace for WorkersNamespace {
                     // A refusal, not an unknown state: `restart` either replaced the worker or it did
                     // not, and the pool knows which. Reporting `unknown` here would teach a caller to
                     // ignore the flag on exactly the call where it matters most.
-                    Err(reason) => Return::refused(reason),
+                    Err(reason) => Return::refused(reason.to_string()),
                 }
             }
             other => Return::refused(format!("the workers namespace does not serve {other}")),

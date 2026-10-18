@@ -176,7 +176,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 
 | What | RR's shape | What it costs here | Why it is worth it |
 | --- | --- | --- | --- |
-| **`volucer workers` / `volucer reset`** (§4.6, §4.7) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S–M**, and not the **S** this was first called. The methods exist and are tested; what is missing is a way *in* from a second process, which is a listener rather than a client. Route it on the `[status]` listener that already exists — see §4.7 | §4.6 promises it and the promise was false in a way worth keeping written down: the channel the registry travels on is held by the pool and the child, so it has no second-process half. Without it, `worker.reset` is reachable only from application code — the operator's own lever is missing. **It also makes two subcommands optional**, which is why it is the endpoints rather than the CLI: `curl -f -XPOST .../workers/3/reset` is the whole command |
+| **`volucer workers` / `volucer reset`** — **built, §4.7** (§4.6) | `informer` + `resetter`, both RPC clients of `rpc.listen` | **S–M**, and not the **S** this was first called. The methods exist and are tested; what was missing was a way *in* from a second process, which is a listener rather than a client. Routed on the `[status]` listener that already exists — see §4.7 | §4.6 promises it and the promise was false in a way worth keeping written down: the channel the registry travels on is held by the pool and the child, so it has no second-process half. Without it, `worker.reset` is reachable only from application code — the operator's own lever was missing. **It also makes two subcommands optional**, which is why it is the endpoints rather than the CLI: `curl -f -XPOST .../workers/3/reset` is the whole command. **And it exposed a defect rather than only adding a feature**: `workers.list` reported pool-local indices while `worker.reset` took global ones, so with two backends the documented round trip recycled the wrong process |
 | **`http.trusted_subnets` + forwarded headers** — **built, §6.8** | `proxy_ip_parser` | **S–M**, and it was S–M. A CIDR check against the peer, then the first parsable of an ordered header list, hand-rolled rather than a crate | **Not a convenience — a correctness bug, and the only defect in this table.** A client behind nginx arrives with the proxy's address, so a rate limit keyed on `ip` limits nginx, and the access log records a peer that is not the client. Both places already took an address, which is why the change is small |
 | **`metrics.observe`** — **built, §6.1** | `metrics.collect` | **S**, and it was **not** S. The estimate said "one registry entry and one namespace arm"; the real work was a declared-kind dispatch (`Registry::record`), a validation that runs *before* a series exists, a name rule, and fixing the SDK's own examples, which used dots and could never have rendered | `emitMetric` rode the wire and landed in a `Vec` nobody read (`codec.rs:1136`), which §6.1 called the first thing to fix. **That was fixed and the feature still did not work**: a registry refuses an undeclared name, so every real sample was dropped while three tests passed by declaring their own metric. The table was the feature, not an upgrade to it |
 | **Rate limiting** — **built, §6.10** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above — which is the half the estimate got right. The bucket *is* a page of arithmetic; what was not S was deciding what a refusal means on **two** front-ends and **two** protocols, and finding that RoadRunner answers a full table with a 503 | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
@@ -301,10 +301,12 @@ hazard 60). Internally the pieces exist and are unused by anything outside the p
 owns the one reload path.
 
 **This section is still true, and that is the point.** §4.2–§4.6 were built, so an application inside a
-worker can now call `workers.list`, `worker.reset`, `kv.get`, `lock.acquire` and the rest. What is
-*not* built is the second process — which is what an operator has, and the reason the CLI is still
+worker can now call `workers.list`, `worker.reset`, `kv.get`, `lock.acquire` and the rest. What was
+*not* built was the second process — which is what an operator has, and the reason the CLI is still
 `serve`, `check`, `version`. §4.6 assumed those two were one feature. §4.7 is the accounting of why
-they are not, and it is the only premise of this section that did not survive the code.
+they are not, and it is the only premise of this section that did not survive the code. **That half is
+now built too**, as routes on the `[status]` listener rather than as subcommands — see §4.7's *Built*
+for what the shape got wrong when it was finally implemented.
 
 ### 4.2 The design: one channel, one dispatcher
 
@@ -509,7 +511,9 @@ the one that would be forgotten:
   (`restart(index)`, `crates/volucer-server/src/worker_pool/mod.rs:1161`)
   and the configuration that already exist. The sentence that matters is that no *service* has to exist
   for them, which turned out to be true: `workers.list` and `worker.reset` are answered by the server's
-  own dispatcher, so nothing has to be written but the way in.
+  own dispatcher, so nothing has to be written but the way in. **They are now HTTP routes rather than
+  subcommands** — `curl -f -XPOST .../workers/3/reset` is the whole command — because the way in is a
+  listener the status table already binds.
 - The `status`/health endpoint (§6.1) can borrow the same `ready` notion.
 - Every §6 service has somewhere to live from the day it is written.
 
@@ -613,6 +617,54 @@ stays a worker-callable method.
   startup fact and no new failure mode is introduced.
 - The status listener answers a 404 to every path it does not serve ([status.rs:28](crates/volucer-http/src/status.rs:28)),
   which is the behaviour `POST /workers/{i}/reset` has to keep for the paths this row does not add.
+
+#### Built, and what the build corrected
+
+**The three premises above survived. Two others did not, and both were found by writing the route
+rather than by re-reading the design.**
+
+**1. `workers.list` and `worker.reset` disagreed about what an index is, and the disagreement was
+invisible with one backend.** The list reported each slot's **pool-local** index; the reset counted
+slots across **every** pool. With one backend the two numbers coincide, which is why the existing
+end-to-end test — a single pool of two workers — asserted on the right answer and could not have
+caught it. With two, the list said `0, 0` and a reset of index 1 recycled the *first* pool's worker.
+
+This is the second time a defect has lived in the seam between two tested halves rather than in
+either (§8's `build_stores` and `build_locks` are the first two), and it is a sharper instance: the
+two methods documented the round trip to each other — *"take the index from `workers.list`"* — and
+each was correct about its own numbering. The fix is a running index in `PoolLookup::workers`, and a
+second field (`slot`) so a log line can still name the number the pool itself uses. The e2e test that
+pins it uses two one-worker backends, because that is the smallest deployment whose two numbers
+differ.
+
+**2. The three refusals had to become a type, and the reason is the status code.** `restart` returned
+`Result<(), String>`, which is enough for a `Return` and not enough for a listener: `curl -f` has to
+fail on "no such worker" (404) without the caller parsing a document, and a `String` cannot be
+matched. `ResetRefusal` is `NoSuchWorker`/`Busy`/`Failed`, mapped to 404/409/500 **in that order of
+meaning** — "you asked for something that does not exist", "try again", "this deployment is broken".
+The `503` from `unavailable_status_code` is deliberately *not* reused: that number is a statement
+about what "not serving traffic" means to this deployment's load balancer, and one busy slot is not
+that.
+
+**What the route needed that this section did not predict.** The reset runs through
+`spawn_blocking`, and there was no way to test that until the listener's runtime was pinned to two
+threads: the first version of the test passed with `spawn_blocking` removed, because a runtime with
+one thread per core had a spare for the probe. Three concurrent resets against a two-thread listener
+is what makes an inline implementation show up as a probe that waited a second. That is worth
+recording as a pattern: **a test for "this does not block" needs a runtime small enough to be filled.**
+
+Two smaller decisions:
+
+- **A wildcard `status.address` with `allow_worker_reset` is refused, not warned about.** An
+  unauthenticated `POST` that recycles workers, reachable from anywhere, is a remote kill switch; the
+  operator who wrote `0.0.0.0` was thinking about the readiness probe being reachable. A mutation
+  endpoint with no worker backend at all is a *warning* — the routes exist and every index is a 404,
+  which is honest about a deployment that may gain a backend tomorrow.
+- **A method other than `GET`/`HEAD` is a `405` before any route returns.** Written first beside the
+  bottom 404, where it guarded nothing: `POST /metrics` answered `200` with the whole exposition,
+  because a guard placed after the function's first `return` does not guard the paths that return.
+  The test caught it.
+
 
 ### 4.8 Versioning, now that nothing is deployed
 
@@ -2064,7 +2116,7 @@ progress on something earlier look bigger.
 | — | **`http.trusted_subnets` + forwarded headers** — §6.8 | — | S–M | **Done.** Independent of 1–9, and the only item in §1.4 that was a *defect* rather than a missing feature: behind nginx the access log and any future rate limit both keyed on the proxy. Restart-only, and deliberately not applied on the FastCGI path |
 | — | **server.access_log reopen on SIGHUP** — §6.12 | — | S | **Done**, and it was a defect rather than a feature: the failure message had promised SIGHUP would reopen the log for as long as the log has existed. Only the reopen; size-based rotation stays with logrotate |
 | — | **Rate limiting** — §6.10 | 1, §6.8's resolved address | S | **Done.** The bucket is a page of arithmetic as §1.4 said; the work was the two front-ends and two protocols. 429 (not RoadRunner's 503, which would remove the node from a load balancer), Retry-After, and RESOURCE_EXHAUSTED for a gRPC call. Restart-only, because the buckets are live state |
-| — | **`volucer workers` / `volucer reset`** — §4.7 | 1, 2, and §6.1's `[status]` listener | S–M | **Not built, and it is the operator's only lever on a running pool.** §4.6 called it a client; it is an endpoint, because the registry's channel has no second-process half. Routes on the listener `[status]` already brings up, behind an off-by-default key |
+| — | **`volucer workers` / `volucer reset`** — §4.7 | 1, 2, and §6.1's `[status]` listener | S–M | **Done, as the HTTP routes rather than the subcommands.** §4.6 called it a client; it is an endpoint, because the registry's channel has no second-process half. `curl -f -XPOST /workers/3/reset` is the whole command, so two subcommands are not needed. Behind an off-by-default key. **The row also produced a defect rather than only a feature**: `workers.list` and `worker.reset` disagreed about what an index is, and one backend made the two numbers coincide. See §4.7's *Built* |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |
 | — | **Runtimes, Tier 2 (protocol + SDKs)** | 2 | M each | Only after Tier 1 shows a measured reason |
 

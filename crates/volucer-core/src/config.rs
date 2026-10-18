@@ -944,6 +944,22 @@ pub struct StatusConfig {
     /// treat anything else as a failed probe of the probe itself.
     #[serde(default = "default_unavailable_status")]
     pub unavailable_status_code: u16,
+
+    /// Serve the worker-control routes: `GET /workers` and `POST /workers/{index}/reset`.
+    ///
+    /// **Off, and off is not "not yet documented" — it is the whole safety of the feature.** A `GET`
+    /// is safe to hand to whoever can reach a port; a `POST` that recycles a worker is not. So a
+    /// deployment that configured `[status]` for an orchestrator, and then upgraded, gains no
+    /// mutation surface: the routes do not exist until this says so, and until they say so they are
+    /// a 404 (`/workers`) and a 405 (anything else `POST`ed), not a 403 — an endpoint that exists and
+    /// refuses is an endpoint an attacker can enumerate.
+    ///
+    /// The alternative protection — a token — was considered and not built: the listener is
+    /// configured by whoever runs the process, and the same one-line misconfiguration that exposes
+    /// it to the world would expose the token's own configuration too. What protects this is that it
+    /// does not exist unless asked for, which is `[metrics]`'s rule one table over.
+    #[serde(default)]
+    pub allow_worker_reset: bool,
 }
 
 fn default_unavailable_status() -> u16 {
@@ -3557,6 +3573,29 @@ impl Config {
                     "status.unavailable_status_code {} is not an HTTP status code",
                     status.unavailable_status_code
                 )));
+            }
+            // The mutation routes recycle a worker, so they are worth a refusal rather than a
+            // warning on the one address that makes them reachable from anywhere. A loopback
+            // address is not proof of safety — a container's loopback is the container's — but a
+            // wildcard bind is proof of the opposite, and an operator who wrote one while setting
+            // this flag has almost certainly not meant to. The hint names the fix rather than
+            // restating the rule.
+            if status.allow_worker_reset {
+                let listener = parse_listener(&status.address)
+                    .map_err(|e| Error::Config(format!("status.address: {e}")))?;
+                let broad = match &listener {
+                    Listener::Tcp(address) => address.ip().is_unspecified(),
+                    Listener::Unix(_) => false,
+                };
+                if broad {
+                    return Err(Error::Config(format!(
+                        "status.allow_worker_reset is set and status.address is {}, which binds \
+                         every interface; POST /workers/{{index}}/reset recycles a worker and has \
+                         no authentication, so give [status] a loopback or private address and \
+                         reach it through the orchestrator's own network",
+                        status.address
+                    )));
+                }
             }
         }
 
@@ -6202,6 +6241,78 @@ address = "127.0.0.1:2114"
         assert_eq!(config.status.expect("present").unavailable_status_code, 503);
     }
 
+    /// The mutation routes are off unless the file says otherwise, and that default is the feature.
+    ///
+    /// A deployment that configured `[status]` for an orchestrator and then upgraded must not gain a
+    /// way to recycle its workers. The assertion is on the *default*, because that is the half an
+    /// upgrade cannot change.
+    #[test]
+    fn the_worker_routes_are_off_by_default() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[status]
+address = "127.0.0.1:2114"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert!(
+            !config.status.expect("present").allow_worker_reset,
+            "a [status] table that says nothing about the mutation routes must not enable them"
+        );
+    }
+
+    /// A wildcard bind plus a mutation endpoint is refused, and the message names the fix.
+    ///
+    /// Not a warning: a `POST` with no authentication that recycles a worker, on an address that
+    /// accepts connections from anywhere, is a remote kill switch for the application — and the
+    /// operator who wrote `0.0.0.0` was almost certainly thinking about the *readiness probe* being
+    /// reachable, not about this.
+    #[test]
+    fn a_wildcard_status_address_cannot_carry_the_worker_routes() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[status]
+address = "0.0.0.0:2114"
+allow_worker_reset = true
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must be refused");
+        let message = err.to_string();
+        assert!(message.contains("allow_worker_reset"), "{message}");
+        assert!(
+            message.contains("every interface"),
+            "the message has to say what is wrong with the address: {message}"
+        );
+
+        // And the same address without the flag is ordinary: a readiness probe on a wildcard bind is
+        // a deployment somebody chose, and refusing it would be refusing the wrong thing.
+        let text = text.replace("allow_worker_reset = true", "");
+        let config = Config::from_toml(&text).expect("config parses");
+        config
+            .validate()
+            .expect("a wildcard [status] without the mutation routes is legal");
+    }
+
+    /// A loopback or a specific private address is accepted, which is the whole of what the check
+    /// above is *not* refusing.
+    #[test]
+    fn a_specific_status_address_may_carry_the_worker_routes() {
+        for address in ["127.0.0.1:2114", "10.1.2.3:2114", "[::1]:2114"] {
+            let text = format!(
+                r#"
+[server]
+http = "127.0.0.1:8080"
+[status]
+address = "{address}"
+allow_worker_reset = true
+"#
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            config.validate().expect("a specific address is fine");
+        }
+    }
+
     /// A status *and* a metrics endpoint is a legal deployment: a container orchestrator polls
     /// readiness while something else scrapes. Neither is a listener in the request path, so neither
     /// satisfies the "no listener configured" refusal on its own.
@@ -7647,6 +7758,20 @@ driver = "memory"
             text.contains("SIGHUP CLOSES AND REOPENS THE FILE"),
             "{} no longer says that SIGHUP reopens the access log, which is what makes logrotate \
              work rather than silently detach the log",
+            path.display()
+        );
+        // And the mutation switch, whose *off* default is the whole safety of the feature: a
+        // deployment that configured `[status]` for an orchestrator must be able to read that it has
+        // not also gained a way to recycle its workers.
+        assert!(
+            text.contains("# allow_worker_reset = true"),
+            "{} no longer documents the [status] allow_worker_reset switch",
+            path.display()
+        );
+        assert!(
+            text.contains("There is no authentication"),
+            "{} no longer says that the worker routes are unauthenticated, which is the reason the \
+             flag is off by default",
             path.display()
         );
     }

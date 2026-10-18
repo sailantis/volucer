@@ -1517,6 +1517,10 @@ fn build_status(
             .status
             .as_ref()
             .map_or(503, |status| status.unavailable_status_code),
+        // The worker routes exist only when the deployment asked, and the implementation is the
+        // dispatcher's own pool directory — the same one `workers.list` reads, so a `GET /workers`
+        // and a worker's own `workers.list` cannot disagree about what a worker is.
+        workers: workers_control(config, dispatcher),
     };
 
     RunningStatus::start(&address, services)
@@ -1524,6 +1528,47 @@ fn build_status(
         .map_err(|err| ServerError::Listener {
             reason: err.to_string(),
         })
+}
+
+/// The worker-control routes, when `[status] allow_worker_reset` asks for them.
+///
+/// `None` in two cases, and they are the same answer for different reasons: the deployment did not
+/// ask, or it asked and configured no worker pool at all — in which case there is nothing to list and
+/// `/workers` would be an empty array that looks like a pool with no workers. A static-only or
+/// upstream-only deployment gets no route rather than a misleading one.
+fn workers_control(
+    config: &Config,
+    dispatcher: &Arc<Dispatcher>,
+) -> Option<Arc<dyn volucer_http::WorkerControl>> {
+    if !config
+        .status
+        .as_ref()
+        .is_some_and(|status| status.allow_worker_reset)
+    {
+        return None;
+    }
+    let pools = dispatcher.pools()?;
+    Some(Arc::new(PoolControl { pools }))
+}
+
+/// [`volucer_http::WorkerControl`] over the pool directory the call plane already reads.
+///
+/// A newtype rather than implementing the trait on `PoolDirectory`, so the HTTP crate depends on a
+/// trait it declares and `volucer-server` never learns that a status listener exists.
+struct PoolControl {
+    pools: Arc<volucer_server::PoolDirectory>,
+}
+
+impl volucer_http::WorkerControl for PoolControl {
+    fn workers(&self) -> Vec<volucer_server::WorkerStatus> {
+        // Through the trait, so this is the *same* implementation `workers.list` answers from rather
+        // than a second rendering of the pools that could drift from it.
+        volucer_server::PoolLookup::workers(&*self.pools)
+    }
+
+    fn restart(&self, index: usize) -> std::result::Result<(), volucer_server::ResetRefusal> {
+        volucer_server::PoolLookup::restart(&*self.pools, index)
+    }
 }
 
 /// Start the metrics and status listener, when the configuration asks for one, and say where it
@@ -1749,6 +1794,7 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
         "a reload does not change: [server.rate_limit] (the buckets are live state, so replacing the policy would reset every caller's allowance)",
         "a reload does not change: [server.access_log] path, format and request_id_header (SIGHUP closes and reopens the log a rotation moved, but the destination is chosen at startup)",
+        "a reload does not change: [status] address and allow_worker_reset (the listener is bound, and a route that mutates must not appear because a file was edited)",
     ]
 }
 
@@ -2395,6 +2441,31 @@ fn check(
             }
         }
         None => println!("  telemetry: none (telemetry is unset)"),
+    }
+
+    // The status listener and the one route on it that mutates. Printed in both cases rather than
+    // only when configured: the *absence* of a mutation surface is the fact an operator auditing
+    // this deployment wants, and a report that printed nothing when `allow_worker_reset` was off
+    // would leave them unable to tell "not configured" from "not reported".
+    match (&config.status, &config.metrics) {
+        (Some(status), _) => {
+            println!("  status: {}", status.address);
+            println!(
+                "    worker routes:    {}",
+                if status.allow_worker_reset {
+                    "GET /workers and POST /workers/{index}/reset (no authentication)"
+                } else {
+                    "disabled (allow_worker_reset is false; the routes do not exist)"
+                }
+            );
+        }
+        (None, Some(metrics)) => {
+            println!("  metrics: {}", metrics.address);
+            println!("    worker routes:    disabled (they live on [status], which is unset)");
+        }
+        (None, None) => {
+            println!("  status:           (disabled: no /health, no /ready, and no worker routes)")
+        }
     }
 
     println!("  PHP binaries:");

@@ -43,6 +43,67 @@ use hyper_util::rt::TokioIo;
 use volucer_metrics::Registry;
 
 use crate::error::{HttpError, Result};
+/// What the worker-control routes can do, without the listener knowing what a worker pool is.
+///
+/// The three things the routes need are the three things `workers.list` and `worker.reset` already
+/// need, which is why there is no new machinery behind this: `crate::PoolLookup` is the same
+/// implementation the call plane uses, so the HTTP route and a worker's own call are one answer with
+/// two callers rather than two implementations of "which pool is worker 3 in".
+///
+/// A separate trait rather than `PoolLookup` itself, because of the last method. A status listener
+/// whose `restart` may block for as long as a PHP process takes to boot has a choice to make about
+/// *where*, and this is the one method that says out loud that the answer is not the listener's
+/// thread — see [`RunningStatus`].
+pub trait WorkerControl: Send + Sync {
+    /// One entry per worker, across every pool, in a stable order.
+    fn workers(&self) -> Vec<volucer_server::WorkerStatus>;
+
+    /// Restart one worker by its index in [`WorkerControl::workers`].
+    ///
+    /// Blocking by nature, which is why the listener calls it through `spawn_blocking` rather than
+    /// inline. The bound is the worker protocol's own handshake deadline, so "how long may this
+    /// take" is already answered by the pool and is not this trait's question.
+    fn restart(&self, index: usize) -> std::result::Result<(), volucer_server::ResetRefusal>;
+}
+
+/// The routes the worker-control surface adds, and what they answer.
+///
+/// Declared as constants rather than assembled at each use, so a test and the router cannot disagree
+/// about a path — which is the defect a hand-written router is prone to and a `match` on a literal
+/// is not.
+struct WorkerRoutes;
+
+impl WorkerRoutes {
+    /// `GET` returns every worker; nothing else is allowed here.
+    const PATH: &'static str = "/workers";
+
+    /// `POST /workers/{index}/reset`, whose prefix and suffix bracket the index.
+    const RESET_PREFIX: &'static str = "/workers/";
+    const RESET_SUFFIX: &'static str = "/reset";
+
+    /// The index in `POST /workers/{index}/reset`, if the path is one.
+    ///
+    /// `None` for anything that is not exactly that shape, which includes `/workers/3/` and
+    /// `/workers//reset`: a router that accepted a trailing slash here would answer two paths for one
+    /// route, and the one thing this surface must not do is exist in more forms than documented.
+    fn reset_index(path: &str) -> Option<usize> {
+        let inner = path
+            .strip_prefix(Self::RESET_PREFIX)?
+            .strip_suffix(Self::RESET_SUFFIX)?;
+        // **Every byte has to be an ASCII digit**, rather than "let `usize::parse` decide".
+        //
+        // `"+3".parse::<usize>()` succeeds, and so does `"+0"` — Rust's integer parser accepts an
+        // explicit sign — so the one-line version of this function accepted `/workers/+3/reset` as
+        // worker 3. Found by the test below rather than by reading, and it matters because the whole
+        // point of pinning the shape is that a caller cannot name an index the pool's own list does
+        // not print. An empty segment is refused too, which `parse` would refuse anyway but which is
+        // clearer stated than depended upon.
+        if inner.is_empty() || !inner.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        inner.parse::<usize>().ok()
+    }
+}
 
 /// What the status endpoints report, and how they are configured.
 ///
@@ -136,6 +197,26 @@ pub struct StatusServices {
     /// listener does not have to depend on `hyper` to say a number. Validation has already refused
     /// anything outside `100..=599`, and the conversion below is where that promise is spent.
     pub unavailable_status: u16,
+    /// The worker-control routes, or `None` to serve none of them.
+    ///
+    /// `None` for a deployment that did not set `[status] allow_worker_reset`, which is every
+    /// deployment until one asks. The routes then do not exist: `/workers` is the same 404 as any
+    /// other unserved path, and a `POST` anywhere is a 405.
+    pub workers: Option<Arc<dyn WorkerControl>>,
+}
+
+impl Default for StatusServices {
+    /// Every endpoint absent. Not a useful listener — it answers 404 to everything — but the honest
+    /// starting point for one built field by field, and what the tests that care about one endpoint
+    /// use so that adding a fourth does not edit seven fixtures.
+    fn default() -> Self {
+        StatusServices {
+            metrics: None,
+            readiness: None,
+            unavailable_status: 503,
+            workers: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for StatusServices {
@@ -147,6 +228,7 @@ impl std::fmt::Debug for StatusServices {
             .field("metrics", &self.metrics.is_some())
             .field("readiness", &self.readiness.is_some())
             .field("unavailable_status", &self.unavailable_status)
+            .field("workers", &self.workers.is_some())
             .finish()
     }
 }
@@ -166,6 +248,14 @@ impl RunningStatus {
     /// Bind and serve, on a thread of its own.
     pub fn start(address: &str, services: StatusServices) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            // Two threads rather than the default, which would be one per core. The listener serves
+            // two things — a scrape and a probe — and a bigger pool is not free: it is idle threads
+            // parked per process, and it is what made a *test* of the `spawn_blocking` boundary pass
+            // while the boundary was absent. With two threads, one blocked inline reset leaves one
+            // thread for everything else, which is the smallest pool that can still serve a probe
+            // during a recycle — so a regression to inline work shows up as a timeout rather than as
+            // a slow answer nobody measures.
+            .worker_threads(2)
             .enable_all()
             .build()
             .map_err(HttpError::Runtime)?;
@@ -267,7 +357,7 @@ async fn serve(
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |request: Request<hyper::body::Incoming>| {
                         let services = Arc::clone(&services);
-                        async move { Ok::<_, Infallible>(answer(request, &services)) }
+                        async move { Ok::<_, Infallible>(answer(request, &services).await) }
                     });
                     // HTTP/1 only, and `hyper`'s auto builder is *not* used here. A scraper and an
                     // orchestrator both speak HTTP/1.1, so h2 would be a negotiation to maintain for
@@ -294,16 +384,37 @@ async fn serve(
 
 /// Build the answer for one request.
 ///
-/// Synchronous and infallible on purpose. Nothing here can fail: the exposition is a `String` the
-/// registry renders, and readiness is a method that returns a `bool`. A `Result` would be a
-/// signature that promises a failure mode this has none of.
-fn answer(
+/// `async` for **one** reason: `POST /workers/{i}/reset` boots a worker process under the protocol's
+/// own handshake deadline, and doing that on the listener's runtime thread would block every other
+/// connection the listener is serving — including the orchestrator's readiness probe, which would
+/// then time out and take the container out of rotation because somebody recycled a worker. Every
+/// other route here is synchronous work that happens to be polled once; the cost of that is nothing.
+async fn answer(
     request: Request<hyper::body::Incoming>,
     services: &StatusServices,
 ) -> Response<Full<Bytes>> {
     // The path only, so `/metrics?x=1` is the same endpoint. A query string is how a scraper adds a
     // cache-buster, and treating it as a different path would answer 404 to a legitimate scrape.
     let path = request.uri().path();
+
+    // The worker routes are checked **before** the metrics path and before readiness, and only when
+    // they were configured. Order rather than precedence: the three sets of paths do not overlap, but
+    // a `POST` has to reach the router at all, and the read-only routes below would answer a `POST` to
+    // `/metrics` with the exposition — a body nobody asked for and a status code that says it worked.
+    if let Some(workers) = &services.workers {
+        if let Some(response) = worker_route(request.method(), path, workers, services).await {
+            return response;
+        }
+    }
+
+    // **The method guard is here, before any read-only route, rather than beside the 404 below.**
+    // It was written in the latter place first, and a `POST /metrics` answered `200` with the whole
+    // exposition — a request that appears to have worked, from a test that caught it. A guard that
+    // runs after the first `return` in the function does not guard the paths that return.
+
+    if !matches!(request.method(), &hyper::Method::GET | &hyper::Method::HEAD) {
+        return method_not_allowed();
+    }
 
     if let Some(metrics) = &services.metrics {
         if path == metrics.path() {
@@ -323,6 +434,9 @@ fn answer(
             );
         }
     }
+
+    // A method other than `GET`/`HEAD` on a read-only path was answered above, before the paths that
+    // return; the 404 is the last word for a path this listener does not serve.
 
     match (path, &services.readiness) {
         ("/health", Some(_)) => text(
@@ -361,6 +475,123 @@ fn answer(
             "text/plain; charset=utf-8",
         ),
     }
+}
+
+/// The worker-control routes, when the deployment asked for them.
+///
+/// `None` means "this path is not mine", and the caller falls through to the read-only routes. That
+/// is deliberately *not* a 404 from here: `/health` and `/metrics` are still served by the same
+/// listener, so an unmatched path has to be the last word rather than this function's.
+async fn worker_route(
+    method: &hyper::Method,
+    path: &str,
+    workers: &Arc<dyn WorkerControl>,
+    services: &StatusServices,
+) -> Option<Response<Full<Bytes>>> {
+    if path == WorkerRoutes::PATH {
+        return Some(match *method {
+            hyper::Method::GET => match serde_json::to_value(workers.workers()) {
+                Ok(list) => json(StatusCode::OK, &list),
+                // Unreachable from a `WorkerStatus`, which is six scalars and two strings. Reported
+                // rather than unwrapped because the encode is the *only* thing between the pool and
+                // a caller, and a panic here would take down a listener whose whole job is to say
+                // whether the process is healthy.
+                Err(err) => json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({ "error": format!("the worker list could not be encoded: {err}") }),
+                ),
+            },
+            // `HEAD` is what a monitoring check does, and answering it as `GET` is the same bytes
+            // `hyper` drops — but the body would still be rendered, so it is answered as the method
+            // it is.
+            hyper::Method::HEAD => text(
+                StatusCode::OK,
+                String::new(),
+                "application/json; charset=utf-8",
+            ),
+            _ => method_not_allowed(),
+        });
+    }
+
+    let index = WorkerRoutes::reset_index(path)?;
+
+    // A `GET` on the reset path is a 405 rather than a 404: the path *is* routed, and the difference
+    // is what tells a caller who typed `curl` instead of `curl -XPOST` what they did wrong.
+    if *method != hyper::Method::POST {
+        return Some(method_not_allowed());
+    }
+
+    // **`spawn_blocking`, and the reason is the whole point of this route's shape.** `restart` boots
+    // a process and waits for its handshake under a 30-second deadline. Run inline it would own a
+    // runtime worker for that long; enough concurrent resets would own all of them, and the readiness
+    // probe this listener exists to answer would time out — turning an operator's maintenance action
+    // into an outage the orchestrator acts on. The same boundary the request path already crosses.
+    let workers = Arc::clone(workers);
+    let outcome = tokio::task::spawn_blocking(move || workers.restart(index)).await;
+    let refusal = match outcome {
+        Ok(Ok(())) => {
+            return Some(json(
+                StatusCode::OK,
+                &serde_json::json!({ "restarted": index }),
+            ))
+        }
+        Ok(Err(refusal)) => refusal,
+        // A panic inside `restart` — which would be a bug in the pool, not a refusal it can name —
+        // arrives here as a `JoinError`. Reported as a 500 with the reason rather than as a dropped
+        // connection, because a caller scripting this has to be able to tell "the server crashed"
+        // from "the reset was refused".
+        Err(err) => {
+            return Some(json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({ "error": format!("the reset task failed: {err}") }),
+            ))
+        }
+    };
+
+    // **The refusal is a status code, and the body only explains it.** `curl -f` has to fail on the
+    // first two without the caller parsing a document: an index that does not exist is the caller's
+    // mistake and retrying it changes nothing (404), while a busy slot is a temporary condition worth
+    // retrying (409). A worker that could not be booted is the deployment's problem (500) and the
+    // slot is empty afterwards, so it is not a `409` — a client told to retry would retry against a
+    // pool that has a hole in it.
+    let status = match refusal {
+        volucer_server::ResetRefusal::NoSuchWorker { .. } => StatusCode::NOT_FOUND,
+        volucer_server::ResetRefusal::Busy { .. } => StatusCode::CONFLICT,
+        volucer_server::ResetRefusal::Failed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    // The readiness number is deliberately not reused here even when the deployment configured one:
+    // that number is a statement about what "not serving traffic" means to *its* load balancer, and a
+    // busy worker is not that. Mixing them would make a retryable `409` arrive as a `503` that takes
+    // the whole node out of rotation because one slot was mid-request.
+    let _ = services;
+    Some(json(
+        status,
+        &serde_json::json!({ "error": refusal.to_string(), "index": refusal.index() }),
+    ))
+}
+
+/// A JSON answer, with the length that comes from the body.
+fn json(status: StatusCode, value: &serde_json::Value) -> Response<Full<Bytes>> {
+    // Rendered rather than unwrapped: a `serde_json::Value` cannot fail to encode, so the `expect`
+    // would be sound — but a listener that panics instead of answering is the failure mode this route
+    // exists to make survivable, and an `expect` here would be the one place the rule was skipped.
+    let body = serde_json::to_string(value)
+        .unwrap_or_else(|err| format!("{{\"error\":\"the answer could not be encoded: {err}\"}}"));
+    text(status, body, "application/json; charset=utf-8")
+}
+
+/// `405`, with the `Allow` header RFC 9110 requires on one.
+fn method_not_allowed() -> Response<Full<Bytes>> {
+    let mut response = text(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed\n".to_string(),
+        "text/plain; charset=utf-8",
+    );
+    response.headers_mut().insert(
+        hyper::header::ALLOW,
+        hyper::header::HeaderValue::from_static("GET, HEAD"),
+    );
+    response
 }
 
 /// A `text/plain` answer with a length that is always right, because it is the body's own.
@@ -417,4 +648,61 @@ fn prefix_metrics(rendered: &str, prefix: &str) -> String {
 #[must_use]
 pub fn process_start() -> Instant {
     Instant::now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerRoutes;
+
+    /// The path router accepts exactly one shape, and the shapes it might have accepted are the ones
+    /// worth pinning.
+    ///
+    /// A route parser that also accepted `/workers/3/` would give one route two spellings, and one
+    /// that accepted `+3` or a `%203` would give a caller a way to name an index the pool's own list
+    /// does not print. The interesting half is the refusals: each of them is a shape a hand-written
+    /// router gets wrong by using `split('/')` and taking the second-to-last segment.
+    #[test]
+    fn only_the_exact_reset_path_names_an_index() {
+        assert_eq!(WorkerRoutes::reset_index("/workers/0/reset"), Some(0));
+        assert_eq!(WorkerRoutes::reset_index("/workers/12/reset"), Some(12));
+
+        for refused in [
+            // Not that route at all.
+            "/workers",
+            "/workers/",
+            "/",
+            // The right route without its index.
+            "/workers//reset",
+            "/workers/reset",
+            "/workers/3",
+            "/workers/3/reset/",
+            "/workers/3/reset/extra",
+            // An index with something in it a caller could have got from a browser's escaping.
+            "/workers/+3/reset",
+            "/workers/%203/reset",
+            "/workers/ 3/reset",
+            "/workers/-1/reset",
+            "/workers/3.0/reset",
+            // A second segment, which `split` would happily read as one index.
+            "/workers/3/extra/reset",
+        ] {
+            assert_eq!(
+                WorkerRoutes::reset_index(refused),
+                None,
+                "{refused:?} must not name a worker"
+            );
+        }
+    }
+
+    /// A number too large for the platform is not an index, and `usize::parse` is what says so rather
+    /// than a truncating cast that would reset worker 0 for a caller who asked about 2^64.
+    #[test]
+    fn an_index_that_does_not_fit_is_not_a_worker() {
+        // `usize::MAX` is 20 digits on a 64-bit host and 20 nines does not fit either way; the test
+        // asserts the refusal rather than the platform's width.
+        assert_eq!(
+            WorkerRoutes::reset_index(&format!("/workers/{}/reset", "9".repeat(40))),
+            None
+        );
+    }
 }

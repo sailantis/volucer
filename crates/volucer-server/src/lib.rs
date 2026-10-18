@@ -20,8 +20,8 @@ pub mod worker_pool;
 pub use backend::{Backend, Contention};
 pub use build::{MINIMUM_PHP_VERSION, WORKER_PROTOCOL_VERSION};
 pub use calls::{
-    ConfigNamespace, KvNamespace, MethodRegistry, Namespace, PoolLookup, WorkerStatus,
-    WorkersNamespace,
+    ConfigNamespace, KvNamespace, MethodRegistry, Namespace, PoolLookup, ResetRefusal,
+    WorkerStatus, WorkersNamespace,
 };
 pub use dispatch::Dispatcher;
 pub use dispatch::PoolDirectory;

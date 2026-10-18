@@ -50,6 +50,7 @@ pub use listener::{
 };
 pub use status::{
     AlwaysReady, MetricsSource, Readiness, RunningStatus, StatusServices, StatusShutdown,
+    WorkerControl,
 };
 pub use tls::{
     CertificateSet, Certs, ServerCertificate, SiteCertificate, SiteCertificatePair, SniResolver,

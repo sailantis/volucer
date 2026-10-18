@@ -25,6 +25,10 @@ volucer-observe.workspace = true
 volucer-metrics.workspace = true
 volucer-acme.workspace = true
 volucer-worker.workspace = true
+# The worker-control routes answer JSON, which is the same document `workers.list` returns over the
+# worker channel — one encoder for both, so a field added to `WorkerStatus` appears in neither
+# answer twice. Already in the graph through `volucer-server`; naming it adds no crate.
+serde_json.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true

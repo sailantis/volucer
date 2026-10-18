@@ -979,6 +979,8 @@ implementation cannot honour should be _stated_, or the operator finds out from 
   every caller's allowance. A limit that a `SIGHUP` clears is not a limit;
 - `[server.access_log]` path, format and `request_id_header` — chosen at startup. **The log file is
   reopened on every SIGHUP regardless**, which is the half logrotate needs; see below.
+- `[status]` address and `allow_worker_reset` — the listener is bound, and a route that recycles
+  workers must not appear because somebody edited a file.
 
 **A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
 a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
@@ -1176,6 +1178,38 @@ apart. On the FastCGI listener the key is `REMOTE_ADDR`, which nginx already res
 
 One policy per process, shared by both front-ends, and it does not distinguish routes or sites: a
 bucket's identity is (who, *which limit*), so two policies over one client are two buckets.
+### The worker-control routes
+
+**Off by default**, and the default is the safety: a deployment that configured `[status]` for an
+orchestrator gains no mutation surface by upgrading.
+
+```toml
+[status]
+address = "127.0.0.1:2114"
+allow_worker_reset = true
+```
+
+    curl -sf http://127.0.0.1:2114/workers | jq        # the list
+    curl -sf -XPOST http://127.0.0.1:2114/workers/3/reset
+
+`GET /workers` answers JSON — the same document `workers.list` gives an application, from the same
+implementation — with one entry per worker across every pool. `index` is the **global** one a reset
+takes; `slot` is the pool's own, which is the number that pool's log uses. Both are reported because
+with two backends they are different numbers, and the list once reported the local one while the reset
+took the global one: with one backend they coincide, which is why nothing had caught it.
+
+**A refusal is a status code, so `curl -f` is the whole client**: `404` for an index that does not
+exist, `409` for a worker that is serving a request (retry when it is idle), `500` for a replacement
+that did not boot. That is why the reset boots through `spawn_blocking` — a 30-second PHP start on the
+listener's own thread would stall the readiness probe this port exists to answer, and an operator
+recycling a worker would take the node out of rotation.
+
+**There is no authentication.** What protects these routes is that they do not exist until the flag is
+set — `404` on the path, not `403` — and that a wildcard `address` with the flag on is **refused at
+startup**, because an unauthenticated `POST` that recycles workers, reachable from anywhere, is a
+remote kill switch. Put `[status]` on loopback or a private interface and reach it through the
+orchestrator's network, or don't turn it on.
+
 ### Trace context
 
 The W3C `traceparent` header is parsed and continued: the trace id is the client's, and this server
@@ -1236,8 +1270,9 @@ trace stops at the queue boundary in one direction. And every request that is tr
 there is no sampler, which for a busy deployment means the `batch_size` and `interval_ms` are the
 only knobs — see `docs/plugins.md` §6.7 for what was measured and what is deliberately left out.
 
-There is also **no external services yet beyond KV, locks, queues and gRPC**: no way to tell a
-running server anything other than a signal. A worker can now reach a **key-value storage**
+There is also **no external services yet beyond KV, locks, queues and gRPC**: the only way to tell a
+running server anything is a signal, or — for workers specifically — the two routes described below. A
+worker can reach a **key-value storage**
 (`[kv.<name>]`, memory or Redis), a **lock backend** (`[lock]`, memory or Redis), and the
 **queues** (`[jobs]`, memory or Redis) through the call plane, which is the `CALL`/`RETURN` pair on
 the worker channel — a frame a worker writes *unprompted*, mid-request, and the server answers. All
@@ -1301,8 +1336,7 @@ targets, and a silently different crypto build is not a change to make for conve
 
 ## Layout
 
-| Path                      | Contents                                                                                              |
-| ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Path                      | Contents                                                                                              || ------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `crates/volucer-core`     | Configuration model, backend types, PHP discovery, deployment preflight checks                        |
 | `crates/volucer-fcgi`     | FastCGI record codec, client, transport and CGI environment                                           |
 | `crates/volucer-worker`   | The worker protocol: framed codec and message set over a worker's pipes                               |

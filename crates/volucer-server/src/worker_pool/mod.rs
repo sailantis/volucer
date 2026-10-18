@@ -780,6 +780,7 @@ impl WorkerPool {
                 let unobserved = crate::calls::WorkerStatus {
                     backend: String::new(),
                     index,
+                    slot: index,
                     pid: 0,
                     idle: false,
                     served: 0,
@@ -1338,16 +1339,15 @@ impl WorkerPool {
     /// should be is open decision §10 item 9, and picking one here would decide the policy by accident. What
     /// *is* settled is that it cannot deadlock — `take_specific` only returns a slot that is in the free
     /// list, so the only lock taken below is one that no request holds.
-    pub fn restart(&self, index: usize) -> Result<()> {
+    pub fn restart(&self, index: usize) -> std::result::Result<(), crate::calls::ResetRefusal> {
         let Some(slot) = self.slots.get(index) else {
-            return Err(ServerError::NoWorker {
-                backend: self.name.clone(),
+            return Err(crate::calls::ResetRefusal::NoSuchWorker {
+                index,
+                workers: self.slots.len(),
             });
         };
         if self.take_specific(index).is_none() {
-            return Err(ServerError::AllBusy {
-                backend: self.name.clone(),
-            });
+            return Err(crate::calls::ResetRefusal::Busy { index });
         }
 
         let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1357,7 +1357,11 @@ impl WorkerPool {
             &self.guard,
             self.call_handler.as_ref(),
             &mut slot,
-        );
+        )
+        .map_err(|err| crate::calls::ResetRefusal::Failed {
+            index,
+            reason: err.to_string(),
+        });
         drop(slot);
         self.release(index);
         outcome

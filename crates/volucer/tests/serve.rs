@@ -102,6 +102,10 @@ struct Server {
     address: String,
     /// The HTTP listener's address, when the configuration asked for one.
     http_address: Option<String>,
+    /// The metrics and status listener's address, when a `[metrics]` or `[status]` table asked for
+    /// one. Read from the banner for the same reason the other two are: a test that guessed a port
+    /// would be testing its own ability to find a free one.
+    status_address: Option<String>,
 }
 
 impl Server {
@@ -144,6 +148,7 @@ impl Server {
             child,
             address: String::new(),
             http_address: None,
+            status_address: None,
         };
         let stdout = server.child.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
@@ -174,6 +179,13 @@ impl Server {
                 if !address.is_empty() && address != "(disabled)" {
                     server.http_address = Some(address.to_string());
                 }
+            } else if let Some(rest) = trimmed.strip_prefix("metrics:") {
+                // `serve` prints the metrics/status listener under `metrics:` whichever of the two
+                // tables configured it, because they share one listener.
+                let address = rest.split_whitespace().next().unwrap_or("");
+                if !address.is_empty() && address != "(disabled)" {
+                    server.status_address = Some(address.to_string());
+                }
             } else if trimmed.starts_with("press Ctrl-C") {
                 // The banner ends here, and this is the last line printed before
                 // the listeners serve. Which addresses appear depends on the
@@ -182,7 +194,10 @@ impl Server {
                 // FastCGI address specifically hangs a config that has only
                 // `http`, and it hangs *silently*: `read_line` has no timeout, so
                 // the deadline above is never re-checked while it blocks.
-                if server.address.is_empty() && server.http_address.is_none() {
+                if server.address.is_empty()
+                    && server.http_address.is_none()
+                    && server.status_address.is_none()
+                {
                     break;
                 }
                 return Some(server);
@@ -500,16 +515,27 @@ fn http_get(address: &str, path: &str) -> HttpResponse {
 
 /// The same, with extra request headers — so a test can send the id this server adopts.
 fn http_get_with(address: &str, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
+    http_request(address, "GET", path, extra)
+}
+
+/// One HTTP request with a method, for the endpoints that mutate.
+fn http_request(address: &str, method: &str, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
     let mut stream = TcpStream::connect(address).expect("connect to the HTTP listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("a read timeout");
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: example.test\r\n");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: example.test\r\n");
     for (name, value) in extra {
         request.push_str(name);
         request.push_str(": ");
         request.push_str(value);
         request.push_str("\r\n");
+    }
+    // A `Content-Length: 0` on a method that carries a body, because `hyper` would otherwise frame
+    // the request by the connection closing and the answer would arrive after the client stopped
+    // writing — which works, but is not what a caller does.
+    if method != "GET" {
+        request.push_str("Content-Length: 0\r\n");
     }
     request.push_str("Connection: close\r\n\r\n");
     stream
@@ -3122,5 +3148,110 @@ static_files = false
         "a log file was created with no [server.access_log]"
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two pools, a list, and a reset of the index the list gave.
+///
+/// **This is the test the index arithmetic needed.** `workers.list` reported each slot's *own*
+/// index, while `worker.reset` counted slots across every pool — so with one backend the two agreed
+/// and with two they did not, which is the arithmetic a single-pool test cannot see. Two is not an
+/// exotic deployment: it is a web backend and a jobs backend, which is what §6.4 recommends.
+///
+/// It goes through the shipped binary, the `[status]` listener and the `POST` route, because the
+/// number in the answer is what an operator types next: a list that says worker 1 twice is an
+/// instruction to reset the wrong process, and no unit test of either half can be wrong in a way this
+/// notices.
+#[test]
+fn the_worker_list_and_the_reset_agree_about_a_worker_in_a_second_pool() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    if find_php().is_none() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+    require_sdk!();
+
+    let root = std::env::temp_dir().join(format!("volucer-workers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+
+    let config_path = root.join("volucer.toml");
+    let script = example_worker();
+    let command = toml_string(&format!("php \"{}\"", script.display()));
+    let document_root = toml_string(&root.display().to_string());
+    // Two worker backends, one worker each, so the second pool's only worker is index 1 globally and
+    // index 0 locally. That is the whole defect: the two numbers differ by exactly the first pool's
+    // size, and reporting the local one sends an operator to the wrong process.
+    let config = format!(
+        "default_backend = \"app\"\n\n\
+         [server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
+         [backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 1\n\n\
+         [backends.jobs]\nkind = \"worker\"\ncommand = {command}\nworkers = 1\n\n\
+         [status]\naddress = \"127.0.0.1:0\"\nallow_worker_reset = true\n"
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let Some(status_address) = server.status_address.clone() else {
+        panic!("the status listener did not report an address; the banner was not parsed");
+    };
+
+    let listed = http_get(&status_address, "/workers");
+    assert_eq!(listed.status, 200, "{listed:?}");
+    let list: serde_json::Value =
+        serde_json::from_slice(&listed.body).expect("the worker list is JSON");
+    let entries = list.as_array().expect("an array of workers");
+    assert_eq!(entries.len(), 2, "one worker per backend: {list}");
+
+    // The two numbers, and the assertion that they are the ones an operator needs: `index` is the
+    // global one the reset takes, `slot` is the pool's own.
+    assert_eq!(entries[0]["index"], 0, "{list}");
+    assert_eq!(entries[0]["slot"], 0, "{list}");
+    assert_eq!(entries[0]["backend"], "app", "{list}");
+    assert_eq!(entries[1]["index"], 1, "{list}");
+    assert_eq!(
+        entries[1]["slot"], 0,
+        "the second pool's only worker is its slot 0: {list}"
+    );
+    assert_eq!(entries[1]["backend"], "jobs", "{list}");
+
+    let pid = entries[1]["pid"]
+        .as_u64()
+        .expect("the second worker has a pid");
+
+    // Reset the index the list gave. A `POST` to `slot` instead would recycle the *first* pool's
+    // worker, so the assertion below is about which process was replaced, not about a status code.
+    let reset = http_request(&status_address, "POST", "/workers/1/reset", &[]);
+    assert_eq!(reset.status, 200, "{reset:?}");
+
+    let after = http_get(&status_address, "/workers");
+    let after: serde_json::Value =
+        serde_json::from_slice(&after.body).expect("the worker list is JSON");
+    let replaced = after[1]["pid"]
+        .as_u64()
+        .expect("the second worker has a pid");
+    assert_ne!(
+        replaced, pid,
+        "the reset replaced the worker the list named: {after}"
+    );
+    assert_eq!(
+        after[0]["pid"].as_u64().expect("a pid"),
+        entries[0]["pid"].as_u64().expect("a pid"),
+        "and it left the first pool's worker alone: {after}"
+    );
+
+    // An index past the end is a 404 rather than a 500 or an empty success, because that is the one
+    // answer `curl -f` can act on without parsing the body.
+    let missing = http_request(&status_address, "POST", "/workers/9/reset", &[]);
+    assert_eq!(missing.status, 404, "{missing:?}");
+
+    drop(server);
     let _ = std::fs::remove_dir_all(&root);
 }

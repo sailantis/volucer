@@ -13,10 +13,10 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use volucer_http::status::{Readiness, RunningStatus, StatusServices};
+use volucer_http::status::{Readiness, RunningStatus, StatusServices, WorkerControl};
 
 /// One HTTP/1.1 GET, returning the whole response as text.
 ///
@@ -24,13 +24,21 @@ use volucer_http::status::{Readiness, RunningStatus, StatusServices};
 /// parse — the assertions are about the status line and the body, and a `Content-Length` parser
 /// would be fixture machinery nothing checks.
 fn get(address: std::net::SocketAddr, path: &str) -> (String, String) {
+    request(address, "GET", path)
+}
+
+/// One HTTP/1.1 request with a method, returning the whole response as text.
+fn request(address: std::net::SocketAddr, method: &str, path: &str) -> (String, String) {
     let mut stream = TcpStream::connect(address).expect("connect to the listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("a read timeout");
+    // A `Content-Length: 0` on the mutating method, because a `POST` without one is framed by the
+    // connection closing — which `hyper` accepts, but a test that relied on it would be testing the
+    // reader's leniency rather than the route.
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .expect("write the request");
     stream.flush().expect("flush");
@@ -108,8 +116,7 @@ fn metrics_services() -> StatusServices {
 
     StatusServices {
         metrics: Some(Arc::new(source)),
-        readiness: None,
-        unavailable_status: 503,
+        ..StatusServices::default()
     }
 }
 
@@ -159,8 +166,7 @@ fn a_prefix_is_applied_to_every_name_including_a_histograms_suffixes() {
                 path: "/metrics".to_string(),
                 prefix: Some("myapp_".to_string()),
             })),
-            readiness: None,
-            unavailable_status: 503,
+            ..StatusServices::default()
         },
     )
     .expect("start");
@@ -189,9 +195,8 @@ fn health_answers_while_the_process_is_alive_even_if_it_is_not_ready() {
     let running = RunningStatus::start(
         "127.0.0.1:0",
         StatusServices {
-            metrics: None,
             readiness: Some(readiness),
-            unavailable_status: 503,
+            ..StatusServices::default()
         },
     )
     .expect("start");
@@ -214,9 +219,8 @@ fn ready_answers_the_configured_status_and_says_why_it_is_not() {
     let running = RunningStatus::start(
         "127.0.0.1:0",
         StatusServices {
-            metrics: None,
             readiness: Some(readiness.clone()),
-            unavailable_status: 503,
+            ..StatusServices::default()
         },
     )
     .expect("start");
@@ -248,9 +252,9 @@ fn the_unavailable_status_is_the_configured_one() {
     let running = RunningStatus::start(
         "127.0.0.1:0",
         StatusServices {
-            metrics: None,
             readiness: Some(readiness),
             unavailable_status: 500,
+            ..StatusServices::default()
         },
     )
     .expect("start");
@@ -311,8 +315,7 @@ fn the_metrics_path_is_configurable() {
         "127.0.0.1:0",
         StatusServices {
             metrics: Some(Arc::new(source)),
-            readiness: None,
-            unavailable_status: 503,
+            ..StatusServices::default()
         },
     )
     .expect("start");
@@ -369,17 +372,306 @@ fn stopping_releases_the_address() {
 /// the first request.
 #[test]
 fn an_empty_configuration_answers_404_rather_than_failing() {
+    let running = RunningStatus::start("127.0.0.1:0", StatusServices::default()).expect("start");
+
+    let (head, _) = get(running.local_addr(), "/metrics");
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    running.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The worker-control routes
+// ---------------------------------------------------------------------------------------------
+
+/// A worker list the test controls, and a record of what was asked for.
+///
+/// The two methods are the whole of the surface, so a fake is honest here: what the routes can get
+/// wrong is *routing* and *status-code mapping*, and neither needs a PHP process. The part that needs
+/// one is `PoolLookup`'s own index arithmetic, which is tested where it lives — against real pools,
+/// because a fake pool directory would agree with whatever the test believed about indices.
+struct FakeControl {
+    workers: Vec<volucer_server::WorkerStatus>,
+    outcome: Mutex<Result<(), volucer_server::ResetRefusal>>,
+    asked: Mutex<Vec<usize>>,
+    /// How long a reset pretends to take, so a test can prove it did not block the listener.
+    delay: Duration,
+}
+
+impl FakeControl {
+    fn with(workers: usize, outcome: Result<(), volucer_server::ResetRefusal>) -> Self {
+        FakeControl {
+            workers: (0..workers)
+                .map(|index| volucer_server::WorkerStatus {
+                    backend: "app".to_string(),
+                    index,
+                    slot: index,
+                    pid: 1000 + index as u32,
+                    idle: index % 2 == 0,
+                    served: index as u64,
+                    memory_bytes: 0,
+                    runtime: "8.3.31 (cli)".to_string(),
+                })
+                .collect(),
+            outcome: Mutex::new(outcome),
+            asked: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+        }
+    }
+}
+
+impl WorkerControl for FakeControl {
+    fn workers(&self) -> Vec<volucer_server::WorkerStatus> {
+        self.workers.clone()
+    }
+
+    fn restart(&self, index: usize) -> Result<(), volucer_server::ResetRefusal> {
+        self.asked.lock().expect("not poisoned").push(index);
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        self.outcome.lock().expect("not poisoned").clone()
+    }
+}
+
+fn worker_services(control: Arc<FakeControl>) -> StatusServices {
+    StatusServices {
+        workers: Some(control),
+        ..StatusServices::default()
+    }
+}
+
+/// `GET /workers` renders the list the pool gave, and it is the same JSON `workers.list` answers.
+#[test]
+fn the_worker_list_is_served_as_json() {
+    let control = Arc::new(FakeControl::with(3, Ok(())));
+    let running =
+        RunningStatus::start("127.0.0.1:0", worker_services(Arc::clone(&control))).expect("start");
+
+    let (head, body) = get(running.local_addr(), "/workers");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: application/json"),
+        "a scripted caller has to be told what it is parsing: {head}"
+    );
+
+    let list: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+    assert_eq!(list.as_array().map(Vec::len), Some(3), "{body}");
+    // The three fields a scripted caller actually keys on, and the global index is asserted because
+    // that is the number `POST` takes.
+    assert_eq!(list[1]["index"], 1);
+    assert_eq!(list[1]["slot"], 1);
+    assert_eq!(list[1]["backend"], "app");
+    assert_eq!(list[2]["pid"], 1002);
+    running.stop();
+}
+
+/// A successful reset is a `200` with the index it was given, and the index reached the pool.
+#[test]
+fn a_reset_is_a_post_to_the_index_and_answers_what_it_did() {
+    let control = Arc::new(FakeControl::with(2, Ok(())));
+    let running =
+        RunningStatus::start("127.0.0.1:0", worker_services(Arc::clone(&control))).expect("start");
+
+    let (head, body) = request(running.local_addr(), "POST", "/workers/1/reset");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let answer: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+    assert_eq!(answer["restarted"], 1, "{body}");
+    assert_eq!(
+        control.asked.lock().expect("not poisoned").as_slice(),
+        &[1],
+        "the pool was asked about the index in the path, not about 0 or about the whole pool"
+    );
+    running.stop();
+}
+
+/// **The three refusals are three status codes, and that is the whole reason the trait returns a
+/// type.** `curl -f` has to fail on the first without the caller parsing a document to find out.
+#[test]
+fn each_refusal_is_its_own_status_code() {
+    for (refusal, expected) in [
+        (
+            volucer_server::ResetRefusal::NoSuchWorker {
+                index: 1,
+                workers: 1,
+            },
+            "HTTP/1.1 404",
+        ),
+        (
+            volucer_server::ResetRefusal::Busy { index: 1 },
+            "HTTP/1.1 409",
+        ),
+        (
+            volucer_server::ResetRefusal::Failed {
+                index: 1,
+                reason: "php exited".to_string(),
+            },
+            "HTTP/1.1 500",
+        ),
+    ] {
+        let control = Arc::new(FakeControl::with(2, Err(refusal.clone())));
+        let running = RunningStatus::start("127.0.0.1:0", worker_services(control)).expect("start");
+
+        let (head, body) = request(running.local_addr(), "POST", "/workers/1/reset");
+        assert!(
+            head.starts_with(expected),
+            "{refusal:?} must be {expected}: {head}"
+        );
+        // The body explains, and it names the index the *caller* asked about rather than the pool's
+        // local one — the difference is what tells an operator which worker to look at.
+        let answer: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        assert_eq!(answer["index"], 1, "{refusal:?}: {body}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{refusal:?} has to say why: {body}"
+        );
+        running.stop();
+    }
+}
+
+/// **The routes do not exist until the deployment asks for them.** This is the safety of the whole
+/// feature, so it is asserted on the surface a caller sees: a `404` on the path, and a `405` on a
+/// method — never a `403`, which would be an endpoint that exists and refuses, and therefore one an
+/// attacker can enumerate.
+#[test]
+fn the_worker_routes_are_absent_when_they_are_not_configured() {
     let running = RunningStatus::start(
         "127.0.0.1:0",
         StatusServices {
-            metrics: None,
-            readiness: None,
-            unavailable_status: 503,
+            readiness: Some(Arc::new(Flappable {
+                ready: AtomicBool::new(true),
+                reasons: Vec::new(),
+            })),
+            ..StatusServices::default()
         },
     )
     .expect("start");
 
-    let (head, _) = get(running.local_addr(), "/metrics");
+    // The rest of the listener still works, so the 404s below are about the route and not about a
+    // listener that failed to start.
+    let (head, _) = get(running.local_addr(), "/health");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let (head, _) = get(running.local_addr(), "/workers");
     assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+
+    let (head, _) = request(running.local_addr(), "POST", "/workers/0/reset");
+    assert!(
+        !head.starts_with("HTTP/1.1 200"),
+        "an unconfigured mutation route must not answer a POST: {head}"
+    );
+    running.stop();
+}
+
+/// A reset that takes a while does not stop the listener answering a readiness probe.
+///
+/// This is the reason `restart` goes through `spawn_blocking`, and it is the failure the alternative
+/// produces in production: the orchestrator's probe times out *because* an operator recycled a
+/// worker, and the container leaves rotation for the duration of a PHP boot.
+///
+/// **The test had to be rewritten to be worth having.** The first version sent one slow reset and
+/// then a probe, and it passed with `spawn_blocking` removed: the runtime had a spare thread, so an
+/// inline `restart` blocked one of many and the probe ran on another. The falsification is what
+/// found that, and the shape that catches it is *fill the runtime, then probe* — three blocking
+/// resets against a two-thread listener leave nothing free, so an inline reset parks the probe for the
+/// whole delay while a `spawn_blocking` one does not.
+#[test]
+fn slow_resets_do_not_block_the_readiness_probe() {
+    let mut control = FakeControl::with(4, Ok(()));
+    control.delay = Duration::from_millis(600);
+    let control = Arc::new(control);
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            workers: Some(Arc::clone(&control) as Arc<dyn WorkerControl>),
+            readiness: Some(Arc::new(Flappable {
+                ready: AtomicBool::new(true),
+                reasons: Vec::new(),
+            })),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+    let address = running.local_addr();
+
+    // Three, against a listener with two runtime threads: enough to occupy every thread an inline
+    // implementation could run on, and therefore enough for the probe below to be a real question.
+    let resets: Vec<_> = (0..3)
+        .map(|index| {
+            std::thread::spawn(move || request(address, "POST", &format!("/workers/{index}/reset")))
+        })
+        .collect();
+
+    // Long enough for every reset to reach its blocking work, short enough that the assertion below
+    // is about concurrency and not about the sleep finishing.
+    std::thread::sleep(Duration::from_millis(150));
+    let started = std::time::Instant::now();
+    let (head, _) = get(address, "/ready");
+    let elapsed = started.elapsed();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "the probe waited {elapsed:?} behind three resets; restart is not off the runtime's thread"
+    );
+
+    for reset in resets {
+        let (head, _) = reset.join().expect("the reset thread finished");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    }
+    running.stop();
+}
+
+/// A mutating method on a read-only route is a `405` with an `Allow`, not the exposition.
+#[test]
+fn a_post_to_a_read_only_route_is_refused_with_allow() {
+    let running = RunningStatus::start("127.0.0.1:0", metrics_services()).expect("start");
+
+    let (head, body) = request(running.local_addr(), "POST", "/metrics");
+    assert!(head.starts_with("HTTP/1.1 405"), "{head}");
+    assert!(
+        head.to_lowercase().contains("allow: get, head"),
+        "a 405 has to say what it allows: {head}"
+    );
+    assert!(
+        !body.contains("rr_test_total"),
+        "the exposition must not be the body of a refused POST: {body}"
+    );
+    running.stop();
+}
+
+/// `GET` on the reset path is a `405`: the path is routed and the method is wrong, which is what tells
+/// somebody who typed `curl` instead of `curl -XPOST` what they did.
+#[test]
+fn a_get_on_the_reset_path_names_the_method_rather_than_the_path() {
+    let control = Arc::new(FakeControl::with(1, Ok(())));
+    let running =
+        RunningStatus::start("127.0.0.1:0", worker_services(Arc::clone(&control))).expect("start");
+
+    let (head, _) = get(running.local_addr(), "/workers/0/reset");
+    assert!(head.starts_with("HTTP/1.1 405"), "{head}");
+    assert!(
+        control.asked.lock().expect("not poisoned").is_empty(),
+        "a GET must not reset anything"
+    );
+    running.stop();
+}
+
+/// A path that is *almost* the route is a `404`, so there is exactly one spelling of it.
+#[test]
+fn a_malformed_reset_path_is_not_a_route() {
+    let control = Arc::new(FakeControl::with(1, Ok(())));
+    let running =
+        RunningStatus::start("127.0.0.1:0", worker_services(Arc::clone(&control))).expect("start");
+
+    for path in ["/workers/0/reset/", "/workers//reset", "/workers/x/reset"] {
+        let (head, _) = get(running.local_addr(), path);
+        assert!(head.starts_with("HTTP/1.1 404"), "{path}: {head}");
+    }
+    assert!(
+        control.asked.lock().expect("not poisoned").is_empty(),
+        "no malformed path may reach the pool"
+    );
     running.stop();
 }

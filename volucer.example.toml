@@ -652,6 +652,23 @@ base_port = 19001
 # [status]
 # address = "127.0.0.1:2114"
 # unavailable_status_code = 503   # some load balancers expect 503 specifically
+#
+# `allow_worker_reset` turns the same listener into the operator's lever on a
+# running pool -- the one thing signals cannot do without a restart:
+#
+#   GET  /workers               -- JSON, the same document workers.list answers
+#   POST /workers/{index}/reset -- recycle one worker, 200 with its index
+#
+# `{index}` is the global one from the GET, so `curl -f -XPOST` is the whole
+# command: no subcommand, no client, and `-f` fails on 404 (no such worker), 409
+# (that worker is serving a request, try again) and 500 (the replacement did not
+# boot). **There is no authentication**: what protects this is that the routes do
+# not exist until this flag is set, which is why an absent or false flag answers
+# 404 -- not 403 -- for the path.
+#
+# Refused rather than warned about on a wildcard address: a POST that recycles a
+# worker, reachable from anywhere, is a remote kill switch with no login.
+# allow_worker_reset = true
 
 # ---------------------------------------------------------------------------
 # Where spans are exported. Absent means none are, and this is a *push*:

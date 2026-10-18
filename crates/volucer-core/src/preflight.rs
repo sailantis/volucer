@@ -161,6 +161,27 @@ pub fn inspect_with(
         ));
     }
 
+    // A mutation endpoint with nothing to mutate is a setting that does nothing, and the honest
+    // report is a warning rather than a refusal: the deployment may be upstream-only today and gain
+    // a worker backend tomorrow, and `serve` already answers `404` for every worker index in that
+    // state. What it must not do is look configured.
+    if config
+        .status
+        .as_ref()
+        .is_some_and(|status| status.allow_worker_reset)
+        && !config
+            .backends
+            .values()
+            .any(|backend| matches!(backend, BackendConfig::Worker(_)))
+    {
+        warnings.push(Warning::with_hint(
+            "status.allow_worker_reset is set, but no backend is a worker pool: the routes exist \
+             and every index is a 404",
+            "either add a `kind = \"worker\"` backend, or remove allow_worker_reset — a mutation \
+             route with nothing behind it is an address an attacker can probe for free",
+        ));
+    }
+
     inspect_programs(config, &mut warnings);
     inspect_tls_with(config, config_path, &mut warnings);
 

@@ -17,7 +17,7 @@ use volucer_fcgi::{cgi, Request, Response};
 use crate::backend::{Backend, UpstreamBody};
 use crate::calls::{
     ConfigNamespace, JobsNamespace, KvNamespace, LockNamespace, MethodRegistry, PoolLookup,
-    WorkerStatus, WorkersNamespace,
+    ResetRefusal, WorkerStatus, WorkersNamespace,
 };
 use crate::error::{Result, ServerError};
 
@@ -489,21 +489,40 @@ fn worker_registry(
 
 impl PoolLookup for PoolDirectory {
     fn workers(&self) -> Vec<WorkerStatus> {
+        // **One running index across every pool, and it is the same one `restart` counts.** A slot's
+        // own `index` is local to its pool, so returning it unmodified made `workers.list` and
+        // `worker.reset` disagree the moment a deployment configured two backends: the list said
+        // worker 1 twice and reset indexed 0..n globally, so "list, then reset what you saw" — the
+        // round trip both methods document — reset somebody else. Two pools is not an exotic
+        // deployment; it is a web backend and a jobs backend.
+        //
+        // Found by writing the HTTP route, because a `POST` echoes the index in its answer and a
+        // wrong number is then visible instead of merely wrong.
+        let mut seen = 0usize;
         self.visit(|backend, pool| {
-            pool.worker_status()
+            let statuses = pool
+                .worker_status()
                 .into_iter()
-                .map(|mut status| {
+                .enumerate()
+                .map(|(slot, mut status)| {
                     status.backend = backend.to_string();
+                    status.index = seen + slot;
+                    // Kept as well as the global one, because a log line that says "worker 4" for a
+                    // pool whose own supervisor calls it worker 1 is a search that starts in the
+                    // wrong place.
+                    status.slot = slot;
                     status
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            seen += statuses.len();
+            statuses
         })
         .into_iter()
         .flatten()
         .collect()
     }
 
-    fn restart(&self, index: usize) -> std::result::Result<(), String> {
+    fn restart(&self, index: usize) -> std::result::Result<(), ResetRefusal> {
         // One walk, counting slots as it goes, because the index is global across pools and the pools
         // are the only thing that knows how many workers each holds. The count is finished even when
         // the index is not found, so the refusal can say how many there are.
@@ -512,17 +531,23 @@ impl PoolLookup for PoolDirectory {
         self.visit(|_, pool| {
             let len = pool.len();
             if found.is_none() && index >= seen && index < seen + len {
-                found = Some(pool.restart(index - seen));
+                found = Some((seen, pool.restart(index - seen)));
             }
             seen += len;
         });
         match found {
-            Some(Ok(())) => Ok(()),
-            Some(Err(err)) => Err(err.to_string()),
-            None => Err(format!(
-                "worker index {index} does not exist; there are {seen} workers, and \
-                 workers.list gives the index to use"
-            )),
+            Some((_, Ok(()))) => Ok(()),
+            // **The pool is asked in its own numbering and answers in it too**, which is the whole
+            // reason this rebase exists: a refusal from pool 2 about its worker 1 must not reach a
+            // caller that asked about worker 5 as "worker 1". A refusal is what an operator acts on —
+            // an index is what they type next — so an off-by-a-pool number is a wrong instruction
+            // rather than a cosmetic slip. Found by writing the HTTP route, where the index is echoed
+            // in a status code's body and every wrong number is visible.
+            Some((offset, Err(refusal))) => Err(refusal.rebased(offset)),
+            None => Err(ResetRefusal::NoSuchWorker {
+                index,
+                workers: seen,
+            }),
         }
     }
 }
