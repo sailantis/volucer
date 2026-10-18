@@ -556,9 +556,16 @@ fn a_pipe_read_without_an_answer_times_out_rather_than_hanging() {
         std::io::ErrorKind::TimedOut,
         "a read with no answer should time out, not fail some other way: {err:?}"
     );
+    // Lower bound with slack, and the slack is measured rather than generous. The Windows
+    // overlapped wait resolves 55 µs *before* the requested 300 ms -- `299.9444ms` on
+    // `windows-latest` -- because the timer that ends the wait is not the same clock this
+    // measures with, so an exact `elapsed >= deadline` fails on a correct implementation.
+    // 10 ms is 30x the observed skew and still three orders of magnitude below the 3 s
+    // upper bound, so a read that returned *immediately* is still caught: the failure this
+    // guards against returns in microseconds, not in 290.
     assert!(
-        elapsed >= deadline,
-        "the read returned before its deadline: {elapsed:?}"
+        elapsed >= deadline - Duration::from_millis(10),
+        "the read returned long before its deadline: {elapsed:?} for a {deadline:?} timeout"
     );
     assert!(
         elapsed < Duration::from_secs(3),
@@ -579,7 +586,7 @@ fn a_pipe_read_without_an_answer_times_out_rather_than_hanging() {
         "the second read should time out like the first: {err:?}"
     );
     assert!(
-        elapsed >= deadline && elapsed < Duration::from_secs(3),
+        elapsed >= deadline - Duration::from_millis(10) && elapsed < Duration::from_secs(3),
         "the second read did not honour its deadline: {elapsed:?}"
     );
 }
