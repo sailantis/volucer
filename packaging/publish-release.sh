@@ -41,8 +41,33 @@ repo="${GITHUB_REPOSITORY:-}"
 
 # Resolved before publishing rather than assumed: a tag with no release behind it means the
 # `release` job did not get this far, and reporting that is more useful than a PATCH 404.
-id="$(gh api "repos/${repo}/releases/tags/${tag}" --jq .id 2>/dev/null)" ||
-    die "no release for ${tag}: the release job did not create one"
+#
+# **The by-tag endpoint cannot be used here, and that is the whole reason this loop exists.**
+# `GET /releases/tags/{tag}` returns 404 for a draft - which is exactly the state the release is
+# in when this script is supposed to act on it. Resolving it that way made the script report "the
+# release job did not create one" for a draft that was sitting right there, and it only showed up
+# when the draft-to-published path was finally exercised against a real draft; every earlier run
+# had been against an already-published tag, where the endpoint works. The list endpoint does
+# return drafts, so the release is found there by tag name.
+id=""
+page=1
+while :; do
+    # `gh api --jq`, not a pipe into `jq` and not a `sed` over the body: `jq` is not guaranteed to
+    # be installed on a runner, and `gh` is already a dependency of this script. The filter must
+    # be handed to `gh` directly - `--jq` belongs to `gh api`, so piping the body into
+    # `gh --jq` is an unknown flag rather than a filter.
+    url="repos/${repo}/releases?per_page=100&page=${page}"
+    # No `| head -n 1`: a pipe would make the substitution's status `head`'s, which is always 0,
+    # so an unreachable API would fall through and report "the release job did not create one" -
+    # the wrong cause. There is one release per tag, so the filter cannot match more than one.
+    id="$(gh api "$url" --jq ".[] | select(.tag_name == \"${tag}\") | .id" 2>/dev/null)" ||
+        die "the releases API could not be reached for ${repo}"
+    [ -n "$id" ] && break
+    # 100 per page is GitHub's maximum, so a short page means there is nothing after it.
+    count="$(gh api "$url" --jq 'length' 2>/dev/null)" || count=0
+    [ "${count:-0}" -ge 100 ] || die "no release for ${tag}: the release job did not create one"
+    page=$((page + 1))
+done
 draft="$(gh api "repos/${repo}/releases/${id}" --jq .draft)" ||
     die "release ${id} for ${tag} could not be read"
 
@@ -55,8 +80,11 @@ if [ "$draft" = true ]; then
     # one-liner at the older version. A release on a maintenance line is better marked
     # `"prerelease": true` (or published with `-f make_latest=false`), which is GitHub's own
     # answer to the same problem.
+    # `-F` (typed) rather than `-f` (string) for `draft`: GitHub validates `draft` as a JSON
+    # boolean and rejects the string `"false"` with a 422. `make_latest` really is an enum, so it
+    # stays a string.
     gh api -X PATCH "repos/${repo}/releases/${id}" \
-        -f draft=false -f make_latest=legacy >/dev/null ||
+        -F draft=false -f make_latest=legacy >/dev/null ||
         die "publishing ${tag} failed"
 else
     note "${tag} is already published; checking what it promises"
