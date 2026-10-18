@@ -34,7 +34,9 @@ use bytes::Bytes;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
-use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use hyper::header::{
+    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, VARY,
+};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -1374,7 +1376,8 @@ async fn prepare(
     let state = front_end.state();
     let resolved = state.resolve(host);
     let site = resolved.site;
-    let (routing, statics) = (resolved.routing, resolved.statics);
+    let (routing, statics, site_compression) =
+        (resolved.routing, resolved.statics, resolved.compression);
     // Static content is decided before the body is read: a `GET` for a file has
     // no body worth buffering, and refusing to buffer one it will never use is
     // the point of a limit.
@@ -1499,6 +1502,10 @@ async fn prepare(
     // SCRIPT_FILENAME, and the backend reads and writes pipes. Both must happen
     // off the runtime's threads.
     let front_end = Arc::clone(front_end);
+    // Taken before `parts` moves into the blocking task: the compression decision needs the
+    // request's own `Accept-Encoding`, and a header map is a cheap clone beside the body copy
+    // that already happens on this path.
+    let request_headers = parts.headers.clone();
     let routing = routing.clone();
     let routes = site.routes.clone();
     let blocking =
@@ -1548,7 +1555,7 @@ async fn prepare(
     if is_grpc {
         return grpc_answer(response);
     }
-    from_cgi(response)
+    from_cgi(response, site_compression, &request_headers)
 }
 
 /// Send a request to an HTTP origin and turn its answer into this front-end's response.
@@ -1771,25 +1778,26 @@ fn to_cgi_with(
 /// connection, while declaring less is merely conservative. `HEAD` is handled by
 /// `hyper`, which suppresses the body and keeps the length — which is exactly
 /// what `HEAD` is for.
-fn from_cgi(response: volucer_fcgi::Response) -> Result<Response<ResponseBody>> {
-    // One pass for status, headers and body. Asking for the headers and then the
-    // body separately made each search the payload for the same blank line, and
-    // `perf` attributed 13.6% of the server process's CPU to the pair.
-    //
-    // `hyper` needs `HeaderName`/`HeaderValue`, which own their bytes, so a copy is
-    // unavoidable here — but only the headers `hyper` actually accepts are copied,
-    // and only once. The parser itself hands back slices of `stdout` instead of a
-    // `String` per header, so the wasted allocation happens nowhere at all.
+fn from_cgi(
+    response: volucer_fcgi::Response,
+    compression: &volucer_core::config::CompressionSetting,
+    request_headers: &hyper::header::HeaderMap,
+) -> Result<Response<ResponseBody>> {
+    let settings = crate::compress::Settings::from(compression);
     let (status, headers, body) = response.parse();
     let body = body.to_vec();
 
-    let mut builder = Response::builder().status(status);
-    for (name, value) in headers {
-        // An unusable header from the application used to panic here, because
-        // `Builder::header` panics on a name or value `hyper` rejects: the
-        // connection was dropped with no response at all. Skipping is what a
-        // gateway should do — the rest of the response is still sendable.
+    // The application's headers, kept as an **ordered list of pairs** because repeats are
+    // meaningful: two `Set-Cookie` headers are two cookies, and folding them into one corrupts
+    // both. A `HeaderMap` is used only for the *decision* below, where collapsing is what the
+    // question needs; the response is built from this list.
+    let mut outgoing: Vec<(HeaderName, HeaderValue)> = Vec::with_capacity(headers.len());
+    for (name, value) in &headers {
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            // An unusable header from the application used to panic, because
+            // `Builder::header` panics on a name or value `hyper` rejects: the connection was
+            // dropped with no response at all. Skipping is what a gateway should do ? the rest
+            // of the response is still sendable.
             continue;
         };
         if is_hop_by_hop(name.as_str()) || name == CONTENT_LENGTH {
@@ -1798,12 +1806,66 @@ fn from_cgi(response: volucer_fcgi::Response) -> Result<Response<ResponseBody>> 
         let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) else {
             continue;
         };
+        outgoing.push((name, value));
+    }
+
+    // Compression is decided from what the application sent, before `Body` is built: the
+    // encoding, the length and `Vary` are header facts, and a body handed to `hyper` cannot be
+    // replaced afterwards.
+    let original = Bytes::from(body);
+    let decision = {
+        let view = {
+            let mut map = hyper::header::HeaderMap::new();
+            for (name, value) in &outgoing {
+                map.append(name.clone(), value.clone());
+            }
+            map
+        };
+        let content_type = view
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        crate::compress::compress(
+            &settings,
+            request_headers,
+            &view,
+            content_type.as_deref(),
+            original.clone(),
+        )
+    };
+
+    let body = match decision {
+        crate::compress::Outcome::Compressed(compressed, encoding) => {
+            outgoing.retain(|(name, _)| *name != CONTENT_ENCODING && *name != VARY);
+            outgoing.push((
+                CONTENT_ENCODING,
+                HeaderValue::from_static(encoding.as_str()),
+            ));
+            if let Some(vary) = crate::compress::vary_value(&outgoing) {
+                outgoing.push((VARY, vary));
+            }
+            compressed
+        }
+        // The clone is only live on the path that keeps the original, so a pass-through costs
+        // one `Bytes` refcount and no copy.
+        crate::compress::Outcome::Unchanged => original,
+    };
+
+    // The length of the body that is actually sent. An application-supplied `Content-Length`
+    // was dropped above: the two cannot both be right, and declaring more than is sent
+    // desynchronises the connection while declaring less is merely conservative.
+    outgoing.push((
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string()).expect("a decimal length"),
+    ));
+
+    let mut builder = Response::builder().status(status);
+    for (name, value) in outgoing {
         builder = builder.header(name, value);
     }
-    builder = builder.header(CONTENT_LENGTH, body.len());
 
     builder
-        .body(body_of(Bytes::from(body)))
+        .body(body_of(body))
         .map_err(|err| HttpError::BadGateway(format!("the backend sent an unusable header: {err}")))
 }
 
@@ -2238,7 +2300,12 @@ mod tests {
             stdout: b"Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nmissing\n".to_vec(),
             ..volucer_fcgi::Response::default()
         };
-        let built = from_cgi(response).expect("a well-formed response");
+        let built = from_cgi(
+            response,
+            &volucer_core::config::CompressionSetting::default(),
+            &hyper::header::HeaderMap::new(),
+        )
+        .expect("a well-formed response");
 
         assert_eq!(built.status(), 404);
         assert_eq!(
@@ -2258,7 +2325,12 @@ mod tests {
             stdout: b"Content-Length: 9999\r\n\r\nshort".to_vec(),
             ..volucer_fcgi::Response::default()
         };
-        let built = from_cgi(response).expect("a well-formed response");
+        let built = from_cgi(
+            response,
+            &volucer_core::config::CompressionSetting::default(),
+            &hyper::header::HeaderMap::new(),
+        )
+        .expect("a well-formed response");
 
         assert_eq!(built.headers().get(CONTENT_LENGTH).expect("a length"), "5");
         assert_eq!(built.status(), 200, "no Status header means 200");
@@ -2272,7 +2344,12 @@ mod tests {
             stdout: b"Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n".to_vec(),
             ..volucer_fcgi::Response::default()
         };
-        let built = from_cgi(response).expect("a well-formed response");
+        let built = from_cgi(
+            response,
+            &volucer_core::config::CompressionSetting::default(),
+            &hyper::header::HeaderMap::new(),
+        )
+        .expect("a well-formed response");
 
         let cookies: Vec<&str> = built
             .headers()

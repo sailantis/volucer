@@ -2632,6 +2632,7 @@ mod tests {
             script_extensions: volucer_core::ScriptExtensions::default(),
             serve_only: volucer_core::config::ServeOnly::All,
             static_files: volucer_core::config::StaticConfig::default(),
+            compression: volucer_core::config::CompressionSetting::default(),
             routes: Vec::new(),
             default_backend: None,
         };
@@ -2675,6 +2676,7 @@ document_root = "/from/file"
             script_extensions: volucer_core::ScriptExtensions::default(),
             serve_only: volucer_core::config::ServeOnly::All,
             static_files: volucer_core::config::StaticConfig::default(),
+            compression: volucer_core::config::CompressionSetting::default(),
             routes: Vec::new(),
             default_backend: None,
         };

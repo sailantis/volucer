@@ -37,6 +37,7 @@
 //! the offer is *not* taken — so the gap is a decision rather than an accident. HTTP/3 is
 //! `quinn` plus `h3`, not `hyper`.
 
+pub mod compress;
 pub mod error;
 pub mod listener;
 pub mod static_files;

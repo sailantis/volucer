@@ -8,6 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# gzip for dynamic responses. `zlib-rs` is a *pure Rust* backend and one of the fastest
+# available, which matters here specifically: this project already pays for a C toolchain in
+# `aws-lc-rs`, and adding a second C dependency for a deflate encoder would repeat that cost
+# for no measurable gain. No `default-features`, so `miniz_oxide` and the C `zlib` are not
+# compiled at all.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# zstd, bindings to the reference C implementation. Its window is clamped to 8 MiB in
+# `compress.rs`, which is what browsers accept. See that module's documentation for the
+# measurements behind both choices.
+zstd = "0.14"
 volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-server.workspace = true
@@ -28,6 +38,7 @@ volucer-worker.workspace = true
 # The worker-control routes answer JSON, which is the same document `workers.list` returns over the
 # worker channel — one encoder for both, so a field added to `WorkerStatus` appears in neither
 # answer twice. Already in the graph through `volucer-server`; naming it adds no crate.
+serde.workspace = true
 serde_json.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true

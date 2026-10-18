@@ -47,6 +47,11 @@ pub struct ResolvedSite {
     pub serve_only: ServeOnly,
     /// The static layer, with inheritance already applied.
     pub static_files: StaticConfig,
+    /// Compression settings, with inheritance already applied.
+    ///
+    /// Resolved here for the same reason as the static layer: a site's override must be applied
+    /// once, against the same snapshot the rest of the request reads.
+    pub compression: crate::config::CompressionSetting,
     /// The route table in effect for this site.
     pub routes: Vec<RouteConfig>,
     /// The backend a request matching no route goes to.
@@ -100,6 +105,7 @@ impl Sites {
             .resolve_front_controller(front_controller_override);
         let default_extensions = config.server.script_extensions();
         let default_statics = config.server.statics();
+        let default_compression = config.server.compression();
 
         let default = ResolvedSite {
             name: "<default>".to_string(),
@@ -108,6 +114,7 @@ impl Sites {
             script_extensions: default_extensions.clone(),
             serve_only: config.server.serve_only,
             static_files: default_statics.clone(),
+            compression: default_compression.clone(),
             routes: config.routes.clone(),
             default_backend: config.default_backend.clone(),
         };
@@ -123,6 +130,7 @@ impl Sites {
                 &default_extensions,
                 config.server.serve_only,
                 &default_statics,
+                &default_compression,
                 &config.routes,
                 config.default_backend.as_deref(),
             );
@@ -201,6 +209,7 @@ fn resolve_site(
     default_extensions: &crate::script::ScriptExtensions,
     default_serve_only: ServeOnly,
     default_statics: &StaticConfig,
+    default_compression: &crate::config::CompressionSetting,
     default_routes: &[RouteConfig],
     default_backend: Option<&str>,
 ) -> ResolvedSite {
@@ -228,6 +237,11 @@ fn resolve_site(
         None => default_statics.clone(),
     };
 
+    let compression = match &site.compression {
+        Some(overrides) => overrides.apply(default_compression),
+        None => default_compression.clone(),
+    };
+
     ResolvedSite {
         name: name.to_string(),
         document_root: site.document_root.clone(),
@@ -235,6 +249,7 @@ fn resolve_site(
         script_extensions,
         serve_only: site.serve_only.unwrap_or(default_serve_only),
         static_files,
+        compression,
         routes: site
             .routes
             .clone()

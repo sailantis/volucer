@@ -1051,6 +1051,10 @@ pub struct SiteConfig {
     #[serde(default)]
     pub static_files: Option<StaticsSetting>,
 
+    /// This site's compression overrides. Absent inherits `[server.compression]`.
+    #[serde(default)]
+    pub compression: Option<CompressionOverrides>,
+
     /// What this site answers with; see [`ServeOnly`].
     ///
     /// Absent inherits the `[server]` value, which itself defaults to
@@ -1323,6 +1327,105 @@ impl RoutePolicy {
             RoutePolicy::All => "all",
             RoutePolicy::Backend => "backend",
             RoutePolicy::Static => "static",
+        }
+    }
+}
+
+/// On-the-fly compression of responses a backend produced.
+///
+/// Absent (or `enabled = false`) means nothing is compressed, which is the default and the
+/// cheap choice. The static layer's precompressed `.br`/`.gz` variants are a different
+/// mechanism and are unaffected by this: those files cost nothing per request, because the
+/// work was done at build time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionSetting {
+    /// Whether responses are compressed at all.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Encodings to offer, in preference order.
+    ///
+    /// Order decides ties: a client accepting both `gzip` and `zstd` at the same quality gets
+    /// whichever comes first here, so the answer is stable rather than dependent on how the
+    /// request happened to be parsed. An explicit `q` value in the request still wins, because
+    /// a client knows its own end better than the deployment does.
+    #[serde(default = "default_compression_encodings")]
+    pub encodings: Vec<String>,
+
+    /// Bodies smaller than this are passed through unchanged.
+    ///
+    /// A deflate stream's framing is a few tens of bytes and the CPU is a few microseconds, so
+    /// below some size the request pays for nothing a client would notice. `volucer-http`'s own
+    /// default is 1024 when this is unset.
+    #[serde(default)]
+    pub min_length: Option<usize>,
+
+    /// The level handed to the encoder.
+    ///
+    /// Clamped by encoding rather than refused: gzip accepts 1?9 and zstd 1?19, so a single key
+    /// cannot mean the same number to both. Out-of-range values are clamped at the encoder.
+    #[serde(default = "default_compression_level")]
+    pub level: u32,
+}
+
+fn default_compression_encodings() -> Vec<String> {
+    // gzip first: every client accepts it, so a client offering both gets the answer with no
+    // compatibility surface. zstd second, for the ones that can use it.
+    vec!["gzip".to_string(), "zstd".to_string()]
+}
+
+/// Level 6 is gzip's own default and is near zstd's sweet spot at these sizes.
+fn default_compression_level() -> u32 {
+    6
+}
+
+impl Default for CompressionSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            encodings: default_compression_encodings(),
+            min_length: None,
+            level: default_compression_level(),
+        }
+    }
+}
+
+/// A site's overrides for compression.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionOverrides {
+    /// Whether this site's responses are compressed.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// This site's encodings, in preference order.
+    ///
+    /// Replaces the server's list rather than adding to it, the same rule `script_extensions`
+    /// and `path_suffix` follow: a site saying "gzip only" must stop returning zstd.
+    #[serde(default)]
+    pub encodings: Option<Vec<String>>,
+
+    /// This site's minimum length.
+    #[serde(default)]
+    pub min_length: Option<usize>,
+
+    /// This site's encoder level.
+    #[serde(default)]
+    pub level: Option<u32>,
+}
+
+impl CompressionOverrides {
+    /// The base settings with these overrides applied.
+    pub fn apply(&self, base: &CompressionSetting) -> CompressionSetting {
+        CompressionSetting {
+            enabled: self.enabled.unwrap_or(base.enabled),
+            encodings: self
+                .encodings
+                .clone()
+                .unwrap_or_else(|| base.encodings.clone()),
+            min_length: self.min_length.or(base.min_length),
+            level: self.level.unwrap_or(base.level),
         }
     }
 }
@@ -1615,6 +1718,15 @@ pub struct ServerConfig {
     /// FastCGI listener, e.g. `127.0.0.1:9000` or `unix:/run/volucer.sock`.
     #[serde(default)]
     pub fastcgi: Option<String>,
+
+    /// How responses this server produces are compressed.
+    ///
+    /// Off by default, which is a deliberate inversion of nginx's: compressing a backend's output
+    /// costs CPU on the request path of a server designed around one request at a time per worker
+    /// slot, so a deployment opts in knowing that rather than discovering it. Precompressed
+    /// static variants are a different mechanism and unaffected by this key.
+    #[serde(default)]
+    pub compression: Option<CompressionSetting>,
 
     /// The largest request body either front-end will accept, in bytes.
     ///
@@ -1967,6 +2079,14 @@ impl ServerConfig {
     /// before this key accepted. [`Config::validate`] refuses a list this cannot parse — an empty
     /// one, or an entry naming a path — so falling back to the default here is only the shape a
     /// caller sees if it skipped validation, never a configuration being silently reinterpreted.
+    /// The server's compression settings, defaulted when absent.
+    ///
+    /// A key that is unset means "off", not "on with defaults": the difference is the whole
+    /// decision, so it is made here once rather than at each reader.
+    pub fn compression(&self) -> CompressionSetting {
+        self.compression.clone().unwrap_or_default()
+    }
+
     pub fn script_extensions(&self) -> crate::script::ScriptExtensions {
         self.script_extensions
             .as_deref()

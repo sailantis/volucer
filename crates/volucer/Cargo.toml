@@ -65,6 +65,7 @@ signal-hook.workspace = true
 ctrlc = "3"
 
 [dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # Certificates are generated per test run rather than committed: a committed key is a key that
 # ends up in someone's deployment.
 rcgen = "0.13"

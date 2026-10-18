@@ -230,6 +230,12 @@ pub struct Reloaded {
     routings: BTreeMap<String, Routing>,
     /// The static layer per site, for the same reason.
     statics: BTreeMap<String, StaticFiles>,
+    /// How responses are compressed per site.
+    ///
+    /// Carried here rather than read from the site at request time for the same reason as the
+    /// other two: a request must be served under one generation, and a reload landing between
+    /// "which site" and "how to compress" would apply half of a configuration.
+    compression: BTreeMap<String, volucer_core::config::CompressionSetting>,
 }
 
 impl Reloaded {
@@ -244,6 +250,7 @@ impl Reloaded {
     pub fn from_sites(sites: Arc<Sites>, server_port: u16) -> Self {
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
+        let mut compression = BTreeMap::new();
         for site in sites
             .named()
             .values()
@@ -267,11 +274,13 @@ impl Reloaded {
                     script_extensions: site.script_extensions.clone(),
                 },
             );
+            compression.insert(site.name.clone(), site.compression.clone());
         }
         Reloaded {
             sites,
             routings,
             statics,
+            compression,
         }
     }
 
@@ -286,11 +295,12 @@ impl Reloaded {
     /// [`Resolved`].
     pub fn resolve(&self, host: Option<&str>) -> Resolved<'_> {
         let site = self.sites.resolve(host);
-        let (routing, statics) = self.for_site(site);
+        let (routing, statics, compression) = self.for_site(site);
         Resolved {
             site,
             routing,
             statics,
+            compression,
         }
     }
 
@@ -300,7 +310,14 @@ impl Reloaded {
     /// same table in the same pass — so a missing entry would mean the two had
     /// diverged, and falling back to the default is the safe direction: it serves the
     /// deployment's own root rather than an empty path.
-    fn for_site(&self, site: &ResolvedSite) -> (&Routing, &StaticFiles) {
+    fn for_site(
+        &self,
+        site: &ResolvedSite,
+    ) -> (
+        &Routing,
+        &StaticFiles,
+        &volucer_core::config::CompressionSetting,
+    ) {
         let routing = self
             .routings
             .get(&site.name)
@@ -311,7 +328,12 @@ impl Reloaded {
             .get(&site.name)
             .or_else(|| self.statics.get(DEFAULT_SITE_KEY))
             .expect("the default site is always built");
-        (routing, statics)
+        let compression = self
+            .compression
+            .get(&site.name)
+            .or_else(|| self.compression.get(DEFAULT_SITE_KEY))
+            .expect("the default site is always built");
+        (routing, statics, compression)
     }
 }
 
@@ -341,6 +363,8 @@ pub struct Resolved<'a> {
     pub routing: &'a Routing,
     /// Its static layer.
     pub statics: &'a StaticFiles,
+    /// How its responses are compressed.
+    pub compression: &'a volucer_core::config::CompressionSetting,
 }
 
 /// The process's one reloadable state, and the handle a trigger applies a new configuration

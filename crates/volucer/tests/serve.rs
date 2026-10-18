@@ -679,6 +679,146 @@ backend = "cgi"
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Compression happens on the wire, and only when it should.
+///
+/// The assertions are chosen so each one fails if the feature is removed *or* if it is made
+/// unconditional: a client that does not ask gets the plain bytes, a client that asks gets a
+/// header matching a body that decodes back to the original, and a body under the threshold is
+/// passed through even when asked for.
+#[test]
+fn a_backend_response_is_compressed_only_when_it_is_asked_for() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(2) else {
+        eprintln!("skipping: no run of two free ports");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-compress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    // A body large enough and repetitive enough to compress, and a second one below the
+    // threshold so the pass-through path is asserted too.
+    std::fs::write(
+        root.join("index.php"),
+        r#"<?php
+$which = $_GET['which'] ?? 'big';
+echo $which === 'big' ? str_repeat('volucer ', 4000) : 'small';
+"#,
+    )
+    .expect("write the front controller");
+
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        r#"
+default_backend = "cgi"
+
+[server]
+http = "127.0.0.1:{port}"
+document_root = {root}
+front_controller = "index.php"
+
+[server.compression]
+enabled = true
+
+[backends.cgi]
+kind = "spawn_cgi"
+binary = {php_cgi}
+workers = 1
+bind_host = "127.0.0.1"
+base_port = {base_port}
+"#,
+        port = base_port,
+        root = toml_string(&root.display().to_string()),
+        php_cgi = toml_string(&php_cgi.display().to_string()),
+        base_port = base_port + 1,
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+
+    // 1. No `Accept-Encoding`: the bytes are the application's own.
+    let plain = http_get(&address, "/?which=big");
+    assert_eq!(200, plain.status);
+    assert_eq!(
+        None,
+        plain.header("content-encoding"),
+        "a client that did not ask must not be sent an encoded body"
+    );
+    let reference = plain.body.clone();
+
+    // 2. gzip asked for, gzip sent, and it decodes back to exactly the plain bytes.
+    let gzipped = http_get_with(&address, "/?which=big", &[("Accept-Encoding", "gzip")]);
+    assert_eq!(200, gzipped.status);
+    assert_eq!(
+        Some("gzip"),
+        gzipped.header("content-encoding"),
+        "the client asked for gzip and the body is text"
+    );
+    assert!(
+        gzipped.body.len() < reference.len(),
+        "the compressed body must be smaller: {} vs {}",
+        gzipped.body.len(),
+        reference.len()
+    );
+    // `Vary` is what stops a cache handing these two answers to each other.
+    assert!(
+        gzipped
+            .header("vary")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("accept-encoding")),
+        "a compressed response must vary by accept-encoding: {:?}",
+        gzipped.header("vary")
+    );
+
+    {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        GzDecoder::new(&gzipped.body[..])
+            .read_to_end(&mut decoded)
+            .expect("the gzip body decodes");
+        assert_eq!(
+            reference, decoded,
+            "the compressed body must decode to the bytes the other client got"
+        );
+    }
+
+    // 3. A small body is passed through even though the client asked.
+    //
+    //     Note on what this does and does not pin: at *this* size two separate guards both
+    //     hold ? `min_length`, and the post-hoc "did compressing actually help" check, since
+    //     a 5-byte body gains a 20-byte gzip header. Removing either one alone still leaves
+    //     the other, so this assertion is a statement about the outcome rather than about
+    //     `min_length` specifically. `compress.rs`'s own unit tests pin the threshold in
+    //     isolation, where a body can be built that is large enough that compression *would*
+    //     help and still below the minimum.
+    let tiny = http_get_with(&address, "/?which=small", &[("Accept-Encoding", "gzip")]);
+    assert_eq!(200, tiny.status);
+    assert_eq!(
+        None,
+        tiny.header("content-encoding"),
+        "a body this small is not worth compressing"
+    );
+    assert_eq!(b"small".as_slice(), tiny.body.as_slice());
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn serve_answers_a_fastcgi_request_from_a_real_php_process() {
     let Some(binary) = volucer_binary() else {

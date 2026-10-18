@@ -696,6 +696,67 @@ hyper frames the response without chunked encoding. Zero-copy (`sendfile`) is _n
 would be a Unix-only second code path — so a large file is copied per block. See
 [the module docs](crates/volucer-http/src/static_files.rs) for what is deliberately absent.
 
+## Compression
+
+Two different mechanisms, and the split matters:
+
+| What | Compressed by | Cost per request |
+| --- | --- | --- |
+| Static files | **your build**, as `.br`/`.gz` beside the file | nothing |
+| Backend responses | **volucer**, if you ask for it | CPU, on the request path |
+
+`[server.static_files] precompressed = true` serves `app.js.br` or `app.js.gz` when one exists and
+the client accepts it. Volucer does not produce those files ? it relays them with the right
+`Content-Encoding`, which is why that path costs nothing.
+
+A backend's output cannot be precompressed, because it does not exist until the request runs. That
+is what this key is for, and it is **off by default**:
+
+```toml
+[server.compression]
+enabled = true
+encodings = ["gzip", "zstd"]   # the default; order decides ties
+level = 6                      # gzip 1-9, zstd 1-19, clamped per encoding
+min_length = 1024              # bodies below this are passed through
+```
+
+Off by default is a deliberate inversion of nginx's. Compressing a response spends CPU on the
+request path of a server designed around one request at a time per worker slot, so this is a
+choice to make knowingly rather than discover in a profile. Measured on this host, a 32 KiB
+repetitive text body goes to about 150 bytes; the encoder cost at level 6 is a few hundred
+microseconds, which is small beside the backend's own latency but not nothing.
+
+**gzip is first** because every client accepts it. **zstd** is offered because it is smaller for
+text and current browsers support it; its window is clamped to 8 MiB, which is the largest browsers
+accept, and the clamp is asserted by a test that parses the frame header rather than trusting the
+default.
+
+**brotli is deliberately not offered at runtime.** Its reference crate defaults to quality 11,
+which is a build-time setting misapplied to a request path ? the well-known `tower-http` issue took
+8.3 seconds for a 770 KiB body at that level. Brotli belongs offline, at high quality, producing
+the `.br` files the static layer already serves.
+
+A site can override any of it, and a list a site states **replaces** the server's rather than
+adding to it:
+
+```toml
+[sites.api.compression]
+enabled = true
+encodings = ["zstd"]
+```
+
+What is never compressed, whatever the configuration says:
+
+- a body under `min_length`, or one that came out *larger* after encoding;
+- a response that already carries `Content-Encoding`, or a `Content-Range` (the bytes are a window
+  into another representation);
+- content that is already entropy-coded: images other than SVG and icons, video, audio, fonts,
+  zip/gzip/zstd archives, PDF, wasm, and `application/grpc` (gRPC negotiates its own encoding).
+
+`Vary: accept-encoding` is added to a compressed response, appended to whatever the application
+already sent, so a cache cannot hand a gzip answer to a client that cannot read it. A client
+sending `q=0` for both encodings gets the plain body, not a 406 ? the request is still servable.
+
 ## TLS
 
 `[server.tls]` is what turns TLS on — there is no `enabled` key, because a flag and a certificate
