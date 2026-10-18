@@ -5098,10 +5098,21 @@ syscalls in all.
 
 **The number to act on is the one on `/`: 18–26%.** The within-round ratios for
 `new-nostat / new-req` are 1.220x, 1.176x, 1.231x and 1.261x at c=1/8/16/32 — every per-round range
-clear of 1.00. On `/items` it is 7–14% (1.141x, 1.139x, 1.133x, 1.068x), whose ranges *do* span
-1.00 on the two lower rounds, so that endpoint is the weaker half of the evidence even though its
-median moved the same way. `/` is the page a front-controller application actually serves, and it is
-also the endpoint where no arm can claim the layer was doing anything useful.
+clear of 1.00. On `/items` it is 7–14% (1.141x, 1.139x, 1.133x, 1.068x), whose ranges *do* cross
+1.00 — in all four cells, not only the lower two. The crossings have one cause: every one of them
+comes from the same round, in which all four `new-nostat` `/items` cells fell together to 0.764,
+0.778, 0.830 and 0.789 of their own medians over the other eight rounds while `rr`, `baseline` and
+`new-req` held — a disturbed measurement block, not a per-cell effect. Recomputing without that
+round leaves 1.143x, 1.143x, 1.133x, 1.072x, every range clear of 1.00. So `/items` remains the
+weaker half by size, not by sign. `/` is the page a front-controller application actually serves,
+and it is also the endpoint where no arm can claim the layer was doing anything useful.
+
+**Re-measured after the layer became self-deciding** (`results/ab-perf-autostat.tsv`, five rotating
+rounds, 160 cells, none failed; RoadRunner reproduced its published cells to within 2.1%, so the
+host is comparable). `/items`, absolute median rps — old `new-nostat` (layer off) against new
+`new-req` (layer now off by itself): 2,327/2,387, 14,451/14,480, 18,932/19,087, 23,011/22,851, i.e.
+**+2.6%, +0.2%, +0.8%, −0.7%**. The inferred default is the arm the explicit switch used to
+produce. The layer costs **13–21% on `/` and 6–14% on `/items`** there, the same order as above.
 
 **Both are fixed**, in that order of confidence: one `metadata` answers directory, file and
 neither (`GET /items` is now 1.05 `statx` per request), and the script-extension test moved ahead
