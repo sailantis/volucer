@@ -78,6 +78,26 @@ Write-Note "platform windows/x86_64 -> $target"
 
 # ------------------------------------------------------------------- version
 
+# Environment variables are the only way to configure the documented one-liner:
+# `irm ... | iex` cannot pass parameters, so a `-InstallDir` there is unreachable. The shell
+# installer reads these names, and two installers that disagree about how to say "put it here" are
+# worse than one, so the parameters stay the PowerShell-native spelling and the variables are an
+# equivalent way in. A parameter wins, because it is the more explicit of the two.
+#
+# **This block has to run before the version is resolved, not after.** It used to sit below the
+# resolution with a comment claiming it came first, and the effect was that `VOLUCER_VERSION` was
+# ignored: by the time it was read, `if (-not $Version)` had already replaced the variable with
+# whatever `releases/latest` said, so the line was unreachable. The failure was invisible until
+# the releases API rate-limited the check and a pinned version would have answered it without the
+# network. `VOLUCER_INSTALL_DIR` and `VOLUCER_DOWNLOAD_URL` were fine only by luck: nothing above
+# set them.
+if (-not $Version -and $env:VOLUCER_VERSION) { $Version = $env:VOLUCER_VERSION }
+if (-not $InstallDir -and $env:VOLUCER_INSTALL_DIR) { $InstallDir = $env:VOLUCER_INSTALL_DIR }
+if (-not $Force -and $env:VOLUCER_FORCE) { $Force = $true }
+if (-not $PSBoundParameters.ContainsKey('BaseUrl') -and $env:VOLUCER_DOWNLOAD_URL) {
+    $BaseUrl = $env:VOLUCER_DOWNLOAD_URL
+}
+
 # Resolved before the asset name, because the asset name contains the version:
 # `volucer-<version>-<target>.zip`. A "latest" URL with a hardcoded version starts
 # returning 404 the moment a newer release exists.
@@ -110,19 +130,6 @@ Write-Note "release $Version"
 Write-Note "asset   $asset"
 
 # ------------------------------------------------------------------- install
-
-# Environment variables are the only way to configure the documented one-liner:
-# `irm ... | iex` cannot pass parameters, so a `-InstallDir` there is unreachable. The shell
-# installer reads these names, and two installers that disagree about how to say "put it here" are
-# worse than one, so the parameters stay the PowerShell-native spelling and the variables are an
-# equivalent way in. A parameter wins, because it is the more explicit of the two -- which is why
-# these are applied *before* the defaults below, not after.
-if (-not $Version -and $env:VOLUCER_VERSION) { $Version = $env:VOLUCER_VERSION }
-if (-not $InstallDir -and $env:VOLUCER_INSTALL_DIR) { $InstallDir = $env:VOLUCER_INSTALL_DIR }
-if (-not $Force -and $env:VOLUCER_FORCE) { $Force = $true }
-if (-not $PSBoundParameters.ContainsKey('BaseUrl') -and $env:VOLUCER_DOWNLOAD_URL) {
-    $BaseUrl = $env:VOLUCER_DOWNLOAD_URL
-}
 
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "$App\bin"

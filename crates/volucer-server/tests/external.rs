@@ -29,29 +29,70 @@ struct ExternalServer {
 }
 
 impl ExternalServer {
+    /// Start a stand-in FastCGI server, or fail having tried more than one port.
+    ///
+    /// The port has to be released before `php-cgi -b` can take it, and releasing a
+    /// port makes it available to everything on the machine — including the other
+    /// tests in this binary, which run concurrently. That is not theoretical: this
+    /// used to bind `:0`, read the port, drop the listener, and then probe the port
+    /// with `TcpStream::connect`. The kernel is free to hand that port to a later
+    /// `bind(":0")` — a listener another test was polling `accept()` on — and the
+    /// probe then *connected to a stranger*, turning that test's "nobody connects"
+    /// assertion into a connection. It surfaced as
+    /// `a_socket_worker_that_never_connects_times_out_rather_than_hanging` failing in
+    /// CI with a live `TcpStream`, several modules away from the cause.
+    ///
+    /// So the retry is on the whole bind-spawn-probe sequence rather than on the
+    /// probe, and the probe is made meaningful: a stolen port kills our child,
+    /// because `php-cgi` cannot bind a port something else holds. "Something answers"
+    /// alone would have been exactly the check that passed for the wrong reason.
     fn start(binary: &Path) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
+        const ATTEMPTS: usize = 10;
+        let mut last: Option<String> = None;
 
-        let child = Command::new(binary)
-            .arg("-b")
-            .arg(format!("127.0.0.1:{port}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start the stand-in server");
+        for _ in 0..ATTEMPTS {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+            let port = listener.local_addr().expect("address").port();
+            drop(listener);
 
-        let server = ExternalServer { child, port };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return server;
+            let mut child = Command::new(binary)
+                .arg("-b")
+                .arg(format!("127.0.0.1:{port}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start the stand-in server");
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                // A child that is gone could not bind, which for a port we have just
+                // released means somebody else took it. Another port is the fix.
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        last = Some(status.to_string());
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(err) => panic!("could not read the stand-in server's status: {err}"),
+                }
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return ExternalServer { child, port };
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        panic!("the stand-in server never started listening on {port}");
+
+        // The child's own status rather than "no port could be taken": a genuinely
+        // broken binary also exits, and relabelling that as a network problem would
+        // send the operator to the wrong place. Same reasoning as `pool.rs`.
+        panic!(
+            "the stand-in server never started listening in {ATTEMPTS} attempts{}",
+            last.map(|status| format!("; the last one {status}"))
+                .unwrap_or_default()
+        );
     }
 
     fn socket(&self) -> String {

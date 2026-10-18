@@ -364,6 +364,13 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
         # `-InstallDir` explicitly, which is precisely why none of them noticed that
         # `VOLUCER_INSTALL_DIR` was ignored. The shell installer reads these names, so the
         # PowerShell one has to agree about them or the two disagree silently.
+        #
+        # `VOLUCER_VERSION` is part of the same check on purpose, and it is the one that found a
+        # second defect: the installer resolved the version from the releases API *before*
+        # reading the variable, so a pinned version was still resolved over the network. Passing
+        # all three means this case never touches the network and a pinned version is actually
+        # pinned -- and it is why this check no longer depends on GitHub's rate limit. It failed
+        # in CI with a 403 from api.github.com and was read as "the variable is ignored".
         if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Stop'
             \$env:VOLUCER_VERSION = '${tag}'
@@ -392,6 +399,34 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
         else
             check fail 'the PowerShell overwrite refusal failed for the wrong reason'
             sed 's/^/      /' "${work}/out-ps-overwrite.txt" >&2
+        fi
+
+        # A pinned version must be resolved *without* the network, and must be the version
+        # actually used. Both halves matter: this check pins a tag that is deliberately *not*
+        # the latest one, because pinning the latest cannot tell "the variable was honoured"
+        # from "the API was asked and happened to agree". Before the ordering was fixed this
+        # printed `release v0.1.0` for a pin of `v0.0.9`.
+        "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Continue'
+            \$env:VOLUCER_VERSION = 'v0.0.9'
+            \$env:VOLUCER_DOWNLOAD_URL = '${base_url}'
+            & '${script_win}' -InstallDir '${work_win}/ps-pinned'
+        " >"${work}/out-ps-pinned.txt" 2>&1 || true
+        # The exit status is deliberately not part of this: the download is expected to 404,
+        # because the fixture serves one tag and this pins a different one, and PowerShell runs
+        # an `exit` trap on the way out so the status says nothing about the resolution. The
+        # assertion is the line printed *before* any request — `release v0.0.9` — which is the
+        # only place the ordering is visible.
+        if grep -q 'release v0.0.9' "${work}/out-ps-pinned.txt"; then
+            if grep -qi 'releases API' "${work}/out-ps-pinned.txt"; then
+                check fail 'install.ps1 asked the releases API for a version it was already given'
+                sed 's/^/      /' "${work}/out-ps-pinned.txt" >&2
+            else
+                check ok 'install.ps1 uses a pinned VOLUCER_VERSION without consulting the API'
+            fi
+        else
+            check fail 'install.ps1 did not use the pinned version'
+            sed 's/^/      /' "${work}/out-ps-pinned.txt" >&2
         fi
     else
         # The positive path is Windows-only, and this is the assertion that keeps the script
