@@ -107,7 +107,7 @@ jobs:
 
   release:
     name: Publish
-    needs: [build, installers]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -134,12 +134,13 @@ jobs:
           generate_release_notes: true
           draft: true
 
-  # The installers are only proven against a fixture release by the `installers` job in ci.yml,
-  # which is what keeps them honest before the tag. This job is the other half: the published
-  # `install.sh`, fetched from the draft release the way a stranger fetches it, against the
-  # real archives. Without it the README's one-liner has never been executed by anything.
-  published:
-    name: Fetch the published installer
+  # ci.yml proves the installers against a fixture built by `stage-archive.sh`. This job is the
+  # other half: `install.sh` run against the archives *this run* actually built, over HTTP, with
+  # nothing substituted but the origin. It is what catches the one failure the fixture cannot -
+  # a real archive whose layout, name or checksum file differs from the fixture's - and it is
+  # the last point before a stranger's `curl | sh` does the same thing for real.
+  install:
+    name: Install from the real archives
     needs: release
     runs-on: ubuntu-latest
     steps:
@@ -147,24 +148,87 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      # The draft is not public, so `releases/latest/download` is not used here - the local
-      # copy of `install.sh` is, against a fixture server holding this run's real archives.
-      # That is the same code path a stranger runs, with only the origin substituted, and it
-      # is the last thing that can catch a `packaging/install.sh` that drifted from the
-      # archive layout `stage-archive.sh` produces.
-      - name: Verify the archives the release actually built
-        shell: bash
+
+      # The assets that are on the release are checked, not just the ones in the runner's
+      # directory: `softprops/action-gh-release` is told to upload them, and an upload that
+      # silently matched nothing still produces a green release.
+      - name: Check the release carries the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for archive in volucer-*.tar.gz; do
-            [ -f "$archive" ] || continue
-            sha256sum --check "${archive}.sha256"
-            tar -tzf "$archive" | grep -q "^$(basename "$archive" .tar.gz)/volucer$" || {
-              echo "::error::${archive} does not hold the binary under its own name" >&2
+          assets="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
+          for want in install.sh install.ps1; do
+            printf '%s\n' "$assets" | grep -qx "$want" || {
+              echo "::error::the release does not carry ${want}" >&2
               exit 1
             }
           done
-          echo "every published tarball verifies and holds the binary where install.sh expects it"
+          printf '%s\n' "$assets" | grep -q 'x86_64-unknown-linux-gnu.tar.gz$' || {
+            echo "::error::no x86_64-unknown-linux-gnu archive on the release" >&2
+            exit 1
+          }
+
+      # The installer is fetched from the release, not from the checkout. `packaging/install.sh`
+      # is already proven by ci.yml; what is unproven until here is the copy that is actually
+      # attached to the release - a `cp` into the wrong name, an upload that matched nothing.
+      # Testing the checkout would pass while the published one was missing.
+      - name: Fetch the published installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'install.sh' --dir . --clobber
+          test -s install.sh || { echo "::error::the published install.sh is empty" >&2; exit 1; }
+
+      # A release fixture laid out the way the release page lays it out, served over HTTP.
+      # `install.sh` refuses `file://` by design (`--proto`), so serving it is the only way to
+      # run the shipping code path rather than a relaxation of it.
+      - name: Serve the release and install from it
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$(mktemp -d)"
+          mkdir -p "${fixture}/releases/download/${GITHUB_REF_NAME}"
+          cp volucer-* "${fixture}/releases/download/${GITHUB_REF_NAME}/"
+
+          # download-artifact puts the archives here rather than extracting them, so the
+          # expected binary is taken out of the tarball the release shipped.
+          expected="$(mktemp -d)"
+          tar -xzf "volucer-${GITHUB_REF_NAME#v}-x86_64-unknown-linux-gnu.tar.gz" -C "$expected"
+
+          port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          python3 -m http.server "$port" --bind 127.0.0.1 --directory "$fixture" &
+          server=$!
+          trap 'kill $server 2>/dev/null || true; rm -rf "$fixture"' EXIT
+
+          # Readiness rather than a sleep: the port is known and a refused connection is the
+          # signal. A fixed sleep is the difference between a job that is slow and a job that
+          # fails once a month on a loaded runner.
+          for _ in $(seq 100); do
+            if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1',${port})) == 0 else 1)"; then
+              break
+            fi
+            sleep 0.1
+          done
+
+          destination="$(mktemp -d)"
+          VOLUCER_VERSION="${GITHUB_REF_NAME}" \
+          VOLUCER_INSTALL_DIR="$destination" \
+          VOLUCER_DOWNLOAD_URL="http://127.0.0.1:${port}/releases/download" \
+          sh install.sh
+
+          # The assertion that matters: the binary the installer placed must be the one this
+          # run built, and it must run. A checksum that verified the wrong bytes would pass
+          # every check before this one.
+          "$destination/volucer" version
+          cmp "$destination/volucer" \
+            "$expected/volucer-${GITHUB_REF_NAME#v}-x86_64-unknown-linux-gnu/volucer" || {
+            echo "::error::the installed binary is not the one this release built" >&2
+            exit 1
+          }
+          echo "the release's own install.sh installs the release's own binary"
 
   docker:
     name: Docker (${{ matrix.image }})
