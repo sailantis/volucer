@@ -96,6 +96,35 @@ fn free_port_run(count: usize) -> Option<u16> {
     None
 }
 
+/// Start a server, re-reserving when the *port* was taken between probe and `bind`.
+///
+/// `free_port_run` binds a range, releases it, and the server binds it a moment later. Nothing can
+/// hold that range across the gap: this workspace's integration tests are separate processes, each
+/// probing ports the same way, so a probe result is a hint rather than a reservation. On
+/// `macos-latest` the kernel hands out the most recently released port first, which turns the gap
+/// into a repeatable collision instead of a rare one -- `a_missing_script_is_an_error_response_not
+/// _a_hang` failed there at `the server started` while the same code was green on Linux.
+///
+/// The retry is narrow: only when the server did not come up, a fresh range each time, and ten
+/// failures panic naming the port. That is deliberately not "retry until green" -- a real
+/// misconfiguration still fails, and it fails on the port rather than on a timeout.
+fn start_server_on_a_free_port(
+    binary: &Path,
+    php_cgi: &Path,
+    root: &Path,
+    workers: u32,
+) -> Option<Server> {
+    let mut tried = Vec::new();
+    for _ in 0..10 {
+        let base_port = free_port_run((workers + 1) as usize)?;
+        tried.push(base_port);
+        if let Some(server) = start_server(binary, php_cgi, root, workers, base_port) {
+            return Some(server);
+        }
+    }
+    panic!("the server did not start on any of ten reserved ports: {tried:?}");
+}
+
 /// A `volucer serve` process that is killed when the test ends.
 struct Server {
     child: Child,
@@ -829,11 +858,6 @@ fn serve_answers_a_fastcgi_request_from_a_real_php_process() {
         eprintln!("skipping: no php-cgi on PATH");
         return;
     };
-    let Some(base_port) = free_port_run(2) else {
-        eprintln!("skipping: no run of two free ports");
-        return;
-    };
-
     let root = std::env::temp_dir().join(format!("volucer-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
@@ -848,7 +872,8 @@ echo "BODY=", file_get_contents('php://input');
     )
     .expect("write the front controller");
 
-    let server = start_server(&binary, &php_cgi, &root, 2, base_port).expect("the server started");
+    let server =
+        start_server_on_a_free_port(&binary, &php_cgi, &root, 2).expect("the server started");
     assert!(!server.address.is_empty());
 
     let body = b"hello-body";
@@ -886,11 +911,6 @@ fn serve_keeps_serving_across_several_requests() {
         eprintln!("skipping: no php-cgi on PATH");
         return;
     };
-    let Some(base_port) = free_port_run(2) else {
-        eprintln!("skipping: no run of two free ports");
-        return;
-    };
-
     let root = std::env::temp_dir().join(format!("volucer-smoke-many-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
@@ -900,7 +920,8 @@ fn serve_keeps_serving_across_several_requests() {
     )
     .expect("write the front controller");
 
-    let server = start_server(&binary, &php_cgi, &root, 2, base_port).expect("the server started");
+    let server =
+        start_server_on_a_free_port(&binary, &php_cgi, &root, 2).expect("the server started");
 
     for index in 0..6 {
         let body = format!("req{index}");
@@ -927,17 +948,13 @@ fn the_nginx_get_values_probe_is_answered_without_ending_the_connection() {
         eprintln!("skipping: no php-cgi on PATH");
         return;
     };
-    let Some(base_port) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
-        return;
-    };
-
     let root = std::env::temp_dir().join(format!("volucer-smoke-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
     std::fs::write(root.join("index.php"), r#"<?php echo "OK";"#).expect("write the script");
 
-    let server = start_server(&binary, &php_cgi, &root, 1, base_port).expect("the server started");
+    let server =
+        start_server_on_a_free_port(&binary, &php_cgi, &root, 1).expect("the server started");
 
     // This is exactly what nginx does before deciding to use a FastCGI server.
     let mut stream = TcpStream::connect(&server.address).expect("connect");
@@ -1014,16 +1031,12 @@ fn a_missing_script_is_an_error_response_not_a_hang() {
         eprintln!("skipping: no php-cgi on PATH");
         return;
     };
-    let Some(base_port) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
-        return;
-    };
-
     let root = std::env::temp_dir().join(format!("volucer-smoke-missing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
 
-    let server = start_server(&binary, &php_cgi, &root, 1, base_port).expect("the server started");
+    let server =
+        start_server_on_a_free_port(&binary, &php_cgi, &root, 1).expect("the server started");
 
     // No front controller exists in this root, so PHP cannot find the script.
     let params = params_for(&root, "/nope.php", 0);
