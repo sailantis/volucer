@@ -300,7 +300,20 @@ fn building_request_info_is_a_small_share_of_the_translation() {
         200_000
     };
 
-    let measure = |extra: usize| -> (f64, f64, f64) {
+    // Repeated, and the **minimum** taken, which is the standard answer to timing noise and
+    // the reason the assertion below used to fail on CI. A descheduled thread makes an
+    // interval *longer*, never shorter, so the fastest of several repetitions is the closest
+    // estimate of the code's own cost. `macos-latest` reported the halves 1,761 ns larger
+    // than the whole they are part of -- a 9% discrepancy between two intervals that cannot
+    // genuinely disagree that much, because a shared runner paused the thread between them.
+    //
+    // The three intervals are kept separate rather than interleaved into one loop: this file
+    // records measurements, and two `Instant::now()` calls per iteration inside the hot path
+    // would perturb the numbers it exists to report. Taking the minimum per interval costs
+    // the repetitions and nothing else.
+    const REPETITIONS: u32 = 3;
+
+    let once = |extra: usize| -> (f64, f64, f64) {
         let parts = parts(extra);
         for _ in 0..200 {
             std::hint::black_box(
@@ -332,6 +345,15 @@ fn building_request_info_is_a_small_share_of_the_translation() {
         (info_ns, env_ns, total_ns)
     };
 
+    let measure = |extra: usize| -> (f64, f64, f64) {
+        let mut best = once(extra);
+        for _ in 1..REPETITIONS {
+            let run = once(extra);
+            best = (best.0.min(run.0), best.1.min(run.1), best.2.min(run.2));
+        }
+        best
+    };
+
     let (info_few, env_few, total_few) = measure(0);
     let (info_many, env_many, total_many) = measure(REALISTIC_HEADERS);
     let few = BROWSER_HEADERS;
@@ -350,9 +372,27 @@ fn building_request_info_is_a_small_share_of_the_translation() {
     );
     println!("RequestInfo grows by {per_header:.0} ns per header, four allocations");
 
+    // The halves and the whole are now measured in the same pass, so this is a property of
+    // the code rather than of scheduling. It still needs a tolerance, because the halves do
+    // not literally sum: `to_cgi` builds the `RequestInfo` *and* the environment in one call
+    // and shares work between them, so the parts are an upper bound on the whole rather than
+    // an identity.
+    //
+    // The tolerance is **5%**, not the 500 ns it was. On a shared `macos-latest` runner the
+    // fixed 500 ns was smaller than the noise: the failure that prompted this reported the
+    // halves 1,761 ns *above* the whole, a 9% discrepancy between two intervals that cannot
+    // genuinely disagree that much. A percentage moves with the measurement; a fixed number is
+    // fine on a quiet machine and arbitrary on a busy one. It stays tight enough to catch the
+    // regression it exists for -- a `to_cgi` that started copying the body or re-walking the
+    // headers would be a large multiple, not a few percent.
+    let within_noise = |halves: f64, whole: f64| halves <= whole * 1.05;
     assert!(
-        info_few + env_few <= total_few + 500.0 && info_many + env_many <= total_many + 500.0,
-        "the two halves must not exceed the whole by more than noise"
+        within_noise(info_few + env_few, total_few)
+            && within_noise(info_many + env_many, total_many),
+        "the two halves must not exceed the whole by more than 5%: \
+         {:.0} vs {total_few:.0} ns, {:.0} vs {total_many:.0} ns",
+        info_few + env_few,
+        info_many + env_many
     );
 
     // A sanity floor on the measurement itself: if these were near zero the optimiser would have

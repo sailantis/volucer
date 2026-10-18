@@ -1063,8 +1063,26 @@ mod tests {
     ///
     /// Deliberately not a `worker` backend: the worker pool starts real processes
     /// in `from_config`, and these tests are about routing, not supervision.
+    ///
+    /// The bind is retried, because binding `:0` is not guaranteed to succeed on a loaded
+    /// machine: this suite runs beside the `spawn_cgi` tests, which start real `php-cgi`
+    /// processes and hold ports, and Windows and macOS both fail an ephemeral bind under
+    /// momentary exhaustion of the dynamic range. A single attempt made this file flaky in
+    /// exactly that way -- `bind a probe port` -- while passing in isolation. Nothing is
+    /// being asserted about the port, only that *some* port was free a moment ago, so
+    /// asking again is the truthful thing to do.
     fn unreachable_backend() -> BackendConfig {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
+        let mut listener = None;
+        for _ in 0..20 {
+            match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        }
+        let listener = listener.expect("bind a probe port after 20 attempts");
         let socket = listener.local_addr().expect("address").to_string();
         drop(listener);
         BackendConfig::External(ExternalConfig { socket })

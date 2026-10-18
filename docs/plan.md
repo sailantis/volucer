@@ -4775,6 +4775,41 @@ blindness: the macOS predicate could not be true, and the Linux race could not b
 Neither is visible from one machine — and note that `fmt`, `clippy` and `cargo package` were all run
 locally first and passed, so the local runs were not what caught this.
 
+**The port race was three races wearing one symptom, and the third one was in the server.** After the
+two test-side fixes the macOS jobs still failed, on a *different* test each run — `a_proxy_trust…`,
+then `a_reload_picks_up_a_renewed…`, then `a_missing_script_is_an_error_response_not_a_hang`, then
+`building_request_info_is_a_small_share…`. A rotating victim is the signature of contention rather
+than of a bug in any one of them, and the right response was to stop patching tests:
+
+- **`CgiPool::start` probed a port with `port_is_free` and then handed it to `php-cgi`, which binds
+  it itself.** The probe binds and drops, so between the two calls the port is free for anything to
+  take — including another test process doing the same thing. `wait_until_listening` treats a child
+  that exited as `StartupExited` and returns immediately, so one lost bind failed the pool and the
+  server printed no banner. Fixed in the **product**, not the test: `spawn_port_slot` retries on
+  `StartupExited` only, because that error means the bind failed and a different port is the fix.
+  A child still running but never accepting is a real misconfiguration and is returned unchanged, so
+  a broken deployment cannot be retried into slowness. Verified both ways with a wrapper that fails
+  its first bind (recovers) and one that always fails (still fails, *keeping php-cgi's own message*
+  rather than being relabelled as a port problem). This is the one fix here that also matters in
+  production, where the same probe-then-bind gap exists at startup.
+- **`unreachable_backend()` in `dispatch.rs`** bound `:0` once and `expect`ed it. Under the
+  `spawn_cgi` suites — real `php-cgi` processes holding ports — an ephemeral bind can fail from
+  momentary exhaustion. Nothing is asserted about the port, so it now asks again up to 20 times.
+- **The proxy test was the last `free_port_run` site without a retry**, and it could not borrow
+  `start_server_on_a_free_port` because its `base_port` lives *inside* the config file. Hence
+  `start_server_with_config`, which takes a closure so a fresh port means a fresh file.
+
+**And the timing test failed for a reason that was a genuine defect in the test.** `to_cgi_allocations`
+measured the whole and its two halves in three separate intervals and asserted they agreed within
+500 ns. On a shared runner they disagreed by 1,761 ns — 9% — which is a paused thread, not a slow
+function. Fixed by taking the **minimum of three repetitions** of each interval (a descheduled thread
+only ever makes an interval longer, so the minimum is the closest estimate of the code's own cost)
+and by making the tolerance a **percentage** (5%), since a fixed number is arbitrary on a busy
+machine. Deliberately *not* by interleaving the three into one loop with timers inside it: this file
+exists to report honest measurements, and two `Instant::now()` calls per iteration in the hot path
+would perturb the numbers it documents. The assertion was re-falsified at a 0.5× bound and still
+fails, so it has teeth rather than merely a wider tolerance.
+
 ### What the live Pebble run established, and where it stopped
 
 `acme-verify`'s plan asked for offline issuance against **Pebble**. Pebble was built and run here

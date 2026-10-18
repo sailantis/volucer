@@ -30,6 +30,14 @@ use crate::lifecycle::{configure_command, LifecycleGuard};
 /// How long to wait for a slot to start accepting connections.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many ports to try when a slot loses the bind race during startup.
+///
+/// Only reached when php-cgi **exits**, which means it could not bind — see
+/// `CgiPool::spawn_port_slot`. Ten is enough to outlast a burst of probe-and-release
+/// from concurrent test processes without turning a genuinely broken binary into a
+/// slow failure: a real misconfiguration fails on the first attempt.
+const PORT_ATTEMPTS: usize = 10;
+
 /// Timeout for a single request to a slot.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -241,7 +249,10 @@ impl CgiPool {
                 }
                 None => {
                     // Skip ports that are already taken rather than failing the whole
-                    // pool: another service on 19001 should not stop startup.
+                    // pool: another service on 19001 should not stop startup. The
+                    // *probe* is only a hint — php-cgi binds the port itself a
+                    // moment later, so it can still lose it — which is what
+                    // `spawn_port_slot` handles.
                     while !port_is_free(&pool.bind_host, port) {
                         port = port
                             .checked_add(1)
@@ -250,14 +261,19 @@ impl CgiPool {
                                 reason: "ran out of ports while allocating slots".to_string(),
                             })?;
                     }
-                    let address = SlotAddress::Port(port);
+                    let port_to_try = port;
+                    // Advanced by one *before* the spawn, so a retry that loses this
+                    // port continues from the next free one rather than re-probing
+                    // the port it just lost.
                     port = port
                         .checked_add(1)
                         .ok_or_else(|| ServerError::Misconfigured {
                             backend: name.to_string(),
                             reason: "ran out of ports while allocating slots".to_string(),
                         })?;
-                    address
+                    let slot = pool.spawn_port_slot(port_to_try)?;
+                    pool.slots.push(Mutex::new(slot));
+                    continue;
                 }
             };
             let slot = pool.spawn_slot(&slot_address)?;
@@ -281,6 +297,70 @@ impl CgiPool {
     pub fn with_max_requests(mut self, max_requests: Option<u64>) -> Self {
         self.max_requests = max_requests.filter(|max| *max > 0);
         self
+    }
+
+    /// Spawn a slot on a port, retrying only when the port was lost to a race.
+    ///
+    /// `CgiPool::start` probes a port with `port_is_free` and then hands it to php-cgi,
+    /// which binds it itself a moment later. **Nothing can hold the port across that
+    /// gap**: the probe binds and immediately drops, so between the two calls the port
+    /// is free for anything else on the machine to take — including another test
+    /// process doing exactly this. On macOS the kernel hands the most recently released
+    /// port out first, which turns the gap into a repeatable collision rather than a
+    /// rare one, and it showed up as an intermittent `StartupExited` from php-cgi
+    /// (which exits non-zero when it cannot bind) and, from the outside, as a server
+    /// that printed no banner.
+    ///
+    /// The retry is narrow on purpose. A child that **exited** during startup failed to
+    /// bind, so a different port is the fix and the next one is already known. A child
+    /// that is still running but never accepted a connection is a real misconfiguration
+    /// — a wrong `-b`, a stuck interpreter — and is returned unchanged rather than
+    /// retried, so this cannot turn a broken deployment into a slow one.
+    ///
+    /// When every attempt has been used, the **last child's own error is returned**, not
+    /// a message about ports. A binary that is genuinely broken also exits, so it is
+    /// retried too — and reporting "could not bind a port in 10 attempts" for a missing
+    /// extension or a bad interpreter would replace the one diagnostic that names the
+    /// real cause with one that sends the operator looking at the network. Each retry is
+    /// a spawn that exits immediately, so the cost of being wrong here is small and the
+    /// message stays true.
+    fn spawn_port_slot(&self, first: u16) -> Result<Slot> {
+        let mut port = first;
+        let mut attempts = 0;
+        loop {
+            if !port_is_free(&self.bind_host, port) {
+                port = port
+                    .checked_add(1)
+                    .ok_or_else(|| ServerError::Misconfigured {
+                        backend: self.name.clone(),
+                        reason: "ran out of ports while allocating slots".to_string(),
+                    })?;
+                continue;
+            }
+            match self.spawn_slot(&SlotAddress::Port(port)) {
+                Ok(slot) => return Ok(slot),
+                // The child died before accepting: it lost the bind race.
+                Err(err @ ServerError::StartupExited { .. }) => {
+                    attempts += 1;
+                    if attempts >= PORT_ATTEMPTS {
+                        return Err(err);
+                    }
+                    tracing::debug!(
+                        backend = %self.name,
+                        port,
+                        attempt = attempts,
+                        "php-cgi exited while binding; trying the next port"
+                    );
+                    port = port
+                        .checked_add(1)
+                        .ok_or_else(|| ServerError::Misconfigured {
+                            backend: self.name.clone(),
+                            reason: "ran out of ports while allocating slots".to_string(),
+                        })?;
+                }
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     fn spawn_slot(&self, address: &SlotAddress) -> Result<Slot> {

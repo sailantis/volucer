@@ -125,6 +125,28 @@ fn start_server_on_a_free_port(
     panic!("the server did not start on any of ten reserved ports: {tried:?}");
 }
 
+/// Start a server from a configuration that has to be **written per attempt**.
+///
+/// `start_server_on_a_free_port` covers the common case, where the only thing that differs
+/// between retries is a port the caller already holds. A test whose configuration *contains*
+/// a `base_port` cannot use it — the port is inside the file, so a fresh range means a fresh
+/// file. Taking a closure is what lets the retry happen without duplicating the template at
+/// the call site, and the closure is free to reserve a new port each time it is called.
+fn start_server_with_config(
+    binary: &Path,
+    config_path: &Path,
+    config_for: &dyn Fn() -> String,
+    what: &str,
+) -> Server {
+    for _ in 0..10 {
+        std::fs::write(config_path, config_for()).expect("write the config");
+        if let Some(server) = Server::start(binary, config_path) {
+            return server;
+        }
+    }
+    panic!("the server did not start on any of ten reserved ports: {what}");
+}
+
 /// A `volucer serve` process that is killed when the test ends.
 struct Server {
     child: Child,
@@ -1994,10 +2016,16 @@ base_port = {port}
             "an untrusted peer's claim is ignored, however plausible it looks",
         ),
     ] {
-        std::fs::write(&config_path, config_for(trusted)).expect("write the config");
-        let Some(server) = Server::start(&binary, &config_path) else {
-            panic!("the server did not start with a proxy table of trusted={trusted}");
-        };
+        // The configuration names a `base_port` for the `php-cgi` pool, so it is rewritten on
+        // every attempt and a lost port costs a retry rather than the test. This was the one
+        // `free_port_run` call site left without a retry, and it failed on `macos-latest` with
+        // "the server did not start" while the same code was green elsewhere.
+        let server = start_server_with_config(
+            &binary,
+            &config_path,
+            &|| config_for(trusted),
+            &format!("a proxy table of trusted={trusted}"),
+        );
         let address = server
             .http_address
             .clone()
