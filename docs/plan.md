@@ -2199,31 +2199,44 @@ the workflow is the same one, but it finally has an output, so it stops being de
       outlives the request in a long-lived process, so a client arriving with no cookie inherits the
       *previous* client's session — which passes every test that sends no cookie.
 
-72. `framework-bridges` — a package per framework, and the work is per-framework state reset rather
-    than the protocol.
-    - **The protocol half is already written.** `sailantis/volucer-worker` is the SDK and
-      `example/worker.php` is a working worker; `azera-volucer`'s `VolucerHttpWorker` is the
-      reference shape — translate the request, run the framework's router and dispatcher, read the
-      response through its getters, then reset per-request state. A bridge is that class with a
-      different kernel underneath.
-    - **The acceptance criterion is the reset, not the routing.** PHP assumes a fresh process per
-      request; a worker breaks that assumption, and each framework repairs it differently. Symfony
-      reboots the kernel between requests; Laravel has Octane's application factory and its flush
-      listeners; Spiral was written for RoadRunner and fits closest. "It serves a request" is not
-      the bar — *two consecutive requests that must not see each other's state* is.
-    - **Laravel has a wall, and it should be recorded before anyone promises it.** Octane's
-      engine list is hardcoded in `StartCommand` (`match ($server) { 'swoole' => …, 'roadrunner' =>
-      …, 'frankenphp' => …, default => invalidServer(…) }`), so `--server=volucer` is an upstream
-      pull request, not something a package can add. The standalone-bridge path is what
-      `baldinof/roadrunner-bundle` did for Symfony — a third-party bundle needing no upstream
-      change — and the same is available here.
-    - **Candidate order by cost, not by popularity:** Spiral (closest fit), Symfony (a bundle, no
-      upstream change), Laravel (bridge now, upstream PR as a separate decision), then
-      Slim/Mezzio/custom PSR-15 (thin, and validates the SDK against a framework with no
-      boot-cost story to protect).
-    - **Verification is per bridge and behavioural:** the framework's own test that two requests do
-      not see each other's state, run *through the worker*; and the SDK's own tests unchanged, since
-      the SDK is what a bridge must not need to patch.
+72. `framework-bridges` — **done for Spiral, Symfony and Laravel.** A package per framework, and the
+    work is per-framework state reset rather than the protocol.
+    - **The protocol half was already written, and it held.** `sailantis/volucer-worker` is the SDK
+      and `azera-volucer`'s `VolucerHttpWorker` was the reference shape — translate the request,
+      run the framework, read the response through its getters, reset. **No bridge needed a change
+      to the SDK**, which was the step's own test: the SDK is what a bridge must not need to patch.
+    - **The acceptance criterion was the reset, and it was right.** Each bridge is verified the way
+      the step said: two consecutive requests through a real `volucer` binary with a real worker
+      process. That is what found the Laravel defect below, which no fixture could have.
+    - **What "reset" means turned out to be per-framework in a way the step did not predict**, and
+      the three answers are genuinely different rather than three spellings of one:
+      - **Spiral** has `runScope()`, which is the primitive the protocol asks for — everything the
+        framework creates inside a scope dies with it. The one thing that mattered and was not
+        obvious: the scope must be named **`http`**, because Spiral declares its HTTP services
+        `#[Scope('http')]` and `CurrentRequest` would otherwise resolve to the root's unset
+        instance while middleware read "the current request" as `null`.
+      - **Symfony** does not need a reboot: `handle()` builds and unwinds the `RequestStack`, so a
+        request-scoped listener is already isolated. What the framework does *not* reset is the
+        superglobals, which a few listeners read directly.
+      - **Laravel**'s answer lives in the container, not in Octane: **`forgetScopedInstances()`** is
+        exactly the per-request flush Octane performs, and it is what makes `scoped()` mean "per
+        request". `resolved()` is consequently the *wrong* probe for whether it ran — it clears the
+        instances, not the bindings — which is why the assertion drives two requests instead.
+    - **Laravel's wall held, and the bridge is the way round it.** Octane's engine list is hardcoded
+      in `StartCommand`, so `--server=volucer` is an upstream pull request. The standalone bridge is
+      what `baldinof/roadrunner-bundle` did for Symfony, and it needed no framework change.
+    - **A defect the tests found rather than the reading**: `Request::createFromBase()` re-parses
+      **only JSON**, because under a SAPI `$_POST` is already populated by PHP. So a form body has
+      to be carried across explicitly or every controller reads "the client sent nothing" — and the
+      first version of the carry-across replaced the request bag unconditionally, which broke the
+      JSON case in turn. Both directions are now asserted.
+    - **`multipart/form-data` is deliberately not parsed by any of the three.** The server has
+      consumed the request, so the boundary is the only thing left, and a truncated set of files is
+      worse than none — an application cannot tell it from "the client sent nothing". Uploads want
+      `upstream`, and the three READMEs say so rather than leaving it to be discovered.
+    - **Not attempted: Slim/Mezzio/custom PSR-15.** It is the cheapest of the four and would
+      validate the SDK against a framework with no boot-cost story to protect, which is exactly why
+      it can wait: it has nothing to prove that the three above did not.
 
 **What this phase does not do.** No PHP extension (FrankenPHP's model, priced by hazard 53 and
 rejected for isolation). No multiplexed FastCGI — the specification has it (§1: *"the protocol
