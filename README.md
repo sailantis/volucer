@@ -1498,8 +1498,21 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/sailantis/volucer/
 
 Both resolve the newest tag, fetch the archive for this platform, **verify its SHA-256 before
 extracting anything**, and install to `~/.local/bin` (`$env:LOCALAPPDATA\volucer\bin` on Windows).
-They need `curl` or `wget` and `tar` ? all three are present on a stock macOS, on any glibc Linux
-and in Git Bash ? and nothing else. No Rust, no PHP, no Python, no Ruby, no `sudo`.
+They need `curl` or `wget` and `tar` — all three are present on a stock macOS, on any glibc Linux
+and in Git Bash — and nothing else. No Rust, no PHP, no Python, no Ruby, no `sudo`.
+
+Neither script takes arguments in the one-liner, because `curl | sh` and `irm | iex` cannot pass
+any. They read the environment instead, and both read the **same names**, so the two halves cannot
+drift apart: `VOLUCER_VERSION` (a tag, instead of the newest release), `VOLUCER_INSTALL_DIR`,
+`VOLUCER_FORCE=1` (replace an existing binary), `VOLUCER_DOWNLOAD_URL` (a mirror, GitHub
+Enterprise, or an air-gapped host), and `VOLUCER_API` (the release API root). The shell script also
+honours `VOLUCER_LIBC` and `VOLUCER_ARCH`; `install.ps1` takes `-InstallDir` and the rest as
+parameters too, and a parameter wins over the variable of the same name.
+
+Git Bash is refused **by name** rather than quietly given a Linux build. It reports
+`MINGW64_NT-…` as its system, and a glibc binary placed there fails with
+`cannot execute binary file: Exec format error` — a message that points at the download rather than
+at the shell it was installed for. On Windows, run the PowerShell line.
 
 That is deliberately **not** `cargo install volucer`, which needs a Rust toolchain and a C toolchain,
 NASM and CMake for `aws-lc-sys`, and compiles for a minute. It is also deliberately not a

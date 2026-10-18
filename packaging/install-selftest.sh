@@ -359,6 +359,28 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
             sed 's/^/      /' "${work}/out-ps-corrupt.txt" >&2
         fi
 
+        # The documented one-liner is `irm ... | iex`, which cannot pass a single parameter, so
+        # environment variables are the *only* way to redirect it -- and every case above passes
+        # `-InstallDir` explicitly, which is precisely why none of them noticed that
+        # `VOLUCER_INSTALL_DIR` was ignored. The shell installer reads these names, so the
+        # PowerShell one has to agree about them or the two disagree silently.
+        if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Stop'
+            \$env:VOLUCER_VERSION = '${tag}'
+            \$env:VOLUCER_INSTALL_DIR = '${work_win}/ps-env'
+            \$env:VOLUCER_DOWNLOAD_URL = '${base_url}'
+            & '${script_win}'
+            if (-not (Test-Path (Join-Path '${work_win}/ps-env' 'volucer.exe'))) {
+                Write-Error 'VOLUCER_INSTALL_DIR was ignored'
+                exit 1
+            }
+        " >"${work}/out-ps-env.txt" 2>&1; then
+            check ok 'install.ps1 honours VOLUCER_INSTALL_DIR, which is all a one-liner can set'
+        else
+            check fail 'install.ps1 ignored the environment variables a one-liner has to use'
+            sed 's/^/      /' "${work}/out-ps-env.txt" >&2
+        fi
+
         if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Stop'
             & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-overwrite' -BaseUrl '${base_url}'

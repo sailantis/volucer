@@ -111,6 +111,19 @@ Write-Note "asset   $asset"
 
 # ------------------------------------------------------------------- install
 
+# Environment variables are the only way to configure the documented one-liner:
+# `irm ... | iex` cannot pass parameters, so a `-InstallDir` there is unreachable. The shell
+# installer reads these names, and two installers that disagree about how to say "put it here" are
+# worse than one, so the parameters stay the PowerShell-native spelling and the variables are an
+# equivalent way in. A parameter wins, because it is the more explicit of the two -- which is why
+# these are applied *before* the defaults below, not after.
+if (-not $Version -and $env:VOLUCER_VERSION) { $Version = $env:VOLUCER_VERSION }
+if (-not $InstallDir -and $env:VOLUCER_INSTALL_DIR) { $InstallDir = $env:VOLUCER_INSTALL_DIR }
+if (-not $Force -and $env:VOLUCER_FORCE) { $Force = $true }
+if (-not $PSBoundParameters.ContainsKey('BaseUrl') -and $env:VOLUCER_DOWNLOAD_URL) {
+    $BaseUrl = $env:VOLUCER_DOWNLOAD_URL
+}
+
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "$App\bin"
 }
