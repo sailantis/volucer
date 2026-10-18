@@ -597,10 +597,6 @@ mod tests {
         }
     }
 
-    /// A listener that accepts one connection and holds it, so the readiness probe succeeds.
-    ///
-    /// The probe connects and drops, so a program that accepts and keeps listening is enough; a
-    /// `gunicorn` is exactly this with more work in between.
     /// The interpreter to start an HTTP origin with, or `None` when the machine has none that works.
     ///
     /// **Two bugs are fixed by this one function, and the second was only visible on Windows.** The
@@ -636,8 +632,33 @@ mod tests {
     /// to succeed. Chosen over a shell trick because it has no quoting to get wrong and because a
     /// *real* server is what this test is about — a supervisor that starts a command and waits for it
     /// to answer needs a command that behaves like the thing a deployment would name.
+    /// A listener that accepts connections and answers, so the readiness probe succeeds.
+    ///
+    /// **Not `python -m http.server`, which loses a race with the probe.** `HTTPServer.server_bind`
+    /// binds and *then* calls `socket.getfqdn(host)` before `server_activate()` gets to `listen()`
+    /// (`socketserver.TCPServer.__init__` -> `server_bind()` -> `server_activate()`). On macOS that
+    /// lookup goes through mDNSResponder and takes seconds, so for that window the port is bound but
+    /// refusing connections: every `connect()` in the readiness loop fails and the supervisor reports
+    /// `StartupTimeout` for an origin that was about to be ready. It was macOS-only and intermittent,
+    /// which is how it read in CI: one red run in four, only on the runner with a slow resolver.
+    ///
+    /// This fixture inverts that order: `listen()` is the first thing it does, and the name lookup
+    /// `http.server` would have done is never performed. It still exercises everything the test is
+    /// about (spawn a command, poll a process, probe an address, kill it on shutdown), because the
+    /// probe only ever needed a TCP connection. What it stops measuring is macOS's resolver.
     fn listener_command(interpreter: &str, port: u16) -> String {
-        format!("{interpreter} -m http.server {port} --bind 127.0.0.1")
+        let bind = format!("s.bind(('127.0.0.1', {port}))");
+        let script = [
+            "import socket, time".to_string(),
+            "s = socket.socket()".to_string(),
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)".to_string(),
+            bind,
+            "s.listen(8)".to_string(),
+            "time.sleep(30)".to_string(),
+        ]
+        .join("; ");
+
+        format!("{interpreter} -c \"{script}\"")
     }
 
     fn free_port() -> u16 {
