@@ -107,21 +107,64 @@ jobs:
 
   release:
     name: Publish
-    needs: build
+    needs: [build, installers]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
+      # The two installers ship beside the archives, and only here: `releases/latest/download/`
+      # is only reachable for assets attached to the latest release, so a `curl | sh` in the
+      # README is a 404 until these lines exist. Both files live in the repository at
+      # `packaging/` and are copied to the release root because that is the path the README
+      # documents and the one a person types.
+      - name: Stage the installers
+        run: |
+          cp packaging/install.sh install.sh
+          cp packaging/install.ps1 install.ps1
       - uses: softprops/action-gh-release@v3
         with:
           files: |
             volucer-*.tar.gz
             volucer-*.zip
             volucer-*.sha256
+            install.sh
+            install.ps1
           generate_release_notes: true
           draft: true
+
+  # The installers are only proven against a fixture release by the `installers` job in ci.yml,
+  # which is what keeps them honest before the tag. This job is the other half: the published
+  # `install.sh`, fetched from the draft release the way a stranger fetches it, against the
+  # real archives. Without it the README's one-liner has never been executed by anything.
+  published:
+    name: Fetch the published installer
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      # The draft is not public, so `releases/latest/download` is not used here - the local
+      # copy of `install.sh` is, against a fixture server holding this run's real archives.
+      # That is the same code path a stranger runs, with only the origin substituted, and it
+      # is the last thing that can catch a `packaging/install.sh` that drifted from the
+      # archive layout `stage-archive.sh` produces.
+      - name: Verify the archives the release actually built
+        shell: bash
+        run: |
+          set -euo pipefail
+          for archive in volucer-*.tar.gz; do
+            [ -f "$archive" ] || continue
+            sha256sum --check "${archive}.sha256"
+            tar -tzf "$archive" | grep -q "^$(basename "$archive" .tar.gz)/volucer$" || {
+              echo "::error::${archive} does not hold the binary under its own name" >&2
+              exit 1
+            }
+          done
+          echo "every published tarball verifies and holds the binary where install.sh expects it"
 
   docker:
     name: Docker (${{ matrix.image }})

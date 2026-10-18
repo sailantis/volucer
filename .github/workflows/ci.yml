@@ -102,6 +102,52 @@ jobs:
           VOLUCER_SDK_DIR: ${{ github.workspace }}/volucer-php-sdk
         run: cargo test --workspace
 
+  # The installers are the first thing an operator runs and the last thing anyone tests, and both
+  # of them are shell scripts with a security property: verify before extracting. A `curl | sh`
+  # that has never executed is a script that fails on a stranger's machine, in a shell nobody here
+  # has. This runs them against a fixture release on every platform, including the negative cases,
+  # because an installer that accepts a corrupted archive is worse than no installer at all.
+  installers:
+    name: Installers (${{ matrix.os }})
+    needs: [fmt, clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+      # A debug build rather than `--release`: the binary only has to run `version` and `--help`,
+      # and compiling the release profile three more times to prove a shell script extracts a
+      # tarball is minutes spent on nothing this job is about.
+      - name: Build
+        run: cargo build -p volucer
+      - name: Run the installer checks
+        shell: bash
+        env:
+          BIN: target/debug/volucer${{ runner.os == 'Windows' && '.exe' || '' }}
+          SELFTEST_ARCHIVE: ${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}
+          # `sh` is `dash` on Ubuntu and `bash` on macOS. The installer claims to be POSIX `sh`,
+          # so it is run under dash explicitly on Linux rather than under whichever shell the
+          # runner happens to link.
+          VOLUCER_SH: ${{ runner.os == 'Linux' && 'dash' || 'sh' }}
+        run: bash packaging/install-selftest.sh "$BIN"
+
   # A published crate cannot depend on a version that is not on crates.io yet, so the publish
   # order is forced and a mistake in it is invisible until release day.
   package:

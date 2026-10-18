@@ -2259,6 +2259,39 @@ the workflow is the same one, but it finally has an output, so it stops being de
       the end-to-end test caught it. Hazards 82–84.
     - **Not chosen: a PHP extension.** FrankenPHP's model embeds PHP in the server, which is the
       design hazard 53 priced and this project rejected on grounds of isolation.
+    - **The gap this left, found later: the only installer required PHP.** `volucer-cli` is a
+      Composer package, so installing volucer needed the one runtime whose users are a third of
+      them — and steps 37 and 73 had just added Python and Ruby workers, for whom a `composer
+      require` is not an option. `packaging/install.sh` and `packaging/install.ps1` close it: the
+      same two decisions (resolve the tag, verify the SHA-256 **before** extracting), in the two
+      shells the platforms already have, needing `curl` or `wget` and `tar` and nothing else.
+      `sudo` is not needed and neither is a Rust toolchain, which `cargo install volucer` would
+      demand along with NASM and CMake for `aws-lc-rs`.
+    - **`cargo-dist` was the obvious candidate and was rejected on evidence, not taste.** It
+      produces shell and PowerShell installers, and it takes over `release.yml` and **renames the
+      archives to drop the version** from the asset name (`{repo}/releases/download/{tag}/
+      {app}-{target}.tar.gz`). Every `volucer-cli` asset name, `Target::assetName()`, its
+      six-name assertion and `stage-archive.sh` assume `volucer-<version>-<target>` — so
+      adopting it is a coordinated rename across two repositories plus the documented URLs, to
+      replace ~150 lines that carry a checksum guarantee `cargo-dist`'s installers do not.
+      **`binstaller` was checked too and generates `install.sh` only** — no PowerShell — so it
+      solves the platform whose users already have Composer and not the one that does not.
+    - **`install.ps1` is written for Windows PowerShell 5.1**, the version Windows ships, not for
+      `pwsh` 7. That rules out `??`, `-AsHashtable` and `Invoke-RestMethod` without
+      `-UseBasicParsing`, so those spellings are avoided rather than detected.
+    - **Both scripts are tested against a fixture release over HTTP, and that surfaced two things
+      the code had wrong.** `--proto '=https'` is what stops a redirect downgrading the download,
+      so it is kept for the default origin — but it also made `VOLUCER_DOWNLOAD_URL` useless for
+      the one case the override exists for, so the allowed protocols now follow the URL's scheme.
+      And `install.sh` was written with CRLF line endings on this machine despite `.gitattributes`
+      covering `*.sh`, which produced `set: Illegal option -` — a failure whose message names a
+      builtin rather than a line ending. `*.ps1` is now declared `eol=crlf` in `.gitattributes`,
+      because PowerShell is the one script here that Windows runs.
+    - **Every refusal is falsified rather than asserted.** Disabling the checksum comparison made
+      the corrupted-archive case fail *at extraction* (`gzip: stdin: unexpected end of file`) and
+      the check caught that it was the wrong reason — which is the distinction a "the command
+      failed" assertion cannot make. The same for `install.ps1`, where the fallthrough error is
+      `the archive does not contain volucer.exe`.
 
 71. `sdk-session-helper` — **done.** `Volucer\Session` in `sailantis/volucer-worker` now owns the
     session handoff, and `docs/worker-protocol.md` points at the SDK instead of at a framework.

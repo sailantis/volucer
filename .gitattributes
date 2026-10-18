@@ -8,5 +8,10 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 
+# PowerShell is the one script here that Windows runs, so it is the one script that may keep
+# CRLF. Declared rather than left to `core.autocrlf`, because an installer with LF-only line
+# endings is rejected by some Windows hosts on the first line.
+*.ps1 text eol=crlf
+
 # The Dockerfile's `RUN` lines are shell too.
 Dockerfile text eol=lf
