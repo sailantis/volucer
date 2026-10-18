@@ -2211,10 +2211,10 @@ the workflow is the same one, but it finally has an output, so it stops being de
       development loop could not have (one a genuine macOS bug, one a port race). Hazard 75.
       The release path is written but has never run, because it needs a tag.
 
-70. `volucer-cli-package` — **done**, and the built thing differs from this step in four verified
-    details. `sailantis/volucer-cli` (31 files, 223 assertions) resolves the archive for this
-    platform, fetches it to a temporary file, verifies the release's own SHA-256 **before
-    extracting**, and moves the binary into place last.
+70. `volucer-cli-package` — **done, and then retired.** The Composer downloader was built and
+    verified (31 files, 223 assertions) and superseded by `packaging/install.sh` and
+    `packaging/install.ps1`; the reasoning is below, kept because the four details it records
+    were each found by reading code rather than documentation.
     - **What `composer require spiral/roadrunner` actually does, verified rather than assumed:**
       nothing. The `composer.json` at that repository's root is `"type": "metapackage"` with no
       `require`, no `bin` and no `autoload` — `composer require` downloads metadata and not one byte
@@ -2292,6 +2292,19 @@ the workflow is the same one, but it finally has an output, so it stops being de
       the check caught that it was the wrong reason — which is the distinction a "the command
       failed" assertion cannot make. The same for `install.ps1`, where the fallthrough error is
       `the archive does not contain volucer.exe`.
+
+    - **Retired once the scripts existed, and the reason is redundancy rather than distaste.**
+      `volucer-cli` had exactly two commands, `install` and `get-binary`, and all fifteen of its
+      source files were download plumbing — transport, tar reader, checksum, target detection.
+      It had no other function to contribute, so there was nothing to fold into the server binary.
+      And a self-updater in the binary could not have replaced it anyway: it only reaches someone
+      who already has the binary, which is the bootstrap the scripts solve and it does not.
+      Measured before deciding: `tar` + `flate2` + `zip` is 26–33 crates in a standalone project,
+      against 259 in the workspace, and it would make the *server* the thing parsing untrusted
+      archives — a worse place for that boundary than the shell scripts, which call the system
+      `tar` and verify the SHA-256 **before** extracting. So the Composer path is gone: the
+      scripts need `curl` or `wget` and `tar`, which every target platform already has, and PHP
+      supplies neither of them.
 
 71. `sdk-session-helper` — **done.** `Volucer\Session` in `sailantis/volucer-worker` now owns the
     session handoff, and `docs/worker-protocol.md` points at the SDK instead of at a framework.
@@ -2854,11 +2867,10 @@ reading out of a crate description.
 | observability: a hostile header cannot write this log line | **works** | `a_header_cannot_forge_a_log_record_or_shift_a_field` — a `User-Agent` containing a newline, quotes, a backslash and spaces. The count of fields is the assertion that catches it; every positional assertion passed while the line had 31 fields. Hazard 79 |
 | observability: off by default changes nothing | **works** | `no_access_log_config_means_no_log_file_and_no_id_header` — no file created, and no `x-request-id` on the response, because a deployment that did not ask must not have an id appear on its answers. The unit control is `a_plaintext_deployment_is_unchanged_by_any_of_this`, which pins `access_log` absent alongside `tls` and `https` |
 | observability: the trace is continued, not replaced | **works** | `an_inbound_trace_is_continued_and_a_missing_one_starts_unsampled` — the client's trace id is kept, this hop's span id is new, its sampling flag is respected, and a request with no `traceparent` starts **unsampled** rather than claiming to be recorded |
-| Composer: the package **installs** and its proxy runs | **works** | `sailantis/volucer-cli`'s `Install (as a user would)` job: `composer require` into a fresh project against a path repository, then run `vendor/bin/volucer-cli`. This is the half a passing unit suite cannot see — the local suite calls the classes directly and requires `autoload.php` by hand, so it would pass with a wrong `bin` entry or no PSR-4 mapping at all |
-| Composer: the archive the downloader asks for is the one the release builds | **works** | six asset names asserted against `release.yml`'s matrix, so a downloader that stops matching the releases it installs fails the suite instead of failing in the field |
-| Composer: the tool and the binary cannot overwrite each other | **works** | the `vendor/bin/volucer` assertion. Composer proxies a `bin` entry under its own name, so a shared name would have the download replace its own proxy and the next run execute the *server* with `get-binary` as an argument |
-| Composer: a corrupt download installs nothing | **works** | `EndToEndTest` flips one byte of a real archive and leaves the stored checksum alone: exit 1, "checksum mismatch", no binary, and **no temporary file left behind**. Falsified by removing the verification, which installs the corrupt archive — so this is the only thing between a hostile download and an operator's filesystem |
-| Composer: the fallback transport is not just written | **works** | `TransportTest` runs curl **and** the stream wrapper against one fixture server, asserting the status for a 200, a 404, a 500 and a redirect on both. `StreamTransport` reported every status as `0` — `$http_response_header` is a local of the scope that made the request — which would have broken the tool on exactly the hosts that have no curl. Hazard 83 |
+| Installing without a runtime: the script installs the release it is pointed at | **works** | `packaging/install-selftest.sh`, which CI runs on Linux, macOS and Windows: a fixture release built by `stage-archive.sh`, served over HTTP, installed by the shipping `install.sh`/`install.ps1`. The assertion that matters is that the binary which lands is the one the fixture built, not merely that a command exited 0 |
+| Installing without a runtime: every refusal, falsified | **works** | a corrupted archive, a missing checksum, an existing binary and a missing musl build are each refused, and each guard was disabled to confirm the check then fails — disabling the checksum fails *at extraction* (`gzip: stdin: unexpected end of file`), and the check catches that it is the wrong reason |
+| Installing without a runtime: the release's own installer, not the checkout's | **works** | `release.yml`'s `install` job fetches `install.sh` **from the published release**, serves that run's real archives over HTTP, installs, and `cmp`s the result against the binary extracted from the tarball. `ci.yml` proves the fixture; this proves the copy a stranger's `curl \| sh` actually reaches |
+| Installing without a runtime: no runtime is needed | **works** | the scripts use `curl`/`wget`, `tar` and a POSIX shell, and `install.sh` is exercised under `dash` in CI rather than only `bash`. No PHP, Python, Ruby or Rust is required, which is the whole point: volucer serves all three runtimes and PHP was previously the only installer |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
