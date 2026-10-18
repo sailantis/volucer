@@ -5053,70 +5053,61 @@ local pass says nothing about it.** Same hazard as `/proc`-is-not-Unix (hazard 7
 asserted on one platform and reported as a pass everywhere. The fix was reproduced in WSL before it
 was pushed, so it was verified where it failed rather than inferred from where it passed.
 
-### Hazard 85 — the static layer is on by default, and on a front-controller application it costs 14–26%
 
-The static-file layer became default-on after the published build (`b9d34c4`, 2026-10-14). Its
-own doc comment says the reason: "every site has assets, and making each one ask for its own was
-a line that said nothing." For a site that serves files, that is right. For a front-controller
-application it is **not** free, because the layer is consulted before the route is dispatched —
-and `respond()` returns `None` only after it has decided there is no file.
+### Hazard 85 — the static layer is on by default, and on a front-controller application it costs 4–6 µs per request
 
-That decision is not a `stat` on the runtime thread. It is `tokio::task::spawn_blocking`, one
-hop to the blocking pool and back, per request, to discover there is no file:
+The static-file layer became default-on after the published build (`b9d34c4`, 2026-10-14). Its own
+doc comment gives the reason: "every site has assets, and making each one ask for its own was a
+line that said nothing." For a site that serves files, that is right. For a front-controller
+application it is not free, because the layer is consulted before the route is dispatched and
+`respond()` returns `None` only after it has decided there is no file — through
+`tokio::task::spawn_blocking`, one hop to the blocking pool and back, per request.
 
-```rust
-tokio::task::spawn_blocking(move || plan(&owned, &files)).await
-```
+Measured on the competition VM (12 cores, 3,884 MB, PHP 8.3.35, 12 workers). Four arms interleaved
+inside nine rotating rounds, both endpoints, 288 cells, none failed. Every figure is a within-round
+ratio, so host drift charges every arm equally:
 
-Measured on the competition VM (12 cores, 3,884 MB, PHP 8.3.35, 12 workers, `GET /items`, the
-ORM-and-template page that boots the framework once). Four arms interleaved inside nine rotating
-rounds, 288 cells, none failed, every figure a within-round ratio so host drift charges every arm
-equally:
+| concurrency | `/` current vs `91cc7b6` | `/items` current vs `91cc7b6` | layer off (`/`) | layer off (`/items`) | new code only (`/`) | new code only (`/items`) |
+|---|---|---|---|---|---|---|
+| 1 | **−4.3%** | +13.3% | **+22.0%** | +14.1% | +16.2% | +29.3% |
+| 8 | **−13.0%** | +8.6% | **+17.6%** | +13.9% | +2.1% | +22.6% |
+| 16 | **−18.3%** | −2.0% | **+23.1%** | +13.3% | −0.6% | +8.8% |
+| 32 | **−12.3%** | +10.7% | **+26.1%** | +6.8% | +10.2% | +19.1% |
 
-| concurrency | everything since `91cc7b6` | cost of the static default | new code only |
-|---|---|---|---|
-| c=1 | **−4.3%** | **−14.1%** | +29.3% |
-| c=8 | **−13.0%** | **−13.9%** | +22.6% |
-| c=16 | **−18.3%** | **−13.3%** | +8.8% |
-| c=32 | **−12.3%** | **−6.8%** | +19.1% |
+Read as three different questions. *"current vs `91cc7b6`"* is `new-req / baseline`, the sum of
+fifty steps, and alone it says the project lost 4–18% on `/`. *"Layer off"* is `new-nostat /
+new-req` — the same binary with `[server.static_files] enabled = false`, so the difference can only
+be that one table. *"New code only"* is `new-nostat / baseline`, the same comparison with that one
+default removed, and it says **the code added since the published build is faster in seven of eight
+cells, up to +29%.**
 
-Read the columns as two different questions. *"Everything since the published build"* is `new-req
-/ baseline`, the sum of fifty steps. *"Cost of the static default"* is `new-nostat / new-req`, the
-same binary with `[server.static_files] enabled = false` — so the difference can only be that one
-table. *"New code only"* is what remains at `new-nostat / baseline`, i.e. the same comparison with
-that one default removed.
+**The regression is a constant, which is what identifies it.** Per-request server cost at c=32 is
+30.3 µs on `/` and 47.3 µs on `/items`; with the layer off, 23.7 and 43.5. The difference is 6.5 µs
+and 3.8 µs, and at c=16 it is 6.7 and 6.5 — a fixed toll, not a function of how much work the
+request does. That is a blocking-pool round trip, and it is paid to be told that a path naming no
+file names no file.
 
-**The `new-nostat` arm is the whole reason this is attributable rather than merely detected.** The
-first three columns would have been one number otherwise, and the natural reading of "current main
-is 13% slower on `/items`" is "the fifty steps cost 13%" — which is the opposite of what the data
-says. The static layer, one config table, is most or all of it; the code added since the published
-build is **faster**, up to 29% at c=1.
+**`new-nostat` is the whole reason this is attributable rather than merely detected.** Without that
+arm there is only "current `main` is slower on `/`", and the natural reading of it is "the fifty new
+steps cost throughput" — which is exactly backwards, and would have pointed at reverting the
+fastest work in the tree. One extra arm and one extra config table moved the conclusion by 20
+points on `/`.
 
-`/` is the sharper case, because the baseline *wins* there and the new default is what takes it
-away: on `/` with the layer off, current `main` is ahead of `91cc7b6` at every concurrency
-(+16.2% at c=1, +2.1% at c=8, −0.6% at c=16, +10.2% at c=32), and with it on, current `main` is
-behind by 4–18%. The regression is not a slow request path; it is a fast path behind a `stat`.
+Two falsifications ran before the numbers were trusted. The layer really is on by default and
+really is off with the table: a real file in the document root answers **200 with its bytes** by
+default and **404** with `enabled = false`, while `/items` answers 200 in both — so the table
+changes behaviour rather than merely parsing. And `/items` names no file, so the layer can only be
+finding nothing, which is what makes the cost a constant rather than a function of the request.
 
-Two falsifications, run before the numbers were trusted:
+**What this is not.** It is not an argument that the default is wrong — that is a product
+judgement, and a site that serves assets wants the layer. It is an argument that a fixed cost
+belongs on the path that asks for it: an application whose every route is a front-controller
+dispatch pays a blocking-pool hop for an answer the route table already had, and `serve_only =
+"backend"` (or a route `policy`) is how a deployment says so. What the measurement establishes is
+the size of the thing, which the default's rationale did not mention.
 
-- The layer is genuinely on by default and genuinely off with the table, verified by probing a
-  real file: `/probe.txt` answers **200 with the file's bytes** with the default and **404**
-  with `enabled = false`, while `/items` answers 200 in both. The config table changes behaviour
-  rather than merely parsing.
-- `/items` is a path that names no file, so the layer can only be finding nothing. That is what
-  makes the cost a constant overhead rather than a function of the request.
-
-**What this is not.** It is not an argument that the layer should be off by default — the
-decision above is a product judgement, and a site that serves assets wants it. It is an argument
-that **the cost belongs on the path that asks for it**: an application whose every route is a
-front-controller dispatch pays a blocking-pool round trip to be told what the route table already
-knew, and `serve_only = "backend"` (or a route `policy`) is the configuration that says so. What
-the measurement establishes is the size of the thing an operator is buying, which the doc comment
-did not.
-
-**The general rule: a default that is right for the common case is still a cost paid by the case
-it is not right for, and a benchmark of one arm cannot see it.** The published sweep had no
-`new-nostat` arm because the layer did not exist when it ran; adding the arm was one config table
-and it moved the conclusion by 20 points. A variant that differs by one setting is cheap evidence
-and the difference between "the new code is slower" and "the new default is slower" — two claims
-that point at different fixes.
+**The general rule: a default that is right for the common case is still a cost paid by the case it
+is not right for, and a benchmark of one arm cannot see it.** The published sweep had no
+`new-nostat` arm because the layer did not exist when it ran. A variant that differs by one setting
+is cheap evidence, and it is the difference between "the new code is slower" and "the new default
+is slower" — two claims that point at different fixes.
