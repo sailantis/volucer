@@ -77,6 +77,29 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// `None` means no expiry at all.
     fn set(&self, key: &[u8], value: Vec<u8>, ttl: Option<Duration>) -> Result<()>;
 
+    /// Store a value **only if the key is not already there**, answering whether it was stored.
+    ///
+    /// This is the conditional write, and it is the reason `docs/plugins.md` §6.3 tells an application
+    /// that a lock cannot protect an invariant — the answer to that sentence is this method. A lock
+    /// without a fencing token cannot stop a late writer (§9.2); a compare-and-swap can, because the
+    /// *storage* decides, and the storage is the thing both writers agree on.
+    ///
+    /// **Required rather than given a default, and that is the whole point.** The obvious default —
+    /// `if self.get(key)?.is_none() { self.set(...) }` — is a check-then-act, which is exactly what
+    /// this method exists to replace: two callers can both find the key absent and both write. A
+    /// default would therefore be a racy implementation of the one operation whose purpose is not to
+    /// be racy, and it would be *silently* racy, because it passes every single-threaded test. So a
+    /// driver has to say how it does it atomically, or not compile.
+    ///
+    /// An **expired** key counts as absent: the deadline is part of what the storage decides, so a
+    /// value nobody can read is not a value that blocks a write.
+    ///
+    /// A `ttl` of `Some(Duration::ZERO)` is refused rather than treated as a delete, because a
+    /// conditional write that immediately deletes is a no-op the caller did not ask for — and unlike
+    /// [`Store::set`], where PSR-16's rule is the client's established semantics, nobody arrives here
+    /// with that expectation.
+    fn set_if_absent(&self, key: &[u8], value: Vec<u8>, ttl: Option<Duration>) -> Result<bool>;
+
     /// Remove a key, answering whether it was there.
     ///
     /// Worth returning: PSR-16's `delete` returns it, and "deleted" versus "was not there" is the

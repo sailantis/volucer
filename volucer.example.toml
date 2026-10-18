@@ -721,6 +721,13 @@ base_port = 19001
 # is refused rather than evicting something else, and the refusal is logged.
 # When the store is full it first sweeps expired entries, so a cache of
 # short-lived items reclaims itself.
+#
+# `Kv::setIfAbsent` is the one method here that is not PSR-16, and it is the
+# answer to what a lock cannot do: a conditional write, where the storage
+# decides who won. `true` means this call's value is the one under the key and
+# `false` means somebody else's already was -- a success, not a failure, so do
+# not retry it. Atomic per driver (`SET NX` on redis, `O_CREAT|O_EXCL` on file,
+# a shard lock in memory), which a client-side `has` then `set` would not be.
 # ---------------------------------------------------------------------------
 # [kv.sessions]
 # driver = "memory"

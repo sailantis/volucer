@@ -7862,6 +7862,22 @@ driver = "memory"
              is the one deployment it silently misbehaves in",
             path.display()
         );
+        // And `setIfAbsent`, because it is the answer to a sentence the deployment will read: the
+        // lock table says a lock is not a correctness primitive, and the reader's next question is
+        // what is. The ordering matters — a deployment that finds this after choosing a long lock
+        // TTL has already chosen wrong.
+        assert!(
+            text.contains("answer to what a lock cannot do"),
+            "{} no longer points an application at setIfAbsent from where it is told a lock is not \
+             a correctness primitive",
+            path.display()
+        );
+        assert!(
+            text.contains("a success, not a failure"),
+            "{} no longer says that a refused conditional write is a success, which is the one thing \
+             a caller must not retry",
+            path.display()
+        );
     }
 
     /// A `[kv.*]` file store parses, resolves its default bound, and refuses two things.

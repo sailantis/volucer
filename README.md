@@ -1304,7 +1304,10 @@ state is reset between units of work: a request worker resets, a consumer does n
 **Locks are not a correctness primitive**, and the API is shaped so that an application can be
 correct about that rather than only warned: a TTL lock has no fencing token, so a worker that stalls
 past its lease can be writing while somebody else holds it. Use a lock to avoid duplicated work;
-where a real invariant is at stake, use the storage's own conditional write.
+where a real invariant is at stake, use **`Kv::setIfAbsent`** — the storage's own conditional write,
+atomic per driver (`SET NX` on Redis, `O_CREAT|O_EXCL` on `file`, a shard lock in memory). It returns
+`true` if this call's value is the one under the key and `false` if somebody else's already was, and
+`false` is a success rather than a failure.
 
 **gRPC has no reflection, and nothing anywhere reads a `.proto`.** A client that wants to introspect
 supplies its own definition, which is what it already does against every non-reflective server;

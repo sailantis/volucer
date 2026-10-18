@@ -1569,6 +1569,7 @@ impl Namespace for KvNamespace {
         match verb {
             "get" => Self::get(store, &params),
             "set" => Self::set(store, &params, call),
+            "setIfAbsent" => Self::set_if_absent(store, &params, call),
             "has" => Self::has(store, &params),
             "delete" => Self::delete(store, &params),
             "clear" => Self::clear(store),
@@ -1576,8 +1577,8 @@ impl Namespace for KvNamespace {
             "getMultiple" => Self::get_multiple(store, &params),
             "setMultiple" => Self::set_multiple(store, &params, call),
             other => Return::refused(format!(
-                "no kv storage serves {other:?}; the methods are get, set, has, delete, clear, ttl, \
-                 getMultiple and setMultiple"
+                "no kv storage serves {other:?}; the methods are get, set, setIfAbsent, has, delete, \
+                 clear, ttl, getMultiple and setMultiple"
             )),
         }
     }
@@ -1641,6 +1642,48 @@ impl KvNamespace {
             "set",
             || store.set(&key, value, ttl),
             |()| Return::ok(serde_json::json!({ "stored": true })),
+        )
+    }
+
+    /// `kv.setIfAbsent` — the conditional write.
+    ///
+    /// **The one method in this namespace that is not a cache operation.** It reaches the store's
+    /// `set_if_absent`, which is atomic per driver (`create_new`, a shard lock, `SET NX`), and it is
+    /// the answer `docs/plugins.md` §6.3 gives to an application that needs to protect an invariant:
+    /// a lock has no fencing token and cannot stop a late writer, and a conditional write can because
+    /// the *storage* decides.
+    ///
+    /// The answer distinguishes the two outcomes, because the caller's next action differs: `stored`
+    /// means this call's value is the one there, and `stored: false` means somebody else's is — which
+    /// is a success, not an error, and must not be reported as one.
+    fn set_if_absent(store: &Arc<dyn volucer_kv::Store>, params: &Params, call: &Call) -> Return {
+        let key = match Self::key_of(params, "kv.setIfAbsent") {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+        let value = match params.base64("value") {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return Return::refused(
+                    "kv.setIfAbsent needs a \"value\" parameter, base64-encoded",
+                )
+            }
+            Err(err) => return Return::refused(format!("kv.setIfAbsent was called with {err}")),
+        };
+        let ttl = match Self::ttl_from(params, &call.name) {
+            Ok(ttl) => ttl,
+            Err(refusal) => return refusal,
+        };
+
+        Self::attempt(
+            "set",
+            || store.set_if_absent(&key, value, ttl),
+            |stored| {
+                // `stored` alone, deliberately: `false` is a **successful answer** — somebody else got
+                // there first — and a client that read it as a failure would retry a conditional write
+                // that was correctly refused. The field is named for the question, not for an outcome.
+                Return::ok(serde_json::json!({ "stored": stored }))
+            },
         )
     }
 

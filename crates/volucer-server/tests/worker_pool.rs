@@ -2771,3 +2771,114 @@ $worker->run(static function (Request $request, Worker $worker) use ($kv): Respo
     drop(dispatcher);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A worker's `Kv::setIfAbsent` is refused when the key exists, and the refusal is an answer.
+///
+/// The whole path again — a real PHP application, the channel, the registry, a real store — and the
+/// thing it pins is the one property no unit test can: that `false` arrives at the application as a
+/// *successful* answer rather than as a refused call. The SDK returns a bool, and an application that
+/// cannot tell "somebody else holds it" from "the call failed" is an application that gives up on the
+/// first contended key.
+///
+/// Two requests, not two threads: the second is what a contending process looks like from inside one,
+/// and the store is the real one the deployment would use.
+#[test]
+fn a_worker_conditional_write_is_refused_when_the_key_is_taken() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-sia-worker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("sia-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    $path = (string) parse_url($request->uri, PHP_URL_PATH);
+    $kv = $worker->kv('sessions');
+
+    if ($path === '/claim') {{
+        // The same key on every request, so the second request is the contended one.
+        $won = $kv->setIfAbsent('the-lock-slot', 'owned by ' . getmypid(), 600);
+        $found = null;
+        $value = $kv->get('the-lock-slot', $found);
+
+        return Response::json(['won' => $won, 'value' => $value, 'found' => $found]);
+    }}
+
+    // A key nobody has claimed: the write must succeed even though `/claim` ran first.
+    $won = $kv->setIfAbsent('fresh-slot', 'first', 600);
+    return Response::json(['won' => $won]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        // One worker, because the contention must come from two *requests* and not from two slots
+        // racing — what is under test is the store's decision, not the pool's scheduling.
+        workers: 1,
+        services: vec!["kv.sessions".to_string()],
+        ..config(1)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+    configured.kv.insert(
+        "sessions".to_string(),
+        KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1 << 20 }),
+    );
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+
+    let first = json_body(
+        &dispatcher
+            .dispatch(&get("/claim"))
+            .expect("the first claim is served"),
+    );
+    assert_eq!(
+        first["won"], true,
+        "the first conditional write on an absent key wins: {first}"
+    );
+
+    let second = json_body(
+        &dispatcher
+            .dispatch(&get("/claim"))
+            .expect("the second claim is served"),
+    );
+    assert_eq!(
+        second["won"], false,
+        "the second is told it did not store, which is an answer rather than a refused call: {second}"
+    );
+    assert_eq!(
+        second["value"], first["value"],
+        "and the value behind the key is still the first writer's: {second} vs {first}"
+    );
+
+    let fresh = json_body(
+        &dispatcher
+            .dispatch(&get("/fresh"))
+            .expect("the fresh claim is served"),
+    );
+    assert_eq!(
+        fresh["won"], true,
+        "a different key is unaffected, which is what says the refusal was about the key rather than \
+         about the store: {fresh}"
+    );
+
+    drop(dispatcher);
+    let _ = std::fs::remove_dir_all(&dir);
+}

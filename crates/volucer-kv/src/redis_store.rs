@@ -246,6 +246,37 @@ impl Store for RedisStore {
         })
     }
 
+    fn set_if_absent(&self, key: &[u8], value: Vec<u8>, ttl: Option<Duration>) -> Result<bool> {
+        // **`SET ... NX` is the atomicity, and this is the one driver where it is a single word.** Redis
+        // evaluates the existence check and the write in one command, so there is no window at all — which
+        // is what `docs/plugins.md` §6.3 means by "Redis `SET NX`" when it tells an application that a lock
+        // cannot protect an invariant and a conditional write can. This is the reason the section asked for
+        // this method rather than for a better lock.
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
+            return Err(Error::BadKey {
+                reason: "is not written conditionally with a zero TTL, which would delete it; use \
+                         delete, or give it a deadline"
+                    .to_string(),
+            });
+        }
+
+        let redis_key = self.redis_key(key);
+        let ttl = crate::clamp_ttl(ttl);
+        self.with_connection("SET NX", |connection| {
+            let mut command = redis::cmd("SET");
+            command.arg(&redis_key).arg(&value).arg("NX");
+            if let Some(ttl) = ttl {
+                command.arg("PX").arg(ttl.as_millis() as u64);
+            }
+            // `SET` with `NX` answers `OK` or **nil**, so the answer is an `Option` rather than the `()`
+            // the plain `SET` above takes — and the nil is the ordinary "somebody else has it", not an
+            // error. Typed as `Option<String>` because a driver that read nil as a failure would raise on
+            // the one path where contending callers are *expected*.
+            command.query::<Option<String>>(connection)
+        })
+        .map(|answer| answer.is_some())
+    }
+
     fn delete(&self, key: &[u8]) -> Result<bool> {
         let redis_key = self.redis_key(key);
         let removed: i64 = self.with_connection("DEL", |connection| {

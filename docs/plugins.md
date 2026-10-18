@@ -884,6 +884,29 @@ the server, because that is where the E2E-encryption case lives. `deleteMultiple
 `getMultiple` and `setMultiple` exist because they are one call where the loop is many, and a delete
 of n keys is n cheap calls whose batched form would buy a round trip and cost a wire format.
 
+**`set_if_absent` is built, and it is the one method here that is not PSR-16.** §6.3 asks for it in
+the same breath as saying a lock is not a correctness primitive, and this is the answer to that
+sentence: a conditional write, where the *storage* decides who won. It is `SET NX` on Redis,
+`O_CREAT|O_EXCL` on the file driver and a shard lock in memory, so the atomicity is the driver's
+rather than a check-then-act composed on the client — which is why the trait member has **no default
+implementation**: the obvious default would be that check-then-act, would pass every single-threaded
+test, and would be silently racy in exactly the case the method exists for.
+
+Three things the build settled:
+
+- **`false` is a successful answer, not a refusal.** It means somebody else's value is under the key.
+  A `Return` error would make an application give up on the first contended key, and the SDK returns
+  a `bool` for that reason.
+- **An expired key does not block a conditional write.** The deadline is part of what the storage
+  decides, so a value nobody can read is not a value that holds a claim.
+- **The file driver needed a mutex that the other two did not**, and the reasoning is the interesting
+  part: `create_new` is atomic in the kernel, but *reclaiming an expired file* is remove-then-create
+  and `remove_file` has no compare-and-delete. The store's `claim` mutex serialises that path within
+  one process, which is the scope the driver already documents. The race test found the first version
+  of this (treating a `Corrupt` header as replaceable, when a file mid-write reads as corrupt — every
+  loser deleted the winner's file) and cannot schedule the second, narrower one; the mutex there is an
+  argument rather than an observation, and the code says so.
+
 **Drivers, in order.** `memory` (**done**) → `redis` (**done**, behind the `redis` feature) → `file` (a
 directory of files; **done**, and what a restart without a dependency buys) → `memcached` (a small
 text-protocol client; the weakest of the four because RR's own memcached driver cannot report TTL, so
@@ -962,7 +985,7 @@ tokens**, which means they cannot stop a late writer — the classic Kleppmann o
   statement than RR makes and a more useful one.
 - Where a real invariant is needed, the answer is the storage's own conditional write — Redis
   `SET NX`, a unique index, a compare-and-swap — and the KV API should expose a
-  `set_if_absent` so that path exists.
+  `set_if_absent` so that path exists. **Built**; see §6.2.
 - **Single-node locks work today and need no external service**, which is worth having for the
   common deployment before the Redis case is written.
 
@@ -2373,9 +2396,10 @@ documentation, where an application author actually is; `volucer.example.toml`, 
 copies from; the README; and here. That is not belt-and-braces — the argument for shipping locks at
 all rests on the warning arriving *before* the call, and the plan is the place it arrives last.
 
-`set_if_absent` on KV remains **not built**, and that is worth saying plainly rather than leaving the
-sentence above to imply otherwise: the primitive that protects an invariant is the one an application
-needs when it discovers a lock cannot, and it is still a sentence in a design document.
+`set_if_absent` on KV is **built**, and it is what this paragraph was pointing at: the primitive
+that protects an invariant is the storage's conditional write, and it exists now on all three
+drivers. What remains true is the ordering advice — a lock is for coordinating work, and the moment
+an application needs a guarantee it should reach for this method rather than for a longer TTL.
 
 ### 9.3 Metrics are on when configured, not when a middleware is listed
 

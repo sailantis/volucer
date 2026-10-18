@@ -124,6 +124,18 @@ struct Shard {
     map: HashMap<Vec<u8>, Entry>,
 }
 
+/// What one attempt inside `set_if_absent`'s shard lock concluded.
+///
+/// A type rather than a `Result`, because the three outcomes are not "ok/err": "present" is a
+/// refusal to write and a *definitive* answer, "no room" is a retry, and collapsing them into a
+/// `Result` would need a second question asked outside the lock — which is a race.
+enum Attempt {
+    Written,
+    Present,
+    /// No room, carrying the value back so the retry can use it without cloning.
+    NoRoom(Vec<u8>),
+}
+
 /// A sharded, byte-bounded, expiring key-value store held in this process's memory.
 #[derive(Debug)]
 pub struct MemoryStore {
@@ -214,7 +226,7 @@ impl MemoryStore {
     /// and it is returned on the fast path — under the bound, or too soon after the last sweep —
     /// without touching any shard.
     fn make_room(&self, needed: usize) -> bool {
-        if self.used_bytes() + needed <= self.max_bytes {
+        if self.has_room(needed) {
             return true;
         }
 
@@ -285,6 +297,16 @@ impl MemoryStore {
             self.used_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
             self.entries.fetch_sub(freed_entries, Ordering::Relaxed);
         }
+    }
+
+    /// Whether `needed` more bytes would fit.
+    ///
+    /// One method rather than `self.used_bytes() + needed <= self.max_bytes` written at each site,
+    /// because `set_if_absent` checks it twice — once under the shard lock and once while deciding
+    /// whether a refusal is `Full` or merely "somebody else got there first" — and two copies of a
+    /// bound comparison is where an off-by-one lives.
+    fn has_room(&self, needed: usize) -> bool {
+        self.used_bytes().saturating_add(needed) <= self.max_bytes
     }
 
     /// Run `f` with the lock held on the shard `key` belongs to.
@@ -365,6 +387,74 @@ impl Store for MemoryStore {
             }
             Ok(())
         })
+    }
+
+    fn set_if_absent(&self, key: &[u8], value: Vec<u8>, ttl: Option<Duration>) -> Result<bool> {
+        // **The decision and the write happen under one shard lock**, which is the atomicity this
+        // method exists for: `get` followed by `set` would release it in between, and two workers
+        // racing for one key would both see it absent and both write. That is why the trait gives this
+        // method no default implementation.
+        //
+        // **`make_room` is called outside the lock, and that is forced rather than chosen.**
+        // `sweep_expired` locks *every* shard by index, so a sweep begun while this thread holds one
+        // would wait for a lock it is itself holding — a deadlock, not a delay. So the shape is: take
+        // the shard, decide, write if there is room; if there is not, release, make room, and try the
+        // whole thing again — re-deciding presence, which is what keeps it correct rather than merely
+        // re-attempting.
+        //
+        // A bounded number of attempts rather than an unbounded loop, because `make_room` either freed
+        // something or refused: a second refusal is the answer, and a loop would be a busy wait against
+        // a store that is genuinely full.
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
+            return Err(Error::BadKey {
+                reason: "is not written conditionally with a zero TTL, which would delete it; use \
+                         delete, or give it a deadline"
+                    .to_string(),
+            });
+        }
+
+        let ttl = clamp_ttl(ttl);
+        let expires_at = ttl.map(|ttl| Instant::now() + ttl);
+        let needed = value.len();
+
+        // `value` moves into the entry, so a retry needs it back. It is restored only on the path where
+        // room had to be made — which is the path that was about to walk the whole store anyway.
+        let mut pending = Some(value);
+        loop {
+            let value = pending.take().expect("restored before every retry");
+            let now = Instant::now();
+            match self.with_shard(key, |shard| {
+                // An expired key is absent, and removed here rather than left for the sweeper: leaving
+                // it would make a key nobody can read block this write.
+                if let Some(entry) = shard.map.get(key) {
+                    if !entry.is_expired(now) {
+                        return Attempt::Present;
+                    }
+                    if let Some(entry) = shard.map.remove(key) {
+                        self.release(entry.bytes());
+                    }
+                }
+                if !self.has_room(needed) {
+                    return Attempt::NoRoom(value);
+                }
+                shard.map.insert(key.to_vec(), Entry { value, expires_at });
+                self.used_bytes.fetch_add(needed, Ordering::Relaxed);
+                self.entries.fetch_add(1, Ordering::Relaxed);
+                Attempt::Written
+            }) {
+                Attempt::Written => return Ok(true),
+                // Decided under the lock, so this is definitive: the key is there and live.
+                Attempt::Present => return Ok(false),
+                Attempt::NoRoom(returned) => {
+                    pending = Some(returned);
+                    if !self.make_room(needed) {
+                        return Err(Error::Full {
+                            max: self.max_bytes,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     fn delete(&self, key: &[u8]) -> Result<bool> {
@@ -796,5 +886,148 @@ mod tests {
             "16 shards exist to avoid one lock per call; {occupied} of {SHARDS} in use means the \
              hash or the index is not spreading keys"
         );
+    }
+    // -----------------------------------------------------------------------------------------
+    // `set_if_absent`
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn set_if_absent_writes_only_when_the_key_is_not_there() {
+        let store = store();
+        assert!(
+            store
+                .set_if_absent(b"k", b"first".to_vec(), None)
+                .expect("the first write succeeds"),
+            "an absent key is written"
+        );
+        assert!(
+            !store
+                .set_if_absent(b"k", b"second".to_vec(), None)
+                .expect("the second is answered, not failed"),
+            "a present key is not overwritten, and that is an answer rather than an error"
+        );
+        assert_eq!(
+            store.get(b"k").expect("get"),
+            Some(b"first".to_vec()),
+            "the first writer's value is the one that survives"
+        );
+    }
+
+    /// **The property the method exists for, at the only scale a test can check honestly.**
+    ///
+    /// `set_if_absent` is the answer to "a lock cannot protect this invariant", so the test has to be
+    /// a race or it proves nothing: a check-then-act implementation passes every single-threaded test,
+    /// which is why the trait has no default. Twenty threads all try to write the same key; exactly
+    /// one may win, and the value behind the key must be that one's.
+    #[test]
+    fn only_one_of_many_racing_writers_stores_the_value() {
+        // **A race test that does not race proves nothing, and the first version of this one did
+        // not.** Twenty unsynchronised threads on one key passed against a check-then-act
+        // implementation: the window between `get` releasing the shard and `set` taking it again is
+        // microseconds, and twenty threads starting whenever the scheduler felt like it rarely landed
+        // in it. Falsifying the implementation is what found that — the pattern that catches it is a
+        // **barrier** so every thread is released at the same instant, and **many rounds** on fresh
+        // keys so the window is offered hundreds of times rather than once.
+        const WRITERS: usize = 16;
+        const ROUNDS: usize = 300;
+
+        let store = std::sync::Arc::new(store());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        // One counter per round, so the assertion can say *which* round raced rather than that some
+        // round did.
+        let winners = std::sync::Arc::new(std::sync::Mutex::new(vec![0usize; ROUNDS]));
+
+        let mut threads = Vec::new();
+        for writer in 0..WRITERS {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let winners = std::sync::Arc::clone(&winners);
+            threads.push(std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    // A key per round, so each round is an unwritten key and exactly one writer may
+                    // win it.
+                    let key = format!("contended-{round}").into_bytes();
+                    barrier.wait();
+                    // Each writer's value is distinct, so the stored value names the winner.
+                    if store
+                        .set_if_absent(&key, vec![writer as u8], None)
+                        .expect("no error")
+                    {
+                        winners.lock().expect("not poisoned")[round] += 1;
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("no thread panicked");
+        }
+
+        let winners = winners.lock().expect("not poisoned").clone();
+        let over = winners
+            .iter()
+            .enumerate()
+            .find(|(_, count)| **count != 1)
+            .map(|(round, count)| (round, *count));
+        assert_eq!(
+            over, None,
+            "every round must have exactly one winner; {over:?} means two writers were told they \
+             stored one key, which is two processes inside the section a lock was supposed to guard"
+        );
+
+        // And the value behind each key is that round's winner's, not a later overwrite.
+        for round in 0..ROUNDS {
+            let key = format!("contended-{round}").into_bytes();
+            let stored = store.get(&key).expect("get").expect("a value is there");
+            assert_eq!(stored.len(), 1, "one writer's value survives round {round}");
+        }
+    }
+
+    /// An expired key is absent, so it does not block a conditional write.
+    #[test]
+    fn a_conditional_write_replaces_an_expired_value() {
+        let store = store();
+        store
+            .set(b"k", b"old".to_vec(), Some(Duration::from_millis(1)))
+            .expect("set");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            store
+                .set_if_absent(b"k", b"new".to_vec(), None)
+                .expect("no error"),
+            "a value nobody can read must not block a write"
+        );
+        assert_eq!(store.get(b"k").expect("get"), Some(b"new".to_vec()));
+    }
+
+    /// A zero TTL is refused rather than silently deleting the key.
+    #[test]
+    fn a_conditional_write_with_a_zero_ttl_is_refused() {
+        let store = store();
+        let err = store
+            .set_if_absent(b"k", b"v".to_vec(), Some(Duration::ZERO))
+            .expect_err("must be refused");
+        assert!(matches!(err, Error::BadKey { .. }), "{err}");
+    }
+
+    /// A conditional write respects the bound, and it does not leak the reservation it could not use.
+    #[test]
+    fn a_conditional_write_that_does_not_fit_is_full_and_leaves_the_accounting_alone() {
+        let store = MemoryStore::with_max_bytes(200);
+        store
+            .set(b"a", vec![1u8; 100], None)
+            .expect("the first fits");
+        let before = store.used_bytes();
+
+        let err = store
+            .set_if_absent(b"b", vec![2u8; 150], None)
+            .expect_err("the second does not fit");
+        assert!(matches!(err, Error::Full { .. }), "{err}");
+        assert_eq!(
+            store.used_bytes(),
+            before,
+            "a refused conditional write must not leave its bytes in the accounting, or the store \
+             shrinks by its own refusals"
+        );
+        assert_eq!(store.get(b"b").expect("get"), None);
     }
 }

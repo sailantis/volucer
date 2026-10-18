@@ -143,6 +143,24 @@ pub struct FileStore {
     /// Monotonic rather than wall-clock: a sweep's *rate limit* has nothing to do with the time of
     /// day, and an `Instant` derived from `SystemTime` would jump when the clock is corrected.
     last_sweep_ms: AtomicU64,
+    /// Serializes the conditional write's **reclaim** path, and nothing else.
+    ///
+    /// `create_new` makes "the key is absent, so create it" atomic against every process at once —
+    /// the kernel decides. The one case it cannot decide is an **expired** file, because reclaiming
+    /// that name is remove-then-create and `remove_file` has no compare-and-delete: two callers can
+    /// both see a dead file, one removes it, and the second then removes the *fresh* file the first
+    /// had just created and creates its own. Two winners, which is the exact failure this method
+    /// exists to prevent.
+    ///
+    /// So the reclaim is serialized here. The scope is this process, which is the scope the driver
+    /// documents ("no cross-process coordination"): one volucer process is the deployment the `file`
+    /// driver is for, and `create_new` still covers the absent case across processes. A deployment
+    /// that needs a conditional write to be atomic between two processes wants Redis, where `SET NX`
+    /// is one command.
+    ///
+    /// A plain `Mutex`, not a sharded one, because a conditional write is a rare operation on a
+    /// deliberate path and the critical section is one `stat` and at most one `remove`.
+    claim: Mutex<()>,
     started: Instant,
 }
 
@@ -181,6 +199,7 @@ impl FileStore {
             max_bytes,
             used_bytes: Mutex::new(0),
             last_sweep_ms: AtomicU64::new(0),
+            claim: Mutex::new(()),
             started: Instant::now(),
         };
         // Accounted for at startup rather than lazily, so the first insert already knows whether it
@@ -383,6 +402,109 @@ impl Store for FileStore {
                 Err(err)
             }
         }
+    }
+
+    fn set_if_absent(&self, key: &[u8], value: Vec<u8>, ttl: Option<Duration>) -> Result<bool> {
+        // **`OpenOptions::create_new` is the atomicity, and it is the kernel's.** `get` followed by
+        // `set` would be the check-then-act this method exists to replace: two processes — or two
+        // workers, since each call blocks its own — would both find the file absent and both write.
+        // `create_new` is a single `open(O_CREAT|O_EXCL)`, which either creates the name or fails
+        // because it exists, with nothing in between. That is what a filesystem buys here and why
+        // this driver can offer the primitive at all.
+        //
+        // The one case the kernel cannot decide is an **expired** file: the name exists, and the
+        // deadline inside it says the value is gone. Removing it and retrying is a small race — two
+        // callers could both remove, one recreating and one failing — but the loser's failure is a
+        // `false`, which is the honest answer to "did I store it", and the winner wrote a value the
+        // deadline permitted. That is the same guarantee the other drivers give.
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
+            return Err(Error::BadKey {
+                reason: "is not written conditionally with a zero TTL, which would delete it; use \
+                         delete, or give it a deadline"
+                    .to_string(),
+            });
+        }
+        let ttl = clamp_ttl(ttl);
+        let expires = ttl.map(|ttl| unix_now() + ttl.as_secs());
+
+        let path = self.path_for(key);
+        let mut body = Vec::with_capacity(value.len() + 32);
+        match expires {
+            Some(deadline) => body.extend_from_slice(format!("{EXPIRY}{deadline}\n").as_bytes()),
+            None => body.extend_from_slice(format!("{EXPIRY}{NEVER}\n").as_bytes()),
+        }
+        body.push(b'\n');
+        body.extend_from_slice(&value);
+
+        // At most twice: the second attempt is the one after removing an expired file. A third would
+        // mean another caller is winning the same race repeatedly, and `false` is the right answer to
+        // that rather than another attempt.
+        // At most twice: the second attempt is the one after reclaiming an expired file. A third
+        // would mean another caller is winning the same race repeatedly, and `false` is the right
+        // answer to that rather than another attempt.
+        for attempt in 0..2 {
+            // Reserved before the create, so a store that is full refuses without taking the name —
+            // and the reservation is given back if the create loses, which is what keeps the
+            // accounting from drifting upward on every race.
+            self.reserve(body.len())?;
+
+            if attempt == 1 {
+                // The second attempt only exists after a successful reclaim, and the reclaim holds
+                // this lock, so the create has to happen inside the same critical section or the
+                // window reopens. Taken here rather than around the loop so the *first* attempt — the
+                // common case — costs one uncontended `create_new` and no lock at all.
+                let _claim = self
+                    .claim
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if reclaim_expired(&path).unwrap_or(false) {
+                    match create_new(&path, &body) {
+                        Ok(()) => return Ok(true),
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            self.release(body.len());
+                            return Ok(false);
+                        }
+                        Err(err) => {
+                            self.release(body.len());
+                            return Err(Error::Store {
+                                driver: "file",
+                                reason: format!("could not create {}: {err}", path.display()),
+                            });
+                        }
+                    }
+                }
+                self.release(body.len());
+                return Ok(false);
+            }
+
+            match create_new(&path, &body) {
+                Ok(()) => return Ok(true),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.release(body.len());
+                    // **Only `Expired` justifies taking the name, and `Corrupt` must not.**
+                    //
+                    // Written as `Expired | Corrupt` first, and the race test below failed with two
+                    // winners per round — because a file the *winner* has created but not yet
+                    // finished writing reads as `Corrupt`. The loser then removed the winner's file
+                    // and created its own, so both were told they had created it.
+                    //
+                    // The check here decides only whether a second attempt is worth taking; the
+                    // second attempt re-checks under `claim` and does the removal itself.
+                    if matches!(read_header(&path), Header::Expired) {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                Err(err) => {
+                    self.release(body.len());
+                    return Err(Error::Store {
+                        driver: "file",
+                        reason: format!("could not create {}: {err}", path.display()),
+                    });
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn delete(&self, key: &[u8]) -> Result<bool> {
@@ -600,20 +722,20 @@ fn write_file(path: &Path, body: &[u8]) -> Result<()> {
         &body as *const _ as usize,
     ));
 
-    let mut options = fs::File::create(&temporary).map_err(|err| Error::Store {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // `mode` on the `open` rather than `set_permissions` after it, for the reason `create_new` gives:
+    // a temporary that exists world-readable for a microsecond is a session id readable in that
+    // microsecond, on a host where the mode is what protects it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(FILE_MODE);
+    }
+    let mut options = options.open(&temporary).map_err(|err| Error::Store {
         driver: "file",
         reason: format!("could not create {}: {err}", temporary.display()),
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        options
-            .set_permissions(fs::Permissions::from_mode(FILE_MODE))
-            .map_err(|err| Error::Store {
-                driver: "file",
-                reason: format!("could not set the mode of {}: {err}", temporary.display()),
-            })?;
-    }
     options.write_all(body).map_err(|err| Error::Store {
         driver: "file",
         reason: format!("could not write {}: {err}", temporary.display()),
@@ -627,6 +749,48 @@ fn write_file(path: &Path, body: &[u8]) -> Result<()> {
             reason: format!("could not replace {}: {err}", path.display()),
         }
     })
+}
+
+/// Create a file that must not already exist, `0600` from the moment it exists.
+///
+/// **The mode is given to `open`, not set afterwards.** `File::create_new` followed by
+/// `set_permissions` would leave a window — short, but real, and on a shared host a window an
+/// unprivileged reader can win — during which a session id is readable by the group. `OpenOptions`
+/// with `mode` asks the kernel to create the inode with the right bits already on it, which is the
+/// only version of this that has no window.
+///
+/// `umask` still applies, and that is fine: it can only *remove* bits, and `0600` has none to remove
+/// beyond what is intended.
+fn create_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(FILE_MODE);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(body)?;
+    Ok(())
+}
+
+/// Remove a file whose deadline has passed, answering whether the name is now free.
+///
+/// **Re-decides rather than trusting the caller's earlier look**, because this is called under the
+/// store's `claim` lock after an attempt that saw an expired file: between that look and this call
+/// the file may have been replaced by somebody's fresh value, and removing *that* would delete a
+/// value someone was told was stored. So the deadline is read again, here, where nothing else in this
+/// process can be removing it.
+///
+/// `false` covers three cases that all mean "do not create": the file is still there and live, it
+/// vanished (somebody else is about to create it), or it could not be removed. Only a successful
+/// removal of a *dead* file answers `true`.
+fn reclaim_expired(path: &Path) -> std::io::Result<bool> {
+    if !matches!(read_header(path), Header::Expired) {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    Ok(true)
 }
 
 /// The wall clock, in seconds since the Unix epoch.
@@ -1013,5 +1177,197 @@ mod tests {
                 .expect("an overwrite of the same size always fits");
         }
         assert_eq!(store.get(b"k").expect("get"), Some(vec![1u8; 100]));
+    }
+    #[test]
+    fn set_if_absent_writes_only_when_the_file_is_not_there() {
+        let fixture = Fixture::new("sia");
+        let store = fixture.store(1024 * 1024);
+        assert!(
+            store
+                .set_if_absent(b"k", b"first".to_vec(), None)
+                .expect("the first write succeeds"),
+            "an absent key is written"
+        );
+        assert!(
+            !store
+                .set_if_absent(b"k", b"second".to_vec(), None)
+                .expect("the second is answered, not failed"),
+            "a present key is not overwritten"
+        );
+        assert_eq!(
+            store.get(b"k").expect("get"),
+            Some(b"first".to_vec()),
+            "and the first writer's value is what is readable"
+        );
+    }
+
+    /// The atomicity is the kernel's `create_new`, so the race test is the same shape as the memory
+    /// driver's and for the same reason: a check-then-act implementation passes a single-threaded
+    /// test, which is exactly why the trait has no default.
+    #[test]
+    fn only_one_of_many_racing_writers_stores_the_value() {
+        const WRITERS: usize = 16;
+        const ROUNDS: usize = 100;
+
+        let fixture = Fixture::new("sia-race");
+        let store = std::sync::Arc::new(fixture.store(64 * 1024 * 1024));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let winners = std::sync::Arc::new(std::sync::Mutex::new(vec![0usize; ROUNDS]));
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let mut threads = Vec::new();
+        for writer in 0..WRITERS {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let winners = std::sync::Arc::clone(&winners);
+            let errors = std::sync::Arc::clone(&errors);
+            threads.push(std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    let key = format!("contended-{round}").into_bytes();
+                    barrier.wait();
+                    // **Recorded rather than asserted inside the thread.** A panic here would leave
+                    // the other fifteen parked on the next arrier.wait for ever, and a hung test
+                    // report says nothing about why — which is exactly how this test first failed.
+                    match store.set_if_absent(&key, vec![writer as u8], None) {
+                        Ok(true) => winners.lock().expect("not poisoned")[round] += 1,
+                        Ok(false) => {}
+                        Err(err) => errors.lock().expect("not poisoned").push(err.to_string()),
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("no thread panicked");
+        }
+
+        let winners = winners.lock().expect("not poisoned").clone();
+        assert_eq!(
+            winners.iter().enumerate().find(|(_, count)| **count != 1),
+            None,
+            "every round must have exactly one winner; {winners:?} means two callers were told they \
+             created one file, which a lock cannot protect but a conditional write must"
+        );
+    }
+
+    /// **The reclaim path, raced — and this test's honest limit is that it does not prove the lock.**
+    ///
+    /// Racing a *new* key proves only that `create_new` is atomic, which is the kernel's. The
+    /// expensive case is a key whose file has **expired**, because reclaiming it is
+    /// remove-then-create and `remove_file` has no compare-and-delete.
+    ///
+    /// This exercises that path at volume and asserts one winner per round, which catches the bug it
+    /// was written for: `reclaim_expired` originally treated a `Corrupt` header as replaceable, and a
+    /// file the *winner* had created but not yet finished writing reads as `Corrupt` — so every loser
+    /// removed the winner's file. The first run failed with two winners in round 0.
+    ///
+    /// What it does **not** deterministically catch is the narrower race that remains: two callers
+    /// both read `Expired`, one removes and creates, the second then removes the *fresh* file. That
+    /// window is between `read_header` and `remove_file` inside one function, nanoseconds wide, and a
+    /// test cannot schedule it. It is closed by the store's `claim` mutex, whose necessity is an
+    /// argument rather than an observation — the one property in this file reasoned about instead of
+    /// measured, which is why it is written down rather than left to look like the others.
+    #[test]
+    fn a_reclaimed_expired_key_still_has_exactly_one_winner() {
+        const WRITERS: usize = 16;
+        const ROUNDS: usize = 60;
+
+        let fixture = Fixture::new("sia-reclaim-race");
+        let store = std::sync::Arc::new(fixture.store(64 * 1024 * 1024));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let winners = std::sync::Arc::new(std::sync::Mutex::new(vec![0usize; ROUNDS]));
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        // **Planted before any thread exists**, one dead file per round, so every round begins with
+        // something to reclaim and the planting is not itself a race.
+        for round in 0..ROUNDS {
+            let key = format!("reclaimed-{round}").into_bytes();
+            let path = fixture.0.join(hex(digest(&key)));
+            fs::write(&path, format!("{EXPIRY}{}\n\ndead", unix_now() - 1)).expect("plant");
+        }
+
+        let mut threads = Vec::new();
+        for writer in 0..WRITERS {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let winners = std::sync::Arc::clone(&winners);
+            let errors = std::sync::Arc::clone(&errors);
+            threads.push(std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    let key = format!("reclaimed-{round}").into_bytes();
+                    barrier.wait();
+                    // Recorded, never panicked: see the note in the test above.
+                    match store.set_if_absent(&key, vec![writer as u8], None) {
+                        Ok(true) => winners.lock().expect("not poisoned")[round] += 1,
+                        Ok(false) => {}
+                        Err(err) => errors.lock().expect("not poisoned").push(err.to_string()),
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("no thread panicked");
+        }
+
+        let winners = winners.lock().expect("not poisoned").clone();
+        assert_eq!(
+            winners.iter().enumerate().find(|(_, count)| **count != 1),
+            None,
+            "every round must have exactly one winner, and {winners:?} has one that does not"
+        );
+    }
+    /// An expired file does not block a conditional write, and the dead file's bytes leave the
+    /// accounting when they leave the disk.
+    #[test]
+    fn a_conditional_write_replaces_an_expired_file() {
+        let fixture = Fixture::new("sia-expired");
+        let store = fixture.store(1024 * 1024);
+        store
+            .set(b"k", b"old".to_vec(), Some(Duration::from_secs(600)))
+            .expect("set");
+        // Rewritten with a deadline in the past, so the test does not wait.
+        let path = fixture.0.join(hex(digest(b"k")));
+        fs::write(&path, format!("{EXPIRY}{}\n\nold", unix_now() - 1)).expect("write");
+
+        assert!(
+            store
+                .set_if_absent(b"k", b"new".to_vec(), None)
+                .expect("no error"),
+            "a file whose deadline has passed must not block a write"
+        );
+        assert_eq!(store.get(b"k").expect("get"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn a_conditional_write_with_a_zero_ttl_is_refused() {
+        let fixture = Fixture::new("sia-zero");
+        let store = fixture.store(1024 * 1024);
+        let err = store
+            .set_if_absent(b"k", b"v".to_vec(), Some(Duration::ZERO))
+            .expect_err("must be refused");
+        assert!(matches!(err, Error::BadKey { .. }), "{err}");
+        assert_eq!(
+            store.get(b"k").expect("get"),
+            None,
+            "and nothing was written"
+        );
+    }
+
+    /// A conditional write that loses gives its reservation back, so a hot key does not shrink the
+    /// store by its own races.
+    #[test]
+    fn a_lost_conditional_write_leaves_the_accounting_alone() {
+        let fixture = Fixture::new("sia-accounting");
+        let store = fixture.store(1024 * 1024);
+        store.set(b"k", b"v".to_vec(), None).expect("set");
+        for _ in 0..50 {
+            assert!(!store
+                .set_if_absent(b"k", vec![9u8; 200], None)
+                .expect("no error"));
+        }
+        // The store can still take nearly its whole bound, which it could not if fifty losses had
+        // each kept a 200-byte reservation.
+        store
+            .set(b"big", vec![7u8; 900_000], None)
+            .expect("the store is not held short by its own lost races");
     }
 }
