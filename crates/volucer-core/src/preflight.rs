@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{BackendConfig, Config, OriginSpec};
+use crate::config::{BackendConfig, Config, OriginSpec, ServeOnly};
 use crate::program::{resolve_program, split_command};
 
 /// One thing that is probably not what the operator meant.
@@ -30,7 +30,7 @@ impl Warning {
         }
     }
 
-    /// A warning with nothing to act on — stated so a deployment can see what volucer is doing.
+    /// A warning with nothing to act on â€” stated so a deployment can see what volucer is doing.
     ///
     /// The same constructor as [`Warning::new`], named for a reader rather than a compiler: the
     /// other warnings in this file all carry a hint because each one is something to *change*, and
@@ -51,16 +51,58 @@ impl Warning {
 /// Inspect the host and report anything that will not work as written.
 ///
 /// `document_root` is the document root that will actually be used, after the
-/// command line has had its say — so `check` can report the same decision `serve`
+/// command line has had its say â€” so `check` can report the same decision `serve`
 /// would make rather than the one the file happens to contain.
 pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
     inspect_with(config, document_root, None)
 }
 
+/// Whether anything under the document root could be served as a file.
+///
+/// Only the top level is read, and that is the deliberate part: the question is not
+/// "does this application ship a file anywhere" â€” every application ships its own
+/// `index.php`, which this layer refuses to serve â€” but "does it have an *assets*
+/// story". An application that serves assets puts them in a directory beside the
+/// front controller (`assets/`, `static/`, `css/`, `js/`, `images/`, `build/`,
+/// `public/`); one that does not has a document root holding a controller and
+/// nothing else. Reading one level deep is a `read_dir` at startup, not a walk.
+///
+/// It is deliberately generous. A directory is enough to suppress the warning even
+/// if it is empty, because a deployment may create it at build time; what this
+/// must never do is tell an application with an asset directory that it has none.
+fn has_static_assets(document_root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(document_root) else {
+        // Unreadable is not "no assets". The caller already warns about a root it
+        // cannot use, and guessing here would add a second, wronger complaint.
+        return true;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || entry
+                .path()
+                .extension()
+                .is_some_and(|ext| !is_script_extension(ext))
+    })
+}
+
+/// Whether an extension names something a backend executes rather than a file.
+///
+/// The three PHP spellings are the ones this layer refuses to serve from disk, so a
+/// document root holding only those is a document root with nothing to serve. The
+/// list is the *default* script list rather than a site's configured one: this runs
+/// before sites are resolved, and being wrong in the direction of "this is an asset"
+/// only suppresses a warning.
+fn is_script_extension(extension: &std::ffi::OsStr) -> bool {
+    matches!(
+        extension.to_str().map(str::to_ascii_lowercase).as_deref(),
+        Some("php" | "php3" | "phtml")
+    )
+}
+
 /// [`inspect`], resolving relative TLS paths against the config file's directory.
 ///
 /// `config_path` is `None` when the caller has no file (a config built in a test), in which
-/// case a relative TLS path is reported as written — the same answer `Path::parent` gives for
+/// case a relative TLS path is reported as written â€” the same answer `Path::parent` gives for
 /// a bare filename, and better than inventing a directory.
 pub fn inspect_with(
     config: &Config,
@@ -96,12 +138,12 @@ pub fn inspect_with(
                         "front controller {front} was not found under {}",
                         document_root.display()
                     ),
-                    // `front_controller = \"\"` cannot be written in the file —
+                    // `front_controller = \"\"` cannot be written in the file â€”
                     // TOML cannot tell an empty string from an absent key, so the
                     // meaning is reserved for the flag. The hint has to say that,
                     // or it recommends something the validator rejects.
                     "check the path, or serve with `--front-controller ''` to mean \"only real \
-                     .php files\" — every unmatched request will 404 meanwhile"
+                     .php files\" â€” every unmatched request will 404 meanwhile"
                         .to_string(),
                 ));
             }
@@ -112,6 +154,39 @@ pub fn inspect_with(
         warnings.push(Warning::new(
             "server.static_files is enabled, but nothing can be served while the document root \
              is unusable",
+        ));
+    }
+
+    // A front-controller application that also runs the static layer pays for a
+    // decision it cannot use. Every request to such an application is a path that
+    // names no file â€” that is what a front controller *is* â€” so the layer answers
+    // `NotAFile` on every one of them, after a `stat` and a hop to the blocking
+    // pool.
+    //
+    // Measured on the competition host, same binary, `GET /items` at c=32: 2.05
+    // `statx` per request with the layer on against 0.04 with it off, 33,043 rps
+    // against 42,142. See hazard 85.
+    //
+    // A warning rather than an inferred default: the layer is legitimately useful
+    // for an application that serves its own assets, and turning it off for one
+    // that does would be a silent behaviour change on upgrade. What is not
+    // defensible is leaving the operator to find out from a benchmark.
+    if config.server.statics().enabled
+        && config.server.serve_only == ServeOnly::All
+        && !config.backends.is_empty()
+        && config
+            .server
+            .resolve_front_controller(None)
+            .is_some_and(|front| !front.is_empty())
+        && document_root.is_dir()
+        && !has_static_assets(document_root)
+    {
+        warnings.push(Warning::with_hint(
+            "server.static_files is on and a front controller is configured, but the document \
+             root holds no asset a file could be served from â€” every request stats for a file \
+             that is never there",
+            "write `serve_only = \"backend\"` to skip the static layer, which answers exactly \
+             the same requests without the stat",
         ));
     }
 
@@ -126,7 +201,7 @@ pub fn inspect_with(
                     "sites.{name}: document root {} does not exist",
                     root.display()
                 ),
-                "create it, or point this site's document_root somewhere else — every request \
+                "create it, or point this site's document_root somewhere else â€” every request \
                  to this site's hosts will fail meanwhile",
             ));
             continue;
@@ -149,14 +224,14 @@ pub fn inspect_with(
         }
     }
 
-    // A listener with no backends is a static-only deployment, which works — but
+    // A listener with no backends is a static-only deployment, which works â€” but
     // only for paths that name a file. A path that names nothing has nowhere to go
     // and answers 500, so it is worth saying once here rather than leaving it to be
     // discovered as an "internal error" at the first request.
     if config.backends.is_empty() {
         warnings.push(Warning::with_hint(
             "no backends are configured: only paths naming a real file can be answered",
-            "with a front controller set, every other path is a 500 — either add a backend, or \
+            "with a front controller set, every other path is a 500 â€” either add a backend, or \
              serve with `--front-controller ''` if this really is files only",
         ));
     }
@@ -177,7 +252,7 @@ pub fn inspect_with(
         warnings.push(Warning::with_hint(
             "status.allow_worker_reset is set, but no backend is a worker pool: the routes exist \
              and every index is a 404",
-            "either add a `kind = \"worker\"` backend, or remove allow_worker_reset — a mutation \
+            "either add a `kind = \"worker\"` backend, or remove allow_worker_reset â€” a mutation \
              route with nothing behind it is an address an attacker can probe for free",
         ));
     }
@@ -191,7 +266,7 @@ pub fn inspect_with(
 /// Report TLS settings whose files are missing or unusable.
 ///
 /// The paths here are as written in the configuration, so this runs against whatever the
-/// caller resolved — `check` passes the config-file-relative paths it printed, which is the
+/// caller resolved â€” `check` passes the config-file-relative paths it printed, which is the
 /// point: the warning names the same file the operator sees.
 ///
 /// Everything is a warning, like the rest of this module. A certificate that is not there yet
@@ -259,7 +334,7 @@ pub fn inspect_tls_with(config: &Config, config_path: Option<&Path>, warnings: &
 /// Report one PEM file that is missing, unreadable, or not PEM.
 ///
 /// "Starts with a PEM header" is deliberately all this checks. Parsing the certificate properly
-/// belongs to `serve`, which must do it anyway before it binds — and duplicating a real parser
+/// belongs to `serve`, which must do it anyway before it binds â€” and duplicating a real parser
 /// here would be a second answer to the same question, which is the drift this codebase avoids.
 /// A file that begins with `-----BEGIN` and is still corrupt is caught at startup.
 fn check_pem(label: &str, path: &Path, what: &str, warnings: &mut Vec<Warning>) {
@@ -318,7 +393,7 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                             binary.display(),
                             worker.command
                         ),
-                        "check the path, or the `command` of this backend — the worker is started \
+                        "check the path, or the `command` of this backend â€” the worker is started \
                          with `command`, not with `binary`, so the two are independent settings",
                     ));
                 }
@@ -327,7 +402,7 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                 if !cgi.binary.is_file() {
                     warnings.push(Warning::with_hint(
                         format!("backends.{name}: {} does not exist", cgi.binary.display()),
-                        "point `binary` at the php-cgi executable for this host — \
+                        "point `binary` at the php-cgi executable for this host â€” \
                          `volucer check` lists every PHP binary it found above",
                     ));
                 }
@@ -352,7 +427,7 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
             BackendConfig::Upstream(upstream) => {
                 // A unix socket is checked the same way the `external` backend's is, and for the
                 // same reason: a missing one is the common cause of a first-request 502, and it is
-                // cheap to notice. A malformed origin is *not* reported here — `Config::validate`
+                // cheap to notice. A malformed origin is *not* reported here â€” `Config::validate`
                 // refuses it outright, so repeating it as a warning would be a weaker second
                 // answer to a question already answered.
                 let Ok(origin) = OriginSpec::parse_with(
@@ -432,6 +507,85 @@ command = "{}"
         Config::from_toml(&text).expect("config parses")
     }
 
+    /// The static layer's default costs a front-controller application a `stat` it
+    /// can never use, and a warning is the only honest way to say so.
+    ///
+    /// Both directions matter. A site whose document root holds only a front
+    /// controller is warned about, because every request to it is a path that names
+    /// no file; a site that ships an asset directory is not, because the layer is
+    /// exactly what it wants. And a site that already said `serve_only = "backend"`
+    /// is not warned about either â€” it has already made the decision the hint
+    /// recommends.
+    #[test]
+    fn a_front_controller_with_no_assets_is_warned_about_the_static_layer() {
+        let fixture = Fixture::bare("no-assets");
+        fixture.write("index.php");
+
+        let warnings = inspect(&config(), fixture.path());
+        let found = warnings.iter().any(|warning| {
+            warning
+                .message
+                .contains("no asset a file could be served from")
+                && warning
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("serve_only"))
+        });
+        assert!(
+            found,
+            "expected the static-layer warning, got {warnings:#?}"
+        );
+        drop(fixture);
+    }
+
+    #[test]
+    fn a_document_root_with_an_asset_directory_is_not_warned_about() {
+        let fixture = Fixture::bare("with-assets");
+        fixture.write("index.php");
+        fixture.write("assets/app.css");
+
+        let warnings = inspect(&config(), fixture.path());
+        assert!(
+            !warnings.iter().any(|warning| warning
+                .message
+                .contains("no asset a file could be served from")),
+            "an application with assets wants the layer: {warnings:#?}"
+        );
+        drop(fixture);
+    }
+
+    #[test]
+    fn opting_out_of_the_static_layer_is_not_warned_about() {
+        let fixture = Fixture::bare("opted-out");
+        fixture.write("index.php");
+
+        let text = format!(
+            r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+serve_only = "backend"
+[backends.app]
+kind = "worker"
+command = "{}"
+"#,
+            std::env::current_exe()
+                .expect("the test binary path")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        let warnings = inspect(&config, fixture.path());
+        assert!(
+            !warnings.iter().any(|warning| warning
+                .message
+                .contains("no asset a file could be served from")),
+            "the operator already asked for this: {warnings:#?}"
+        );
+        drop(fixture);
+    }
+
     /// A configuration with one backend whose program cannot be started.
     fn config_with_worker_command(command: &str) -> Config {
         let text = format!(
@@ -451,11 +605,26 @@ command = "{command}"
     struct Fixture(std::path::PathBuf);
 
     impl Fixture {
+        /// An empty root, for the tests that are *about* the static layer warning.
+        fn bare(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("volucer-preflight-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create the fixture");
+            Fixture(path)
+        }
+
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir()
                 .join(format!("volucer-preflight-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("create the fixture");
+            // A directory, so these tests stay about the document root rather than
+            // about the static layer. A root holding only a front controller is now
+            // warned about (it pays a stat per request for nothing), and a fixture
+            // that triggered that would make every test here assert two subjects at
+            // once. The warning has its own tests, which build their own root.
+            std::fs::create_dir_all(path.join("assets")).expect("create the asset directory");
             Fixture(path)
         }
 
@@ -489,7 +658,7 @@ command = "{command}"
     ///
     /// This is the mistake a configuration file is most likely to make, because
     /// `binary` is the one setting that is a filesystem path rather than a value
-    /// with a default — and it is the one `Config::validate` cannot see.
+    /// with a default â€” and it is the one `Config::validate` cannot see.
     #[test]
     fn a_php_cgi_binary_that_does_not_exist_is_reported() {
         let root = Fixture::new("bad-binary");
@@ -504,7 +673,7 @@ binary = "C:/definitely/not/php-cgi.exe"
 "#;
         let config = Config::from_toml(text).expect("config parses");
         // Validation is about the shape of the file, so the missing file is not
-        // its business — which is exactly why `inspect` has to catch it.
+        // its business â€” which is exactly why `inspect` has to catch it.
         config.validate().expect("the shape of the file is valid");
 
         let warnings = inspect(&config, root.path());
@@ -539,7 +708,7 @@ binary = "C:/definitely/not/php-cgi.exe"
     /// by name rather than parsed into something else.
     ///
     /// It used to be accepted and then refused at startup, with `check` warning that it
-    /// would not be started — a key that looked supported and could not work. `deny_unknown_fields`
+    /// would not be started â€” a key that looked supported and could not work. `deny_unknown_fields`
     /// on the backend table is what turns that into an error at the point the file is
     /// read, which is where a removed setting should be noticed.
     #[test]
@@ -569,7 +738,7 @@ binary = "/usr/sbin/php-fpm"
         // still naming a script, which is the shape that answers 500.
         root.write("index.php");
         // No front controller key, so the default (`index.php`) is in effect and
-        // a path naming no file would answer 500 — which is what the warning
+        // a path naming no file would answer 500 â€” which is what the warning
         // exists to say before the first request does.
         let config = Config::from_toml(
             r#"
@@ -598,7 +767,7 @@ http = "127.0.0.1:8080"
         let root = Fixture::new("missing");
         let gone = root.path().join("not-created-yet");
         let warnings = inspect(&config(), &gone);
-        // Two: the root is gone, and the static layer — on by default — has nothing to
+        // Two: the root is gone, and the static layer â€” on by default â€” has nothing to
         // serve from. Both are true and both name the same cause, which is the point.
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
@@ -686,7 +855,7 @@ key = "{key}"
         Config::from_toml(&text).expect("config parses")
     }
 
-    /// A valid-looking PEM block. The check is deliberately shallow — it asks whether the
+    /// A valid-looking PEM block. The check is deliberately shallow â€” it asks whether the
     /// file starts with a PEM header, not whether the certificate parses, because parsing
     /// belongs to `serve` and a second parser here would be a second answer.
     const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
@@ -694,7 +863,7 @@ key = "{key}"
     /// Only the warnings this module's TLS checks produced.
     ///
     /// The fixture deliberately has no front controller and no backends, so `inspect_with`
-    /// also reports those — they are real findings about the fixture, not about TLS, and
+    /// also reports those â€” they are real findings about the fixture, not about TLS, and
     /// counting them here would make these tests break whenever an unrelated check grows.
     fn tls_warnings(warnings: &[Warning]) -> Vec<&Warning> {
         warnings
@@ -800,7 +969,7 @@ key = "shop.key"
             Some(&root.path().join("volucer.toml")),
         );
 
-        // The server's pair is present, the site's is not — so exactly the site's two are
+        // The server's pair is present, the site's is not â€” so exactly the site's two are
         // reported, and the server's absence of a warning is what proves the check is
         // looking at the right pair rather than reporting everything.
         let tls = tls_warnings(&warnings);

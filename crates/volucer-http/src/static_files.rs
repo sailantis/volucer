@@ -204,27 +204,6 @@ fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
         Resolution::Outside => return Plan::Forbidden,
     };
 
-    if files.config.directory_index {
-        if path.ends_with('/') {
-            let index = resolved.join("index.html");
-            if !index.is_file() {
-                // A directory with no index is not a file, so PHP gets it — an
-                // application may well have a route for it.
-                return Plan::NotAFile;
-            }
-            return describe(index, owned, files);
-        }
-        // A directory without its trailing slash: `docs` becomes `docs/`, so
-        // relative links inside the page resolve against it.
-        if resolved.is_dir() && resolved.join("index.html").is_file() {
-            return Plan::Redirect(directory_location(owned, files.server_port));
-        }
-    }
-
-    if !resolved.is_file() {
-        return Plan::NotAFile;
-    }
-
     // A file a backend is meant to execute is never served from disk: sending
     // `index.php` as a file discloses its source, and `<?php …` is a valid
     // response body, so nothing downstream would notice. It goes to the
@@ -233,22 +212,67 @@ fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
     // is shared with the routing layer instead of duplicated: two lists of "what
     // is a script" would drift, and the one that drifted would be the one that
     // serves source code.
+    //
+    // Checked *before* the stat because it is pure string work: asking the
+    // filesystem about a path this layer may never serve is a round trip to learn
+    // something the extension already answered.
     if files.script_extensions.matches(path) {
         return Plan::NotAFile;
     }
 
-    describe(resolved, owned, files)
+    // A directory URL is answered before anything else is stat-ed, because the
+    // only file it can name is its own index. `is_file()` then `describe` would
+    // stat that one file twice.
+    if files.config.directory_index && path.ends_with('/') {
+        let index = resolved.join("index.html");
+        return match std::fs::metadata(&index) {
+            Ok(metadata) if metadata.is_file() => describe(index, metadata, owned, files),
+            // A directory with no index is not a file, so PHP gets it — an
+            // application may well have a route for it.
+            _ => Plan::NotAFile,
+        };
+    }
+
+    // One `stat`, and it is the only one. `is_dir()` and `is_file()` each stat on
+    // their own, so asking both cost two round trips to learn a single fact — and
+    // for a front-controller application that is two round trips on *every* path
+    // in the application, since none of them names a file. The metadata answers
+    // both questions, and it is also what `describe` needs, so the file case costs
+    // one stat where it used to cost two as well.
+    //
+    // Measured: `GET /items` went from 2.05 `statx` per request to 1.05, which is
+    // the one this line makes. See hazard 85 in the plan.
+    let Some(metadata) = std::fs::metadata(&resolved).ok() else {
+        // Not there. `NotAFile` rather than a 404: a path that names no file may
+        // still be the application's, and this layer's job is to get out of the
+        // way rather than to shadow a route that exists.
+        return Plan::NotAFile;
+    };
+
+    if files.config.directory_index && metadata.is_dir() && resolved.join("index.html").is_file() {
+        // A directory without its trailing slash: `docs` becomes `docs/`, so
+        // relative links inside the page resolve against it.
+        return Plan::Redirect(directory_location(owned, files.server_port));
+    }
+
+    if !metadata.is_file() {
+        return Plan::NotAFile;
+    }
+
+    describe(resolved, metadata, owned, files)
 }
 
 /// Turn a file that is known to exist into a `Plan::File`.
-fn describe(path: PathBuf, owned: &Owned, files: &StaticFiles) -> Plan {
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        // It was there a moment ago and is not now. A 404 is the correct and
-        // unremarkable answer to a request racing a deployment.
-        Err(_) => return Plan::NotFound,
-    };
-
+///
+/// The metadata is passed in rather than read here: the caller has already stat-ed
+/// the path to establish that it is a file, and a second `stat` of the same file
+/// would be a second round trip for a fact already in hand.
+fn describe(
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+    owned: &Owned,
+    files: &StaticFiles,
+) -> Plan {
     let (path, encoding, length) = choose_encoding(&path, metadata.len(), &owned.wanted, files);
     Plan::File {
         path,
@@ -1427,6 +1451,57 @@ mod tests {
         bare.host = None;
         assert_eq!(directory_location(&bare, 8080), "//localhost:8080/docs/");
         assert_eq!(directory_location(&bare, 80), "//localhost/docs/");
+    }
+
+    #[test]
+    fn a_path_that_names_no_file_is_not_shadowed_by_its_absent_neighbour() {
+        // `plan` stats the resolved path once and decides directory/file/neither
+        // from that one metadata. The distinction this pins is the one that matters
+        // to a front-controller application, where *every* route is a path that
+        // names no file: `docs` exists as a directory, `about` does not exist at
+        // all, and both must reach the backend rather than being answered here.
+        //
+        // An earlier shape asked `is_dir()` and then `is_file()`, which is two
+        // `stat`s for one fact — measured at 2.05 `statx` per request against 1.05
+        // after collapsing them. The answers are what this test holds; the count is
+        // not observable from here, which is why hazard 85 records the strace.
+        let root = fixture(
+            "plan-one-stat",
+            &[("docs/index.html", "docs"), ("file.txt", "x")],
+        );
+        let files = layer(&root, true);
+        let headers = no_headers();
+
+        // A directory with no index reaches the backend, not a redirect to nothing.
+        fs::create_dir_all(root.join("empty")).expect("create the directory");
+        assert_eq!(
+            name_of(&plan(&owned("/empty", &headers), &files)),
+            "not a file"
+        );
+        assert_eq!(
+            name_of(&plan(&owned("/empty/", &headers), &files)),
+            "not a file"
+        );
+
+        // A directory *with* an index still gets its redirect, from the same stat.
+        assert_eq!(
+            name_of(&plan(&owned("/docs", &headers), &files)),
+            "redirect"
+        );
+
+        // A path that exists nowhere.
+        assert_eq!(
+            name_of(&plan(&owned("/about", &headers), &files)),
+            "not a file"
+        );
+
+        // And a real file is still served, from the metadata the plan already had.
+        match plan(&owned("/file.txt", &headers), &files) {
+            Plan::File { length, .. } => assert_eq!(length, 1),
+            other => panic!("unexpected: {}", name_of(&other)),
+        };
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
