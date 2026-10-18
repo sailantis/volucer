@@ -2202,6 +2202,17 @@ the workflow is the same one, but it finally has an output, so it stops being de
         green check mean anything: a tag with no release, no tag at all, an asset that is not on
         the release (404), and a mutated `install.sh` in the checkout all fail with a message
         naming the cause rather than the symptom.
+      - **`GET /releases/tags/{tag}` answers 404 for a draft**, and that nearly shipped. The
+        release is resolved from the *list* endpoint, which does return drafts — the by-tag
+        endpoint only works once a release is published, i.e. exactly when this script has nothing
+        left to do. Every test before the fix was against an already-published `v0.1.0`, so the
+        lookup passed for the wrong reason; it took creating a throwaway draft, running the real
+        script against it, and watching it claim "the release job did not create one" for a release
+        that existed. The throwaway was deleted afterwards, and `latest` was checked to still point
+        at `v0.1.0` rather than at it.
+      - **`draft=false` needs `-F`, not `-f`.** `gh -f` sends a string, and GitHub validates
+        `draft` as a JSON boolean and rejects `"false"` with a 422. `make_latest` is a real enum
+        and stays a string. The distinction was invisible until the PATCH actually ran.
       - **`make_latest=legacy` rather than `true`**, and the difference is a real scenario: GitHub
         defines `legacy` as "determined based on the release creation date and higher semantic
         version", so a maintenance release (`v0.1.1` after `v0.2.0`) does not repoint the
