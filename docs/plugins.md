@@ -226,7 +226,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
   every file *and its imports* recursively, which is a descriptor compiler and not a parser. §6.6
   records what it buys and what its absence costs.
 - **`plugin-abis`** — a compile-time DI container in Go, so there is no ABI to copy; `plan.md` item 39
-  already refuses it.
+  has now been withdrawn for exactly that reason.
 
 **One of the four rows in the first table was a defect rather than a missing feature, and it is
 built — §6.8.** That is the useful conclusion of the sort: the parts of RoadRunner that volucer

@@ -1539,8 +1539,12 @@ Later milestone
     shared by sites, SNI and route matching (hazard 54).
 25. `prefork-optional` — Unix-only prefork to cut worker bootstrap cost, forked from a PHP boot
     parent (never the Tokio runtime).
-26. `rpc-sidechannel` — only if a v2 need appears (background jobs, websockets) that the
-    request/response protocol genuinely cannot express.
+26. ~~`rpc-sidechannel`~~ — **withdrawn.** It was never a task, only a marker for "if a v2 need
+    appears (background jobs, websockets) that the request/response protocol genuinely cannot
+    express". No such need has appeared, and the protocol has since grown `JOB`/`CALL` frames and a
+    Python and Ruby SDK that use them, so the condition is answered rather than pending. A marker
+    nobody intends to reach is a step that reads as backlog; it is struck through rather than
+    deleted so the numbering after it stays stable.
 
 Phase 8 — sites (vhosts)
 
@@ -1675,12 +1679,56 @@ Later, and deliberately not part of Phase 8:
       `server.script_extensions` or `sites.<name>.script_extensions`, whichever was written.
     - **`check` prints the list only when it is not the default**, and prints it normalised, so an
       operator who wrote `".py"` sees that the server compares `py`.
-39. `plugin-abis` — only if a real need appears. RoadRunner's "plugins" are statically linked Go
-    packages resolved by a compile-time DI container (`container/plugins.go`; there is no
-    `plugin.Open` anywhere), so the enum backend kind stays the extension point.
-40. `route-policy` — `RouteConfig` gains `policy` and `backend` becomes optional, so a route is a
-    location rather than only a backend selector. §4.8 of the design notes.
-41. `compression` — on-the-fly gzip/brotli, and the ETag and negotiation-cache questions it raises.
+39. ~~`plugin-abis`~~ — **withdrawn, and the reason is the finding itself.** RoadRunner's
+    "plugins" are statically linked Go packages resolved by a compile-time DI container
+    (`container/plugins.go`; there is no `plugin.Open` anywhere), so there is no ABI in RR to copy.
+    The Rust-shaped equivalent — a compile-time service registry plus cargo features — is
+    described in `docs/plugins.md` §5 and is not a step this plan needs to schedule. The enum
+    backend kind stays the extension point.
+40. `route-policy` — **done** (`5709b03`). `RouteConfig` gains `policy` (`all` | `backend` |
+    `static`) and `backend` becomes optional, so a route is a location rather than only a backend
+    selector. §4.8 of the design notes.
+    - **The load-bearing change was ordering, not the field.** The route used to be selected
+      *after* the static decision, so a route could not influence layering at all — it could only
+      choose a backend once static had already missed. It is selected first now and both layers
+      read it. This is the same rule the `skip_stat` work established: two answers to one question
+      is the drift.
+    - **`backend` is optional only for `policy = "static"`, and refused otherwise.** A route that
+      can reach a backend and does not name one would silently inherit the *site's*
+      `default_backend` — a request answered by a backend its own table never mentioned.
+    - **`skip_stat` returns `false` for a route with no backend.** The check it performs is "can
+      this backend interpret this path", and answering `false` (vacuously true) for an absent
+      backend would remove the only check a files-only subtree depends on.
+    - **`check` prints `policy` only when it is not `all`.** Printing it unconditionally broke a
+      pre-existing test's line-adjacency assumption, which is the site-table convention this now
+      follows.
+41. `compression` — **done** (`bf09794`). `crates/volucer-http/src/compress.rs`, 20 tests.
+    `[server.compression]`, **off by default** — a deliberate inversion of nginx's, because a
+    server that starts compressing an application's output on upgrade is a change the operator did
+    not make. `[sites.x.compression]` overrides, and a site's `encodings` **replaces** rather than
+    appends.
+    - **gzip and zstd; brotli deliberately not offered at runtime.** The `brotli` crate defaults to
+      quality 11 and `async-compression` inherits that, which is the tower-http issue where a
+      770 KiB body took 8.3 s. Precompressed `.br` beside a static file is the right shape for
+      brotli and the static layer already does it. gzip is `flate2` with the pure-Rust `zlib-rs`
+      backend (no second C dependency on top of `aws-lc-rs`); zstd is the reference C bindings.
+    - **The zstd window trap is real but narrower than the colleague's write-up said, and the
+      measurement is the reason to clamp anyway.** Browsers refuse a frame whose window exceeds
+      8 MiB. Measured here, the default window at levels 1–19 stays at or below 8 MiB even for a
+      32 MiB input; only the ultra levels (20+) switch to single-segment framing, where the window
+      is the whole body. `MAX_WINDOW_LOG = 23` is set explicitly and a test parses the frame
+      header rather than trusting the setting.
+    - **`tower_http::CompressionLayer` was rejected on evidence.** The colleague recommended it as
+      the negotiation layer that RoadRunner lacks. It is the right tool for a tower stack, and
+      this listener is a bare `hyper` `service_fn` (`listener.rs:1048`) with none — adopting it
+      would mean restructuring the hot path to gain a header parser.
+    - **Two guards held where one was intended, found by an existing test rather than a new one.**
+      The end-to-end `min_length` assertion passed with the threshold removed: the post-hoc "did
+      it actually shrink" check refuses a 5-byte body too. The unit test that distinguishes them
+      uses an 800-byte compressible body.
+    - **Collecting headers into a `HeaderMap` collapsed repeated headers** — two `Set-Cookie`
+      became one. The response is built from the ordered pair list; the map exists only for the
+      compression decision.
 
 Phase 9 — TLS termination (step 24a, split from `tls-acme` by hazard 54)
 
@@ -2345,7 +2393,9 @@ the workflow is the same one, but it finally has an output, so it stops being de
 rejected for isolation). No multiplexed FastCGI — the specification has it (§1: *"the protocol
 multiplexes a single transport connection between several independent FastCGI requests"*, and the
 `request_id` is a `u16`) but no provider implements it, so a consumer would have to be written as
-well as a producer. No HTTP/3, no `prefork-optional`, no `rpc-sidechannel`.
+well as a producer. No HTTP/3, no `prefork-optional`. `rpc-sidechannel` and `plugin-abis` were the plan's two
+"only if a need appears" markers and both have been withdrawn — steps 26 and 39 — so the
+list of deferred work is now the two items above it.
 
 **Two things are recorded here that this plan previously did not mention at all**, because the user
 asked about both and the honest answer was "neither is anywhere in this document":
