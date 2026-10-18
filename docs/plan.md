@@ -2186,19 +2186,48 @@ the workflow is the same one, but it finally has an output, so it stops being de
     - **Not chosen: a PHP extension.** FrankenPHP's model embeds PHP in the server, which is the
       design hazard 53 priced and this project rejected on grounds of isolation.
 
-71. `sdk-session-helper` — small, and a prerequisite for the next step rather than tidying.
-    - `docs/worker-protocol.md` currently tells an adapter author where the session handoff lives:
-      *"Both adapters share one implementation of this, `Azera\Http\WorkerSession` in
-      `sailantis/azera-framework`, which is where a third one should look first."* For a **public**
-      SDK that is backwards — it points a third-party author at one vendor's framework to find a
-      helper for a protocol that has nothing to do with that framework.
-    - Move the two halves — read the session id from the request and write `Set-Cookie` on the
-      response, with the between-requests reset — into `sailantis/volucer-worker`, where the rest of
-      the worker contract already lives. The framework adapters then depend on the SDK instead of
-      each other.
-    - **Why it is a step and not a note:** the failure it prevents is silent. `session_id()`
+71. `sdk-session-helper` — **done.** `Volucer\Session` in `sailantis/volucer-worker` now owns the
+    session handoff, and `docs/worker-protocol.md` points at the SDK instead of at a framework.
+    - **What `docs/worker-protocol.md` said was backwards, and that was the step.** *"Both adapters
+      share one implementation of this, `Azera\Http\WorkerSession` in
+      `sailantis/azera-framework`, which is where a third one should look first."* A public
+      protocol document pointing a third-party adapter author at one vendor's framework to find a
+      helper for a contract that has nothing to do with that framework.
+    - **The API is shaped around the failure, not around the two halves.** `begin($request)` then
+      `applyTo($response)`, and **`applyTo()` ends the request as well**. The reason is measured
+      rather than argued: `end()` clears the id, so `cookie()` called afterwards returns `null` and
+      the `Set-Cookie` is never sent — the session is created on every request and nothing logs a
+      word. The first version of this step shipped them as independent calls with `end()` documented
+      as "call this after"; the end-to-end test caught it, because the response arrived with the
+      right session data and no cookie at all. Fusing them makes the wrong order unexpressible.
+    - **Two entry points, because there are two kinds of caller.** `begin($request)` parses the
+      `Cookie` header through `Request::cookies()`; `beginWithCookies($array)` is the primitive for
+      an adapter whose request is PSR-7 or a framework's own object. The same split on the way out:
+      `applyTo($response)` for a `Volucer\Response`, `cookie()` + `end()` for anything else.
+    - **`WorkerSession` was deleted rather than kept as a deprecated alias.** Its only consumer was
+      `azera-volucer`, which already depends on `sailantis/volucer-worker`; it is migrated, its 28
+      tests (5 of them about sessions) pass unchanged, and `azera-framework`'s 573 tests pass
+      without the class. A second copy of a security-relevant handoff is the thing this step
+      existed to remove.
+    - **One assumption was checked rather than coded around.** An early draft read the cookie name
+      from `session_get_cookie_params()['name']`; that key does not exist in PHP 8.3 (it returns
+      `lifetime`, `path`, `domain`, `secure`, `httponly`, `samesite`), so the fallback was dead code.
+      `session_name()` is the one source.
+    - **Verification:** `tests/SessionTest.php` — 44 assertions with no PHPUnit, including the
+      ordering trap pinned as its own case — plus a real `volucer` binary, a real worker process and
+      a real client: a session reaches the client, survives the next request, is not echoed back, a
+      cookieless interloper gets no session *on the same worker process*, and the first client's
+      session still works afterwards.
+    - **Why it was a step and not a note:** the failure it prevents is silent. `session_id()`
       outlives the request in a long-lived process, so a client arriving with no cookie inherits the
       *previous* client's session — which passes every test that sends no cookie.
+    - **The three PHP framework bridges do not use it, and that is correct rather than an
+      omission.** They hand the request to a framework that has its own session middleware and its
+      own response header bag, so the id comes in from the PSR-7 cookie params and the `Set-Cookie`
+      goes out as an ordinary framework header — the SDK relays response headers either way. What
+      makes `Volucer\Session` necessary for `azera-volucer` is that Azera uses PHP's *native*
+      `$_SESSION`, which needs a SAPI that a worker is not. A bridge that later reaches for native
+      sessions should use this class instead of writing the handoff again.
 
 72. `framework-bridges` — **done for Spiral, Symfony and Laravel.** A package per framework, and the
     work is per-framework state reset rather than the protocol.

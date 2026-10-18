@@ -496,8 +496,20 @@ The session id also has to be reset between requests. `session_id()` outlives th
 long-lived process, so a client arriving with no cookie would otherwise inherit the previous
 client's session from the process rather than from its own request.
 
-Both adapters share one implementation of this, `Azera\Http\WorkerSession` in
-`sailantis/azera-framework`, which is where a third one should look first.
+**The SDK implements this, and an adapter should not reimplement it.** `Volucer\Session` in
+`sailantis/volucer-worker` does both halves: `begin($request)` before the application runs, then
+`applyTo($response)` to end the request and put the `Set-Cookie` on the result. The two are fused
+into one call on purpose — reading the id after ending the session yields `''`, so a caller that
+does them in the wrong order drops the cookie *silently*, which is precisely the failure this
+section is about. An adapter whose response is not a `Volucer\Response` (PSR-7, a framework's own
+object) takes `cookie()` and ends with `end()` instead.
+
+It is a worker-only concern. Under a normal SAPI, `session_start()` already does all of it.
+
+Nothing in this section is PHP-specific in *shape* — another runtime's SDK faces the same two
+halves. Python and Ruby sidestep it entirely, because their frameworks emit `Set-Cookie` as an
+ordinary response header and the SDKs carry response headers; the problem exists here because a
+SAPI is missing, not because the protocol is.
 
 ## The server's side of the contract
 
