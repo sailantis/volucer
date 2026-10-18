@@ -281,7 +281,8 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
             path_prefix: Some("/api".to_string()),
             path_suffix: None,
             host: None,
-            backend: "api_pool".to_string(),
+            policy: volucer_core::config::RoutePolicy::All,
+            backend: Some("api_pool".to_string()),
         }],
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()

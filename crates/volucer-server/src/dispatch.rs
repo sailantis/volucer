@@ -1033,6 +1033,7 @@ fn strip_query(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use volucer_core::config::RoutePolicy;
     use volucer_core::config::{
         BackendConfig, Config, ExternalConfig, MemoryKvConfig, ServerConfig,
     };
@@ -1528,10 +1529,11 @@ url = "redis://127.0.0.1:6379"
             "app",
         );
         config.routes = vec![RouteConfig {
+            policy: RoutePolicy::All,
             path_prefix: Some("/api".to_string()),
             path_suffix: None,
             host: None,
-            backend: "legacy".to_string(),
+            backend: Some("legacy".to_string()),
         }];
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
 
@@ -1564,16 +1566,18 @@ url = "redis://127.0.0.1:6379"
         );
         config.routes = vec![
             RouteConfig {
+                policy: RoutePolicy::All,
                 path_prefix: Some("/api".to_string()),
                 path_suffix: None,
                 host: None,
-                backend: "api".to_string(),
+                backend: Some("api".to_string()),
             },
             RouteConfig {
+                policy: RoutePolicy::All,
                 path_prefix: Some("/".to_string()),
                 path_suffix: None,
                 host: Some("admin.test".to_string()),
-                backend: "admin_api".to_string(),
+                backend: Some("admin_api".to_string()),
             },
         ];
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
@@ -1697,19 +1701,21 @@ url = "redis://127.0.0.1:6379"
         config.default_backend = Some("fallback".to_string());
         config.routes = vec![
             RouteConfig {
+                policy: RoutePolicy::All,
                 host: None,
                 path_prefix: Some("/api".to_string()),
                 path_suffix: None,
-                backend: "api".to_string(),
+                backend: Some("api".to_string()),
             },
             // A *suffix* route, deliberately, because it is the one that makes the stripping
             // load-bearing: `/api` as a prefix still matches `/api?x=1` with the query left on,
             // whereas `/index.php?x=1` does not end with `.php`.
             RouteConfig {
+                policy: RoutePolicy::All,
                 host: None,
                 path_prefix: None,
                 path_suffix: Some(".php".to_string()),
-                backend: "app".to_string(),
+                backend: Some("app".to_string()),
             },
         ];
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();

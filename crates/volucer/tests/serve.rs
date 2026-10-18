@@ -574,6 +574,111 @@ fn http_request(address: &str, method: &str, path: &str, extra: &[(&str, &str)])
     }
 }
 
+/// A route's `policy` decides which layer answers, asserted from outside the process.
+///
+/// **The case is chosen so the two layers genuinely disagree.** `policy = "backend"` on a
+/// subtree that contains a real file: without the policy the static layer serves the file, with
+/// it the backend answers instead. The distinguishing evidence is therefore the *body*, not the
+/// status ? a first version of this test used `policy = "static"` and a missing path, and the
+/// falsification passed, because a `spawn_cgi` backend answers 404 for a path naming no script
+/// whether or not the route told it to. Two paths agreeing is not a test of which one ran.
+#[test]
+fn a_route_policy_decides_which_layer_answers() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    // Two *separate* runs of ports, not one shared value: the HTTP listener binds one and
+    // `spawn_cgi` binds the next, so reusing the same number for both would have the backend
+    // try to listen on the port the front-end already holds.
+    let Some(http_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+    let Some(base_port) = free_port_run(2) else {
+        eprintln!("skipping: no run of two free ports");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("assets")).expect("create the document root");
+    std::fs::write(root.join("index.php"), "<?php echo 'APP';\n")
+        .expect("write the front controller");
+    // A real file under the subtree. Its presence is what makes the two policies differ.
+    std::fs::write(root.join("assets").join("present.txt"), "A FILE").expect("write an asset");
+
+    let port = http_port;
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        r#"
+default_backend = "cgi"
+
+[server]
+http = "127.0.0.1:{port}"
+document_root = {root}
+front_controller = "index.php"
+
+[backends.cgi]
+kind = "spawn_cgi"
+binary = {php_cgi}
+workers = 1
+bind_host = "127.0.0.1"
+base_port = {base_port}
+
+[[routes]]
+path_prefix = "/assets"
+policy = "backend"
+backend = "cgi"
+"#,
+        root = toml_string(&root.display().to_string()),
+        php_cgi = toml_string(&php_cgi.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+
+    // Inside the subtree the backend answers even though a file exists there. `spawn_cgi`
+    // hands a non-script path to the front controller, so the body is the application's.
+    let routed = http_get(&address, "/assets/present.txt");
+    assert_eq!(200, routed.status, "the request is served");
+    assert_eq!(
+        b"APP".as_slice(),
+        routed.body.as_slice(),
+        "policy = backend must dispatch rather than serve the file that is sitting there"
+    );
+
+    // The control, and it has to be a case the two layers answer *differently* -- which is the
+    // whole reason the assertion above means anything. A file outside the subtree is served by
+    // the static layer, so the same server returns its bytes rather than the application's.
+    std::fs::write(root.join("outside.txt"), "OUTSIDE").expect("write a file outside the route");
+    let plain = http_get(&address, "/outside.txt");
+    assert_eq!(
+        200, plain.status,
+        "outside the route the static layer answers"
+    );
+    assert_eq!(
+        b"OUTSIDE".as_slice(),
+        plain.body.as_slice(),
+        "with the file's own bytes, not the front controller's output"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn serve_answers_a_fastcgi_request_from_a_real_php_process() {
     let Some(binary) = volucer_binary() else {

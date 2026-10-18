@@ -2317,7 +2317,18 @@ fn check(
         let host = route.host.as_deref().unwrap_or("*");
         let prefix = route.path_prefix.as_deref().unwrap_or("*");
         let suffix = route.path_suffix.as_deref().unwrap_or("*");
-        println!("{indent}{host}{prefix}…{suffix} -> {}", route.backend);
+        // A route with no backend is a files-only location, and saying so is the point: it
+        // explains why a missing file there is a 404 rather than a dispatch.
+        match &route.backend {
+            Some(backend) => println!("{indent}{host}{prefix}{suffix} -> {backend}"),
+            None => println!("{indent}{host}{prefix}{suffix} -> (files only: no backend)"),
+        }
+        // Only what the route *states*, which is the same rule the site table uses: printing
+        // `all` under every route would make the table read as though every route had been
+        // configured with it.
+        if route.policy != volucer_core::config::RoutePolicy::All {
+            println!("{indent}  policy: {}", route.policy.as_str());
+        }
         if volucer_core::config::skip_stat(route, interprets_path, extensions) {
             println!("{indent}  stat: skipped (the pattern proves the extension)");
         }
@@ -2346,7 +2357,7 @@ fn check(
     for route in &config.routes {
         print_route(
             route,
-            interprets_path(&route.backend),
+            route.backend.as_deref().is_some_and(interprets_path),
             &default_extensions,
             "    ",
         );
@@ -2391,7 +2402,7 @@ fn check(
             for route in routes {
                 print_route(
                     route,
-                    interprets_path(&route.backend),
+                    route.backend.as_deref().is_some_and(interprets_path),
                     extensions,
                     "        ",
                 );

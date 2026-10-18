@@ -1383,7 +1383,22 @@ async fn prepare(
     // backend skips it, which is the difference between "static files first" and "no
     // static layer": the first still stats on every request to discover there is no
     // file, and for an application host there never is one.
-    if site.serve_only.serves_files() {
+    // The route is selected *before* the static decision, which is the change step 40 makes.
+    // It used to be selected after, so a route's `policy` could not affect the layering at all
+    // and the two layers could disagree about which subtree they were serving. One selection,
+    // used by both, is the same rule the `skip_stat` work established: two answers to one
+    // question is the drift.
+    let route = volucer_core::config::select_route(&site.routes, host, parts.uri.path());
+
+    // A route's policy is the site's `serve_only` for one subtree -- the only place a
+    // deployment can say "/assets is files, /api is the application" without splitting the
+    // site in two. A route that states nothing gets the site's behaviour, because `policy`
+    // defaults to `all`.
+    let policy = route.map(|route| route.policy).unwrap_or_default();
+    let serves_files = policy.serves_files() && site.serve_only.serves_files();
+    let serves_backend = policy.serves_backend() && site.serve_only.serves_backend();
+
+    if serves_files {
         let static_request = static_files::Request {
             method: &parts.method,
             path: parts.uri.path(),
@@ -1398,13 +1413,12 @@ async fn prepare(
     // A site that serves only files has no backend to fall through to, and the honest
     // answer for a path naming no file is then 404 — not a dispatch, and not a 500 from
     // a backend the deployment never configured.
-    if !site.serve_only.serves_backend() {
+    if !serves_backend {
         return Err(HttpError::NotFound(parts.uri.path().to_string()));
     }
 
-    let route = volucer_core::config::select_route(&site.routes, host, parts.uri.path());
     let backend = route
-        .map(|route| route.backend.clone())
+        .and_then(|route| route.backend.clone())
         .unwrap_or_else(|| front_end.dispatcher.default_backend().to_string());
 
     // A gRPC call leaves this function twice as often as a plain request does, so the one answer is
@@ -1471,11 +1485,14 @@ async fn prepare(
 
     // A route that proves its pattern names a script may skip the router's own `stat`:
     let skips_stat = route.is_some_and(|route| {
-        volucer_core::config::skip_stat(
-            route,
-            front_end.dispatcher.interprets_path(&route.backend),
-            &site.script_extensions,
-        )
+        // A route with no backend cannot reach one, so `interprets_path` has nothing to
+        // answer about: `true` here means "does not interpret", which would skip the stat that
+        // is the only thing resolving a files-only subtree.
+        let interprets = route
+            .backend
+            .as_deref()
+            .is_some_and(|name| front_end.dispatcher.interprets_path(name));
+        volucer_core::config::skip_stat(route, interprets, &site.script_extensions)
     });
 
     // Everything from here on blocks: routing stats the filesystem to resolve

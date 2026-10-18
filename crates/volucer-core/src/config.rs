@@ -1283,6 +1283,50 @@ impl StaticOverrides {
     }
 }
 
+/// What a matching route asks to be done with the request.
+///
+/// The distinction that matters is *which layer answers*, not which backend runs: a site's
+/// `serve_only` is one setting for the whole site, and a route is the only place a
+/// deployment can say "this subtree is files, that one is the application". Without it,
+/// `/assets` costs a `stat` on every request and a miss falls through to the front
+/// controller, which is what an application host pays for having a document root at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutePolicy {
+    /// Static files first, then the route's backend. What a site does by default.
+    #[default]
+    All,
+    /// The route's backend only: a path naming a file is dispatched like any other.
+    Backend,
+    /// Files only: a path naming no file is a 404, and no backend is consulted.
+    ///
+    /// Refused when the route names no backend *and* the site has no
+    /// `default_backend`, because there would be nothing for `/assets/missing.png` to be
+    /// a 404 *instead of* — see `Config::validate`.
+    Static,
+}
+
+impl RoutePolicy {
+    /// Whether the static layer runs for a request matched by this route.
+    pub fn serves_files(self) -> bool {
+        !matches!(self, RoutePolicy::Backend)
+    }
+
+    /// Whether a path that names no file may reach the route's backend.
+    pub fn serves_backend(self) -> bool {
+        !matches!(self, RoutePolicy::Static)
+    }
+
+    /// The name as it is written in configuration, for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoutePolicy::All => "all",
+            RoutePolicy::Backend => "backend",
+            RoutePolicy::Static => "static",
+        }
+    }
+}
+
 /// A route entry, selecting a backend for matching requests.
 ///
 /// Both matchers are optional, but at least one must be present — a route with
@@ -1311,8 +1355,18 @@ pub struct RouteConfig {
     #[serde(default)]
     pub host: Option<String>,
 
+    /// Which layer answers. Defaults to `all`, which is what the site already does.
+    #[serde(default)]
+    pub policy: RoutePolicy,
+
     /// The backend to dispatch to.
-    pub backend: String,
+    ///
+    /// Optional only for `policy = "static"`, which never dispatches: a route that can
+    /// reach a backend without naming one would have to guess, and the guess would be
+    /// `default_backend` — which is the site's setting, not this route's. Refused
+    /// otherwise, at the route that omitted it.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl RouteConfig {
@@ -1427,7 +1481,7 @@ pub fn select_backend<'a>(
     host: Option<&str>,
     path: &str,
 ) -> Option<&'a str> {
-    select_route(routes, host, path).map(|route| route.backend.as_str())
+    select_route(routes, host, path).and_then(|route| route.backend.as_deref())
 }
 
 /// [`select_backend`], keeping the route so its other properties are available.
@@ -1465,6 +1519,14 @@ pub fn skip_stat(
     backend_interprets_path: bool,
     extensions: &crate::script::ScriptExtensions,
 ) -> bool {
+    // A route may name no backend, which means `policy = "static"`: the static layer answers
+    // every request under it and nothing dispatches. `backend_interprets_path` is then
+    // vacuously false, and treating that as "skip the stat" would remove the one check a
+    // files-only subtree depends on -- so the caller is the wrong place to ask. Nothing to skip
+    // for: with no backend the stat is the only thing that resolves the request.
+    if route.backend.is_none() {
+        return false;
+    }
     // A backend that does not interpret the path never reads the file it names, so there is
     // nothing for the stat to protect. That covers two kinds for two different reasons: a worker
     // reads `script_filename` as metadata and routes on `REQUEST_URI`, and an upstream is handed
@@ -4934,11 +4996,28 @@ fn validate_route(
     index: usize,
     backends: &BTreeMap<String, BackendConfig>,
 ) -> Result<()> {
-    if !backends.contains_key(&route.backend) {
-        return Err(Error::Config(format!(
-            "{where_}[{index}].backend {:?} does not match any configured backend",
-            route.backend
-        )));
+    // A route that can reach a backend without naming one would have to fall back to the
+    // site's `default_backend`, which is a different table's setting — so it is refused at the
+    // route that omitted it rather than resolved somewhere the operator did not look. Only
+    // `static` may leave it out, because it never dispatches.
+    let backend = match (route.policy, &route.backend) {
+        (RoutePolicy::Static, None) => None,
+        (_, Some(name)) => Some(name),
+        (policy, None) => {
+            return Err(Error::Config(format!(
+                "{where_}[{index}].backend is required for policy {:?}: a route that can reach \
+                 a backend must name the one it reaches; only policy \"static\" may omit it",
+                policy.as_str()
+            )))
+        }
+    };
+
+    if let Some(name) = backend {
+        if !backends.contains_key(name) {
+            return Err(Error::Config(format!(
+                "{where_}[{index}].backend {name:?} does not match any configured backend"
+            )));
+        }
     }
     if route.path_prefix.is_none() && route.path_suffix.is_none() && route.host.is_none() {
         return Err(Error::Config(format!(
@@ -6073,6 +6152,102 @@ backend = "missing"
         let config = Config::from_toml(text).expect("config parses");
         let err = config.validate().expect_err("must fail");
         assert!(err.to_string().contains("routes[0].backend"), "{err}");
+    }
+
+    #[test]
+    fn a_route_without_a_backend_is_refused_unless_it_is_files_only() {
+        // The rule, and it is not decoration: a route that can reach a backend and does not name
+        // one would silently inherit the *site's* `default_backend`, so the request would be
+        // answered by a backend this route's own table never mentioned. `static` is the one
+        // policy that never dispatches, so it is the one that may omit the name.
+        let with_route = |route: &str| {
+            format!(
+                r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[[routes]]
+path_prefix = "/assets"
+{route}
+"#
+            )
+        };
+
+        for policy in ["", "policy = \"all\"", "policy = \"backend\""] {
+            let text = with_route(policy);
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err(&format!(
+                "policy {policy:?} without a backend must be refused"
+            ));
+            assert!(
+                err.to_string().contains("routes[0].backend is required"),
+                "policy {policy:?}: {err}"
+            );
+        }
+
+        let text = with_route("policy = \"static\"");
+        let config = Config::from_toml(&text).expect("config parses");
+        config
+            .validate()
+            .expect("a files-only route may omit the backend, because it never dispatches");
+    }
+
+    #[test]
+    fn a_route_policy_defaults_to_all_so_existing_configuration_is_unchanged() {
+        // The compatibility claim, asserted rather than assumed: every route written before
+        // `policy` existed must behave exactly as it did.
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[[routes]]
+path_prefix = "/api"
+backend = "app"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+        let route = &config.routes[0];
+        assert_eq!(RoutePolicy::All, route.policy);
+        assert_eq!(Some("app"), route.backend.as_deref());
+        assert!(route.policy.serves_files(), "all serves files");
+        assert!(route.policy.serves_backend(), "and reaches a backend");
+    }
+
+    #[test]
+    fn each_policy_answers_which_layers_run() {
+        // The predicate the request path uses, in isolation from it, so a routing regression
+        // and a policy regression cannot be mistaken for each other.
+        assert!(RoutePolicy::All.serves_files() && RoutePolicy::All.serves_backend());
+        assert!(!RoutePolicy::Backend.serves_files() && RoutePolicy::Backend.serves_backend());
+        assert!(RoutePolicy::Static.serves_files() && !RoutePolicy::Static.serves_backend());
+        assert_eq!("all", RoutePolicy::All.as_str());
+        assert_eq!("backend", RoutePolicy::Backend.as_str());
+        assert_eq!("static", RoutePolicy::Static.as_str());
+    }
+
+    #[test]
+    fn a_files_only_route_never_skips_the_stat() {
+        // `skip_stat` takes "the backend does not interpret the path" as its reason to skip.
+        // A route with no backend is vacuously "a backend that does not interpret", and reading
+        // that as a skip would remove the check the files-only subtree depends on for its 404.
+        let route = RouteConfig {
+            path_prefix: Some("/assets".to_string()),
+            path_suffix: None,
+            host: None,
+            policy: RoutePolicy::Static,
+            backend: None,
+        };
+        let extensions = crate::script::ScriptExtensions::default();
+        assert!(
+            !skip_stat(&route, false, &extensions),
+            "no backend means the stat is the only thing resolving the request"
+        );
     }
 
     #[test]
@@ -10041,7 +10216,8 @@ binary = "/usr/bin/php-cgi"
                 host: None,
                 path_prefix: Some("/legacy".to_string()),
                 path_suffix: None,
-                backend: name.to_string(),
+                policy: RoutePolicy::All,
+                backend: Some(name.to_string()),
             };
             skip_stat(
                 &route,
@@ -10175,7 +10351,8 @@ script_extensions = []
             host: None,
             path_prefix: None,
             path_suffix: Some(suffix.to_string()),
-            backend: "app".to_string(),
+            policy: RoutePolicy::All,
+            backend: Some("app".to_string()),
         };
 
         assert!(skip_stat(&route(".php"), false, &php));
