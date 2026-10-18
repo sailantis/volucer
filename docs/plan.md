@@ -5081,11 +5081,19 @@ be that one table. *"New code only"* is `new-nostat / baseline`, the same compar
 default removed, and it says **the code added since the published build is faster in seven of eight
 cells, up to +29%.**
 
-**The regression is a constant, which is what identifies it.** Per-request server cost at c=32 is
-30.3 µs on `/` and 47.3 µs on `/items`; with the layer off, 23.7 and 43.5. The difference is 6.5 µs
-and 3.8 µs, and at c=16 it is 6.7 and 6.5 — a fixed toll, not a function of how much work the
-request does. That is a blocking-pool round trip, and it is paid to be told that a path naming no
-file names no file.
+**The regression is a fixed per-request toll, which is what identifies it.** Per-request service
+time for the same binary, layer on minus off: **63.0 µs at c=1, 7.1 at c=8, 6.7 at c=16, 6.5 at
+c=32**. Flat in the request, not proportional to it. The 63 µs at c=1 is the same overhead with
+nothing to hide behind — at 300 µs per request it is 20% of the total, because it is a wake-up
+rather than a computation.
+
+**The mechanism, counted rather than inferred.** `strace -f -c` over 300 requests, same binary,
+four workers: `statx` goes from **0.04 to 2.05 per request**, and all syscalls from 158.4 to 179.7.
+**Two stats where the path needs one** — `decide()` runs `plan()` twice, once to learn there is no
+file and again when `respond()` returns `None` and the caller's fall-through re-enters. The rest is
+the `spawn_blocking` hop: `futex` 14.11 → 20.00 and `clock_gettime` 50.40 → 61.58 per request, the
+traffic of a task handed to another thread and awaited back. The two together — two stats and a
+hop — are +21.3 syscalls per request, which is the whole of the difference.
 
 **`new-nostat` is the whole reason this is attributable rather than merely detected.** Without that
 arm there is only "current `main` is slower on `/`", and the natural reading of it is "the fifty new
@@ -5097,7 +5105,7 @@ Two falsifications ran before the numbers were trusted. The layer really is on b
 really is off with the table: a real file in the document root answers **200 with its bytes** by
 default and **404** with `enabled = false`, while `/items` answers 200 in both — so the table
 changes behaviour rather than merely parsing. And `/items` names no file, so the layer can only be
-finding nothing, which is what makes the cost a constant rather than a function of the request.
+finding nothing — which is why the cost is the same regardless of what the request goes on to do.
 
 **What this is not.** It is not an argument that the default is wrong — that is a product
 judgement, and a site that serves assets wants the layer. It is an argument that a fixed cost
