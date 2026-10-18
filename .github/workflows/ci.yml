@@ -148,6 +148,45 @@ jobs:
           VOLUCER_SH: ${{ runner.os == 'Linux' && 'dash' || 'sh' }}
         run: bash packaging/install-selftest.sh "$BIN"
 
+  # `release.yml` is the one workflow whose logic cannot be exercised by pushing a branch: the
+  # staging, smoke-test and publish steps only run on a `v*` tag, so without this job the first
+  # execution of any of them is release day. `release-selftest.sh` runs the first two for real
+  # against a binary built here. The third is a `gh api` call against a release that does not
+  # exist yet, so what is checked here is the half that does not need one: the argument and
+  # environment handling, which is what silently misbehaves in a workflow - an unset
+  # `GITHUB_REF_NAME` reaching `gh` as an empty tag.
+  release-scripts:
+    name: Release scripts
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      # Debug, like the installer job: the binary only has to run `version`, and a release build
+      # here would be minutes spent proving that `tar` packs a file.
+      - name: Build
+        run: cargo build -p volucer
+      - name: Stage, pack, smoke-test and refuse a corrupted archive
+        shell: bash
+        run: bash packaging/release-selftest.sh target/debug/volucer
+      # A script that publishes a release is one to be careful with, and the careful thing is that
+      # it refuses to run rather than guessing which release was meant. Both of these exit non-zero
+      # before any `gh` call, which is the property being asserted - not the wording.
+      - name: The publish script refuses an unidentifiable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if bash packaging/publish-release.sh; then
+            echo "::error::publish-release.sh ran with no tag at all" >&2
+            exit 1
+          fi
+          if GITHUB_REF_NAME=v0.0.0 GITHUB_REPOSITORY=sailantis/volucer \
+             GH_TOKEN="${{ github.token }}" bash packaging/publish-release.sh; then
+            echo "::error::publish-release.sh ran for a tag that has no release" >&2
+            exit 1
+          fi
+
   # A published crate cannot depend on a version that is not on crates.io yet, so the publish
   # order is forced and a mistake in it is invisible until release day.
   package:

@@ -2189,6 +2189,30 @@ the workflow is the same one, but it finally has an output, so it stops being de
       `x86_64`/`aarch64` Linux (`gnu` and `musl`), both macOS architectures, and
       `x86_64-pc-windows-msvc`. Each archive holds the binary, `README.md`, `LICENSE` and the
       systemd unit.
+    - **The draft is opened by a job, not by a person.** The first release was published by hand,
+      which made "a broken release is never public" true only for as long as someone remembered to
+      check — and the README's one-liner a 404 in the meantime, since `releases/latest/download/`
+      resolves nothing for a draft. `packaging/publish-release.sh` is now the last job in the
+      graph, gated on `install` rather than on `release`, so the ordering is a property of `needs:`
+      rather than of discipline. It asserts the release really stopped being a draft and that both
+      installers download **anonymously** — the README is run by someone with no account here, and
+      an authenticated fetch passes for a release nobody else can reach. `cmp` against the
+      checkout catches an upload that attached the wrong file.
+      - **Each assertion was inverted to prove it can fail**, which is the only thing that makes a
+        green check mean anything: a tag with no release, no tag at all, an asset that is not on
+        the release (404), and a mutated `install.sh` in the checkout all fail with a message
+        naming the cause rather than the symptom.
+      - **`make_latest=legacy` rather than `true`**, and the difference is a real scenario: GitHub
+        defines `legacy` as "determined based on the release creation date and higher semantic
+        version", so a maintenance release (`v0.1.1` after `v0.2.0`) does not repoint the
+        installer one-liner at the older line. Forcing `latest` is right only while releases are
+        published in increasing version order, which is a convention nothing enforces.
+      - **The two installers are compared as bytes, and that is a claim about `.gitattributes`
+        rather than about hashing.** The released `install.ps1` is CRLF (`eol=crlf`) while the git
+        blob is LF, so a naive `cmp` of `HEAD:` against the asset would fail on line endings alone.
+        It is compared against the **worktree** copy, which is what the `release` job's `cp` uploads
+        — and which only matches on a checkout that honours the attribute, so a mismatch is either
+        a wrong upload or a checkout that is not the tagged commit, and both are worth failing on.
     - **The packaging is testable without a tag, and that is what makes it verified rather than
       written.** The staging and smoke-test halves live in `packaging/stage-archive.sh` and
       `packaging/smoke-test-archive.sh` rather than as inline `run:` blocks, because the only way

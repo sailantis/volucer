@@ -132,6 +132,12 @@ jobs:
             install.sh
             install.ps1
           generate_release_notes: true
+          # Still a draft, and the `publish` job below is what opens it. The reason is ordering:
+          # `releases/latest/download/` resolves nothing for a draft, so the README's one-liner is
+          # a 404 until the assets have been proven - and the proof is the `install` job, which
+          # installs from these archives over HTTP and compares the result with the binary this
+          # run built. Creating the release public would serve an unverified binary to anyone who
+          # typed the one-liner during the window, which is the failure the draft was added for.
           draft: true
 
   # ci.yml proves the installers against a fixture built by `stage-archive.sh`. This job is the
@@ -229,6 +235,26 @@ jobs:
             exit 1
           }
           echo "the release's own install.sh installs the release's own binary"
+
+  # The last step, and the only one that changes what the outside world can see. It waits for
+  # `install` rather than for `release`, because publishing is the moment the one-liner in the
+  # README stops being a 404 - it should not start working before the assets behind it have been
+  # installed and compared. `docker` runs in parallel with this and depends on `build`, not on it:
+  # the images are built and discarded, so nothing they do can be invalidated by publishing.
+  publish:
+    name: Publish the release
+    needs: [release, install]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # One script rather than a `gh api` call inline, so the steps that matter - that the release
+      # really stopped being a draft, and that its installers really download without a token -
+      # can be run against a real release. They were, against `v0.1.0`, including each assertion
+      # inverted to prove it fails.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash packaging/publish-release.sh
 
   docker:
     name: Docker (${{ matrix.image }})

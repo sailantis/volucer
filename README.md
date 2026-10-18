@@ -1560,7 +1560,8 @@ beside this repository, which is how CI passes the SDK repository it fetches.
 
 **Tagging publishes the binaries.** Pushing a `v*` tag runs `.github/workflows/release.yml`, which
 builds a static-linked archive per target, writes a `.sha256` beside each, smoke-tests the archive
-by extracting and running it somewhere else, attests its provenance, and opens a **draft** release:
+by extracting and running it somewhere else, attests its provenance, and creates a **draft**
+release:
 
     volucer-0.1.0-x86_64-unknown-linux-gnu.tar.gz
     volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz
@@ -1569,8 +1570,17 @@ by extracting and running it somewhere else, attests its provenance, and opens a
     volucer-0.1.0-x86_64-apple-darwin.tar.gz
     volucer-0.1.0-x86_64-pc-windows-msvc.zip
 
-Each archive holds the binary, `README.md`, `LICENSE` and the systemd unit. The release is a draft
-because a tag is a decision and a broken release is public the moment it is not.
+Each archive holds the binary, `README.md`, `LICENSE` and the systemd unit.
+
+The draft is created on purpose and then published automatically, in that order. A tag is a
+decision, and a broken release is public the moment it is not a draft — so between the two there is
+a job, and it is the job that decides. `install` runs the release's own `install.sh` against the
+release's own archives over HTTP and compares what it installed with the binary the build produced;
+only then does `publish` run, and it is the last job in the graph. `releases/latest/download/` is a
+404 until it does, which is why the ordering is enforced by `needs:` rather than by habit: anything
+published earlier would be served to whoever typed the one-liner during the window. Nothing about
+this needs a human, and a release that fails a test stays a draft, visible only to people with push
+access.
 
 `install.sh` and `install.ps1` are attached to the same release, because
 `releases/latest/download/` is only reachable for assets that are on the latest *release* — the
