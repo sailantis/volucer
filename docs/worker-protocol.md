@@ -2,10 +2,18 @@
 
 **Version 1.** This document is the specification; `crates/volucer-worker` is its reference
 implementation, and the tests in that crate (plus `tests/wire_format.rs`) pin it byte for byte.
-The PHP SDK implements the other end; it lives in
-[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk), because a
-Composer package needs `composer.json` at the root of a repository. A release of that package
-links back to this document at a pinned commit, so the two versions can be compared.
+**Four** implementations exist, and each pins the same frozen bytes rather than its own:
+the Rust reference, [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk),
+[`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk) and
+[`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk). Each lives in
+its own repository because its package manager needs a manifest at the root, and a release of
+each links back to this document at a pinned commit, so the versions can be compared.
+
+The document is written from the PHP end because that is the one whose adapters need the most
+explanation — `$_SERVER`, sessions, `Set-Cookie`. The parts that are *not* PHP's business are
+still protocol, and the two non-PHP SDKs are what found them: the RSS answer is not the same
+in any of the three languages, and each says so rather than quietly reporting a different
+number under the same field name.
 
 ## Why this exists at all
 

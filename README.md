@@ -19,10 +19,14 @@ supervises it for you.
 > client, CGI environment, `php-cgi` pool, backend dispatch and both front-ends are all
 > implemented, with integration tests driving real `php-cgi` processes end to end. The worker
 > protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md), implemented in
-> `crates/volucer-worker`, and the PHP worker SDK implements the other end — it lives in its own
-> repository, [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk),
-> because a Composer package needs `composer.json` at the root of a repository. It is proven by
-> tests that drive a live `php worker.php` over pipes. The worker pool that
+> `crates/volucer-worker`, and three worker SDKs implement the other end — PHP
+> ([`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk)), Python
+> ([`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk)) and Ruby
+> ([`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk)), each in its
+> own repository because its package manager needs a manifest at the root. All three pin the
+> same frozen wire bytes as the Rust tests. PHP is proven by tests that drive a live
+> `php worker.php` over pipes, and the other two by tests that drive a live `volucer` binary
+> with a live worker. The worker pool that
 > supervises those workers is implemented in `crates/volucer-server`, so `kind = "worker"` now
 > serves for real: `volucer serve` boots the pool, handshakes each worker, and serves through it.
 > The HTTP front-end is implemented in `crates/volucer-http` — a `hyper` listener speaking
@@ -457,8 +461,31 @@ behaviour. That form is a _flag_ and not a config value, deliberately: TOML cann
 string from an absent key, so writing `front_controller = ""` in the file is rejected with a
 message saying so rather than being given a meaning of its own.
 
+**`script_extensions` is what makes a non-PHP worker reachable at all.** It defaults to
+`["php", "php3", "phtml"]` and says which extensions name a script a backend is asked to
+execute:
+
+```toml
+[server]
+document_root = "/srv/app"
+front_controller = "app.py"          # a Python worker's entry point
+script_extensions = ["py"]
+```
+
+Without it, `/app.py` is not a script to the router, so it arrives at the front controller as
+`PATH_INFO` instead of being resolved — and `path_suffix` can *route* such a path but cannot
+make it a script. **The list is one list, used in three places**, which is the point: the
+router decides what to hand a backend, the static layer refuses to serve a script from disk
+(serving `app.py` would send a Python program's source, credentials and all, to the client),
+and `skip_stat` decides whether a route has already proved its pattern names a script. A site
+may name its own list, which *replaces* the inherited one — "this tree is Python" should stop
+treating `.php` as a script. An empty list is refused, because accepted as "no scripts" it
+would silently send every script path to the front controller as `PATH_INFO`.
+
 `volucer check` prints the document root and front controller it resolved and whether each is
-actually present, which is the fastest way to see what a running deployment uses.
+actually present, which is the fastest way to see what a running deployment uses. It prints a
+non-default `script_extensions` too, normalised, so a list written as `".py"` is visibly the
+`py` the server compares.
 
 `volucer` answers nginx's `GET_VALUES` health probe, so it stays in rotation rather than being
 marked down.
@@ -962,8 +989,9 @@ resolved, its routing and its static layer always come from one generation. That
 the reloadable state is one pointer and not one per setting.
 
 **Reloadable.** `[server.tls]` and `[sites.*.tls]` certificates and keys, `[sites.*]` `hosts`,
-`document_root`, `front_controller`, `serve_only`, `default_backend`, `routes` and
-`[server.statics]` (including turning the layer on or off), and `redirect_to_https`/`https_port`.
+`document_root`, `front_controller`, `script_extensions`, `serve_only`, `default_backend`, `routes`
+and `[server.statics]` (including turning the layer on or off), and
+`redirect_to_https`/`https_port`.
 
 **Restart-only, and reported on every reload** rather than left to be discovered — a setting the
 implementation cannot honour should be _stated_, or the operator finds out from behaviour:
@@ -1351,12 +1379,17 @@ targets, and a silently different crypto build is not a change to make for conve
 | `packaging/systemd`       | `volucer.service` — the unit whose `ExecReload=` is what makes `SIGHUP` reload reachable              |
 | `packaging/docker`        | `Dockerfile` producing a `glibc` image and a static `musl` one from the same crate                    |
 | `docs/plan.md`            | The design and the phase plan                                                                         |
-| `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements                                   |
+| `docs/worker-protocol.md` | The worker wire protocol — the specification the three SDKs implement                          |
 
-The PHP SDK is not in this repository. It is
-[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk), a Composer
-package that implements the other end of the worker protocol. The tests here drive its example
-worker, so a working checkout is expected beside this one — or at `VOLUCER_SDK_DIR`.
+The worker SDKs are not in this repository. They are
+[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk),
+[`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk) and
+[`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk), each a package
+that implements the other end of the worker protocol in its own ecosystem. The tests here drive
+the PHP SDK's example worker, so a working checkout is expected beside this one — or at
+`VOLUCER_SDK_DIR`. The Python and Ruby SDKs' own suites drive this server's binary instead, and
+are the reason `script_extensions` exists: without it a `.py` or `.rb` path never reaches a
+backend.
 
 ## Development
 

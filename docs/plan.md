@@ -1595,13 +1595,34 @@ the wiring.
 
 Later, and deliberately not part of Phase 8:
 
-37. `worker-sdks` — Python / Ruby / Node worker **clients**, mirroring `docs/worker-protocol.md`,
-    one repository each. Nothing blocks them: `HelloAck` carries a free-form `runtime` and the
-    handshake checks the *protocol* version, not the language, so a non-PHP worker handshakes
-    today. What each needs is its own answer to "how does this process report its RSS", because
-    the recycling contract is otherwise silently unenforced. **`script-extensions` (38) landed
-    first**, because a client for `.py` or `.rb` cannot be routed until the extension table is
+37. `worker-sdks` — Python and Ruby worker **clients**, mirroring `docs/worker-protocol.md`, one
+    repository each. **Both are done**, and `script-extensions` (38) landed first as a
+    prerequisite: a client for `.py` or `.rb` cannot be routed until the extension table is
     configurable.
+    - **`sailantis/volucer-python-sdk`** — `Worker.connect().run(wsgi.call(app))`, 65 tests of
+      which 2 are end-to-end against a real `volucer` binary. WSGI only; ASGI is a protocol change
+      rather than an adapter, and the README says so.
+    - **`sailantis/volucer-ruby-sdk`** — `Volucer::Worker.connect.run(&Volucer::Rack.handler(app))`,
+      57 tests of which 2 are end-to-end. Rack; Rails needs its own `executor.wrap` around each
+      dispatch, which is what the framework bridge is for (steps 72–74) rather than this gem.
+    - **Both report the same frozen wire bytes as the Rust and PHP tests**, so four
+      implementations cannot drift apart silently. That is the property the step was really for.
+    - **The RSS question was not answered the same way in either, and that is the honest result.**
+      PHP has `memory_get_peak_usage()` plus `memory_reset_peak_usage()`, which is exactly the
+      per-request shape the protocol asks for. Neither Python nor Ruby has an equivalent: the
+      Python SDK offers `tracemalloc` with a per-request reset (exact, but blind to memory a C
+      extension allocates) or the process RSS (cheap, cumulative); the Ruby SDK reports the
+      process RSS and documents that a `memory_limit_mb` below a genuine peak recycles every
+      request. **What the step said each client needs turned out to be "state the compromise",
+      not "solve it"** — a cumulative figure is allowed by the protocol and the server acts on
+      whatever it is told, so the SDK's job is to make the operator's choice legible.
+    - **`Worker.connect()` is what a worker file calls, and both SDKs implement the socket
+      transport**, not only stdio: `VOLUCER_WORKER_SOCKET` is the server's instruction and a
+      worker that ignored it presents as a startup timeout. Both exit non-zero rather than
+      falling back, because a silent fallback hangs while the server waits for a connection.
+    - **Node was dropped rather than deferred.** It has the same property Go did — a warm HTTP
+      server already — so the SDK buys the channel rather than the model, and nobody has asked
+      for the channel. Recorded here so the absence is a decision rather than an omission.
 38. `script-extensions` — **done.** `ScriptExtensions` in `crates/volucer-core/src/script.rs`, reached
     from `server.script_extensions` and carried per site on `ResolvedSite`, so "what counts as a
     script" is configuration rather than the hardcoded `[".php", ".php3", ".phtml"]`. Required
