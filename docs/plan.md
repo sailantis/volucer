@@ -5088,12 +5088,31 @@ nothing to hide behind — at 300 µs per request it is 20% of the total, becaus
 rather than a computation.
 
 **The mechanism, counted rather than inferred.** `strace -f -c` over 300 requests, same binary,
-four workers: `statx` goes from **0.04 to 2.05 per request**, and all syscalls from 158.4 to 179.7.
-**Two stats where the path needs one** — `decide()` runs `plan()` twice, once to learn there is no
-file and again when `respond()` returns `None` and the caller's fall-through re-enters. The rest is
-the `spawn_blocking` hop: `futex` 14.11 → 20.00 and `clock_gettime` 50.40 → 61.58 per request, the
-traffic of a task handed to another thread and awaited back. The two together — two stats and a
-hop — are +21.3 syscalls per request, which is the whole of the difference.
+four workers. A path that names no file needs one `stat`, and the layer was paying **two**:
+`statx` on `GET /items` goes 0.04 → 2.05 per request, because the layer asked `is_dir()` and then
+`is_file()` — two round trips to learn one fact, on *every* route of a front-controller
+application, since no route names a file. (`GET /` paid one, because a trailing slash takes the
+`directory_index` branch.) The rest is the `spawn_blocking` hop that carries the stat off the
+runtime thread: `futex` 14.11 → 20.00 and `clock_gettime` 50.40 → 61.58 per request, +21.3
+syscalls in all.
+
+**Both are fixed**, in that order of confidence: one `metadata` answers directory, file and
+neither (`GET /items` is now 1.05 `statx` per request), and the script-extension test moved ahead
+of the stat because it is string work and needs no filesystem at all.
+
+**And the fix buys nothing, which is the finding rather than a footnote.** Two binaries differing
+only by that change, same config, seven rotating rounds, 168 cells, none failed: **+0.2%, +1.1%,
+−0.1%, −0.2% on `/` and +0.5%, +0.9%, +0.1%, +0.2% on `/items`**, every per-round range spanning
+1.00. Rows in `volucer-competition/results/ab-perf-statfix.tsv`.
+
+So the stat was ~1.5 µs of the 6.5 µs, and the rest is the `spawn_blocking` hop. **Removing one
+syscall from a path that wakes a thread is not worth a release note** — the change stays because
+one stat to learn one fact is the correct code, but the 14–22% is not recoverable by fixing the
+layer's arithmetic. It is only recoverable by not entering the layer.
+
+**The general rule: a constant you have attributed is not the same as a constant you have priced.**
+`strace` said where the cost was; it took an A/B to say how much of it the obvious fix could
+reach, and the answer was essentially none.
 
 **`new-nostat` is the whole reason this is attributable rather than merely detected.** Without that
 arm there is only "current `main` is slower on `/`", and the natural reading of it is "the fifty new
