@@ -34,22 +34,27 @@ fn find_php_cgi() -> Option<PathBuf> {
 
 /// Ask the OS for an unused port, then release it.
 ///
-/// Racy in principle, but the window is microseconds and the alternative is a
-/// hardcoded port that collides with whatever else is running.
+/// Racier than it looks, and the mutex is not enough on its own. `bind(":0")` asks the kernel for
+/// an ephemeral port and `local_addr` reports it, but the listener is then dropped, which **returns
+/// the port to the pool** — so the *next* `bind(":0")` can be handed the same number. Holding the
+/// lock only while reserving therefore serialises the reservation and leaves the real window open:
+/// the gap between this function returning and `php-cgi` calling `bind` on that port.
 ///
-/// **The race is real and CI found it.** These tests run in parallel inside one binary, so two of
-/// them can be handed the same ephemeral port before either binds it: on `ubuntu-latest` the
-/// `a_status_header_from_the_script_is_preserved` test connected to a `php-cgi` that belonged to a
-/// different test, which answered the readiness probe and then dropped the connection as
-/// `ConnectionReset` — the process it actually spoke to had already been killed by its owner's
-/// `Drop`, and php-cgi accepts one connection at a time. It is intermittent (it passed on a rerun
-/// and on Windows) which is exactly what a port race looks like.
+/// **CI found it twice.** On `ubuntu-latest` a test connected to a `php-cgi` belonging to a
+/// different test, which answered the readiness probe and then dropped as `ConnectionReset` — the
+/// process it spoke to had already been killed by its owner's `Drop`, and php-cgi accepts one
+/// connection at a time. A mutex around this function alone did not fix it,
+/// `passes_the_request_body_through_as_stdin` failed twice more with `ConnectionRefused`, and it
+/// passed on a rerun: exactly what a port race looks like.
 ///
-/// `crates/volucer-server/tests/common/mod.rs` solved this for the pool tests with a process-wide
-/// mutex, for the same reason and with the same wording. This is that fix, applied where the same
-/// helper exists. Not a retry: retrying would hide the collision rather than remove it.
+/// So the caller holds `port_lock` across **reserve -> spawn -> listening**, not just the
+/// reservation. The window is short (php-cgi binds in well under a second) and serialising it costs
+/// the suite nothing measurable. Not a retry: retrying would hide the collision rather than remove
+/// it. `crates/volucer-server/tests/common/mod.rs` uses the same process-wide mutex for the pool
+/// tests.
+///
+/// The caller must already hold `port_lock`.
 fn free_port() -> u16 {
-    let _serial = port_lock();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     listener
         .local_addr()
@@ -59,9 +64,8 @@ fn free_port() -> u16 {
 
 /// Serialise the tests that take a port from the OS.
 ///
-/// Only the *reservation* is serialised, not the process that later binds it: the window is the
-/// gap between `free_port` returning and `php-cgi` calling `bind`, and two tests entering that gap
-/// at once is what produced the CI failure above.
+/// Held by `PhpCgi::start` from reservation until `php-cgi` is listening, because the port is
+/// released the moment the reserving listener is dropped.
 fn port_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -79,6 +83,9 @@ struct PhpCgi {
 impl PhpCgi {
     fn start() -> Option<Self> {
         let binary = find_php_cgi()?;
+        // Held until php-cgi is listening: the port `free_port` read is released when its
+        // reserving listener drops, so releasing the lock any earlier reopens the race.
+        let _serial = port_lock();
         let port = free_port();
 
         let child = Command::new(&binary)
