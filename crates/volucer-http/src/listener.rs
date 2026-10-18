@@ -102,7 +102,10 @@ impl Default for HttpLimits {
     fn default() -> Self {
         HttpLimits {
             max_connections: 512,
-            max_body_bytes: 32 * 1024 * 1024,
+            // The one constant, rather than the same literal spelled twice. The FastCGI front-end's
+            // `Limits::default()` reads it too, which is what makes "32 MiB" a single decision
+            // instead of two that happen to agree.
+            max_body_bytes: volucer_core::config::DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -2200,4 +2203,20 @@ mod tests {
         assert_eq!(protocol_name(hyper::Version::HTTP_11), "HTTP/1.1");
         assert_eq!(protocol_name(hyper::Version::HTTP_2), "HTTP/2.0");
     }
+}
+
+#[test]
+fn the_two_front_ends_default_to_the_same_body_limit() {
+    // The property the config key exists for: one answer, whichever protocol a request arrived on.
+    // These are two independent `Default` impls in two crates, so nothing but this assertion stops
+    // them drifting — and a drift would be invisible, because it would only show as one protocol
+    // accepting an upload the other refuses.
+    assert_eq!(
+        HttpLimits::default().max_body_bytes,
+        volucer_core::config::DEFAULT_MAX_BODY_BYTES
+    );
+    assert_eq!(
+        volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+        32 * 1024 * 1024
+    );
 }

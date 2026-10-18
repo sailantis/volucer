@@ -26,6 +26,28 @@ fastcgi = "127.0.0.1:9080"
 # because TOML cannot tell an empty string from an absent key.
 # front_controller = "index.php"
 
+# The largest request body either front-end will accept, in bytes. Absent means
+# 32 MiB, which is what was hard-coded here before this key existed, so a
+# deployment that says nothing keeps its behaviour. `volucer check` prints the
+# value in effect, including the default.
+#
+# **Bytes, not megabytes**, and the unit is in the name to keep it obvious:
+# RoadRunner spells this `http.max_request_size` and counts megabytes, so
+# copying that spelling here is an error rather than a silently different unit.
+#
+# It bounds both listeners. That is the point of it being configuration: the
+# FastCGI front-end had no bound at all before this, so a request forwarded by a
+# proxy with no `client_max_body_size` of its own could make volucer buffer
+# without limit.
+#
+# It does NOT bound an `upstream` backend, whose body streams to the origin
+# unread; the limit to configure for one of those is the origin's. See the
+# README, *Backends*.
+#
+# Zero is refused rather than read as "unlimited" -- a zero here refuses every
+# request with a body, which is never what was meant.
+# max_body_bytes = 33554432     # 32 MiB
+
 # ---------------------------------------------------------------------------
 # TLS. The presence of `[server.tls]` is what turns it on -- there is no
 # `enabled` flag, because a flag and a certificate are two statements about one

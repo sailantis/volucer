@@ -1485,6 +1485,31 @@ pub struct ServerConfig {
     #[serde(default)]
     pub fastcgi: Option<String>,
 
+    /// The largest request body either front-end will accept, in bytes.
+    ///
+    /// Defaults to 32 MiB, which is what was hard-coded here before this key existed, so a
+    /// deployment that says nothing keeps its behaviour. The **unit is in the name**, following
+    /// [`max_multirange_bytes`](StaticConfig::max_multirange_bytes) and `memory_limit_mb`: RoadRunner
+    /// spells this `http.max_request_size` and counts **megabytes**, and a key with the same name and
+    /// a different unit is the one kind of compatibility that costs more than it buys.
+    ///
+    /// It bounds the **body**, not the headers: a header block is already bounded by the protocol
+    /// layer, and the body is the part a client chooses freely. Both front-ends apply it, because
+    /// both buffer the body before a backend sees it — the CGI environment has to carry
+    /// `CONTENT_LENGTH` before `php-cgi` reads a byte, so there is no stream to pass through. That is
+    /// also why it is a *refusal* rather than a back-pressure valve.
+    ///
+    /// **It deliberately does not bound an `upstream` backend**, whose request body streams to the
+    /// origin unread. That is a documented decision rather than an omission — a reverse proxy
+    /// silently imposing a limit its own client never set is a bug report waiting — and the limit to
+    /// configure for one is the origin's. See the README, *Backends*.
+    ///
+    /// Zero is refused rather than read as "unlimited": a zero here refuses every request with a
+    /// body, which is never what was meant, and the same rule already governs
+    /// `static_files.max_multirange_bytes`.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
+
     /// Directory that PHP scripts and static files are resolved against.
     ///
     /// A relative path is relative to the process's working directory, not to
@@ -1659,6 +1684,12 @@ pub enum AccessLogFormat {
 /// The front controller used when neither the config nor the command line says.
 pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
 
+/// The largest request body a backend will be handed, when configuration says nothing.
+///
+/// The value `HttpLimits::default()` used before [`ServerConfig::max_body_bytes`] existed, kept
+/// deliberately: an unconfigured deployment must not change behaviour because the key was added.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// ALPN protocol names this server understands.
 ///
 /// Checked by name rather than passed through, because an unknown identifier is accepted by
@@ -1695,6 +1726,15 @@ impl ServerConfig {
             enabled: true,
             ..StaticConfig::default()
         })
+    }
+
+    /// The largest body either front-end will accept, with the default resolved.
+    ///
+    /// Reads through to the one constant rather than repeating it, so the HTTP and FastCGI
+    /// front-ends cannot disagree about the answer — the defect this key was added to fix was
+    /// that only one of them had an answer at all.
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES)
     }
 
     /// Whether a plaintext listener exists to redirect *from*.
@@ -3739,6 +3779,13 @@ impl Config {
             return Err(Error::Config(
                 "server.static_files.max_multirange_bytes is zero, which refuses every \
                  multi-range request; set a value or remove the key"
+                    .to_string(),
+            ));
+        }
+        if self.server.max_body_bytes == Some(0) {
+            return Err(Error::Config(
+                "server.max_body_bytes is zero, which refuses every request with a body; set a \
+                 value or remove the key — an unset key means the 32 MiB default"
                     .to_string(),
             ));
         }
@@ -7560,6 +7607,59 @@ max_multirange_bytes = 0
         let config = Config::from_toml(text).expect("config parses");
         let err = config.validate().expect_err("must fail");
         assert!(err.to_string().contains("max_multirange_bytes"), "{err}");
+    }
+
+    #[test]
+    fn a_body_limit_that_is_absent_or_stated_is_one_answer() {
+        // The point of the key is that the answer must not depend on *which* front-end asks,
+        // so it is resolved once, here, and both callers read it.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert_eq!(config.server.max_body_bytes(), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(config.server.max_body_bytes(), 32 * 1024 * 1024);
+        config.validate().expect("an absent key is valid");
+
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+max_body_bytes = 1048576
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert_eq!(config.server.max_body_bytes(), 1_048_576);
+        config.validate().expect("a stated limit is valid");
+    }
+
+    #[test]
+    fn a_zero_body_limit_is_refused_rather_than_read_as_unlimited() {
+        // Zero cannot mean "no limit": RoadRunner's `max_request_size` says "zero means no
+        // limit" and volucer's does not, so the *names* differ too. Reading a zero as unlimited
+        // is the one interpretation that turns a typo into an unbounded allocation.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+max_body_bytes = 0
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("max_body_bytes"), "{err}");
+        assert!(err.to_string().contains("32 MiB"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_body_limit_key_is_rejected_rather_than_ignored() {
+        // `deny_unknown_fields` on `ServerConfig` is what makes the unit in the name safe: a
+        // deployment that copies RoadRunner's `max_request_size` gets an error, not a server that
+        // silently keeps the default while reading as configured.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+max_request_size = 256
+"#;
+        let err = Config::from_toml(text).expect_err("an unknown key must be refused");
+        assert!(err.to_string().contains("max_request_size"), "{err}");
     }
 
     #[test]

@@ -92,7 +92,18 @@ pub enum NextRequest {
 ///
 /// Returns `Ok(None)` for a clean end of stream, which is how nginx closes an
 /// idle keep-alive connection.
-pub fn read_next<R: Read>(reader: &mut R) -> Result<Option<NextRequest>> {
+///
+/// **`max_body_bytes` is a parameter rather than a constant because it is configuration**, and
+/// because there is no second place to apply it: the body arrives as a sequence of `STDIN`
+/// records that are only complete once their terminator is, so anything buffering the request has
+/// to bound it as the records arrive. That is the same rule the HTTP front-end follows in
+/// `read_body`, and the two must agree — a limit that only one protocol enforced would be a key
+/// that reads as a setting and is not one.
+///
+/// An oversized body is [`ServerError::BodyTooLarge`], not a protocol error: the request was
+/// well-formed and refused, and the caller has to tell that apart to answer `413` rather than
+/// `502`.
+pub fn read_next<R: Read>(reader: &mut R, max_body_bytes: usize) -> Result<Option<NextRequest>> {
     let begin = loop {
         let Some(record) = record::read_record(reader)? else {
             return Ok(None);
@@ -148,6 +159,18 @@ pub fn read_next<R: Read>(reader: &mut R) -> Result<Option<NextRequest>> {
                     // params terminator already seen ends the request.
                     break;
                 }
+                // **Checked before the extend, not after.** Checking afterwards would let one
+                // record over the limit be buffered and then refused, so the memory a client can
+                // make this process hold is `max_body_bytes` plus one record (64 KiB) rather than
+                // `max_body_bytes`. The same ordering rule applies to the counter-refusal in
+                // `volucer-metrics`: a limit enforced after the work it exists to prevent is not a
+                // limit.
+                let total = body.len().saturating_add(record.content.len());
+                if total > max_body_bytes {
+                    return Err(ServerError::BodyTooLarge {
+                        limit: max_body_bytes,
+                    });
+                }
                 body.extend_from_slice(&record.content);
             }
             RecordType::AbortRequest => {
@@ -180,8 +203,15 @@ pub fn read_next<R: Read>(reader: &mut R) -> Result<Option<NextRequest>> {
 ///
 /// Kept for callers that only serve requests; the listener uses [`read_next`] so
 /// it can answer probes.
-pub fn read_request<R: Read>(reader: &mut R) -> Result<Option<IncomingRequest>> {
-    match read_next(reader)? {
+///
+/// Carries the limit through for the same reason [`read_next`] takes it: a caller reading a
+/// request has to have an answer for how large one may be, and defaulting here would put a
+/// second, invisible limit in the codebase.
+pub fn read_request<R: Read>(
+    reader: &mut R,
+    max_body_bytes: usize,
+) -> Result<Option<IncomingRequest>> {
+    match read_next(reader, max_body_bytes)? {
         None => Ok(None),
         Some(NextRequest::Request(request)) => Ok(Some(request)),
         Some(NextRequest::GetValues(_)) => Err(ServerError::UnsupportedManagementRecord),
@@ -270,7 +300,9 @@ where
 /// Write an error that happened before the backend produced a response.
 ///
 /// nginx surfaces this as a 502, which is the correct outcome: the gateway is
-/// what failed.
+/// what failed. **Except for a body that was too large**, which is a 413 — the reason decides the
+/// status line, because the `Status:` line is how this front-end says anything to the client and
+/// blaming the gateway for a limit the client exceeded would send an operator to look at PHP.
 pub fn write_error<W: Write>(
     writer: &mut W,
     request_id: u16,
@@ -278,7 +310,8 @@ pub fn write_error<W: Write>(
     reason: ServerErrorKind,
 ) -> Result<()> {
     let body = format!(
-        "Status: 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nvolucer: {message}\r\n"
+        "Status: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nvolucer: {message}\r\n",
+        reason.status_line()
     );
 
     // A failed request also gets one assembled write, and its END_REQUEST carries the
@@ -314,6 +347,8 @@ pub enum ServerErrorKind {
     Overloaded,
     /// Multiplexed connections are not supported.
     NoMultiplexing,
+    /// The body was over `server.max_body_bytes`.
+    BodyTooLarge,
 }
 
 impl ServerErrorKind {
@@ -322,6 +357,25 @@ impl ServerErrorKind {
             ServerErrorKind::Backend => ProtocolStatus::RequestComplete,
             ServerErrorKind::Overloaded => ProtocolStatus::Overloaded,
             ServerErrorKind::NoMultiplexing => ProtocolStatus::CantMpxConn,
+            // **`RequestComplete`, deliberately.** The request was read to its terminator and
+            // refused by policy, so nothing about the *connection* went wrong — the same reason a
+            // 404 is `RequestComplete`. `Overloaded` would tell nginx to try elsewhere, and an
+            // oversized body is oversized at every worker.
+            ServerErrorKind::BodyTooLarge => ProtocolStatus::RequestComplete,
+        }
+    }
+
+    /// The `Status:` line this failure answers with.
+    ///
+    /// A `&'static str` rather than the code, because the whole string is written verbatim into
+    /// the CGI response and a caller assembling it from parts would be a second place a status
+    /// line could be wrong.
+    fn status_line(self) -> &'static str {
+        match self {
+            // **413, not 502.** The gateway did not fail; the client sent a body over the limit,
+            // and `413 Content Too Large` is the answer nginx itself gives for the same reason.
+            ServerErrorKind::BodyTooLarge => "413 Content Too Large",
+            _ => "502 Bad Gateway",
         }
     }
 }
@@ -400,6 +454,14 @@ pub fn split_response(response: &Response) -> (&[u8], &[u8], u16) {
 mod tests {
     use super::*;
 
+    /// The limit the request-reading tests pass.
+    ///
+    /// A named constant rather than a literal at each call site so the tests that assert a
+    /// *successful* read are visibly separate from the ones that assert a refusal — a test that
+    /// passes `LIMIT` and expects data is testing the default, and a test that expects an error
+    /// has to say which limit it exceeded.
+    const LIMIT: usize = volucer_core::config::DEFAULT_MAX_BODY_BYTES;
+
     fn framed(record_type: RecordType, request_id: u16, content: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let header = record::Header::new(record_type, request_id, content.len() as u16);
@@ -463,7 +525,7 @@ mod tests {
         ]));
         wire.extend(stdin(b"a=1"));
 
-        let request = read_request(&mut wire.as_slice()).unwrap().unwrap();
+        let request = read_request(&mut wire.as_slice(), LIMIT).unwrap().unwrap();
         assert_eq!(request.param_str("REQUEST_METHOD").as_deref(), Some("POST"));
         assert_eq!(
             request.param_str("SCRIPT_FILENAME").as_deref(),
@@ -489,7 +551,7 @@ mod tests {
         wire.extend(framed(RecordType::Params, 1, b""));
         wire.extend(stdin(b""));
 
-        let request = read_request(&mut wire.as_slice()).unwrap().unwrap();
+        let request = read_request(&mut wire.as_slice(), LIMIT).unwrap().unwrap();
         assert_eq!(request.params.len(), 2);
         assert_eq!(request.param_str("QUERY_STRING").as_deref(), Some("x=1"));
         assert!(!request.keep_conn);
@@ -503,13 +565,13 @@ mod tests {
         wire.extend(framed(RecordType::Stdin, 1, b"part-two"));
         wire.extend(framed(RecordType::Stdin, 1, b""));
 
-        let request = read_request(&mut wire.as_slice()).unwrap().unwrap();
+        let request = read_request(&mut wire.as_slice(), LIMIT).unwrap().unwrap();
         assert_eq!(request.body, b"part-onepart-two");
     }
 
     #[test]
     fn a_clean_end_of_stream_is_not_an_error() {
-        assert!(read_request(&mut [].as_slice()).unwrap().is_none());
+        assert!(read_request(&mut [].as_slice(), LIMIT).unwrap().is_none());
     }
 
     #[test]
@@ -517,7 +579,7 @@ mod tests {
         let mut wire = begin(true);
         wire.extend(params(&[("REQUEST_METHOD", "GET")]));
         // No STDIN terminator: the connection died.
-        assert!(read_request(&mut wire.as_slice()).is_err());
+        assert!(read_request(&mut wire.as_slice(), LIMIT).is_err());
     }
 
     #[test]
@@ -527,7 +589,7 @@ mod tests {
         header.write(&mut wire).unwrap();
         wire.extend_from_slice(&[0, 9]);
         wire.extend(std::iter::repeat_n(0u8, header.padding_length as usize));
-        assert!(read_request(&mut wire.as_slice()).is_err());
+        assert!(read_request(&mut wire.as_slice(), LIMIT).is_err());
     }
 
     #[test]
@@ -641,6 +703,36 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_body_is_a_413_and_not_a_502() {
+        // The `Status:` line was hardcoded to `502 Bad Gateway` for every kind, which would blame
+        // the backend for a limit the *client* exceeded. Pinned as its own test because the string
+        // is assembled in one place and nothing else reads it.
+        let mut wire = Vec::new();
+        write_error(
+            &mut wire,
+            1,
+            "the request body exceeds the 15 byte limit",
+            ServerErrorKind::BodyTooLarge,
+        )
+        .unwrap();
+
+        let mut cursor = wire.as_slice();
+        let stdout = next_non_empty(&mut cursor).unwrap();
+        let text = String::from_utf8_lossy(&stdout.content);
+        assert!(text.starts_with("Status: 413 Content Too Large"), "{text}");
+        assert!(!text.contains("502"), "{text}");
+
+        let _ = next_non_empty(&mut cursor).unwrap();
+        let end = next_non_empty(&mut cursor).unwrap();
+        // The *connection* was fine, so nginx must not retry elsewhere: an oversized body is
+        // oversized at every worker.
+        assert!(EndRequest::decode(&end.content)
+            .unwrap()
+            .protocol_status
+            .is_complete());
+    }
+
+    #[test]
     fn answers_a_get_values_probe() {
         let mut wire = Vec::new();
         write_get_values(&mut wire, &[("max_connections", "10")]).unwrap();
@@ -673,7 +765,7 @@ mod tests {
         let mut wire = begin(true);
         wire.extend(params(&[("REQUEST_METHOD", "GET")]));
         wire.extend(stdin(b""));
-        let incoming = read_request(&mut wire.as_slice()).unwrap().unwrap();
+        let incoming = read_request(&mut wire.as_slice(), LIMIT).unwrap().unwrap();
 
         let backend = incoming.into_backend_request();
         assert_eq!(backend.body, b"");
@@ -690,8 +782,67 @@ mod tests {
         wire.extend(params(&[("REQUEST_METHOD", "GET")]));
         wire.extend(stdin(b""));
 
-        let request = read_request(&mut wire.as_slice()).unwrap().unwrap();
+        let request = read_request(&mut wire.as_slice(), LIMIT).unwrap().unwrap();
         assert_eq!(request.param_str("REQUEST_METHOD").as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_refused_while_it_is_still_arriving() {
+        // The defect this closes: `read_next` extended a `Vec` for as long as `STDIN` records
+        // arrived, so a request that reached this front-end had **no** bound and the only limit
+        // was nginx's `client_max_body_size` on somebody else's configuration.
+        //
+        // `framed` rather than the `stdin` helper, deliberately: `stdin` appends its own
+        // terminator, so two calls to it send `chunk, END, chunk, END` and the body ends at the
+        // first chunk. The limit then looks like it works when it is never reached — which is how
+        // this test first passed its own setup and failed the assertion it was written for.
+        let mut wire = begin(false);
+        wire.extend(params(&[("REQUEST_METHOD", "POST")]));
+        wire.extend(framed(RecordType::Stdin, 1, b"0123456789"));
+        wire.extend(framed(RecordType::Stdin, 1, b"0123456789"));
+        wire.extend(framed(RecordType::Stdin, 1, b""));
+
+        let err = read_request(&mut wire.as_slice(), 15).expect_err("must be refused");
+        assert!(
+            matches!(err, ServerError::BodyTooLarge { limit: 15 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_exactly_at_the_limit_is_accepted() {
+        // The boundary, because "at the limit" and "over the limit" differ by one byte and an
+        // off-by-one here refuses a legitimate upload of exactly the configured size.
+        let mut wire = begin(false);
+        wire.extend(params(&[("REQUEST_METHOD", "POST")]));
+        wire.extend(framed(RecordType::Stdin, 1, b"0123456789"));
+        wire.extend(framed(RecordType::Stdin, 1, b"01234"));
+        wire.extend(framed(RecordType::Stdin, 1, b""));
+
+        let request = read_request(&mut wire.as_slice(), 15)
+            .expect("accepted")
+            .expect("a request");
+        assert_eq!(request.body.len(), 15);
+    }
+
+    #[test]
+    fn a_limit_of_zero_refuses_a_body_but_not_a_request_without_one() {
+        // Zero cannot be reached through `Config::validate`, which refuses it, but the read path
+        // still has to have an answer — and the answer that matters is that a bodyless `GET` is
+        // unaffected, so `max_body_bytes = 0` could never be mistaken for "refuse everything".
+        let mut wire = begin(false);
+        wire.extend(params(&[("REQUEST_METHOD", "GET")]));
+        wire.extend(framed(RecordType::Stdin, 1, b""));
+        let request = read_request(&mut wire.as_slice(), 0)
+            .expect("a bodyless request is under any limit")
+            .expect("a request");
+        assert!(request.body.is_empty());
+
+        let mut wire = begin(false);
+        wire.extend(params(&[("REQUEST_METHOD", "POST")]));
+        wire.extend(framed(RecordType::Stdin, 1, b"x"));
+        wire.extend(framed(RecordType::Stdin, 1, b""));
+        assert!(read_request(&mut wire.as_slice(), 0).is_err());
     }
 
     #[test]

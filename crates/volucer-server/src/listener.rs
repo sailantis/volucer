@@ -50,12 +50,23 @@ const READ_BUFFER_LEN: usize = 8 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub max_connections: usize,
+    /// The largest request body this listener will buffer.
+    ///
+    /// **Here rather than only on the HTTP listener**, which is the defect this field fixes:
+    /// `read_next` used to extend a `Vec` for as long as `STDIN` records arrived, so a request
+    /// arriving over FastCGI had no bound at all and the only thing limiting it was nginx's
+    /// `client_max_body_size` on somebody else's configuration. The two front-ends now read the
+    /// same `server.max_body_bytes`.
+    pub max_body_bytes: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_connections: 512,
+            // Through the one constant the HTTP front-end's `HttpLimits::default()` also uses, so
+            // "the default" is a single number rather than two that agree today.
+            max_body_bytes: volucer_core::config::DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -242,18 +253,12 @@ impl FastCgiListener {
                     let sites = self.sites.clone();
                     let stats = Arc::clone(&self.stats);
                     let shutdown = Arc::clone(&self.shutdown);
-                    let max_connections = self.limits.max_connections;
+                    let limits = self.limits;
                     let observe = Arc::clone(&self.observe);
                     handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
                     handlers.push(std::thread::spawn(move || {
                         if let Err(err) = serve_connection(
-                            stream,
-                            dispatcher,
-                            sites,
-                            stats,
-                            shutdown,
-                            max_connections,
-                            observe,
+                            stream, dispatcher, sites, stats, shutdown, limits, observe,
                         ) {
                             tracing::debug!(%peer, %err, "connection ended");
                         }
@@ -315,6 +320,7 @@ fn param<'a>(params: &'a [(Vec<u8>, Vec<u8>)], name: &[u8]) -> Option<&'a str> {
 fn server_error_status(err: &ServerError) -> u16 {
     match err {
         ServerError::AllBusy { .. } => 503,
+        ServerError::BodyTooLarge { .. } => 413,
         _ => 502,
     }
 }
@@ -410,7 +416,7 @@ fn serve_connection(
     sites: SharedState,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
-    max_connections: usize,
+    limits: Limits,
     observe: Arc<volucer_observe::Observability>,
 ) -> Result<()> {
     // On Windows an accepted socket inherits the listener's non-blocking mode,
@@ -432,7 +438,7 @@ fn serve_connection(
     // request, 7 for the same request in one record. Writes go through `get_mut`, so a response
     // still leaves in its records rather than being held back, and the read half stays buffered.
     let mut stream = std::io::BufReader::with_capacity(READ_BUFFER_LEN, stream);
-    let max_connections_string = max_connections.to_string();
+    let max_connections_string = limits.max_connections.to_string();
     let mut requests_string = String::new();
 
     loop {
@@ -440,10 +446,32 @@ fn serve_connection(
             return Ok(());
         }
 
-        let next = match fastcgi::read_next(&mut stream) {
+        let next = match fastcgi::read_next(&mut stream, limits.max_body_bytes) {
             Ok(Some(next)) => next,
             // Clean end of stream: the peer closed between requests.
             Ok(None) => return Ok(()),
+            // **A body over the limit is answered, not just logged.** It reaches here rather than
+            // the dispatch branch because the refusal happens while the request is being read, so
+            // there is no dispatch result to map — and a listener that dropped the connection
+            // instead would leave nginx reporting an upstream failure rather than a 413.
+            Err(ServerError::BodyTooLarge { limit }) => {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    limit,
+                    "refusing a request: the body is over server.max_body_bytes"
+                );
+                fastcgi::write_error(
+                    stream.get_mut(),
+                    volucer_fcgi::REQUEST_ID,
+                    &ServerError::BodyTooLarge { limit }.to_string(),
+                    ServerErrorKind::BodyTooLarge,
+                )?;
+                // A keep-alive connection cannot be reused after this: the rest of the oversized
+                // body is still on the wire, and reading it to find the next request would be
+                // exactly the buffering the limit exists to refuse. Closing is the only correct
+                // answer, and it is what nginx does too.
+                return Ok(());
+            }
             Err(err) => return Err(err),
         };
 
@@ -569,7 +597,10 @@ fn serve_connection(
                     stream.get_mut(),
                     request_id,
                     &err.to_string(),
-                    ServerErrorKind::Backend,
+                    match err {
+                        ServerError::BodyTooLarge { .. } => ServerErrorKind::BodyTooLarge,
+                        _ => ServerErrorKind::Backend,
+                    },
                 )?;
             }
         }

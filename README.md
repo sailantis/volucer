@@ -188,11 +188,11 @@ is honest about what the hop is.
 
 What is different from the CGI-shaped backends, and worth knowing before deploying one:
 
-- **The request body streams and has no size cap.** The `max_body_bytes` limit protects the CGI path,
-  where the environment must carry `CONTENT_LENGTH` before `php-cgi` will read a byte — so the body
-  cannot be streamed there and the limit is what stops an unauthenticated client allocating without
-  bound. An upstream is handed the body unread, so the limit does not apply and **the limit to
-  configure is the origin's.** This is a real change in exposure, accepted by configuring an
+- **The request body streams and has no size cap.** The `server.max_body_bytes` limit protects the
+  CGI path, where the environment must carry `CONTENT_LENGTH` before `php-cgi` will read a byte — so
+  the body cannot be streamed there and the limit is what stops an unauthenticated client allocating
+  without bound. An upstream is handed the body unread, so the limit does not apply and **the limit
+  to configure is the origin's.** This is a real change in exposure, accepted by configuring an
   upstream at all.
 - **The response streams too**, which is what makes SSE and a large download work: an origin that
   answers in pieces reaches the client in pieces.

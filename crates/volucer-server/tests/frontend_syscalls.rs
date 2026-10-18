@@ -148,7 +148,8 @@ fn buffered_reads(pairs: &[(Vec<u8>, Vec<u8>)], pairs_per_record: usize) -> usiz
         },
     );
     count_start();
-    let next = read_next(&mut stream).expect("a readable request");
+    let next = read_next(&mut stream, volucer_core::config::DEFAULT_MAX_BODY_BYTES)
+        .expect("a readable request");
     assert!(matches!(
         next,
         Some(volucer_server::frontend::fastcgi::NextRequest::Request(_))
@@ -164,7 +165,8 @@ fn unbuffered_reads(pairs: &[(Vec<u8>, Vec<u8>)], pairs_per_record: usize) -> us
         out: Vec::new(),
     };
     count_start();
-    let next = read_next(&mut transport).expect("a readable request");
+    let next = read_next(&mut transport, volucer_core::config::DEFAULT_MAX_BODY_BYTES)
+        .expect("a readable request");
     assert!(matches!(
         next,
         Some(volucer_server::frontend::fastcgi::NextRequest::Request(_))

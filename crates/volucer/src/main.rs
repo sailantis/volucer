@@ -822,7 +822,10 @@ fn serve(
                 address,
                 Arc::clone(&dispatcher),
                 Arc::clone(&registry),
-                Limits { max_connections },
+                Limits {
+                    max_connections,
+                    max_body_bytes: config.server.max_body_bytes(),
+                },
             )?
             .with_observability(Arc::clone(&observe));
             println!("  fastcgi:          {}", listener.local_addr()?);
@@ -1109,7 +1112,7 @@ fn serve(
                 handles_for(tls_on_http),
                 HttpLimits {
                     max_connections,
-                    ..HttpLimits::default()
+                    max_body_bytes: config.server.max_body_bytes(),
                 },
                 http_settings,
             )
@@ -1137,7 +1140,7 @@ fn serve(
                 handles_for(true),
                 HttpLimits {
                     max_connections,
-                    ..HttpLimits::default()
+                    max_body_bytes: config.server.max_body_bytes(),
                 },
                 // TLS only: this listener is already the https endpoint, so a redirect here
                 // would send a client to where it came from.
@@ -1853,6 +1856,14 @@ fn check(
         Some(fcgi) => println!("    fastcgi: {fcgi}"),
         None => println!("    fastcgi: (disabled)"),
     }
+    // Printed beside the listeners because it is a property of them rather than of a backend, and
+    // because the value an operator most needs to see is the one they did *not* write: a deployment
+    // with no key has a 32 MiB limit that appears nowhere in its file.
+    println!(
+        "    max body: {} ({} MiB; bounds both front-ends, not an upstream)",
+        config.server.max_body_bytes(),
+        config.server.max_body_bytes() / (1024 * 1024)
+    );
 
     // TLS, and which paths were actually resolved. The resolution is printed rather than
     // assumed because a certificate path is the one setting whose *file* the reader cannot

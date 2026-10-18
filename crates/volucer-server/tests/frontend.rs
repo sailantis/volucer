@@ -62,9 +62,12 @@ fn front_end_round_trip(
 
     // The front-end reads it.
     let mut cursor = wire.as_slice();
-    let incoming = volucer_server::frontend::read_request(&mut cursor)
-        .expect("the front-end parses the request")
-        .expect("a request was present");
+    let incoming = volucer_server::frontend::read_request(
+        &mut cursor,
+        volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+    )
+    .expect("the front-end parses the request")
+    .expect("a request was present");
 
     // Dispatch to the backend.
     let response = dispatcher
@@ -532,9 +535,12 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
     };
 
     let mut cursor = wire.as_slice();
-    let incoming = volucer_server::frontend::read_request(&mut cursor)
-        .unwrap()
-        .unwrap();
+    let incoming = volucer_server::frontend::read_request(
+        &mut cursor,
+        volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+    )
+    .unwrap()
+    .unwrap();
 
     // The dispatch fails, so the front-end must answer with an error response.
     let err = dispatcher
@@ -582,9 +588,12 @@ fn the_frame_codec_works_over_a_real_socket() {
 
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let request = volucer_server::frontend::read_request(&mut stream)
-            .expect("read the request")
-            .expect("a request arrived");
+        let request = volucer_server::frontend::read_request(
+            &mut stream,
+            volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+        )
+        .expect("read the request")
+        .expect("a request arrived");
         let method = request.param_str("REQUEST_METHOD").unwrap_or_default();
         let body = String::from_utf8_lossy(&request.body).into_owned();
         let reply = format!("Status: 200 OK\r\n\r\necho={method}:{body}");
@@ -665,9 +674,12 @@ fn a_socket_front_end_can_be_built_from_the_parser() {
 
 /// Handle exactly one request on a connection, then close.
 fn serve_one(mut stream: TcpStream) -> String {
-    let request = volucer_server::frontend::read_request(&mut stream)
-        .expect("read the request")
-        .expect("a request arrived");
+    let request = volucer_server::frontend::read_request(
+        &mut stream,
+        volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+    )
+    .expect("read the request")
+    .expect("a request arrived");
     let summary = format!(
         "{} {}",
         request.param_str("REQUEST_METHOD").unwrap_or_default(),
@@ -678,4 +690,115 @@ fn serve_one(mut stream: TcpStream) -> String {
         .expect("write the response");
     let _ = stream.shutdown(std::net::Shutdown::Write);
     summary
+}
+
+#[test]
+fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
+    let _serial = serial();
+
+    // **The defect this closes is that the FastCGI front-end had no bound at all.**
+    // `read_next` extended a `Vec` for as long as `STDIN` records arrived, so a request that
+    // reached this listener could make it allocate without limit — the protection was nginx's
+    // `client_max_body_size`, on somebody else's configuration. `server.max_body_bytes` now bounds
+    // both front-ends, and this is the assertion that it reaches *this* one.
+    //
+    // The backend is an unreachable socket on purpose: a refusal that only became visible after a
+    // dispatch would be a limit applied too late, and an unreachable backend turns any such late
+    // refusal into a 502 that this test would catch.
+    let config = Config {
+        server: ServerConfig {
+            fastcgi: Some("127.0.0.1:0".to_string()),
+            max_body_bytes: Some(16),
+            ..Default::default()
+        },
+        backends: [(
+            "dead".to_string(),
+            BackendConfig::External(volucer_core::config::ExternalConfig {
+                socket: "127.0.0.1:1".to_string(),
+            }),
+        )]
+        .into_iter()
+        .collect(),
+        default_backend: Some("dead".to_string()),
+        ..volucer_core::config::Config::default()
+    };
+    config.validate().expect("a stated limit is valid");
+    assert_eq!(config.server.max_body_bytes(), 16);
+
+    let sites = SharedState::new(Sites::from_config(&config, Path::new(".")));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let listener = FastCgiListener::bind_registered(
+        "127.0.0.1:0",
+        dispatcher,
+        Arc::new(Registry::new(sites)),
+        Limits {
+            max_connections: 8,
+            max_body_bytes: config.server.max_body_bytes(),
+        },
+    )
+    .expect("bind the fastcgi listener");
+    let address = listener.local_addr().expect("bound address");
+    let shutdown = listener.shutdown_handle();
+    let handle = std::thread::spawn(move || listener.run());
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Two STDIN records over a 16-byte limit: the refusal has to happen on the second one, while
+    // the body is still arriving. One record would be refused by the same check, so splitting it
+    // is what proves the limit is cumulative rather than per record.
+    let mut wire = Vec::new();
+    record::Header::new(RecordType::BeginRequest, 9, 8)
+        .write(&mut wire)
+        .expect("write BEGIN_REQUEST");
+    wire.write_all(&BeginRequest::responder(true).encode())
+        .expect("write begin body");
+    record::write_records(&mut wire, RecordType::Params, 9, b"", true).expect("write params");
+    // **`false`, not `true`.** `write_records` emits a zero-length terminator when asked to, so
+    // two `true` calls send `chunk, END, chunk, END` and the body ends at the first chunk — the
+    // fixture then never reaches the limit this test exists to exercise. That is how the first
+    // version of this test reported a 502 from the backend the body was never sent to.
+    record::write_records(&mut wire, RecordType::Stdin, 9, b"0123456789", false)
+        .expect("write the first chunk");
+    record::write_records(&mut wire, RecordType::Stdin, 9, b"0123456789", false)
+        .expect("write the second chunk");
+    record::write_records(&mut wire, RecordType::Stdin, 9, b"", true).expect("terminate stdin");
+
+    let mut connection = fastcgi_connection(address);
+    connection
+        .get_mut()
+        .write_all(&wire)
+        .expect("send the request");
+    connection.get_mut().flush().expect("flush");
+
+    let mut answer = Vec::new();
+    loop {
+        match record::read_record(&mut connection) {
+            Ok(Some(record)) => {
+                let end = record.record_type() == RecordType::EndRequest;
+                answer.extend_from_slice(&record.content);
+                if end {
+                    break;
+                }
+            }
+            // **The listener closed the connection instead of answering**, which is the failure
+            // mode this test exists to catch: a client would see an upstream failure rather than
+            // a 413.
+            Ok(None) => panic!("the listener closed without answering"),
+            Err(err) => panic!("the listener sent a malformed record: {err}"),
+        }
+    }
+    let text = String::from_utf8_lossy(&answer);
+    assert!(text.contains("Status: 413 Content Too Large"), "{text}");
+    assert!(
+        text.contains("max_body_bytes"),
+        "the message must name the key: {text}"
+    );
+    assert!(
+        !text.contains("502"),
+        "an oversized body is not a gateway failure: {text}"
+    );
+
+    shutdown.shutdown();
+    let _ = handle.join();
 }

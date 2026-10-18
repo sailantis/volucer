@@ -86,6 +86,15 @@ pub enum ServerError {
     #[error("bad FastCGI protocol: {reason}")]
     BadProtocol { reason: String },
 
+    /// The request body was larger than `server.max_body_bytes`.
+    ///
+    /// Its own variant rather than a [`ServerError::BadProtocol`] because the request was
+    /// *well-formed* and refused: a front-end has to answer `413`, which a protocol error cannot
+    /// mean, and a client that sent a large upload must be told exactly that. It is also not a
+    /// [`ServerError::AllBusy`]: nothing was attempted, so retrying the same body changes nothing.
+    #[error("the request body exceeds the {limit} byte limit (server.max_body_bytes)")]
+    BodyTooLarge { limit: usize },
+
     #[error(transparent)]
     Config(#[from] volucer_core::Error),
 

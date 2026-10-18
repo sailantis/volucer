@@ -187,7 +187,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 | --- | --- | --- | --- |
 | **`file` KV driver** | `boltdb` | **S–M**: an embedded store, or a directory of files | Already §6.2's next driver, so it is here only to be counted. Note what a filesystem buys that boltdb does not: a cache survives a restart **without a dependency**, which is the whole reason it beats `memcached` in this order |
 | **`server.access_log` rotation** | `app-logger` is request logs *out of the application*; RR does not rotate either | **S** if it is "reopen on `SIGHUP`"; **M+** if it is rotation by age or size | A log an unprivileged server cannot reopen survives exactly one `logrotate` and then writes to a deleted inode for ever, silently. **The signal is already wired** — `SIGHUP` reloads, so "reopen the log first" is a few lines rather than a subsystem. Size-based rotation is where it becomes a subsystem, and `logrotate` already exists |
-| **`max_request_size`** | `http.max_request_size` | **S** — one `HttpLimits` field read beside the CLI's `--max-connections` | Today `max_body_bytes` is a constant, so the only way to bound a public upload endpoint is to recompile. Weak, because the limit exists at all and only its configurability is missing |
+| **`max_request_size`** | `http.max_request_size` | **S, and the estimate was wrong again** — built as `server.max_body_bytes`; the FastCGI front-end had no bound at all, so the "one `HttpLimits` field" reading was half the work | The limit existed and only its configurability was missing — but only on one protocol. Behind nginx the only bound was `client_max_body_size` on somebody else's configuration, while `read_next` extended a `Vec` for as long as `STDIN` records arrived. See §6.9 |
 
 #### Not worth building, and the reason is a property of something already here
 
@@ -1630,6 +1630,55 @@ which is already restart-only for a comparable reason.
 - 13 unit tests over the parser and the policy, including the ranges that would panic a naive mask
   (`/0` and `/32` shift by a full width), the four spellings a forwarded address arrives in, and the
   RFC 7239 `for=` target — with `by=` as the control that it is not mistaken for it.
+
+### 6.9 The request body limit: it was a defect, not a setting
+
+**Built, and it is the second estimate in this document that was wrong in the flattering
+direction.** §1.4's row said this was "one `HttpLimits` field read beside the CLI's
+`--max-connections`", which is true of the HTTP front-end and **entirely false of the FastCGI
+one**:
+
+- `volucer-server`'s `read_next` did `body.extend_from_slice(&record.content)` for as long as
+  `STDIN` records arrived. There was no bound at all. Behind nginx the only limit was nginx's
+  `client_max_body_size`, which is somebody else's configuration file — and a deployment that
+  forwarded to volucer from a load balancer, or from a proxy that did not set one, had nothing.
+- So the slice was not "read a field"; it was "give the second front-end a bound it never had",
+  and the config key is what made the two front-ends agree rather than the *point* of the slice.
+
+Four decisions, recorded because each could reasonably have gone the other way:
+
+1. **The unit is in the name** — `max_body_bytes`, not RoadRunner's `max_request_size` (megabytes).
+   A key with the same name and a different unit is the one kind of compatibility that costs more
+   than it buys, and `deny_unknown_fields` turns a deployment that copies RR's spelling into an
+   error rather than a server that reads as configured and keeps the default. `memory_limit_mb` and
+   `static_files.max_multirange_bytes` already establish both conventions.
+2. **Zero is refused, not read as "unlimited".** RR's own documentation says "zero means no limit";
+   reading a zero as unlimited is the one interpretation that turns a typo into an unbounded
+   allocation. The message names the 32 MiB default, because the useful information is what you
+   get by deleting the line.
+3. **The check runs before the extend, not after.** Checking afterwards lets one record over the
+   limit be buffered and then refused, so the memory a client can make the process hold is
+   `max_body_bytes` **plus a record** rather than `max_body_bytes`. Same rule as the pre-creation
+   counter check in `volucer-metrics`: a limit enforced after the work it exists to prevent is not
+   a limit.
+4. **`413`, and the status line had to move.** `write_error` hardcoded `Status: 502 Bad Gateway`
+   for every `ServerErrorKind`, so an oversized body would have told the client the *gateway*
+   failed. The kind now carries its own status line. The `END_REQUEST` protocol status stays
+   `RequestComplete` deliberately: an oversized body is oversized at every worker, so `Overloaded`
+   would invite nginx to retry elsewhere for ever.
+
+**The upstream path is deliberately still unbounded**, and now says so beside a key that reads as
+though it bounds everything. An `upstream` backend is handed the body unread, so applying a limit
+there would be a reverse proxy imposing a cap its own client never set. The README states it in
+both places.
+
+**And the fixture was the bug, twice.** Both new refusal tests first asserted against a body that
+ended at its first chunk: the `stdin` helper appends its own terminator, and `write_records` takes
+a `terminate` flag that the end-to-end test passed as `true` per chunk. The limit then looked like
+it worked because it was never reached. Two lessons, both already in this document's list: a test
+fixture that builds the input for the assertion can hide the assertion, and the fix is to check
+that the test *fails* when the code under test is broken — which it now does, verified by ignoring
+the configured limit and watching the 413 become a 502.
 
 ---
 
