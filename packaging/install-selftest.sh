@@ -296,7 +296,7 @@ if [ "$os" != windows ]; then
     # existing binary exactly as it was" that is testable without an interrupted download.
     echo "== install.sh refuses to overwrite"
     if VOLUCER_VERSION="$tag" \
-        VOLUCER_INSTALL_DIR="${work}/bin-linux-gnu" \
+        VOLUCER_INSTALL_DIR="${work}/bin-${native_label}" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-overwrite.sh" 2>&1; then
         check fail 'install.sh overwrote an existing binary without being asked'
