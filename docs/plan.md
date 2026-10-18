@@ -1624,6 +1624,32 @@ Later, and deliberately not part of Phase 8:
     - **Node was dropped rather than deferred.** It has the same property Go did — a warm HTTP
       server already — so the SDK buys the channel rather than the model, and nobody has asked
       for the channel. Recorded here so the absence is a decision rather than an omission.
+    - **The pipe transport shipped broken, and only Linux could have found it.** Importing the
+      Python SDK rebinds `sys.stdout` so an application's `print` cannot land inside a frame —
+      the right design, and the same problem the PHP SDK solves with an output buffer. But
+      `Worker.create()` then read `sys.stdout.buffer` as the *channel*, and by then that name is
+      the guard: the `HELLO_ACK` and every response went to **stderr**, the server saw no
+      handshake and reported a startup timeout whose last log line was "configuration loaded".
+      **Windows cannot observe this.** The transport defaults to `Socket` on Windows and `Pipe`
+      everywhere else (hazard 46), so on Windows the channel is a socket and `sys.stdout` is
+      never consulted. Every measurement taken on this host passed while Linux and macOS took
+      the broken branch. The end-to-end suite would have caught it years earlier, but its CI job
+      had been *skipping* — see the next bullet — so it had never run.
+    - **Both SDK CI workflows were provably green while proving nothing.** The skip predicate was
+      inverted: `volucer_binary() or not e2e_required()` is `False or False` when `VOLUCER_E2E=1`
+      is set and no binary exists, so the suite **skipped** — and a skipped job is the same green
+      as a passing one. The Ruby gem had the same shape (`skip ... unless binary`, with
+      `required?` defined and never consulted). Worse, neither workflow could have built the
+      server even if reached: no NASM or CMake, which `aws-lc-sys` needs. Both are fixed, the
+      predicate is now a named function with its own tests, and the Python job runs the
+      end-to-end pair against a freshly built Linux binary — verified in CI log output, not
+      only by the job being green.
+    - **A lesson for the other SDKs, recorded rather than implied:** the transport split means
+      *three* implementations must be exercised on both, and a green Windows run says nothing
+      about the pipe path. The PHP SDK is the one that has always been tested on both.
+    - **The end-to-end timeout said only "the server never answered"** and discarded stderr,
+      which was the only evidence of the bug above. It now prints the command, the config, and
+      both streams.
 38. `script-extensions` — **done.** `ScriptExtensions` in `crates/volucer-core/src/script.rs`, reached
     from `server.script_extensions` and carried per site on `ResolvedSite`, so "what counts as a
     script" is configuration rather than the hardcoded `[".php", ".php3", ".phtml"]`. Required
