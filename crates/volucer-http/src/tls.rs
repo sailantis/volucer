@@ -3,7 +3,7 @@
 //! This is the only place in the project that reads key material, and it exists because SNI
 //! happens *before* any HTTP request: the client names the host in the handshake, so the
 //! certificate has to be selected without a `Host` header to read. Site selection cannot help
-//! â€” it runs on a request that does not exist yet.
+//! — it runs on a request that does not exist yet.
 //!
 //! What it shares with site selection is the *rule*, not the table:
 //! [`volucer_core::HostMap`] does exact-name-then-longest-wildcard there and here, so a name
@@ -13,13 +13,13 @@
 //!
 //! rustls calls [`rustls::server::ResolvesServerCert::resolve`] once per handshake, on whatever
 //! thread the handshake is on, and it must be `Send + Sync`. The map is behind one pointer that
-//! a reload replaces whole, so a resolve is one pointer load, one lookup and an `Arc` clone â€”
+//! a reload replaces whole, so a resolve is one pointer load, one lookup and an `Arc` clone —
 //! no allocation, no lock, and it is on the handshake path rather than the request path.
 //!
 //! # Why the map is replaceable at all
 //!
-//! A certificate issued while the process is running â€” by ACME, or by an operator who renewed
-//! one by hand â€” has to appear in the map that is consulted *now*, not on the next restart.
+//! A certificate issued while the process is running — by ACME, or by an operator who renewed
+//! one by hand — has to appear in the map that is consulted *now*, not on the next restart.
 //! Everything else here follows from that: the resolver handed to rustls is stable and what is
 //! behind it moves, and replacing it is a whole-or-nothing operation that fails without
 //! touching what is already serving.
@@ -55,8 +55,8 @@ pub type LoadedCert = Arc<CertifiedKey>;
 ///
 /// Separate from [`SniResolver`] so that the resolver rustls holds is stable while the table
 /// behind it moves. Both halves are one value for the same reason [`crate::Reloaded`] is: the
-/// per-host entries and the fallback are two answers to one question â€” *which certificate is
-/// this name served under* â€” and a request that took one from each generation could present a
+/// per-host entries and the fallback are two answers to one question — *which certificate is
+/// this name served under* — and a request that took one from each generation could present a
 /// certificate the deployment had already replaced.
 pub struct Certs {
     /// Host pattern to certificate. Rebuilt on a reload rather than mutated in place, so a
@@ -78,7 +78,7 @@ impl Certs {
     /// Build a table from a fallback certificate and the names that get their own.
     ///
     /// The fallback is required rather than optional because a handshake for a name nothing
-    /// claims must still complete â€” that is what makes an unknown SNI name reach the `Host`
+    /// claims must still complete — that is what makes an unknown SNI name reach the `Host`
     /// decision instead of failing before it.
     pub fn new(default: LoadedCert, hosts: impl IntoIterator<Item = (String, LoadedCert)>) -> Self {
         let mut map: HostMap<LoadedCert> = HostMap::new();
@@ -123,7 +123,7 @@ impl Certs {
 
     /// Every named entry, as host-and-certificate pairs.
     ///
-    /// For a caller building the *next* table from this one â€” an ACME installation, which adds a
+    /// For a caller building the *next* table from this one — an ACME installation, which adds a
     /// name and must not drop the rest. Sorted by host, and exact names before wildcards, because
     /// [`HostMap::iter`] guarantees it.
     pub fn entries(&self) -> Vec<(String, LoadedCert)> {
@@ -137,7 +137,7 @@ impl Certs {
 /// Resolve a certificate for a name the client claimed in the handshake.
 ///
 /// Falls back to the default entry for a name nothing claims, which is what makes an unknown
-/// SNI name a handshake that succeeds and then meets whatever site the `Host` selects â€” rather
+/// SNI name a handshake that succeeds and then meets whatever site the `Host` selects — rather
 /// than a failed connection for a request that might have been perfectly legitimate. A client
 /// may claim one name and send another; that is legal, and the two decisions are separate.
 ///
@@ -149,7 +149,7 @@ impl Certs {
 /// arrives after a reload reads the new one without anything being reconfigured.
 ///
 /// `T: Send + Sync` is rustls' requirement on this trait, and `HostMap<LoadedCert>` provides it
-/// as long as the map is only read â€” which is why the map is replaced rather than mutated.
+/// as long as the map is only read — which is why the map is replaced rather than mutated.
 #[derive(Debug)]
 pub struct SniResolver {
     /// Where relative `certificate`/`key` paths resolve, kept so a reload can read the same
@@ -165,12 +165,12 @@ pub struct SniResolver {
     ///
     /// Held as its own resolver rather than merged into the table above, because the two answer
     /// **different questions** and must not be confused: this one produces a certificate for
-    /// *proving control of a name* â€” a one-off, valid for a single validation â€” while the table
+    /// *proving control of a name* — a one-off, valid for a single validation — while the table
     /// is what the deployment serves to real clients. Merging them would put a validation
     /// certificate in the serving table.
     ///
     /// A trait object rather than [`volucer_acme::ChallengeResolver`], so the dispatch below is
-    /// testable with a stub. The safety does not come from the type being concrete â€” it comes from
+    /// testable with a stub. The safety does not come from the type being concrete — it comes from
     /// the *order* in [`SniResolver::resolve`], which asks [`ChallengeSource::is_challenge`] before
     /// consulting a source at all, and from `volucer_acme::ChallengeResolver`'s own implementation
     /// of that method being the exact ALPN match.
@@ -178,14 +178,14 @@ pub struct SniResolver {
     /// Per-site challenge sources, tried after the deployment-wide one.
     ///
     /// A `Vec` rather than a map because the order is the rule and the count is the number of sites
-    /// with their own ACME table â€” small, and read once per *handshake*, never per request.
+    /// with their own ACME table — small, and read once per *handshake*, never per request.
     site_acme: Vec<(String, Arc<dyn ChallengeSource>)>,
 }
 
 /// Which certificates a deployment serves, as the config states them.
 ///
 /// Two sources, deliberately merged into one value: a [`Config`] describes a *whole*
-/// deployment, while a *reload* often changes only certificates â€” an ACME renewal, or an
+/// deployment, while a *reload* often changes only certificates — an ACME renewal, or an
 /// operator replacing a renewed PEM. Taking `Config` as the only constructor would force every
 /// certificate update to round-trip through a config file, which is the slower loop with more
 /// ways to fail. Both are accepted; both produce the same table.
@@ -206,7 +206,7 @@ pub struct CertificateSet {
 /// A certificate pair for the whole listener, named as `[server.tls]` names it.
 ///
 /// A name and a key rather than a whole [`TlsConfig`], because everything else in that struct
-/// is a property of the [`rustls::ServerConfig`] rather than of the certificate â€” and those are
+/// is a property of the [`rustls::ServerConfig`] rather than of the certificate — and those are
 /// **restart-only** (Â§ `tls.rs`'s module doc). Storing them here would invite a reload that
 /// appeared to apply them.
 #[derive(Debug, Clone)]
@@ -220,7 +220,7 @@ pub struct ServerCertificate {
     /// PEM certificate chain, leaf first. Relative paths resolve against the config file.
     ///
     /// `None` means the configuration left the pair out, and a self-signed placeholder is
-    /// generated in memory â€” see [`load_certified`]. It is only allowed when an ACME table will
+    /// generated in memory — see [`load_certified`]. It is only allowed when an ACME table will
     /// replace it, which `Config::validate` enforces.
     pub certificate: Option<PathBuf>,
     /// PEM private key. `None` for the same reason as `certificate`, and always together with it.
@@ -232,7 +232,7 @@ pub struct ServerCertificate {
 pub struct SiteCertificate {
     /// The site's name, for the error message when the pair cannot be loaded.
     pub name: String,
-    /// The host patterns from `[sites.<name>].hosts`, unnormalised â€” `HostMap` normalises.
+    /// The host patterns from `[sites.<name>].hosts`, unnormalised — `HostMap` normalises.
     pub hosts: Vec<String>,
     /// The certificate and key.
     pub tls: SiteCertificatePair,
@@ -268,7 +268,7 @@ pub struct GeneratedSite {
 impl CertificateSet {
     /// The certificates a configuration states.
     ///
-    /// Reads `[server.tls]` and every `[sites.*.tls]`, and nothing else â€” so a reload of the
+    /// Reads `[server.tls]` and every `[sites.*.tls]`, and nothing else — so a reload of the
     /// table alone does not depend on the rest of the file being unchanged. A site naming no
     /// certificate contributes nothing rather than an error: it is served under the server's
     /// certificate, which is the same rule `SniResolver::from_config` has always applied.
@@ -321,7 +321,7 @@ impl SniResolver {
     /// Build a resolver from a config and the directory the config file lives in.
     ///
     /// `config_dir` is where relative `certificate`/`key` paths resolve, which is a deliberate
-    /// exception to `document_root`'s rule â€” see [`volucer_core::config::TlsConfig`].
+    /// exception to `document_root`'s rule — see [`volucer_core::config::TlsConfig`].
     ///
     /// Fails rather than warning, and that is the opposite of `preflight` on purpose: preflight
     /// is a diagnostic that must tolerate a certificate that is not there *yet*, while this
@@ -339,7 +339,7 @@ impl SniResolver {
 
     /// Build a resolver around a certificate table the caller has already loaded.
     ///
-    /// For a caller that obtains certificates itself rather than from a config file â€” ACME â€”
+    /// For a caller that obtains certificates itself rather than from a config file — ACME —
     /// and for tests that want a resolver with a known table.
     pub fn from_certs(state: Certs, config_dir: &Path) -> Self {
         SniResolver {
@@ -355,8 +355,8 @@ impl SniResolver {
     /// The ACME case, and the reason it exists rather than a `clone`: the challenge source has to
     /// be composed in at construction, while the certificate table is what a reload and an issuance
     /// replace. Rebuilding the resolver around the *same* table means there is one table and two
-    /// names for it â€” the composed resolver answers handshakes and the original handle installs
-    /// certificates â€” rather than two tables that would drift apart on the next issuance.
+    /// names for it — the composed resolver answers handshakes and the original handle installs
+    /// certificates — rather than two tables that would drift apart on the next issuance.
     ///
     /// So: one `Swappable` behind two `SniResolver`s, which is safe because the field is an `Arc`
     /// and everything about it is a pointer swap.
@@ -387,7 +387,7 @@ impl SniResolver {
     ///
     /// **This is the whole reason the composition is ours.** `rustls-acme`'s
     /// `ResolvesServerCertAcme` holds exactly one `cert`, and on any handshake that is not a
-    /// challenge it returns that certificate for *every* SNI name â€” including names this
+    /// challenge it returns that certificate for *every* SNI name — including names this
     /// deployment deliberately falls back on, and including a name belonging to a different site.
     /// Installing it with `with_cert_resolver(...)` would therefore silently replace the
     /// hostâ†’certificate rule the whole TLS layer is built around: the symptom would be one site
@@ -407,7 +407,7 @@ impl SniResolver {
 
     /// Add a challenge source for **one site**, leaving the deployment-wide one in place.
     ///
-    /// Several tables can exist at once â€” the deployment's and one per site â€” and a validation
+    /// Several tables can exist at once — the deployment's and one per site — and a validation
     /// handshake carries only an SNI name, so *something* has to say which table answers it. That
     /// something is the name: [`ChallengeSource::site_for`] is asked, and a source that names a
     /// different site, or the deployment-wide one, is passed over.
@@ -415,7 +415,7 @@ impl SniResolver {
     /// The order is therefore a rule rather than an accident: the deployment-wide source stays first
     /// because it is the fallback for a name no site claims, and a site's source is consulted after
     /// it. `rustls-acme`'s resolver returns `None` for a name it is not validating, so a wrong
-    /// source declines rather than answering with somebody else's challenge certificate â€” which is
+    /// source declines rather than answering with somebody else's challenge certificate — which is
     /// what makes the search safe rather than merely usually right.
     ///
     /// Bounded on purpose. With one table per site this is a walk over a handful of entries, and
@@ -483,7 +483,7 @@ impl SniResolver {
     ///
     /// Whole-or-nothing: every certificate in the set is loaded and paired **before** anything
     /// is installed, so a set with one unreadable pair is refused entirely and the deployment
-    /// keeps serving the table it had. That is the only safe direction â€” a table that dropped
+    /// keeps serving the table it had. That is the only safe direction — a table that dropped
     /// one entry would fail every handshake for the names it covered, which is a worse failure
     /// than the one that was being reported.
     ///
@@ -502,7 +502,7 @@ impl SniResolver {
 
     /// Install a certificate table that is already in memory.
     ///
-    /// For a certificate whose bytes never went through a file this process wrote â€” an ACME
+    /// For a certificate whose bytes never went through a file this process wrote — an ACME
     /// issuance. The PEM is still written for durability and for an operator to inspect, but
     /// correctness does not depend on re-reading it, and that is what keeps a renewal off the
     /// filesystem at the moment it matters.
@@ -517,8 +517,8 @@ impl SniResolver {
     /// the fallback, while every other entry in the table is left exactly as it was.
     ///
     /// That last part is the correctness rather than an optimisation. A deployment can serve
-    /// several sites from several certificates â€” a per-site table, or a mix of issued and named
-    /// pairs â€” and a renewal of one name must not take away the others. So this is a *partial*
+    /// several sites from several certificates — a per-site table, or a mix of issued and named
+    /// pairs — and a renewal of one name must not take away the others. So this is a *partial*
     /// update where [`refresh`](SniResolver::refresh) is whole-or-nothing: refresh rebuilds from a
     /// configuration, and this adds what a CA just issued to what is already serving.
     ///
@@ -589,7 +589,7 @@ impl SniResolver {
     /// Resolve against the site table alone, ignoring any ACME challenge.
     ///
     /// Split out from [`ResolvesServerCert::resolve`] so the challenge branch is one `if` and the
-    /// behaviour for everything else is one call â€” a caller in a test can therefore assert the
+    /// behaviour for everything else is one call — a caller in a test can therefore assert the
     /// site table's answer without a challenge in the way.
     pub fn resolve_site(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // One load, once per handshake: the table this handshake resolves against is one
@@ -706,12 +706,12 @@ fn load_keeping(
 /// Generate a self-signed placeholder for a set of names, in memory.
 ///
 /// **Not written anywhere.** The only claim this certificate makes is "this deployment can complete
-/// a handshake", and it stops being served the moment an authority issues a real one â€” the install
+/// a handshake", and it stops being served the moment an authority issues a real one — the install
 /// path replaces it without a restart. Persisting it would leave a private key on disk that nothing
 /// ever needed and that a backup would carry for years.
 ///
 /// The names are the host patterns the deployment answers to, wildcards included, because a browser
-/// checks the SAN list regardless of what SNI asked for â€” a generated certificate with no names
+/// checks the SAN list regardless of what SNI asked for — a generated certificate with no names
 /// fails every handshake with a name mismatch, which reads as a broken server rather than as "no
 /// certificate yet". A wildcard pattern goes on as-is: `rcgen` accepts `*.example.com` and rustls
 /// matches it, which is exactly what a placeholder is for.
@@ -719,7 +719,7 @@ fn generate(names: &[String], where_: &str) -> Result<LoadedCert, TlsError> {
     install_crypto_provider();
 
     // A name is required, because a certificate with no SAN is one no client accepts. An empty list
-    // here means the configuration had no names either â€” a server with no sites â€” and an empty
+    // here means the configuration had no names either — a server with no sites — and an empty
     // certificate would fail every handshake while looking like a TLS bug.
     let names: Vec<String> = if names.is_empty() {
         vec!["localhost".to_string()]
@@ -792,7 +792,7 @@ fn default_names(config: &Config) -> Vec<String> {
 /// Install the process-wide crypto provider, once.
 ///
 /// rustls 0.23 leaves the provider to the crate features but only *installs* it lazily, and
-/// only on the paths that ask for it â€” `ServerConfig::builder` does, `CertifiedKey::from_der`
+/// only on the paths that ask for it — `ServerConfig::builder` does, `CertifiedKey::from_der`
 /// does not. So a build that loads a certificate before it builds a config finds no provider
 /// and fails, which is what happened the first time this ran. Installing it here makes the
 /// order irrelevant.
@@ -815,7 +815,7 @@ pub fn install_crypto_provider() {
 ///
 /// The named-file entry point: load a certificate chain and key from two paths.
 ///
-/// A caller that lets the pair be left out â€” because an ACME authority will issue one â€” goes
+/// A caller that lets the pair be left out — because an ACME authority will issue one — goes
 /// through [`load_or_generate`] instead, which is what an *absent* pair means in a configuration.
 /// This function is for a pair that is definitely there.
 pub fn load_certified(
@@ -855,7 +855,7 @@ pub fn load_certified(
 ///
 /// The path ACME takes, and the reason it is a separate function rather than a variant of
 /// [`load_certified`]: an issued certificate's bytes never went through a file this process wrote,
-/// so requiring a path would mean writing a PEM and reading it back â€” a second, slower loop that
+/// so requiring a path would mean writing a PEM and reading it back — a second, slower loop that
 /// can fail *after* the first already succeeded. `rustls-acme` hands over PEM, so PEM is what this
 /// takes.
 ///
@@ -925,7 +925,7 @@ pub fn server_config(
         .with_no_client_auth()
         .with_cert_resolver(resolver);
 
-    // ALPN decided the protocol, so it must be exactly what the config asks for â€” `h2` first,
+    // ALPN decided the protocol, so it must be exactly what the config asks for — `h2` first,
     // and `http/1.1` present unless someone deliberately removed it. `validate` has already
     // refused an unknown name, so passing them through cannot advertise something unroutable.
     server.alpn_protocols = tls.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();

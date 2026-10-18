@@ -771,8 +771,26 @@ fn serve(
             println!("    {name}: {}", site.hosts.join(", "));
         }
     }
-    if config.server.statics().enabled {
+    // The table is built just above, so this reports what will actually serve rather than what
+    // the file says. That matters for exactly one setting: a static layer turned off because the
+    // document root has no asset to serve. Printing "serving from the document root" there would
+    // be the silent version of the change.
+    let suppressed = sites.suppressed_static_layer();
+    let suppressed_default = suppressed.iter().any(|site| site.name == "<default>");
+    if suppressed_default {
+        println!(
+            "  static files:     off (the document root holds no asset a file could be served \
+             from)"
+        );
+    } else if config.server.statics().enabled {
         println!("  static files:     serving from the document root");
+    }
+    for site in suppressed.iter().filter(|site| site.name != "<default>") {
+        println!(
+            "    {}: off (no asset in {} a file could be served from)",
+            site.name,
+            site.document_root.display()
+        );
     }
 
     // Reported before the listeners start, not after: a document root that is
@@ -2420,6 +2438,10 @@ fn check(
             "    this is the default site's setting; a site that states serve_only overrides it"
         );
     }
+    // The layer the file configured, and then the one the document roots can use. Both are
+    // printed when they differ, because a setting that is not in force is exactly what an
+    // operator runs `check` to find out.
+    let suppressed = sites.suppressed_static_layer();
     if config.server.statics().enabled {
         println!("    enabled for the HTTP listener");
         println!(
@@ -2448,6 +2470,16 @@ fn check(
         );
     } else {
         println!("    (disabled: every request goes to a backend)");
+    }
+    // After the settings it overrides, so the block reads top to bottom: what the file says,
+    // and then where it does not apply.
+    for site in &suppressed {
+        println!(
+            "    {}: off, though the file enables it — {} holds no asset a file could be served \
+             from",
+            site.name,
+            site.document_root.display()
+        );
     }
 
     let mut dirs = extra_php_dirs.to_vec();
@@ -2632,6 +2664,7 @@ mod tests {
             script_extensions: volucer_core::ScriptExtensions::default(),
             serve_only: volucer_core::config::ServeOnly::All,
             static_files: volucer_core::config::StaticConfig::default(),
+            static_files_suppressed: false,
             compression: volucer_core::config::CompressionSetting::default(),
             routes: Vec::new(),
             default_backend: None,
@@ -2676,6 +2709,7 @@ document_root = "/from/file"
             script_extensions: volucer_core::ScriptExtensions::default(),
             serve_only: volucer_core::config::ServeOnly::All,
             static_files: volucer_core::config::StaticConfig::default(),
+            static_files_suppressed: false,
             compression: volucer_core::config::CompressionSetting::default(),
             routes: Vec::new(),
             default_backend: None,

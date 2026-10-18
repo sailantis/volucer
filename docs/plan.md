@@ -4989,7 +4989,7 @@ became `U+0000`. The same three characters were *text* to the editor that wrote 
 **The general rule: prose that quotes an escape sequence must not go through a tool that interprets
 it.** The fix is a single-quoted here-string (which processes no escapes) or a doubled backtick, and
 the check is one line — `ReadAllBytes` and count the zeros — which is far cheaper than the diagnosis.
-The same class of mistake is `Add-Content` mojibaking non-ASCII (`—` becoming `â€”`), recorded in
+The same class of mistake is `Add-Content` mojibaking non-ASCII (`—` becoming `—`), recorded in
 hazard 77's neighbourhood: **every write of non-ASCII text on this host gets byte-verified afterwards,
 and that is now a habit rather than a lesson.**
 
@@ -5054,7 +5054,7 @@ asserted on one platform and reported as a pass everywhere. The fix was reproduc
 was pushed, so it was verified where it failed rather than inferred from where it passed.
 
 
-### Hazard 85 — the static layer is on by default, and on a front-controller application it costs 4–6 µs per request
+### Hazard 85 — the static layer is on by default, and on a front-controller application it costs 6.5–63 µs per request
 
 The static-file layer became default-on after the published build (`b9d34c4`, 2026-10-14). Its own
 doc comment gives the reason: "every site has assets, and making each one ask for its own was a
@@ -5096,6 +5096,13 @@ application, since no route names a file. (`GET /` paid one, because a trailing 
 runtime thread: `futex` 14.11 → 20.00 and `clock_gettime` 50.40 → 61.58 per request, +21.3
 syscalls in all.
 
+**The number to act on is the one on `/`: 18–26%.** The within-round ratios for
+`new-nostat / new-req` are 1.220x, 1.176x, 1.231x and 1.261x at c=1/8/16/32 — every per-round range
+clear of 1.00. On `/items` it is 7–14% (1.141x, 1.139x, 1.133x, 1.068x), whose ranges *do* span
+1.00 on the two lower rounds, so that endpoint is the weaker half of the evidence even though its
+median moved the same way. `/` is the page a front-controller application actually serves, and it is
+also the endpoint where no arm can claim the layer was doing anything useful.
+
 **Both are fixed**, in that order of confidence: one `metadata` answers directory, file and
 neither (`GET /items` is now 1.05 `statx` per request), and the script-extension test moved ahead
 of the stat because it is string work and needs no filesystem at all.
@@ -5107,7 +5114,7 @@ only by that change, same config, seven rotating rounds, 168 cells, none failed:
 
 So the stat was ~1.5 µs of the 6.5 µs, and the rest is the `spawn_blocking` hop. **Removing one
 syscall from a path that wakes a thread is not worth a release note** — the change stays because
-one stat to learn one fact is the correct code, but the 14–22% is not recoverable by fixing the
+one stat to learn one fact is the correct code, but the 18–26% is not recoverable by fixing the
 layer's arithmetic. It is only recoverable by not entering the layer.
 
 **The general rule: a constant you have attributed is not the same as a constant you have priced.**
@@ -5129,9 +5136,32 @@ finding nothing — which is why the cost is the same regardless of what the req
 **What this is not.** It is not an argument that the default is wrong — that is a product
 judgement, and a site that serves assets wants the layer. It is an argument that a fixed cost
 belongs on the path that asks for it: an application whose every route is a front-controller
-dispatch pays a blocking-pool hop for an answer the route table already had, and `serve_only =
-"backend"` (or a route `policy`) is how a deployment says so. What the measurement establishes is
-the size of the thing, which the default's rationale did not mention.
+dispatch pays a blocking-pool hop for an answer the route table already had.
+
+**The layer is now turned off for exactly those applications**, in `Sites::from_config_with`, so
+`serve` and `check` serve and report the same decision. Three conditions keep it from being a
+silent behaviour change: only an *unrequested* layer is touched (a file that wrote
+`enabled = true` keeps it), only a root with **no asset in it** (any directory, or any non-script
+file, keeps the layer — so a `public/` deployment is never affected), and only when an HTTP
+listener and a backend both exist (otherwise the layer is either unreachable or the whole
+application). Every suppression is printed by `check`, printed in `serve`'s banner, and logged at
+`WARN`, because a setting the file wrote and the server is not running is the one thing this
+must never be quiet about.
+
+A `SIGHUP` re-derives the table from the same function, so creating an `assets/` directory and
+reloading brings the layer back — which is the right behaviour for a build that produces assets
+after the first start, and is why this is a decision rather than a startup-only flag.
+
+This replaced an earlier warning that told the operator to write `serve_only = "backend"`
+themselves. The warning was honest and named the mechanism, but not the size, so the only way to
+learn whether it was worth acting on was a benchmark — and the fix it recommended was a setting the
+operator had to discover, understand and write. A default that costs 18–26% on the commonest page
+should not depend on that.
+
+It also cost a *second* decision the operator could get wrong: `serve_only = "backend"` is
+contradictory with `static_files = true`, so following the old hint required deleting a key the file
+did not have. Turning the layer off for the site states the same thing in one place, and the
+contradiction check still refuses the case where someone writes both.
 
 **The general rule: a default that is right for the common case is still a cost paid by the case it
 is not right for, and a benchmark of one arm cannot see it.** The published sweep had no

@@ -21,6 +21,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo fmt --all --check
+      # Em dashes and similar punctuation are written in this repository's prose, and a tool that
+      # round-trips a UTF-8 file through a single-byte encoding turns every one of them into three
+      # visible characters. `cargo fmt` does not read comments, so it cannot catch that, and 106 of
+      # them were committed across five files before anyone noticed.
+      #
+      # The pattern is the UTF-8 encoding of the two characters that damage produces, matched as
+      # fixed bytes rather than as a regex so no locale can reinterpret it.
+      - name: No double-encoded UTF-8
+        run: |
+          if grep -rIl --exclude-dir=target --exclude-dir=.git -F $'\xc3\xa2\xe2\x82\xac' .; then
+            echo "::error::the files above contain mojibake — a UTF-8 file was written as CP-1252 and read back as UTF-8"
+            exit 1
+          fi
 
   clippy:
     name: Clippy

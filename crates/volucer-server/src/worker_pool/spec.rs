@@ -1,6 +1,6 @@
 //! What a worker process is started from: the resolved program, its arguments, its
 //! environment, and the checks that make a typo a startup error by name rather than a
-//! confusing `CreateProcess` / `execvp` failure later. **No process is created here** â€”
+//! confusing `CreateProcess` / `execvp` failure later. **No process is created here** —
 //! this module only decides *what* to run.
 
 use crate::error::{Result, ServerError};

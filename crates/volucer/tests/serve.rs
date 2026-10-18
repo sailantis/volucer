@@ -157,6 +157,13 @@ struct Server {
     /// one. Read from the banner for the same reason the other two are: a test that guessed a port
     /// would be testing its own ability to find a free one.
     status_address: Option<String>,
+    /// Everything the banner printed before the server started serving.
+    ///
+    /// Kept because some of it is a *decision* rather than an address: a static layer that the
+    /// configuration enables and the document root cannot use is turned off at startup, and the
+    /// banner is where a deployment learns that. A test that only asked the request path would
+    /// not be able to tell "the layer answered no" from "the layer never ran".
+    banner: String,
 }
 
 impl Server {
@@ -200,6 +207,7 @@ impl Server {
             address: String::new(),
             http_address: None,
             status_address: None,
+            banner: String::new(),
         };
         let stdout = server.child.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
@@ -210,6 +218,7 @@ impl Server {
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 break;
             }
+            server.banner.push_str(&line);
             // The banner is read line by line and parsed by field name rather than
             // by whole line, so the surrounding text can grow without breaking
             // every test that starts a server. Reading stops at the line that says
@@ -256,6 +265,16 @@ impl Server {
         }
         let _ = server.child.kill();
         None
+    }
+
+    /// The banner `serve` printed before it started listening.
+    fn banner(&self) -> &str {
+        &self.banner
+    }
+
+    /// Whether the banner said this, which is how a startup *decision* is asserted.
+    fn banner_mentions(&self, text: &str) -> bool {
+        self.banner.contains(text)
     }
 }
 
@@ -1221,12 +1240,82 @@ fn serve_serves_a_static_file_and_still_reaches_php_for_a_route() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A front-controller document root with no asset loses the static layer, end to end.
+///
+/// The unit tests establish that `Sites::from_config` turns the layer off. This is the part
+/// they cannot see: that the *listener* skips it, so a `GET /` that names no file reaches PHP
+/// without a `stat`. The observable difference is a file in the root that the layer would have
+/// served — and the assertion is that it is *not* served, because the layer is not running.
+///
+/// The two configurations differ in one key, which is what makes this attributable: the same
+/// root and the same binary, with `enabled = true` written down and then left out.
+#[test]
+fn a_root_with_no_assets_serves_no_files_even_though_the_default_is_on() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    require_sdk!();
+    if find_php().is_none() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("volucer-auto-off-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(root.join("index.php"), "<?php echo 'APP';\n").expect("write the controller");
+
+    // One backend and one controller: the shape that pays for a stat it cannot use. The
+    // file is written *after* the root exists, and it is not an asset — a `.php` file is
+    // what the layer refuses to serve — so the root still has nothing to serve.
+    //
+    // The configuration lives *outside* the document root, and not for tidiness: a
+    // `volucer.toml` in the root is a file the layer would happily serve, which would make
+    // this root one with an asset in it.
+    let config_path = root
+        .join("..")
+        .join(format!("volucer-auto-off-{}.toml", std::process::id()));
+    let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let document_root = toml_string(&root.display().to_string());
+    let config = format!(
+        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = \
+         {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let Some(http_address) = server.http_address.clone() else {
+        panic!("the HTTP listener did not report an address; the banner was not parsed");
+    };
+    // The banner is the operator's notice that the layer is not the one the file describes.
+    // Asserted here rather than left to `check`, because `serve` is what a deployment runs.
+    assert!(
+        server.banner_mentions("static files:     off"),
+        "the banner must say the layer is off, not leave it to be inferred: {}",
+        server.banner()
+    );
+
+    // The front controller answers, and the body is the worker's own — so the request reached
+    // PHP rather than being answered by a layer that is not running.
+    let response = http_get(&http_address, "/");
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(
+        response.text().contains("volucer worker"),
+        "the front controller answers, not the layer: {}",
+        response.text()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(&config_path);
+}
+
 /// A config that describes the whole deployment, and a flag that overrides part
 /// of it — which is the rule the CLI documents.
 ///
-/// Two document roots exist, and each holds a front controller that says which
-/// one ran. That matters because the file and the flag are both plausible places
-/// to set the root, and "which wins" has to be observable rather than assumed.
 #[test]
 fn the_command_line_document_root_overrides_the_one_in_the_file() {
     let Some(binary) = volucer_binary() else {
