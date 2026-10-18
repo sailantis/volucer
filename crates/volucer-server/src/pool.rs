@@ -594,6 +594,22 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
 mod tests {
     use super::*;
 
+    /// Serialise the unit tests in this module that need a loopback port.
+    ///
+    /// The same reasoning as `tests/common::serial`, which the integration tests use, applied one
+    /// layer down: `port_is_free_reports_the_truth` releases an ephemeral port and then asserts it
+    /// can be bound again, and "can I bind this port" is a fact about the whole machine, not about
+    /// this test. Fifteen other tests in this workspace bind ephemeral ports while it runs, so the
+    /// assertion was racing them for a port number the OS had just handed back. It failed only on
+    /// macos-latest, where the released port sits in the ephemeral range that the next `bind(0)`
+    /// picks from first, which is why it looked platform-specific rather than like a race.
+    fn port_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn zero_workers_means_the_available_parallelism() {
         assert!(worker_count(0) >= 1);
@@ -702,6 +718,12 @@ mod tests {
 
     #[test]
     fn port_is_free_reports_the_truth() {
+        let _serial = port_lock();
+
+        // The "held" half is asserted first and is the one that matters: it is what the startup
+        // path uses to decide a port is taken. The "released" half proves the predicate is not
+        // simply always false, and it is why this test now holds the lock -- a released ephemeral
+        // port can be handed straight to another test's `bind(0)`.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = listener.local_addr().unwrap().port();
         assert!(!port_is_free("127.0.0.1", port), "the port is held");
