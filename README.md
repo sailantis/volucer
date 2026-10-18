@@ -976,7 +976,9 @@ implementation cannot honour should be _stated_, or the operator finds out from 
   topology rather than about a request, and it is deliberately the same kind of setting as `alpn`
   rather than the same kind as the site table;
 - `[server.rate_limit]` — the token buckets are live state, so swapping the policy would reset
-  every caller's allowance. A limit that a `SIGHUP` clears is not a limit.
+  every caller's allowance. A limit that a `SIGHUP` clears is not a limit;
+- `[server.access_log]` path, format and `request_id_header` — chosen at startup. **The log file is
+  reopened on every SIGHUP regardless**, which is the half logrotate needs; see below.
 
 **A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
 a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
@@ -1048,6 +1050,28 @@ the client's slowness. `-` means there was no origin: a static file never had on
 that answered instantly did, and rendering both as `0.000` would make a graph of a mixed deployment
 wrong in the direction that flatters it. `format = "json"` emits one object per line instead, with
 `origin_time: null` for the same distinction.
+
+**`SIGHUP` closes and reopens the file, so `logrotate` works.** That is the whole reason the reopen
+exists: `logrotate` renames the log and signals the process, and a server that does not reopen keeps
+writing to the **unlinked inode**. Every write succeeds, the path holds a fresh empty file, and the log
+is found to be empty during the incident it was needed for. So the signal reopens unconditionally,
+before the configuration is even read — a rotation is a change to the filesystem and a config that
+fails to parse is not a reason to keep writing into a renamed file.
+
+```text
+/var/log/volucer/access.log {
+    daily
+    rotate 14
+    compress
+    postrotate
+        kill -HUP "$(pidof volucer)"    # or: systemctl reload volucer
+    endscript
+}
+```
+
+**Rotation by size or age is not built**, deliberately: `logrotate` knows the deployment's retention
+policy, and a second rotator is a second schedule to get wrong. `SIGHUP` also does not change the
+log's path, format or `request_id_header` — those are chosen at startup and `restart_only` says so.
 
 **It is not the diagnostic log, and that separation is the point.** An access log that shared a
 verbosity filter with diagnostics would be one setting away from silence, and both directions are

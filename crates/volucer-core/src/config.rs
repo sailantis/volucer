@@ -7640,6 +7640,15 @@ driver = "memory"
              queue, which is the fact that made the queue a leak",
             path.display()
         );
+        // And the sentence about rotation, because it is the one thing a deployment must do *after*
+        // configuring the log: a server whose log is rotated without a reopen writes into an unlinked
+        // inode for ever, silently.
+        assert!(
+            text.contains("SIGHUP CLOSES AND REOPENS THE FILE"),
+            "{} no longer says that SIGHUP reopens the access log, which is what makes logrotate \
+             work rather than silently detach the log",
+            path.display()
+        );
     }
 
     #[test]

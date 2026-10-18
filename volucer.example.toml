@@ -235,7 +235,28 @@ fastcgi = "127.0.0.1:9080"
 # \x20, \x22, \x5C and \n, because the format is space-separated and line-based:
 # an unescaped space in a User-Agent would otherwise let a client write fields of
 # this log line.
-
+#
+# SIGHUP CLOSES AND REOPENS THE FILE, which is the half `logrotate` needs. logrotate
+# renames the log and signals the process; a server that does not reopen keeps
+# writing to the unlinked inode -- every write succeeds, the path holds a fresh
+# empty file, and the log is found empty during the incident it was needed for.
+# So the reopen is unconditional and happens BEFORE the configuration is re-read: a
+# rotation is a change to the filesystem, and a config that fails to parse is not a
+# reason to keep writing into a renamed file.
+#
+#   /var/log/volucer/access.log {
+#       daily
+#       rotate 14
+#       compress
+#       postrotate
+#           kill -HUP "$(pidof volucer)"    # or: systemctl reload volucer
+#       endscript
+#   }
+#
+# Rotation BY SIZE OR AGE is deliberately not built: logrotate knows the deployment's
+# retention policy, and a second rotator is a second schedule to get wrong. SIGHUP
+# does not change path, format or request_id_header either -- those are chosen at
+# startup, and `restart_only` says so on every reload.
 # ---------------------------------------------------------------------------
 # Behind a reverse proxy: whose word for the client's address is believed.
 #

@@ -191,7 +191,7 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 | What | RR's shape | What it costs here | The argument against, and what would beat it |
 | --- | --- | --- | --- |
 | **`file` KV driver** | `boltdb` | **S–M**: an embedded store, or a directory of files | Already §6.2's next driver, so it is here only to be counted. Note what a filesystem buys that boltdb does not: a cache survives a restart **without a dependency**, which is the whole reason it beats `memcached` in this order |
-| **`server.access_log` rotation** | `app-logger` is request logs *out of the application*; RR does not rotate either | **S** if it is "reopen on `SIGHUP`"; **M+** if it is rotation by age or size | A log an unprivileged server cannot reopen survives exactly one `logrotate` and then writes to a deleted inode for ever, silently. **The signal is already wired** — `SIGHUP` reloads, so "reopen the log first" is a few lines rather than a subsystem. Size-based rotation is where it becomes a subsystem, and `logrotate` already exists |
+| **`server.access_log` rotation** — **reopen built, §6.12** | `app-logger` is request logs *out of the application*; RR does not rotate either | **S**, and the *estimate* was right for once while the **claim** was not: "the signal is already wired" is true, and the reopen still did not exist. The message printed on a broken log had promised it for as long as the log has existed | A log an unprivileged server cannot reopen survives exactly one `logrotate` and then writes to a deleted inode for ever, silently. Size-based rotation is still where it becomes a subsystem, and `logrotate` already exists — so **only the reopen half is built** |
 | **`max_request_size`** | `http.max_request_size` | **S, and the estimate was wrong again** — built as `server.max_body_bytes`; the FastCGI front-end had no bound at all, so the "one `HttpLimits` field" reading was half the work | The limit existed and only its configurability was missing — but only on one protocol. Behind nginx the only bound was `client_max_body_size` on somebody else's configuration, while `read_next` extended a `Vec` for as long as `STDIN` records arrived. See §6.9 |
 
 #### Not worth building, and the reason is a property of something already here
@@ -1850,6 +1850,75 @@ covers a deployment the others do not:
   `pending + dropped == handled` is asserted so a sample cannot simply vanish.
 - **Falsified** by removing the cap (`let room = usize::MAX`): the queue reaches **6596**, which is
   exactly the leak, and the test says so.
+### 6.12 The log that promised a reopen it did not have
+
+**A defect found by reading a message rather than by writing a test**, which is worth recording because
+it is the only one in this document found that way. The access log's failure path ended:
+
+    Fix the path and send SIGHUP, or restart
+
+Nothing reopened the file. The message had been written when the log was, describing an intention, and
+`SIGHUP` was wired up later for *configuration* — so the sentence became true-looking and stayed false.
+
+#### What it actually cost
+
+`logrotate` renames the file and signals the process. A process that does not reopen keeps writing to the
+**unlinked inode**: the path holds a fresh empty file, `lsof` shows a deleted file holding the
+deployment's whole log, and **every write succeeds**. So this is not a failure anybody sees from the
+server's side. It is discovered when an operator opens the log during an incident and finds it empty —
+which is the one moment the log was for.
+
+`[server.access_log]` was also in **neither** reload list. Not the reloadable one and not the
+restart-only one, so an operator who edited its path and sent a `SIGHUP` got silence in both directions:
+no change, and no statement that there would not be.
+
+#### Three states, and the variant that made them expressible
+
+The reopen has to answer three questions differently, and `Sink` could only hold two:
+
+| State | A reopen must | Why |
+| --- | --- | --- |
+| a file is open | flush, close, reopen | this is the rotation |
+| `Broken(reason)` | try again | a directory created after the first failure is the case a signal is for |
+| not configured | **do nothing** | a deployment that asked for no log must not get one |
+
+The third was spelled `Broken(String::new())`, with the distinction living in `reported` — which
+`is_enabled` could not see. So the reopen would have either resurrected a disabled log or never retried a
+broken one, depending on which the operator would rather have had. `Sink::Nowhere` is the fix, and it is
+the kind of change that is invisible in the happy path and load-bearing in exactly the two cases above.
+
+#### Four details
+
+- **The path lives on `AccessLog`, not on the reload.** A reopen is a property of *this log*: `SIGHUP`
+  closes and reopens the same path whether or not the file changed, which is what `logrotate` needs. The
+  reload has no reason to know a path, and passing one would be a second place it could be wrong.
+- **One `open_sink` for startup and reopen.** An `open` in the reopen path that forgot `append` would
+  truncate the log on every rotation — a worse bug than the one being fixed, and one the rotation test
+  would catch only if it checked contents rather than existence.
+- **`reported` resets on a successful reopen.** Otherwise a log that broke once, was repaired by a
+  rotation, and broke again would be silent from the second time on: the warning budget spent on the
+  first.
+- **The reopen runs first in `reload`, before the configuration is read.** A rotation is a change to the
+  filesystem; a configuration that fails to parse is not a reason to keep writing into a renamed inode
+  for another day. An operator who sends the signal after `logrotate` and edits the file in the same
+  breath gets the repair *and* the error, in that order.
+
+#### Verified
+
+- **Unit:** a rename followed by a reopen puts the next record in the new file and leaves the rotated one
+  alone; a path that could not be opened is retried and succeeds once the directory exists; a disabled
+  log stays disabled.
+- **End to end on Linux**, against a real process: rename the log, send `SIGHUP`, and the next record
+  lands in the new file **while the rotated one does not grow**. That second assertion is the control —
+  a reopen that wrote to both, or to neither, is invisible to an assertion on the fresh file alone, and
+  a server that merely *created* the file and kept writing elsewhere would pass one.
+- **Falsified** on Linux by making the reopen call conditional: the test fails on "SIGHUP must close and
+  reopen the log", after the ten-second poll that exists so the assertion names the missing behaviour
+  rather than a timeout.
+
+**Rotation by size or age is deliberately not built.** `logrotate` does that, and it does it better than
+a server embedded in an application's process could: it knows the deployment's retention policy, and a
+second rotator is a second schedule to get wrong.
 ---
 
 ## 7. Python/Django and Ruby/Rails
@@ -1993,6 +2062,7 @@ progress on something earlier look bigger.
 | 8 | **gRPC Tier B** (application as the handler, via `CALL`/`RETURN`) | 2, 7 | M | **Done.** `grpc_services` on a backend, `UNIMPLEMENTED` for anything else, and the application's status moved into the trailers. The application states its outcome in two response headers; the server never parses a message. Five of this section's own premises were corrected on contact, and the largest is that routing to a *worker* became protocol-aware |
 | 9 | **gRPC Tier C** (reflection) | 8, and §10 item 2 | M, optional | **Settled: not built**, and §10 item 2 is the decision. The only descriptor consumer turned out to be the service itself — a reply is already-framed bytes the server never decodes — so no other use could justify loading a schema either |
 | — | **`http.trusted_subnets` + forwarded headers** — §6.8 | — | S–M | **Done.** Independent of 1–9, and the only item in §1.4 that was a *defect* rather than a missing feature: behind nginx the access log and any future rate limit both keyed on the proxy. Restart-only, and deliberately not applied on the FastCGI path |
+| — | **server.access_log reopen on SIGHUP** — §6.12 | — | S | **Done**, and it was a defect rather than a feature: the failure message had promised SIGHUP would reopen the log for as long as the log has existed. Only the reopen; size-based rotation stays with logrotate |
 | — | **Rate limiting** — §6.10 | 1, §6.8's resolved address | S | **Done.** The bucket is a page of arithmetic as §1.4 said; the work was the two front-ends and two protocols. 429 (not RoadRunner's 503, which would remove the node from a load balancer), Retry-After, and RESOURCE_EXHAUSTED for a gRPC call. Restart-only, because the buckets are live state |
 | — | **`volucer workers` / `volucer reset`** — §4.7 | 1, 2, and §6.1's `[status]` listener | S–M | **Not built, and it is the operator's only lever on a running pool.** §4.6 called it a client; it is an endpoint, because the registry's channel has no second-process half. Routes on the listener `[status]` already brings up, behind an off-by-default key |
 | — | **Runtimes, Tier 1 (`upstream` supervision)** | — | S–M | **Done.** Independent of 1–9. Highest value per unit of work in this document — and it turned out to be the prerequisite step 7 was waiting for |

@@ -2357,6 +2357,13 @@ fn check(
                     );
                 }
             }
+            // Printed because it is the one thing a deployment must do *after* configuring a log,
+            // and because the alternative is finding out during an incident that `logrotate` detached
+            // the log silently. The path and format above are restart-only; the reopen is not.
+            println!(
+                "    rotate: send SIGHUP (or `systemctl reload`) after logrotate renames the file — \
+                 volucer closes and reopens it, so the new file is the one written"
+            );
         }
         None => println!("  access log: none (server.access_log is unset)"),
     }
