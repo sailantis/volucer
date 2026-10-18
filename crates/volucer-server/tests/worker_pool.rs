@@ -2558,3 +2558,106 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
         "the refusal names the namespace that is missing: {message}"
     );
 }
+
+/// A pool nobody scrapes still bounds its queue, and still says what it lost.
+///
+/// **This is the leak, end to end.** `publish_metrics` has one caller — the scrape — so a deployment
+/// with `[server.access_log]` and no `[metrics]` table never drains the worker-metric queue, and an
+/// earlier version of it grew for the process's life while its documentation claimed the drain bounded
+/// it. The fixture is therefore the deployment in question: a real pool, a real worker emitting samples
+/// on every request, and **no `publish_metrics` call anywhere in the test**.
+///
+/// Two properties, and the second is what makes the first useful:
+///
+/// - the queue stops at its bound, so what the process can be made to hold is finite;
+/// - the loss is *counted* and readable through `dropped_metrics`, which is what the shutdown line
+///   prints — because a deployment that never scrapes would otherwise never learn that its samples were
+///   going nowhere.
+#[test]
+fn a_pool_that_is_never_scraped_bounds_its_metric_queue_and_counts_the_loss() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-metric-bound-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("metric-flood.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    // **One emission per request, and the sample is deliberately undeclared.** A declared name would
+    // still be refused by this test's registry (which declares nothing), so the sample count is what
+    // matters rather than where it lands — this test is about the queue, not about the registry.
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response {{
+    $worker->emitMetric('app_requests_total', 1.0);
+    return Response::text('ok');
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let config = WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers: 1,
+        memory_limit_mb: None,
+        max_requests: None,
+        working_dir: None,
+        env: Default::default(),
+        checksum: Default::default(),
+        services: Vec::new(),
+        grpc_services: Vec::new(),
+        transport: Default::default(),
+    };
+    let pool = match WorkerPool::start("bound", &config) {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("skipping: the worker pool could not start: {err}");
+            return;
+        }
+    };
+
+    // Enough requests to overflow the bound several times over. One sample per request, and the bound
+    // is four thousand — so this is a few seconds of a small pool and would be a moment in production.
+    //
+    // **The count is not asserted as an exact number**, and that was the first version's mistake: the
+    // example worker emits on every request, but a worker's own protocol work is not this test's
+    // subject — the SDK's first request does not carry a sample (it is the handshake) and a replay
+    // can count twice. What matters is that samples arrived, that the queue stopped at its bound, and
+    // that everything beyond the bound was *counted* rather than silently dropped. An exact figure
+    // here would be an assertion about the SDK's emission policy wearing this test's name.
+    let requests = 4096 + 2500;
+    for n in 0..requests {
+        pool.request(&get("/"))
+            .unwrap_or_else(|err| panic!("request {n} failed: {err}"));
+    }
+
+    let pending = pool.pending_metrics();
+    let dropped = pool.dropped_metrics();
+    assert_eq!(
+        pending, 4096,
+        "the queue must stop at its bound rather than growing with the requests served"
+    );
+    assert!(
+        dropped > 2000,
+        "most of the {requests} requests carried a sample, so most of the overflow must be counted; \
+         got {dropped}"
+    );
+    assert_eq!(
+        pending as u64 + dropped,
+        pool.metrics_handled(),
+        "and the two must account for every sample the pool ever took in: {pending} waiting + \
+         {dropped} dropped != {}",
+        pool.metrics_handled()
+    );
+
+    // **No scrape, deliberately.** Reaching this line with the numbers above is the whole test: a
+    // `publish_metrics` call here would drain the queue and hide the defect it exists to catch.
+    let _ = std::fs::remove_dir_all(&dir);
+}

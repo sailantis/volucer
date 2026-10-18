@@ -263,6 +263,38 @@ fn the_set_describes_its_kinds() {
     );
 }
 
+/// The drop counter is a **counter**, and that is the assertion worth having.
+///
+/// The name ends in `_total`, which is the convention Prometheus reads as monotonic — `rate()` over it
+/// is how an operator asks "how fast am I losing samples", and a gauge there would make that query
+/// meaningless. So the pool reports a *delta* per scrape and this is an increment; setting a gauge from
+/// the running total would pass a test that only checked the number, which is why this checks the type.
+#[test]
+fn the_dropped_sample_counter_is_a_counter_and_not_a_gauge() {
+    let registry = registry_with_the_set();
+    // **Not in the `rr_http_*` set**, asserted here rather than left to the naming test above: this
+    // series describes a volucer decision, and putting it in RoadRunner's namespace would add a line to
+    // every operator's existing `rr_http_*` queries. The prefix is the boundary.
+    assert!(
+        !registry.names().iter().any(|n| n.contains("dropped")),
+        "a volucer-only series must not enter the rr_ set: {:?}",
+        registry.names()
+    );
+
+    http::count_dropped_metrics(&registry, 3);
+    http::count_dropped_metrics(&registry, 4);
+    let rendered = registry.render();
+
+    assert!(
+        rendered.contains("# TYPE volucer_metrics_dropped_total counter\n"),
+        "the type is what makes `rate()` readable: {rendered}"
+    );
+    assert!(
+        rendered.contains("volucer_metrics_dropped_total 7\n"),
+        "two scrapes' worth of drops must add rather than replace: {rendered}"
+    );
+}
+
 /// Nothing in this set takes a label from the request, which is what keeps the registry's series
 /// cap a backstop rather than a load-bearing limit. A path or a host in a label would make the
 /// number of series a function of what clients ask for.

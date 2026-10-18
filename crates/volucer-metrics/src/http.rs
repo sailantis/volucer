@@ -117,6 +117,20 @@ pub fn describe(registry: &Registry) {
     );
 }
 
+/// A name volucer has and RoadRunner does not, kept out of [`PREFIX`] on purpose.
+///
+/// The `rr_http_*` set is an **interface with dashboards that already exist**, and a test asserts its
+/// membership literally for that reason. A series that describes a volucer-specific decision therefore
+/// cannot go in it: an operator's `rr_http_*` queries would acquire a line they never asked for, and the
+/// set would stop being the guarantee its own test makes it. So this family is `volucer_`, and the
+/// boundary is the point rather than the spelling.
+pub const VOLUCER_PREFIX: &str = "volucer_";
+
+/// The full name for a metric only volucer emits.
+fn volucer_name(suffix: &str) -> String {
+    format!("{VOLUCER_PREFIX}{suffix}")
+}
+
 /// One pool, as the metrics need to see it.
 ///
 /// A snapshot rather than a set of accessors on the pool, so that emission is one call at one
@@ -210,6 +224,25 @@ pub fn set_uptime_seconds(registry: &Registry, seconds: f64) {
 /// Record a request that found no worker free.
 pub fn count_no_free_workers(registry: &Registry) {
     registry.counter_add(&name("no_free_workers_total"), &[], 1);
+}
+
+/// Count worker-emitted samples this pool refused because its queue was full.
+///
+/// **An increment, not a set**, because the name ends in `_total`: a gauge there would be a series
+/// `rate()` cannot read, and the question an operator has — "how fast am I losing samples" — is a rate.
+/// The pool reports what happened since the last scrape; see its `PendingMetrics`.
+///
+/// Declared here rather than in [`describe`] because it is **not** part of RoadRunner's set: see
+/// [`VOLUCER_PREFIX`]. Declaring it on first use instead of at startup would be a family that appears
+/// only once something has already gone wrong, which is exactly when a graph needs to have been
+/// collecting from zero.
+pub fn count_dropped_metrics(registry: &Registry, dropped: u64) {
+    registry.describe(
+        &volucer_name("metrics_dropped_total"),
+        crate::Kind::Counter,
+        "Worker-emitted samples refused because the pool's queue was full",
+    );
+    registry.counter_add(&volucer_name("metrics_dropped_total"), &[], dropped);
 }
 
 /// The full name for a metric in this set.

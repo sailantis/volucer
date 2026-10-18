@@ -1294,6 +1294,18 @@ fn serve(
     // diagnostic should depend on.
     for contention in reporting.contention() {
         println!("{}", contention_line(&contention));
+        // **Printed only when something was lost**, and separately from the line above because it is a
+        // different kind of fact: the contention figures are diagnostics that are always interesting,
+        // while a drop count of zero is noise. A deployment with no `[metrics]` table has no other way
+        // to learn that its worker-emitted samples were refused, which is why this is here rather than
+        // only in the registry.
+        if contention.dropped_metrics > 0 {
+            println!(
+                "metrics: {} worker-emitted sample(s) dropped for the backend {:?} — its queue was \
+                 full, and a scrape is what drains it",
+                contention.dropped_metrics, contention.backend
+            );
+        }
     }
 
     // The consumers go last, after the listeners and after the last scrape. Stopping them earlier would
@@ -2398,6 +2410,7 @@ mod tests {
             p99_us: 16_384,
             busiest: 7,
             busiest_us: 41_233,
+            dropped_metrics: 0,
         };
         let line = contention_line(&reported);
         // Whitespace-collapsed comparison: the format is what matters, not the width of

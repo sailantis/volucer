@@ -571,7 +571,24 @@ base_port = 19001
 # A sample whose name is not declared is refused, deliberately -- otherwise an
 # application could widen the published set at runtime. So the table is not an
 # optional extra: without it, emitMetric does nothing that anyone can see.
-# ---------------------------------------------------------------------------
+#
+# AND WITHOUT THIS TABLE NOTHING DRAINS THE QUEUE. A worker's sample is held in
+# a per-pool queue until a scrape takes it, and `publish_metrics` has exactly one
+# caller -- the scrape. A deployment with an access log and no [metrics] table
+# therefore never drains it; an earlier version grew for the process's life while
+# its own documentation said the drain bounded it. The queue is now capped at
+# 4096 samples per pool, and what does not fit is counted and reported three ways
+# rather than silently lost:
+#
+#   volucer_metrics_dropped_total   -- on a scrape, so a graph shows the gap.
+#                                      NOT rr_http_*: that set is RoadRunner's,
+#                                      and this series is volucer's own decision.
+#   a warning, one per 1024 samples  -- so the log of a deployment with no
+#                                      [metrics] table says so;
+#   a line at shutdown               -- printed only when something was lost.
+#
+# 4096 is far above what a scrape a minute needs, so it is not a throughput limit
+# -- what it bounds is a deployment that emits and never drains.# ---------------------------------------------------------------------------
 # [metrics]
 # address = "127.0.0.1:2112"
 # prefix = "myapp_"

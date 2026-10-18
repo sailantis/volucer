@@ -148,6 +148,29 @@ const MAX_SLOT_WAIT: Option<Duration> = Some(Duration::from_millis(500));
 /// width of a millisecond cannot resolve the microseconds a healthy wait lives at.
 const WAIT_BUCKETS: usize = 20;
 
+/// How many worker-emitted samples one pool holds before it starts dropping them.
+///
+/// **A cap rather than no cap, and the reason is a leak that shipped.** The obvious account of this
+/// queue — "a worker that emits a per-request metric is bounded by the requests it serves" — is true
+/// and irrelevant, because it describes the producer. The consumer is a *scrape*, and a deployment
+/// with `[server.access_log]` and no `[metrics]` table has no scrape at all: `publish_metrics` has one
+/// caller, `DispatcherMetrics::refresh`. So every sample an application emitted accumulated for the
+/// process's life. The queue was described in its own doc comment as bounded by the drain, and it was
+/// — when there was a drain.
+///
+/// 4096 records of `{String, f64, String}` is a few hundred kilobytes in the worst case and nothing in
+/// the ordinary one: an application emitting ten samples a request and scraped once a minute fills it
+/// long before a scrape, so the cap is not a throughput limit. What it bounds is the pathological case,
+/// which is the only one that needs bounding.
+const MAX_PENDING_METRICS: usize = 4096;
+
+/// How often a pool that is dropping samples says so, in samples.
+///
+/// A warning per dropped sample on a queue that is full by definition would be a log line per request
+/// — the flood that makes an operator stop reading the log, which is worse than the silence this
+/// replaces. Every 1024th is rare enough to be read and frequent enough to be noticed.
+const DROP_WARNING_INTERVAL: u64 = 1024;
+
 /// The bucket a wait of `micros` belongs in.
 ///
 /// Never negative and never zero-valued, so the index is `floor(log2)` of the wait.
@@ -167,6 +190,83 @@ fn wait_bucket(micros: u64) -> usize {
 /// direction that matters when the number is being used to decide whether a tail is real.
 fn bucket_upper_edge(index: usize) -> u64 {
     1u64 << (index + 1)
+}
+
+/// The worker-emitted samples waiting for a scrape, and what could not fit.
+///
+/// # Why this is a type rather than a bare `Vec`
+///
+/// Because the overflow has to be *counted*, and a counter written by two call sites that each
+/// remembered to check the cap is a counter that eventually stops matching the drops. Every push goes
+/// through [`PendingMetrics::push`], so there is one place the cap is applied and one place the
+/// count moves.
+#[derive(Debug, Default)]
+struct PendingMetrics {
+    /// Samples already counted for a drop, so the arithmetic is O(batch) rather than O(queue).
+    records: Vec<MetricRecord>,
+    /// How many samples were refused because the queue was full.
+    ///
+    /// **Reported rather than swallowed**, on three paths, because each covers a deployment the
+    /// others do not:
+    ///
+    /// - `volucer_metrics_dropped_total` when a scrape does happen, so a graph shows a gap instead of
+    ///   a silently flat line;
+    /// - a rate-limited warning, so the log of a deployment with no `[metrics]` table says so;
+    /// - the shutdown summary, so a load test's log records it even when nobody was reading either.
+    dropped: u64,
+    /// How much of `dropped` has already reached the registry.
+    ///
+    /// The registry's series is a **counter** — the name ends in `_total`, and a gauge there would
+    /// break `rate()` on it — so what the scrape adds is the difference, and this is where the
+    /// difference is remembered. Setting the gauge to the running total instead would work today and
+    /// be wrong for anyone graphing it, which is the audience a metric exists for.
+    reported: u64,
+}
+
+impl PendingMetrics {
+    /// Add samples, keeping at most [`MAX_PENDING_METRICS`] and counting the rest.
+    ///
+    /// Returns how many were dropped, so the caller can warn **outside** the lock: a `tracing` call
+    /// under a mutex every worker contends for is a log line that can stall the request path, and this
+    /// queue is written from the exchange thread.
+    fn push(&mut self, records: &[MetricRecord]) -> u64 {
+        let room = MAX_PENDING_METRICS.saturating_sub(self.records.len());
+        let take = room.min(records.len());
+        self.records.extend_from_slice(&records[..take]);
+        let dropped = (records.len() - take) as u64;
+        self.dropped = self.dropped.saturating_add(dropped);
+        dropped
+    }
+
+    /// Take everything, for a drain.
+    fn drain(&mut self) -> Vec<MetricRecord> {
+        std::mem::take(&mut self.records)
+    }
+
+    /// How many samples were dropped over this pool's life.
+    fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Every sample this queue ever took in, whether it fitted or not.
+    fn handled(&self) -> u64 {
+        self.records.len() as u64 + self.dropped
+    }
+
+    /// How many drops have not yet reached the registry, marking them reported.
+    ///
+    /// A drain, in the sense that matters: the scrape asks once and the next scrape asks for what
+    /// happened since.
+    fn take_unreported(&mut self) -> u64 {
+        let delta = self.dropped - self.reported;
+        self.reported = self.dropped;
+        delta
+    }
+
+    /// How many are waiting.
+    fn len(&self) -> usize {
+        self.records.len()
+    }
 }
 
 /// The pool's free slots, and how many requests are owed one.
@@ -337,11 +437,16 @@ pub struct WorkerPool {
     /// accumulates, and the next scrape drains. The alternative, publishing on arrival, would need the
     /// registry threaded through the exchange, which is the coupling `volucer-metrics` exists to avoid.
     ///
-    /// A plain `Mutex<Vec>`: the write is once per worker per metric and the read is once per scrape,
-    /// so neither side is on a hot path. Drained rather than copied, so a long-running deployment does
-    /// not grow this without bound — a worker that emits a per-request metric is bounded by the requests
-    /// it serves, but a worker that emitted one per loop iteration would not be.
-    pending_metrics: Mutex<Vec<MetricRecord>>,
+    /// **Bounded, and it has to be: the consumer is a scrape, and a deployment need not have one.**
+    /// `publish_metrics` has exactly one caller in this server — the scrape's `refresh` — so with no
+    /// `[metrics]` table there is no drain at all, and an earlier version of this field grew for the
+    /// process's life while its own documentation claimed the drain bounded it. That account was true
+    /// when a scrape happens and silently false when one does not, which is the kind of limit that is
+    /// only wrong on the deployments nobody watches. See [`MAX_PENDING_METRICS`].
+    ///
+    /// A plain `Mutex`, not an async one: the write is once per worker per metric and the read is once
+    /// per scrape, so neither side is on a hot path, and nothing awaits inside the lock.
+    pending_metrics: Mutex<PendingMetrics>,
     /// Held for the life of the pool; dropping it reaps every worker.
     guard: LifecycleGuard,
     /// What this pool's workers may call, or `None` to grant nothing.
@@ -465,7 +570,7 @@ impl WorkerPool {
                 .memory_limit_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024)),
             max_requests: config.max_requests,
-            pending_metrics: Mutex::new(Vec::new()),
+            pending_metrics: Mutex::new(PendingMetrics::default()),
             guard,
             call_handler,
         };
@@ -912,18 +1017,25 @@ impl WorkerPool {
         // recycled still reaches the graph, and so this drain happens even if the pool turns out to
         // have no slots to describe below.
         //
-        // Drained rather than copied, and that bounds the queue: a worker emitting one sample per
-        // request is bounded by the requests it serves, but one emitting a sample per loop iteration
-        // is not, and a queue that only ever grows would be a leak wearing a feature's name. Drained
-        // *before* the registry is written to, so a sample is never counted twice by two concurrent
-        // scrapes — the `Mutex` makes the drain atomic, and the second scrape finds an empty queue.
-        let samples = {
+        // Drained rather than copied, so a sample is never counted twice by two concurrent scrapes —
+        // the `Mutex` makes the drain atomic, and the second scrape finds an empty queue.
+        //
+        // **The drain is not what bounds the queue**, and this comment used to say it was. Only a
+        // scrape drains, and a deployment need not have one: with no `[metrics]` table nothing calls
+        // this at all. The bound is `MAX_PENDING_METRICS`, applied where samples are pushed. What the
+        // drain owes is the *drop count*, so a graph shows the gap rather than a flat line that looks
+        // like an application which stopped emitting.
+        let (samples, dropped_now) = {
             let mut pending = self
                 .pending_metrics
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *pending)
+            let dropped_now = pending.take_unreported();
+            (pending.drain(), dropped_now)
         };
+        if dropped_now > 0 {
+            volucer_metrics::http::count_dropped_metrics(registry, dropped_now);
+        }
         for record in samples {
             // `record` rather than `observe`, because the *declaration* decides what a sample means:
             // a counter's is an increment and a gauge's is a reading, and a worker sending
@@ -1120,11 +1232,7 @@ impl WorkerPool {
         // scrape would otherwise take its samples with it, which is precisely when they are
         // interesting.
         if !response.metrics.is_empty() {
-            let mut pending = self
-                .pending_metrics
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.extend(response.metrics.iter().cloned());
+            self.stash_metrics(response.metrics.to_vec());
         }
 
         let duration = started.elapsed();
@@ -1136,18 +1244,77 @@ impl WorkerPool {
     ///
     /// The records are taken from the *exchange's* answer rather than read off a response, because a job
     /// has no response object to carry them: the request path finds its records on `WorkerResponse` and
-    /// this one is handed them. Drained rather than copied, which is what bounds the queue — a worker
-    /// emitting one sample per job is bounded by the jobs it handles, but one emitting a sample per loop
-    /// iteration is not, and a buffer that only grew would be a leak wearing a feature's name.
+    /// this one is handed them.
+    ///
+    /// **The one place samples enter the queue**, so it is where the cap is applied — a second push site
+    /// that forgot to check would be a queue that grew past its bound while this one kept counting.
+    /// Overflow is warned about from here as well as counted, on a rate, because a deployment with no
+    /// `[metrics]` table never drains and would otherwise never learn that its samples were going
+    /// nowhere. See [`MAX_PENDING_METRICS`].
     fn stash_metrics(&self, records: Vec<MetricRecord>) {
         if records.is_empty() {
             return;
         }
-        let mut pending = self
-            .pending_metrics
+        let (dropped_now, total) = {
+            let mut pending = self
+                .pending_metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dropped_now = pending.push(&records);
+            (dropped_now, pending.dropped())
+        };
+
+        // Outside the lock, deliberately: a `tracing` subscriber that does any I/O would otherwise hold
+        // the queue's mutex for the length of a write, on the thread every in-flight request shares.
+        //
+        // Rate-limited on the *total* rather than on each drop, so a full queue produces one line per
+        // thousand samples rather than one per request — and the line carries the total, which is the
+        // number an operator actually acts on.
+        if dropped_now > 0
+            && total / DROP_WARNING_INTERVAL > (total - dropped_now) / DROP_WARNING_INTERVAL
+        {
+            tracing::warn!(
+                backend = %self.name,
+                dropped = total,
+                waiting = MAX_PENDING_METRICS,
+                "the worker-metric queue is full; samples are being dropped",
+            );
+        }
+    }
+
+    /// How many worker-emitted samples this pool dropped, for the shutdown report.
+    ///
+    /// Every path that reports a number here is one a *particular* deployment has: only this one is
+    /// reached by a deployment with no `[metrics]` table, which is exactly the deployment that could
+    /// fill the queue without anyone noticing.
+    pub fn dropped_metrics(&self) -> u64 {
+        self.pending_metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.extend(records);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dropped()
+    }
+
+    /// How many worker-emitted samples are waiting for a scrape.
+    ///
+    /// Public because it is the honest answer to "is the queue backing up", and because a test that
+    /// asserts the cap through this is asserting the *bound* rather than the drop counter's
+    /// arithmetic.
+    pub fn pending_metrics(&self) -> usize {
+        self.pending_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Every worker-emitted sample this pool ever took in, whether it fitted or not.
+    ///
+    /// The accounting identity a test can hold it to: `pending_metrics() + dropped_metrics()` is this,
+    /// so a sample can be shown to have gone *somewhere* rather than merely to have not grown a queue.
+    pub fn metrics_handled(&self) -> u64 {
+        self.pending_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handled()
     }
 
     /// Replace the worker in a slot, for an operator or a test.
@@ -1746,6 +1913,95 @@ pub(super) fn params(pairs: &[(&str, &str)]) -> NameValuePairs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pool's queue keeps at most its bound, and counts what it refused.
+    ///
+    /// **The bug this test exists for was a leak, and it was described in the wrong direction.** The
+    /// queue's own documentation said the drain bounded it, which is true only when a scrape happens —
+    /// and `publish_metrics` has one caller, the scrape. A deployment with `[server.access_log]` and no
+    /// `[metrics]` table therefore grew this for the process's life while reading as safe. So the bound
+    /// is asserted where the samples are pushed, which is the site that does not depend on a scrape.
+    #[test]
+    fn the_pending_metric_queue_keeps_its_bound_rather_than_growing() {
+        let mut pending = PendingMetrics::default();
+        let record = |n: usize| MetricRecord {
+            name: "app_samples_total".to_string(),
+            value: n as f64,
+            unit: String::new(),
+        };
+
+        // Half a bound, then the next batch overflows by all of it: the queue fills to exactly
+        // `MAX_PENDING_METRICS` and the rest is counted rather than stored.
+        let half = MAX_PENDING_METRICS / 2;
+        assert_eq!(pending.push(&[record(1)]), 0, "there is room");
+        let batch: Vec<MetricRecord> = (0..half).map(record).collect();
+        assert_eq!(pending.push(&batch), 0, "still room");
+        assert_eq!(pending.len(), half + 1);
+
+        let rest = MAX_PENDING_METRICS;
+        let dropped = pending.push(&(0..rest).map(record).collect::<Vec<_>>());
+        assert_eq!(
+            dropped as usize,
+            (half + 1) + rest - MAX_PENDING_METRICS,
+            "only what did not fit is refused"
+        );
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_METRICS,
+            "the bound is the bound, however large the batch"
+        );
+
+        // And it keeps counting on subsequent pushes rather than resetting, because the number an
+        // operator acts on is the total lost, not the last batch's.
+        let more = pending.push(&[record(2), record(3)]);
+        assert_eq!(more, 2);
+        assert_eq!(pending.dropped(), dropped + 2);
+    }
+
+    /// A drain empties the queue and moves the drop count to the registry exactly once.
+    #[test]
+    fn the_drop_count_reaches_a_scrape_once_and_not_once_per_scrape() {
+        // A `_total` counter that were re-set from the running total on every scrape would be a series
+        // where `rate()` returns zero after the first scrape, which is the opposite of what an operator
+        // graphs. The pool reports the *difference*, so two scrapes with nothing in between add
+        // nothing.
+        let record = MetricRecord {
+            name: "app_total".to_string(),
+            value: 1.0,
+            unit: String::new(),
+        };
+        let mut pending = PendingMetrics::default();
+        pending.push(&vec![record; 3]);
+        // Force an overflow without a million-record fixture: the counter is what is under test here,
+        // and `push` is where it moves.
+        let mut pending = PendingMetrics {
+            records: pending.records,
+            dropped: 5,
+            reported: 0,
+        };
+
+        assert_eq!(
+            pending.take_unreported(),
+            5,
+            "everything since the last scrape"
+        );
+        assert_eq!(pending.take_unreported(), 0, "and nothing on the next one");
+        assert_eq!(pending.dropped(), 5, "the total is not consumed");
+    }
+
+    /// A queue that was never drained still reports its total at shutdown.
+    #[test]
+    fn a_drop_count_survives_never_being_scraped() {
+        // The deployment this is about: no `[metrics]` table, so `take_unreported` is never called and
+        // `publish_metrics` never runs. `dropped_metrics` is read straight off the queue for the
+        // shutdown line, which is the only report that deployment ever gets.
+        let mut pending = PendingMetrics {
+            dropped: 7,
+            ..PendingMetrics::default()
+        };
+        assert_eq!(pending.dropped(), 7);
+        assert_eq!(pending.take_unreported(), 7);
+    }
 
     /// The concurrency guarantee, stated as a type-level fact.
     ///

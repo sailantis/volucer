@@ -150,6 +150,15 @@ pub struct Contention {
     /// The slot that took the most wait, and how much.
     pub busiest: usize,
     pub busiest_us: u64,
+    /// Worker-emitted samples this pool refused because its queue was full.
+    ///
+    /// **The only report of this that a deployment without `[metrics]` ever gets.** The counter in the
+    /// registry is reachable only by a scrape, and a deployment that was never scraped is exactly the
+    /// one whose queue could fill unnoticed — so the figure rides here, to be printed once at
+    /// shutdown, rather than being left to a graph nobody was drawing.
+    ///
+    /// Zero on a healthy pool, which is why the line is only printed when something was lost.
+    pub dropped_metrics: u64,
 }
 
 /// A backend, ready to serve requests.
@@ -516,6 +525,7 @@ impl Backend {
             p99_us: pool.slot_wait_percentile_us(0.99),
             busiest,
             busiest_us,
+            dropped_metrics: pool.dropped_metrics(),
         })
     }
 

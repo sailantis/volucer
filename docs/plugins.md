@@ -181,6 +181,11 @@ sorting rule is the one §5 states: **what does it cost here, given what is alre
 | **`metrics.observe`** — **built, §6.1** | `metrics.collect` | **S**, and it was **not** S. The estimate said "one registry entry and one namespace arm"; the real work was a declared-kind dispatch (`Registry::record`), a validation that runs *before* a series exists, a name rule, and fixing the SDK's own examples, which used dots and could never have rendered | `emitMetric` rode the wire and landed in a `Vec` nobody read (`codec.rs:1136`), which §6.1 called the first thing to fix. **That was fixed and the feature still did not work**: a registry refuses an undeclared name, so every real sample was dropped while three tests passed by declaring their own metric. The table was the feature, not an upgrade to it |
 | **Rate limiting** — **built, §6.10** | `rate-limiter`, `http.middleware` | **S**, and it depends on the row above — which is the half the estimate got right. The bucket *is* a page of arithmetic; what was not S was deciding what a refusal means on **two** front-ends and **two** protocols, and finding that RoadRunner answers a full table with a 503 | A reverse proxy in front of an unauthenticated endpoint has no other lever; the token bucket is a page of arithmetic. It is the one middleware RR ships that is not a substitute for something nginx does better |
 
+#### Found by building the row above — a leak, not a plugin
+
+| What | How it was found | What it cost | Why it is here rather than in a section of its own |
+| --- | --- | --- | --- |
+| **The worker-metric queue grew without bound** — **fixed, §6.11** | Building §6.10 and asking what a `429` should be counted as: the counter had nowhere to go, because `publish_metrics` has exactly one caller — the scrape | **S**, and the fix is a cap and three reports | The queue's own doc comment said the drain bounded it, and that was true only when a scrape happens. A deployment with `[server.access_log]` and no `[metrics]` table has no drain at all, so every `emitMetric` accumulated for the process's life. It is a defect that **no test could have been written for before it was noticed**, because the test that would have found it is the deployment nobody configured |
 #### Worth considering — real value, but it duplicates or complicates something that exists
 
 | What | RR's shape | What it costs here | The argument against, and what would beat it |
@@ -1771,6 +1776,80 @@ asking the operator to reload.
 - gRPC: a limited call carries `grpc-status: 8` and no `429`.
 - Falsified twice: moving the check behind the static layer, and removing it from the FastCGI path.
   Both times the relevant test failed with the answer the request became instead.
+### 6.11 The metric queue that only a scrape bounded
+
+**A defect found by building §6.10, and it is the third in this document whose estimate was not the
+problem — the *premise* was.** The rate limiter needed a counter for refusals, and asking where that
+counter goes turned up this:
+
+    pending_metrics: Mutex<Vec<MetricRecord>>,
+
+with a doc comment that said, in as many words, that draining it "bounds the queue". That sentence
+was true **when a scrape happens**. `publish_metrics` has exactly one caller — `DispatcherMetrics::
+refresh`, reached from the `[metrics]` endpoint — so a deployment with `[server.access_log]` and no
+`[metrics]` table never drained it at all, and every `emitMetric` from PHP accumulated for the
+process's life.
+
+#### Why this is the shape of bug that ships
+
+The account was not wrong, it was **conditionally** right, and the condition was invisible at the
+place it was written. A reader of that comment would have to reconstruct the call graph to discover
+that "bounded" meant "bounded if you have also configured a second, unrelated table". Nothing in the
+pool can see whether a scrape exists — the registry is not reachable from the exchange thread, by
+design (§6.1) — so the queue had no way to know either.
+
+It is also the one kind of leak a benchmark will not show: a `Vec` growing by one small record per
+request costs nothing measurable, and the deployment that suffers is a single-node one with an access
+log and no Prometheus, which is a perfectly ordinary configuration.
+
+#### The fix, and why it is a cap rather than a flag
+
+The alternative considered and rejected was **threading "is metrics configured" into the pool**. It is
+honest, and it costs a parameter through `Dispatcher::from_config` → `Backend::from_config` →
+`WorkerPool::start` → `start_consumers`, for a queue that already has a better answer available: a
+bound does not need to know *why* nobody is draining.
+
+So `MAX_PENDING_METRICS` is 4096 — a few hundred kilobytes in the worst case, and far above what a
+scrape a minute needs, so it is not a throughput limit. What it bounds is the pathological case, which
+is the only one that needed bounding. And the overflow is **counted**, on three paths, because each
+covers a deployment the others do not:
+
+1. **`volucer_metrics_dropped_total`** when a scrape does happen, so a graph shows a gap rather than a
+   flat line that looks like an application which stopped emitting.
+2. **A rate-limited warning** — one line per 1024 samples, carrying the running total — so the log of a
+   deployment with no `[metrics]` table says so. A warning per drop would be a log line per request,
+   which is the flood that makes an operator stop reading.
+3. **The shutdown summary**, printed only when something was lost, alongside the slot-contention line.
+
+#### Four details that are decisions
+
+- **The counter is `volucer_`, not `rr_http_`.** The `rr_http_*` set is an interface with dashboards
+  that already exist, and a test asserts its membership literally for that reason. A series describing a
+  volucer-specific decision would add a line to every operator's existing queries, so the prefix is the
+  boundary and that test now asserts it stays outside.
+- **It is a counter with a `_total` name, fed by a delta.** The pool reports what was dropped *since the
+  last scrape*, so two scrapes with nothing between them add nothing. Setting a gauge from the running
+  total would pass a test that checked only the number and would break `rate()` — which is the query an
+  operator actually writes.
+- **The warning is emitted outside the lock.** `tracing` is not guaranteed to be cheap, and the queue's
+  mutex is contended by every in-flight request; a log write under it is a request-path stall waiting
+  for a slow subscriber.
+- **`pending_metrics` is a type, not a `Vec`.** Two push sites each remembering to check a cap is how a
+  counter stops matching the drops. Every sample enters through `PendingMetrics::push`, so there is one
+  place the bound is applied and one place the count moves — and the request path now calls the same
+  `stash_metrics` the consumer path already did, rather than duplicating the lock dance.
+
+#### Verified
+
+- **Unit:** the bound holds for a batch larger than the bound; the drop count keeps accumulating across
+  pushes; a delta reaches a scrape exactly once and a second scrape adds nothing; a queue that is never
+  drained still reports its total.
+- **End to end, and this is the one that matters:** a real pool, a real PHP worker emitting a sample per
+  request, **and no `publish_metrics` call anywhere in the test** — the deployment in question. 6596
+  requests leave 4096 waiting and the rest counted, and the accounting identity
+  `pending + dropped == handled` is asserted so a sample cannot simply vanish.
+- **Falsified** by removing the cap (`let room = usize::MAX`): the queue reaches **6596**, which is
+  exactly the leak, and the test says so.
 ---
 
 ## 7. Python/Django and Ruby/Rails

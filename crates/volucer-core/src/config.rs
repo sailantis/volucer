@@ -7631,6 +7631,15 @@ driver = "memory"
              which is the difference between limiting a client and limiting nginx",
             path.display()
         );
+        // And the sentence a deployment needs *before* it decides to skip `[metrics]`: that skipping
+        // it means nothing drains the worker-metric queue. It was a real leak, and the fix (a cap) is
+        // a backstop rather than the intended reason to have the table.
+        assert!(
+            text.contains("NOTHING DRAINS THE QUEUE"),
+            "{} no longer says that a deployment without [metrics] never drains the worker-metric \
+             queue, which is the fact that made the queue a leak",
+            path.display()
+        );
     }
 
     #[test]
