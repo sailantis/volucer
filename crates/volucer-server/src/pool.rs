@@ -722,13 +722,30 @@ mod tests {
 
         // The "held" half is asserted first and is the one that matters: it is what the startup
         // path uses to decide a port is taken. The "released" half proves the predicate is not
-        // simply always false, and it is why this test now holds the lock -- a released ephemeral
-        // port can be handed straight to another test's `bind(0)`.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        assert!(!port_is_free("127.0.0.1", port), "the port is held");
-        drop(listener);
-        assert!(port_is_free("127.0.0.1", port), "the port was released");
+        // simply always false.
+        //
+        // **The released half has to retry, and the mutex cannot help it.** `port_lock` only
+        // serialises this binary; the workspace's integration tests run as *separate processes* and
+        // bind ephemeral ports concurrently, so any of them can take the port in the window
+        // between `drop(listener)` and the check. On macos-latest that window is unusually wide
+        // because the kernel hands the just-released port out first, which is why the failure
+        // looked platform-specific. Retrying here is not hiding a product bug: the property under
+        // test is "the predicate answers honestly about *some* free port", and a port stolen by
+        // another process is the environment changing, not the predicate lying. The "held" half is
+        // still asserted on every attempt, and exhausting the attempts is a real failure.
+        for attempt in 1..=10 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+            let port = listener.local_addr().unwrap().port();
+            assert!(!port_is_free("127.0.0.1", port), "the port is held");
+            drop(listener);
+            if port_is_free("127.0.0.1", port) {
+                return;
+            }
+            assert!(
+                attempt < 10,
+                "port_is_free called {port} taken on all 10 attempts after releasing it"
+            );
+        }
     }
 
     #[test]
