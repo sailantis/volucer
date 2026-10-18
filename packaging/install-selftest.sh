@@ -194,17 +194,27 @@ expect_install_sh_ok() {
 
 if [ "$os" != windows ]; then
     echo "== install.sh"
-    expect_install_sh_ok linux-gnu
+
+    # The label names the archive this host installs, which is not always `linux-gnu`.
+    native_label="linux-gnu"
+    if [ "$os" = macos ]; then
+        native_label="macos"
+    fi
+    expect_install_sh_ok "$native_label"
 
     # The archive the operator gets has to be the one this host would actually run. Running
     # it is the only assertion that proves the platform table and the archive contents agree.
-    installed="${work}/bin-linux-gnu/volucer"
+    installed="${work}/bin-${native_label}/volucer"
     if "$installed" version >/dev/null 2>&1; then
-        check ok 'linux-gnu: the installed binary runs'
+        check ok "${native_label}: the installed binary runs"
     else
-        check fail 'linux-gnu: the installed binary does not run'
+        check fail "${native_label}: the installed binary does not run"
     fi
 
+    # Only Linux has two libcs, so these assertions are gated rather than rewritten: on macOS
+    # `VOLUCER_LIBC=musl` must be *refused*, and asserting the Linux answer there is asserting
+    # the wrong thing about the right script. The refusal itself is checked below.
+    if [ "$os" = linux ]; then
     # musl is the branch that fails silently at the loader rather than at the installer, so
     # it is asserted from the target string and the refusal rather than inferred from an
     # install succeeding. `VOLUCER_LIBC` forces it, which is the only way to reach it from a
@@ -243,6 +253,20 @@ if [ "$os" != windows ]; then
     else
         check fail 'arm64 musl failed for an unexpected reason'
         sed 's/^/      /' "${work}/out-arm-musl.sh" >&2
+    fi
+    else
+        # macOS: there is no second libc, so asking for one must be refused by name rather
+        # than silently ignored - a silently ignored override is worse than an unsupported one.
+        if VOLUCER_VERSION="$tag" VOLUCER_LIBC=musl VOLUCER_INSTALL_DIR="${work}/bin-musl" \
+            VOLUCER_DOWNLOAD_URL="$base_url" \
+            "$VOLUCER_SH" packaging/install.sh >"${work}/out-musl.sh" 2>&1; then
+            check fail 'VOLUCER_LIBC=musl was accepted on a platform with no musl libc'
+        elif grep -q 'makes no sense on' "${work}/out-musl.sh"; then
+            check ok 'VOLUCER_LIBC is refused on a platform with only one libc'
+        else
+            check fail 'the VOLUCER_LIBC refusal failed for the wrong reason'
+            sed 's/^/      /' "${work}/out-musl.sh" >&2
+        fi
     fi
 
     echo "== install.sh refuses a corrupted archive"
