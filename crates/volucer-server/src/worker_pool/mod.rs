@@ -1819,7 +1819,10 @@ impl Slot {
         // The exchange thread goes first, so nothing can read or write a
         // half-written frame while the process is being reaped.
         self.exchange = None;
-        let _ = self.child.kill();
+        // The *group*, not the pid: a worker that forked children of its own — a prefork
+        // supervisor — would otherwise leave them running with no configuration and no way to
+        // be reached again. See `lifecycle::kill`.
+        let _ = crate::lifecycle::kill(&mut self.child);
         let _ = self.child.wait();
     }
 
@@ -1856,7 +1859,7 @@ impl Slot {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = self.child.kill();
+        let _ = crate::lifecycle::kill(&mut self.child);
         let _ = self.child.wait();
     }
 }

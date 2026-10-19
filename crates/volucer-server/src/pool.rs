@@ -465,7 +465,9 @@ impl CgiPool {
                 replacement.served = 0;
                 let old = std::mem::replace(&mut *slot, replacement);
                 let mut old = old;
-                let _ = old.child.kill();
+                // The group, so a `php-cgi` reached through a wrapper script does not leave
+                // the interpreter it started behind. See `lifecycle::kill`.
+                let _ = crate::lifecycle::kill(&mut old.child);
                 let _ = old.child.wait();
             }
         }
@@ -521,7 +523,7 @@ impl CgiPool {
         let mut replacement = self.spawn_slot(&address)?;
         replacement.served = 0;
         let mut old = std::mem::replace(slot, replacement);
-        let _ = old.child.kill();
+        let _ = crate::lifecycle::kill(&mut old.child);
         let _ = old.child.wait();
         Ok(())
     }
@@ -538,7 +540,7 @@ impl CgiPool {
             let slot = slot
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = slot.child.kill();
+            let _ = crate::lifecycle::kill(&mut slot.child);
             let _ = slot.child.wait();
         }
         self.slots.clear();

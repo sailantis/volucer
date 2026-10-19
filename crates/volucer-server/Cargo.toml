@@ -70,3 +70,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# `killpg` and `PR_SET_PDEATHSIG` have no wrapper in `std`, and both are what makes a child die
+# with its parent on Unix. `volucer-fcgi` takes the same dependency for `TCP_QUICKACK`, for the
+# same reason: a Linux socket option with no `std` equivalent.
+libc = "0.2"
+

@@ -243,7 +243,7 @@ pub(super) fn boot(
                 match accept_with_deadline(&listener, spec, &mut child, HANDSHAKE_TIMEOUT) {
                     Ok(stream) => stream,
                     Err(source) => {
-                        let _ = child.kill();
+                        let _ = crate::lifecycle::kill(&mut child);
                         let _ = child.wait();
                         return Err(source);
                     }
@@ -291,7 +291,7 @@ pub(super) fn boot(
             if matches!(failure, HandshakeFailure::TimedOut) {
                 // The reader thread is still blocked in a read; ending the
                 // process is what ends it.
-                let _ = child.kill();
+                let _ = crate::lifecycle::kill(&mut child);
             }
             let status = child.try_wait().ok().flatten();
             let _ = child.wait();
@@ -468,7 +468,7 @@ mod tests {
         .expect_err("a listener nobody connects to must not succeed");
         let elapsed = started.elapsed();
 
-        let _ = child.kill();
+        let _ = crate::lifecycle::kill(&mut child);
         let _ = child.wait();
 
         assert!(
@@ -513,7 +513,7 @@ mod tests {
         )
         .expect_err("a live worker that never connects must not hold startup for ever");
 
-        let _ = child.kill();
+        let _ = crate::lifecycle::kill(&mut child);
         let _ = child.wait();
 
         match err {

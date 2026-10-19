@@ -188,7 +188,9 @@ impl Shared {
     /// Kill the child and reap it, so nothing is left running or unreaped.
     fn kill(&self) {
         let mut process = self.process.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = process.child.kill();
+        // The group, for the reason every other kill site does it: an origin started through a
+        // shell wrapper is a tree, and the process we spawned is only its root.
+        let _ = crate::lifecycle::kill(&mut process.child);
         let _ = process.child.wait();
     }
 }
@@ -284,7 +286,7 @@ impl Supervisor {
             // Not adopted, so nothing else will reap it. A process that already exited is not a
             // lifecycle failure, and saying "job object" would hide the real reason.
             let exit = child.try_wait();
-            let _ = child.kill();
+            let _ = crate::lifecycle::kill(&mut child);
             let _ = child.wait();
             return Err(match exit {
                 Ok(Some(status)) => ServerError::StartupExited {
