@@ -115,11 +115,14 @@ workers = 16
 
 A supervisor boots the application once, forks, and listens on `relay`; volucer **connects** and
 does not start a process at all. Each connection is a slot, with the same handshake, exchange
-thread, recycling and metrics as a spawned worker. `worker.php --prefork unix:/run/app/workers.sock`
-in [`volucer-competition`](https://github.com/sailantis/volucer-competition) is a working supervisor:
-it accepts in the master and forks per connection, which is what makes the assignment exact — N
-children sharing one listener accept unfairly, so one child can take two connections and another
-none.
+thread, recycling and metrics as a spawned worker. The prefork loop ships in each SDK —
+`Volucer\Supervisor`, `volucer_worker.supervisor` and `Volucer::Supervisor` — because the side that
+owns the listening socket has to be the side that owns the fork, and no SDK can hand the descriptor
+to the server instead. `worker.php --prefork unix:/run/app/workers.sock` in
+[`volucer-competition`](https://github.com/sailantis/volucer-competition) is that supervisor behind
+the real application: it accepts in the master and forks per connection, which is what makes the
+assignment exact — N children sharing one listener accept unfairly, so one child can take two
+connections and another none.
 
 Measured on 12 cores, the same `/items` page, `w = 16`, `c = 64`, `wrk -t12`, three alternating
 runs each:
