@@ -389,13 +389,18 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                 // warning is not an error because the supervisor may legitimately be slower to
                 // start, and because a relay in another container is reached over TCP where
                 // nothing is checkable here.
-                if let Some(path) = attach.relay.trim().strip_prefix("unix:") {
+                //
+                // A relay that comes from `RELAY_SOCKET_ENV` is checked identically: which of the
+                // two places the address was written in makes no difference to whether something
+                // is listening on it.
+                let relay = attach.relay().unwrap_or_default();
+                if let Some(path) = relay.trim().strip_prefix("unix:") {
                     if !Path::new(path).exists() {
                         warnings.push(Warning::with_hint(
                             format!(
                                 "backends.{name}: nothing is listening on {} yet, so every \
                                  connection to this pool will fail at startup",
-                                attach.relay.trim()
+                                relay.trim()
                             ),
                             "start the supervisor that forks this backend's workers — volucer \
                              does not start it, which is the whole point of `attach` — or ignore \

@@ -317,7 +317,7 @@ fn pid_of(response: &volucer_fcgi::Response) -> u32 {
 
 fn attach_config(relay: String, workers: u32, max_requests: Option<u64>) -> AttachConfig {
     AttachConfig {
-        relay,
+        relay: Some(relay),
         workers,
         max_requests,
         checksum: Default::default(),

@@ -4,6 +4,7 @@
 //! of named backends, a route table selecting between them, and an optional
 //! static-content layer in front of the whole thing.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -3674,6 +3675,21 @@ impl std::fmt::Display for WorkerTransport {
 /// worker is told rather than having to discover it.
 pub const WORKER_SOCKET_ENV: &str = "VOLUCER_WORKER_SOCKET";
 
+/// The environment variable naming the relay an `attach` backend dials, for a supervisor that
+/// would rather read it than take it as an argument.
+///
+/// **The one address both halves of an `attach` deployment must agree on, and until this existed
+/// they agreed by being written twice.** `VOLUCER_WORKER_SOCKET` cannot do this job: there is no
+/// spawned child to inherit it, so a supervisor that read it would be reading whatever an
+/// enclosing environment happened to leave there. This is the variable the *operator* sets, in
+/// the unit file or the container's environment, and both the server and the SDK read it — so
+/// `relay` may be omitted from the configuration entirely and the supervisor needs no argument.
+///
+/// Named `_SOCKET` to match [`WORKER_SOCKET_ENV`], and it is a naming convention rather than a
+/// claim about the transport: a relay may legitimately be `host:port` for a supervisor in another
+/// container, and that variable's own value is a TCP address too.
+pub const RELAY_SOCKET_ENV: &str = "VOLUCER_RELAY_SOCKET";
+
 /// The call namespaces a worker backend may be granted, and the fixed half of the allow-list
 /// `WorkerConfig::services` is checked against.
 ///
@@ -3801,7 +3817,15 @@ pub struct AttachConfig {
     /// **38.96 ms per request against 0.06 ms** for the same protocol until `TCP_NODELAY` was set
     /// on both ends. A `host:port` is accepted because a supervisor may live in another
     /// container, and it is not the documented default for that reason.
-    pub relay: String,
+    ///
+    /// **Omittable, in which case [`RELAY_SOCKET_ENV`] supplies it.** The address is the one fact
+    /// the configuration and the supervisor both have to know, and before this they stated it
+    /// twice with nothing keeping the two copies equal — a mismatch starts, then fails on the
+    /// first request. An environment variable read by both is the one form that lets a deployment
+    /// write it once. Writing it here still wins, so a file that names a relay keeps meaning
+    /// exactly what it says and a stale variable in the operator's shell cannot move it.
+    #[serde(default)]
+    pub relay: Option<String>,
 
     /// How many connections to the relay to hold, which is how many requests run at once.
     ///
@@ -3840,6 +3864,45 @@ pub struct AttachConfig {
 }
 
 impl AttachConfig {
+    /// The relay to connect to: the configured one, or the environment's, or an error saying both
+    /// are missing.
+    ///
+    /// One read per call rather than a `resolve()` step that writes the answer back into the
+    /// configuration, because this is what [`validate`] and the pool both call and neither should
+    /// have to know which of them ran first. It is also why a *reload* cannot leave a stale
+    /// address behind: the pool is built once, and a reload does not rebuild backends.
+    ///
+    /// The configured value wins over the variable, and the trimming rule is the same on both —
+    /// a stray `=` in a unit file produces an empty value, which must mean "unset" rather than
+    /// "connect to nothing".
+    ///
+    /// [`validate`]: AttachConfig::validate
+    pub fn relay(&self) -> std::result::Result<Cow<'_, str>, String> {
+        if let Some(relay) = self
+            .relay
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            return Ok(Cow::Borrowed(relay));
+        }
+
+        match std::env::var(RELAY_SOCKET_ENV) {
+            Ok(address) if !address.trim().is_empty() => {
+                // Owned only in this branch, and only the trimmed copy: the caller builds a `Spec`
+                // that outlives this call, and a borrowed slice into the process environment would
+                // not. The configured branch borrows, which is the one a test can assert on
+                // without touching the environment at all.
+                Ok(Cow::Owned(address.trim().to_string()))
+            }
+            _ => Err(format!(
+                "backends.relay is not set, and {RELAY_SOCKET_ENV} is not in the environment; \
+                 give the path the supervisor listens on, e.g. \"unix:/run/app/workers.sock\", \
+                 or export {RELAY_SOCKET_ENV} to have both sides read one value"
+            )),
+        }
+    }
+
     /// Refuse a table whose values cannot mean what they look like.
     ///
     /// Checked at configuration load so that a bad relay is a startup error naming the key,
@@ -3852,16 +3915,12 @@ impl AttachConfig {
                  would leave every one of them unreachable"
             ));
         }
-        let relay = self.relay.trim();
-        if relay.is_empty() {
-            return Err(format!(
-                "backends.{backend}.relay is empty; give the path the supervisor listens on, \
-                 e.g. \"unix:/run/app/workers.sock\""
-            ));
-        }
         // The same parser the `external` and `spawn_cgi` sockets use, because it is the same
         // question: is this a `unix:` path or a `host:port`, and is the path absolute?
-        parse_listener(relay).map_err(|err| format!("backends.{backend}.relay: {err}"))?;
+        let relay = self
+            .relay()
+            .map_err(|reason| format!("backends.{backend}: {reason}"))?;
+        parse_listener(relay.as_ref()).map_err(|err| format!("backends.{backend}.relay: {err}"))?;
         Ok(())
     }
 }
@@ -5604,6 +5663,119 @@ mod tests {
     /// that means something other than what it looks like. `None` is how "no cap" is spelled, so
     /// a `0` would be a backend that can never serve anything — and the failure would surface on
     /// the first request rather than at startup.
+    /// A relay named in the file wins over the one in the environment.
+    ///
+    /// The precedence is the whole of the safety argument for the variable: a file that names an
+    /// address keeps meaning exactly that, so a stale variable in an operator's shell — or one
+    /// inherited from a parent unit — cannot silently move a deployment to a different socket.
+    #[test]
+    fn a_configured_relay_wins_over_the_environment() {
+        let _serial = relay_env_lock();
+        let previous = std::env::var(RELAY_SOCKET_ENV).ok();
+        std::env::set_var(RELAY_SOCKET_ENV, "unix:/from/the/environment.sock");
+
+        let attach = attach_with_relay(Some("unix:/from/the/file.sock"));
+        assert_eq!("unix:/from/the/file.sock", attach.relay().unwrap());
+
+        match previous {
+            Some(value) => std::env::set_var(RELAY_SOCKET_ENV, value),
+            None => std::env::remove_var(RELAY_SOCKET_ENV),
+        }
+    }
+
+    /// An omitted relay is read from the environment, and that value is validated like any other.
+    #[test]
+    fn an_omitted_relay_comes_from_the_environment() {
+        let _serial = relay_env_lock();
+        let previous = std::env::var(RELAY_SOCKET_ENV).ok();
+        std::env::set_var(RELAY_SOCKET_ENV, " unix:/from/the/environment.sock ");
+
+        let attach = attach_with_relay(None);
+        assert_eq!("unix:/from/the/environment.sock", attach.relay().unwrap());
+        attach
+            .validate("app")
+            .expect("the environment's relay is valid");
+
+        match previous {
+            Some(value) => std::env::set_var(RELAY_SOCKET_ENV, value),
+            None => std::env::remove_var(RELAY_SOCKET_ENV),
+        }
+    }
+
+    /// Neither place set is a startup error that names both places.
+    ///
+    /// The message is asserted rather than only the failure, because the reader of it is the
+    /// operator who has just discovered that "the supervisor is down" was never the question.
+    #[test]
+    fn a_relay_missing_from_both_places_is_refused_by_name() {
+        let _serial = relay_env_lock();
+        let previous = std::env::var(RELAY_SOCKET_ENV).ok();
+        std::env::remove_var(RELAY_SOCKET_ENV);
+
+        let err = attach_with_relay(None)
+            .validate("app")
+            .expect_err("nothing names a relay");
+        assert!(err.contains("relay"), "{err}");
+        assert!(err.contains(RELAY_SOCKET_ENV), "{err}");
+
+        match previous {
+            Some(value) => std::env::set_var(RELAY_SOCKET_ENV, value),
+            None => std::env::remove_var(RELAY_SOCKET_ENV),
+        }
+    }
+
+    /// An empty value means "unset", not "connect to nothing".
+    ///
+    /// A unit file's `Environment=VOLUCER_RELAY_SOCKET=` produces exactly this, and so does a
+    /// shell's `export VOLUCER_RELAY_SOCKET=`. Reporting it as an empty *relay* would send the
+    /// operator looking for a typo in a file that does not mention the key.
+    #[test]
+    fn an_empty_environment_value_is_unset() {
+        let _serial = relay_env_lock();
+        let previous = std::env::var(RELAY_SOCKET_ENV).ok();
+        std::env::set_var(RELAY_SOCKET_ENV, "   ");
+
+        let attach = attach_with_relay(None);
+        assert!(
+            attach.relay().is_err(),
+            "whitespace is not an address: {:?}",
+            attach.relay()
+        );
+
+        match previous {
+            Some(value) => std::env::set_var(RELAY_SOCKET_ENV, value),
+            None => std::env::remove_var(RELAY_SOCKET_ENV),
+        }
+    }
+
+    /// The environment is process-global, so the tests that write it cannot run concurrently.
+    ///
+    /// Without this they pass alone and fail under `cargo test`'s default parallelism: one test
+    /// removes the variable while another expects its value, and the assertion that fires is the
+    /// one about precedence rather than about the environment. The same `OnceLock<Mutex<_>>` the
+    /// server's process-spawning tests use, for the same reason.
+    fn relay_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The two halves of the fallback must not be able to disagree about trimming.
+    ///
+    /// One helper for both tests above rather than three literals, because a `relay` that trimmed
+    /// differently from the variable would pass every test that only ever used one of them.
+    fn attach_with_relay(relay: Option<&str>) -> AttachConfig {
+        AttachConfig {
+            relay: relay.map(str::to_string),
+            workers: 1,
+            max_requests: None,
+            checksum: Default::default(),
+            services: Vec::new(),
+            grpc_services: Vec::new(),
+        }
+    }
+
     #[test]
     fn an_external_backend_is_uncapped_by_default_and_refuses_a_zero() {
         let uncapped = r#"

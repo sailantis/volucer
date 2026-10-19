@@ -2305,7 +2305,15 @@ fn check(
         // there" is a question for `preflight` rather than for `check`. Printing the address is
         // what makes the two processes' relationship visible in one line.
         if let volucer_core::config::BackendConfig::Attach(attach) = backend {
-            println!("      relay:             {}", attach.relay.trim());
+            // `relay()` is what the pool will actually dial — the configuration's value, or the
+            // one `VOLUCER_RELAY_SOCKET` supplies — and printing the *resolved* address is the
+            // point of this line: an omission plus a variable in the operator's shell is exactly
+            // the case where "what the file says" and "what will be dialled" differ.
+            let relay = attach
+                .relay()
+                .map(|relay| relay.into_owned())
+                .unwrap_or_else(|reason| format!("<unresolved: {reason}>"));
+            println!("      relay:             {}", relay.trim());
             println!("      connections:       {}", attach.workers);
         }
         // And for `external`, the address, for the same reason: it is the other process's socket,

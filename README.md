@@ -108,10 +108,17 @@ That is the whole shape:
 ```toml
 [backends.app]
 kind = "attach"
+# Optional: when omitted, VOLUCER_RELAY_SOCKET supplies the address — so the supervisor can read
+# the same variable instead of being passed an argument, and the address is written once.
 # A path, not an address list: volucer dials it `workers` times and holds each connection as a slot.
 relay = "unix:/run/app/workers.sock"
 workers = 16
 ```
+
+`relay` may be left out, in which case volucer reads `VOLUCER_RELAY_SOCKET` — the same variable the
+SDK supervisors read, so one line in a unit file or a container environment configures both sides.
+A `relay` in the file wins over the variable, so editing the file still means what it says. With
+neither set, startup fails naming both places rather than trying to connect to nothing.
 
 A supervisor boots the application once, forks, and listens on `relay`; volucer **connects** and
 does not start a process at all. Each connection is a slot, with the same handshake, exchange

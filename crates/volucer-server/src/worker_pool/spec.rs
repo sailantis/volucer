@@ -129,9 +129,16 @@ impl Spec {
                 reason,
             })?;
 
+        let relay = config
+            .relay()
+            .map_err(|reason| ServerError::Misconfigured {
+                backend: name.to_string(),
+                reason,
+            })?;
+
         Ok(Spec {
             launch: Launch::Attach(AttachSpec {
-                relay: config.relay.trim().to_string(),
+                relay: relay.into_owned(),
                 workers: config.workers,
             }),
             checksum: checksum_of(config.checksum),
@@ -207,7 +214,7 @@ mod tests {
 
     fn attach_config(workers: u32) -> AttachConfig {
         AttachConfig {
-            relay: "unix:/run/app/workers.sock".to_string(),
+            relay: Some("unix:/run/app/workers.sock".to_string()),
             workers,
             max_requests: None,
             checksum: Default::default(),
