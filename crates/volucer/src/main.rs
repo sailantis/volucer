@@ -2295,6 +2295,14 @@ fn check(
             "      per-request reset: {}",
             backend.request_scope().describe()
         );
+        // The relay is the one thing an operator has to look at for an `attach` backend, and it
+        // is the one thing volucer does not own: nothing in this process started it, so "is it
+        // there" is a question for `preflight` rather than for `check`. Printing the address is
+        // what makes the two processes' relationship visible in one line.
+        if let volucer_core::config::BackendConfig::Attach(attach) = backend {
+            println!("      relay:             {}", attach.relay.trim());
+            println!("      connections:       {}", attach.workers);
+        }
         // A `kind = "upstream"` backend was reported here as "not served yet" for exactly one
         // commit — the one that built the client before any listener could reach it — and that line
         // went away with the same commit that added the request path below it. Both existed so that

@@ -80,15 +80,14 @@ use crate::error::{Result, ServerError};
 use crate::lifecycle::LifecycleGuard;
 use crate::pool::worker_count;
 use exchange::ChannelExchange;
-use handshake::{boot, Ready};
+use handshake::{boot, Link, Ready};
 use request::{encode_head, text_param};
 use response::render;
 use spec::Spec;
-use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use volucer_core::config::{JobsPoolConfig, WorkerConfig};
+use volucer_core::config::{AttachConfig, JobsPoolConfig, WorkerConfig};
 use volucer_fcgi::{Request, Response};
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
@@ -522,7 +521,52 @@ impl WorkerPool {
         call_handler: Option<Arc<MethodRegistry>>,
     ) -> Result<Self> {
         let spec = Spec::from_config(name, config)?;
+        Self::start_spec(
+            name,
+            spec,
+            worker_count(config.workers),
+            config.max_requests,
+            config.memory_limit_mb,
+            call_handler,
+        )
+    }
 
+    /// Start a pool of workers somebody else started, by connecting to their relay.
+    ///
+    /// The counterpart of [`WorkerPool::start_with`] for a backend whose processes volucer does
+    /// not own. It is the *same pool*: every slot is a handshake, an exchange thread and a lock,
+    /// and only the way the far end comes to exist differs — see [`Link`].
+    ///
+    /// There is no memory limit here, and that is not an omission: `memory_limit_mb` recycles a
+    /// worker by killing it, and a process volucer did not fork has no signal we may send. An
+    /// attached pool bounds a leak with `max_requests` instead, which closes the connection and
+    /// dials again — the supervisor's child sees end-of-file and exits, and its own supervisor
+    /// forks a replacement. That is the recycling contract the two halves can actually share.
+    pub fn start_attached(
+        name: &str,
+        config: &AttachConfig,
+        call_handler: Option<Arc<MethodRegistry>>,
+    ) -> Result<Self> {
+        let spec = Spec::from_attach_config(name, config)?;
+        let count = spec
+            .attached_workers()
+            .expect("an attach spec always carries its connection count");
+        Self::start_spec(name, spec, count, config.max_requests, None, call_handler)
+    }
+
+    /// Build the pool once the spec and the slot count are known.
+    ///
+    /// The one place that boots slots, so the two constructors above cannot drift: they differ
+    /// only in how they produce a `Spec` and a count, and everything from the boot loop on is
+    /// identical for a spawned and an attached worker.
+    fn start_spec(
+        name: &str,
+        spec: Spec,
+        count: u32,
+        max_requests: Option<u64>,
+        memory_limit_mb: Option<u64>,
+        call_handler: Option<Arc<MethodRegistry>>,
+    ) -> Result<Self> {
         let guard = LifecycleGuard::new(&format!("volucer-{name}")).map_err(|source| {
             ServerError::Misconfigured {
                 backend: name.to_string(),
@@ -530,7 +574,6 @@ impl WorkerPool {
             }
         })?;
 
-        let count = worker_count(config.workers);
         let mut slots = Vec::with_capacity(count as usize);
         for _ in 0..count {
             // A failure here returns early, and `slots` is dropped — which kills
@@ -566,10 +609,8 @@ impl WorkerPool {
             wait_us: (0..count as usize).map(|_| AtomicU64::new(0)).collect(),
             wait_buckets: (0..WAIT_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             served: AtomicU64::new(0),
-            memory_limit_bytes: config
-                .memory_limit_mb
-                .map(|mb| mb.saturating_mul(1024 * 1024)),
-            max_requests: config.max_requests,
+            memory_limit_bytes: memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+            max_requests,
             pending_metrics: Mutex::new(PendingMetrics::default()),
             guard,
             call_handler,
@@ -578,11 +619,9 @@ impl WorkerPool {
         tracing::info!(
             backend = %pool.name,
             workers = pool.slots.len(),
-            command = %config.command,
-            // Logged because the transport is invisible on the wire: a pool that ended up on
-            // the wrong one answers every request with a 200, only slower, and on Windows the
-            // difference is 21× — so this is the only place the choice is ever visible.
-            transport = %pool.spec.transport,
+            // The command for a spawned pool, the relay for an attached one: the thing an
+            // operator looks for first when a pool misbehaves.
+            target = %pool.spec.describe(),
             "worker pool started"
         );
         Ok(pool)
@@ -695,7 +734,7 @@ impl WorkerPool {
     pub fn pids(&self) -> Vec<u32> {
         self.locked_slots()
             .iter()
-            .map(|slot| slot.child.id())
+            .map(|slot| slot.link.id())
             .collect()
     }
 
@@ -789,7 +828,7 @@ impl WorkerPool {
                 };
                 match slot.try_lock() {
                     Ok(slot) => crate::calls::WorkerStatus {
-                        pid: slot.child.id(),
+                        pid: slot.link.id(),
                         idle: free.contains(&index),
                         served: slot.served,
                         memory_bytes: slot.peak_memory_bytes,
@@ -979,7 +1018,7 @@ impl WorkerPool {
         if let Some(reason) = recycle {
             tracing::debug!(
                 pool = %self.name,
-                pid = slot.child.id(),
+                pid = slot.link.id(),
                 reason,
                 duration_us = duration.as_micros() as u64,
                 "recycling a consumer"
@@ -1089,7 +1128,7 @@ impl WorkerPool {
                 volucer_metrics::http::state::WORKING
             };
             workers.push(volucer_metrics::http::WorkerSnapshot {
-                pid: slot.child.id(),
+                pid: slot.link.id(),
                 state,
                 // From the worker's own `END` frame, so it is the peak it reported and zero until it
                 // has served something. Reporting the pool's own resident set instead would be a
@@ -1574,7 +1613,7 @@ impl WorkerPool {
             }
         }
         if let Some(reason) = recycle {
-            tracing::debug!(backend = %name, pid = slot.child.id(), reason, "recycling a worker");
+            tracing::debug!(backend = %name, pid = slot.link.id(), reason, "recycling a worker");
             replace(
                 name,
                 &self.spec,
@@ -1750,7 +1789,7 @@ fn replace(
     if let Err(err) = respawn(name, spec, guard, call_handler, slot) {
         tracing::error!(
             backend = %name,
-            pid = slot.child.id(),
+            pid = slot.link.id(),
             %err,
             "could not replace a worker"
         );
@@ -1765,7 +1804,7 @@ fn replace(
 /// slot's lock is what keeps two requests off one worker.
 #[derive(Debug)]
 struct Slot {
-    child: Child,
+    link: Link,
     exchange: Option<ChannelExchange>,
     /// The handshake answer, kept so a diagnostic can say which PHP and SAPI the
     /// slot is actually running.
@@ -1796,7 +1835,7 @@ struct Slot {
 impl Slot {
     fn from_boot(ready: Ready) -> Self {
         Slot {
-            child: ready.child,
+            link: ready.link,
             exchange: Some(ready.exchange),
             hello: ready.ack,
             served: 0,
@@ -1811,8 +1850,12 @@ impl Slot {
     /// `try_wait` is the only portable way to ask the second question, and it
     /// matters: a worker that died leaves its pipes at end-of-file, so without it
     /// the pool would confidently hand out a worker that is already gone.
+    ///
+    /// An attached slot has no `try_wait`: see [`Link::is_alive`] for why the honest answer
+    /// there is "the connection is still open", and why that is the same window a spawned
+    /// worker has.
     fn is_available(&mut self) -> bool {
-        self.exchange.is_some() && matches!(self.child.try_wait(), Ok(None))
+        self.exchange.is_some() && self.link.is_alive()
     }
     /// Kill the worker and drop its pipes.
     fn terminate(&mut self) {
@@ -1821,9 +1864,10 @@ impl Slot {
         self.exchange = None;
         // The *group*, not the pid: a worker that forked children of its own — a prefork
         // supervisor — would otherwise leave them running with no configuration and no way to
-        // be reached again. See `lifecycle::kill`.
-        let _ = crate::lifecycle::kill(&mut self.child);
-        let _ = self.child.wait();
+        // be reached again. See `lifecycle::kill`. An attached worker has no process to kill,
+        // and closing its connection here is the whole of that teardown.
+        let _ = self.link.kill();
+        let _ = self.link.wait();
     }
 
     /// Ask the worker to stop, and make sure that it does.
@@ -1851,16 +1895,24 @@ impl Slot {
     }
 
     /// Wait for the process to exit, killing it if it does not.
+    ///
+    /// An attached worker has nothing to wait for: `Link::is_alive` is optimistically true, so
+    /// this waits out the full grace period and then "kills" by closing the connection. That is
+    /// deliberate rather than a bug — the close is what ends the worker's read loop, and the
+    /// supervisor on the far side reaps it — but it does mean an attached slot's shutdown costs
+    /// `EXIT_TIMEOUT` rather than the few microseconds a spawned worker takes. Shutdown happens
+    /// once per deployment, and the alternative would be a `waitpid` on a process this server did
+    /// not fork, which does not exist.
     fn wait_or_kill(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if !self.link.is_alive() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = crate::lifecycle::kill(&mut self.child);
-        let _ = self.child.wait();
+        let _ = self.link.kill();
+        let _ = self.link.wait();
     }
 }
 

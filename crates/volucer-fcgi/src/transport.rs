@@ -224,6 +224,35 @@ impl Write for Stream {
     }
 }
 
+impl Stream {
+    /// A second handle onto the same connection, for a reader and a writer in two places.
+    ///
+    /// **The worker protocol needs this and FastCGI does not**, which is why it exists: a worker
+    /// channel holds one handle for writing and one for reading, and they must be the same socket
+    /// so that a request and its answer stay ordered. FastCGI's client keeps both ends in one
+    /// `&mut Stream` and never needs two.
+    ///
+    /// `UnixStream::try_clone` performs the same `dup` that `TcpStream::try_clone` does, so the
+    /// two arms are one call and no unsafe is needed.
+    pub fn try_clone_stream(&self) -> std::io::Result<Self> {
+        match self {
+            Stream::Tcp(stream) => stream.try_clone().map(Stream::Tcp),
+            // A named pipe's `OVERLAPPED` state is per connection and a duplicated handle would
+            // share it, so a second handle would have to be a second `connect` — and the path it
+            // would need is not reachable from here. The worker protocol has no named-pipe
+            // transport (a worker is stdio or TCP), so this arm is unreachable in practice and
+            // says so rather than pretending to work.
+            #[cfg(windows)]
+            Stream::Pipe(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a named pipe cannot be cloned for a reader/writer split",
+            )),
+            #[cfg(unix)]
+            Stream::Unix(stream) => stream.try_clone().map(Stream::Unix),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

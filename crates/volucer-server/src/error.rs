@@ -13,6 +13,20 @@ pub enum ServerError {
         source: std::io::Error,
     },
 
+    /// volucer could not reach the relay an `attach` backend points at.
+    ///
+    /// Its own variant rather than [`ServerError::Spawn`] because there is no binary and no
+    /// process: the thing that failed is a `connect`, and the operator's next move is to look at
+    /// the supervisor that was supposed to be listening. Naming a relay in a message about a
+    /// program would send them to the wrong half of the deployment.
+    #[error("backend {backend:?} could not connect to its relay {relay:?}: {source}")]
+    Attach {
+        backend: String,
+        relay: String,
+        #[source]
+        source: volucer_fcgi::FcgiError,
+    },
+
     #[error("{binary} exited during startup with {status}{hint}")]
     StartupExited {
         binary: std::path::PathBuf,

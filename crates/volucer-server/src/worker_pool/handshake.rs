@@ -1,20 +1,21 @@
-//! Starting a worker and getting it ready: `spawn`, the `HELLO` / `HELLO_ACK`
-//! handshake under a deadline, the socket-transport accept poll, and the `stderr`
-//! drain thread. Everything that waits here has a deadline, and the deadline is
-//! enforced by killing the worker — see the note in [`super`].
+//! Starting a worker and getting it ready: `spawn`, or a `connect` to a relay somebody else
+//! listens on; the `HELLO` / `HELLO_ACK` handshake under a deadline; the socket-transport accept
+//! poll; and the `stderr` drain thread. Everything that waits here has a deadline, and the
+//! deadline is enforced by killing the worker — see the note in [`super`].
 
 use super::exchange::{Channel, ChannelExchange};
-use super::spec::Spec;
+use super::spec::{AttachSpec, Launch, Spec};
 use crate::calls::MethodRegistry;
 use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
 use crate::lifecycle::{configure_command, LifecycleGuard};
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use volucer_core::config::WORKER_SOCKET_ENV;
+use volucer_fcgi::{Endpoint, FcgiError, Stream};
 use volucer_worker::{BoundedChannel, Checksum, HelloAck, WorkerError};
 
 /// How long a worker gets to complete the `HELLO` / `HELLO_ACK` handshake.
@@ -23,6 +24,13 @@ use volucer_worker::{BoundedChannel, Checksum, HelloAck, WorkerError};
 /// real time, and a worker that boots once should not be killed for taking a
 /// while at the one moment where being slow is expected.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a connect to an `attach` relay gets before startup fails.
+///
+/// Short, because there is nothing to wait for: a supervisor that is listening accepts
+/// immediately, and one that is not will not become so because we waited. Thirty seconds would
+/// turn a missing socket into a startup that looks like it is doing something.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a socket-transport pool looks for a worker that has not connected yet.
 ///
@@ -34,9 +42,126 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// A worker that has been started and has completed its handshake.
 #[derive(Debug)]
 pub(super) struct Ready {
-    pub(super) child: Child,
+    pub(super) link: Link,
     pub(super) exchange: ChannelExchange,
     pub(super) ack: HelloAck,
+}
+
+/// The far end of a slot: a process volucer started, or a connection it dialled.
+///
+/// **One type, because everything above it is the same.** A slot needs four things from its
+/// worker: an identity for logs and metrics, an answer to "is it still there", a way to kill it,
+/// and a way to wait for it to be gone. For a spawned worker all four are
+/// [`std::process::Child`]. For an attached one they are the connection itself: closing it is
+/// the kill, dialling again is the respawn, and the supervisor on the other end decides what its
+/// child does.
+///
+/// The alternative — a second pool — was rejected because the *interesting* part is identical
+/// (handshake, exchange thread, slot locking, recycling, metrics, calls) and duplicating it
+/// would mean every future fix to one of them being made twice, or once.
+///
+/// An attached slot deliberately has **no waiting**: there is no `waitpid` for a process we did
+/// not fork, so [`Link::wait`] closes nothing and returns. That is the honest answer rather than
+/// a simulated one — the process's own exit is the supervisor's to observe, and it is the
+/// supervisor that will replace it.
+#[derive(Debug)]
+pub(super) enum Link {
+    /// volucer started this process and is responsible for reaping it.
+    Process(Child),
+    /// volucer connected to this worker and is responsible only for closing the connection.
+    ///
+    /// The pid is what the worker reported in its `HELLO_ACK`, which is the *child's* pid on
+    /// the far side — a process this one cannot signal. It is kept because a pid is the only
+    /// handle an operator has on a worker, and because `workers.list` reports one.
+    Attached {
+        /// The worker's self-reported pid, or 0 if it did not report one.
+        pid: u32,
+    },
+}
+
+impl Link {
+    /// The worker's pid, for logs, metrics and `workers.list`.
+    pub(super) fn id(&self) -> u32 {
+        match self {
+            Link::Process(child) => child.id(),
+            Link::Attached { pid } => *pid,
+        }
+    }
+
+    /// Whether the worker is still there, without blocking.
+    ///
+    /// For a process, `try_wait`. For a connection, `true` until a request fails: a closed socket
+    /// is discovered by writing to it, and there is no equivalent of `try_wait` for a peer that
+    /// may be mid-request. Polling with a zero-byte read would be the wrong question — a healthy
+    /// worker is deliberately silent between requests — so this answers the optimistic thing and
+    /// lets the exchange thread's error be the real signal, which is the same path a pipe worker
+    /// takes when it dies between `try_wait` and the write.
+    pub(super) fn is_alive(&mut self) -> bool {
+        match self {
+            Link::Process(child) => matches!(child.try_wait(), Ok(None)),
+            Link::Attached { .. } => true,
+        }
+    }
+
+    /// Terminate the worker.
+    ///
+    /// A process is killed by group (see [`crate::lifecycle::kill`]). An attached worker is
+    /// released by closing its connection — the exchange thread owns the socket and drops it when
+    /// the slot does — which is how this protocol says "stop": the worker's read loop returns and
+    /// it exits on its own. That is also the graceful half of `Slot::stop`; for `terminate` there
+    /// is nothing more, because a process we did not start has no signal we may send.
+    pub(super) fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Link::Process(child) => crate::lifecycle::kill(child),
+            // Nothing to signal: the connection closes when the exchange is dropped.
+            Link::Attached { .. } => Ok(()),
+        }
+    }
+
+    /// Wait for the worker to be gone.
+    ///
+    /// A process is reaped. An attached one is not waited for at all: `waitpid` only works on
+    /// children, and the supervisor that owns this worker notices its exit before we could.
+    /// Returning immediately rather than sleeping is deliberate — a pool that blocked here would
+    /// make shutdown slower for a process it does not own.
+    pub(super) fn wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Link::Process(child) => child.wait().map(Some),
+            Link::Attached { .. } => Ok(None),
+        }
+    }
+}
+
+/// The writer half of a relay connection.
+///
+/// A newtype rather than passing `Stream` twice, because the two halves are handed to
+/// `BoundedChannel::new` as two different trait objects and naming them keeps the type of each
+/// obvious at the call site.
+#[derive(Debug)]
+struct RelayWriter(Stream);
+
+impl Write for RelayWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// The reader half of a relay connection.
+///
+/// Reading through `Stream` is what arms `TCP_QUICKACK` on the TCP arm — see
+/// [`volucer_fcgi::transport`] — which matters here for the same reason it does for FastCGI: the
+/// protocol is a ping-pong of small frames, and a delayed ACK is a delayed answer.
+#[derive(Debug)]
+struct RelayReader(Stream);
+
+impl Read for RelayReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
 }
 
 /// Wait for a socket-transport worker to connect back, and give up rather than hang.
@@ -57,11 +182,14 @@ fn accept_with_deadline(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<TcpStream> {
+    let binary = spec
+        .binary()
+        .expect("a socket-transport listener only exists for a spawned pool");
     let deadline = Instant::now() + timeout;
     listener
         .set_nonblocking(true)
         .map_err(|source| ServerError::Spawn {
-            binary: spec.binary.clone(),
+            binary: binary.clone(),
             source,
         })?;
 
@@ -78,14 +206,14 @@ fn accept_with_deadline(
                 // usually the reason: a fatal error, a missing extension, a bad path.
                 if let Ok(Some(status)) = child.try_wait() {
                     return Err(ServerError::StartupExited {
-                        binary: spec.binary.clone(),
+                        binary: binary.clone(),
                         status: status.to_string(),
                         hint: Hint(Some(SOCKET_WORKER_HINT)),
                     });
                 }
                 if Instant::now() >= deadline {
                     return Err(ServerError::StartupTimeout {
-                        binary: spec.binary.clone(),
+                        binary: binary.clone(),
                         address: listener
                             .local_addr()
                             .map(|found| found.to_string())
@@ -98,7 +226,7 @@ fn accept_with_deadline(
             }
             Err(source) => {
                 return Err(ServerError::Spawn {
-                    binary: spec.binary.clone(),
+                    binary: binary.clone(),
                     source,
                 })
             }
@@ -130,52 +258,217 @@ fn install_call_handler(channel: &mut Channel, handler: Option<&Arc<MethodRegist
 /// everything useful about it. A socket-transport worker has one far more likely explanation
 /// that the status alone cannot express, which is the whole reason the hint exists.
 fn transport_hint(spec: &Spec) -> Option<&'static str> {
-    if spec.transport.is_pipe() {
-        None
-    } else {
-        Some(SOCKET_WORKER_HINT)
+    match &spec.launch {
+        Launch::Spawn { transport, .. } if !transport.is_pipe() => Some(SOCKET_WORKER_HINT),
+        // An attached pool never sets `VOLUCER_WORKER_SOCKET`, so the hint would be about a
+        // transport it is not using.
+        _ => None,
     }
 }
 
-/// Start a worker and complete its handshake.
+/// Start, or connect to, one worker, and complete its handshake.
 ///
 /// Everything that can go wrong with a worker does so here, which is the point:
 /// a worker that cannot boot is a startup error, not a mystery on the first
 /// request that happens to reach it.
 ///
-/// `handler` is the method registry this backend's workers may call, or `None` to grant nothing. It
-/// is installed on the channel before the handshake; see [`install_call_handler`].
+/// The two halves below — `boot_spawned` and [`boot_attached`] — differ in exactly two steps,
+/// which is why they are two functions rather than two pools: how the far end comes to exist, and
+/// what a failure means. Everything between them — installing the call handler, the handshake
+/// under its deadline, the `Ready` — is shared, and is what [`finish_boot`] is.
+///
+/// `handler` is the method registry this backend's workers may call, or `None` to grant nothing.
+/// It is installed on the channel before the handshake; see [`install_call_handler`].
 pub(super) fn boot(
     name: &str,
     spec: &Spec,
     guard: &LifecycleGuard,
     handler: Option<&Arc<MethodRegistry>>,
 ) -> Result<Ready> {
+    match &spec.launch {
+        Launch::Spawn { .. } => boot_spawned(name, spec, guard, handler),
+        Launch::Attach(attach) => boot_attached(name, spec, attach, handler),
+    }
+}
+
+/// Connect to a worker somebody else started, and complete its handshake.
+///
+/// **volucer dials; it does not listen.** That direction is the whole reason this backend can
+/// exist: a PHP prefork supervisor boots the application once and forks its children, and those
+/// children inherit the booted heap — measured at 89% less resident memory for the same 16
+/// workers, because each `exec`ed worker maps its own OPcache segment and each `fork`ed one
+/// shares the original. But a PHP process cannot hand a file descriptor over, so the side that
+/// owns the socket has to be the side that owns the fork. It listens; we connect.
+///
+/// One connection is one slot: it carries one request at a time, which is exactly the contract a
+/// spawned worker's pipes have. That makes `attach.workers` the concurrency of the pool, and it
+/// has to match the number of children the supervisor forked — a mismatch is either idle
+/// children or requests queued behind a connection with no child to answer them.
+///
+/// A failed connect is a startup failure rather than a lazily-retried condition, for the same
+/// reason a worker that cannot boot is: a deployment that starts and then 502s is worse than one
+/// that does not start.
+fn boot_attached(
+    name: &str,
+    spec: &Spec,
+    attach: &AttachSpec,
+    handler: Option<&Arc<MethodRegistry>>,
+) -> Result<Ready> {
+    let (writer, reader) = connect_relay(name, attach)?;
+    let channel = BoundedChannel::new(writer, reader);
+
+    finish_boot(name, spec, Link::Attached { pid: 0 }, channel, handler)
+}
+
+/// One connection to the relay, as a writer and a reader.
+///
+/// A unix socket is **not** shared through one handle: the exchange thread needs a reader and the
+/// request path a writer, and `BoundedChannel` takes them as two objects. `try_clone_stream` is
+/// the `dup`, and a failure to make one is a startup error rather than a silent half-duplex
+/// channel.
+///
+/// The relay is parsed by the same `Endpoint` the FastCGI client uses, so `unix:` and `host:port`
+/// mean the same thing here as everywhere else in the configuration.
+fn connect_relay(name: &str, attach: &AttachSpec) -> Result<(RelayWriter, RelayReader)> {
+    let fail = |source: FcgiError| ServerError::Attach {
+        backend: name.to_string(),
+        relay: attach.relay.clone(),
+        source,
+    };
+
+    let endpoint = Endpoint::parse(&attach.relay).map_err(fail)?;
+    let stream = endpoint
+        .connect(Some(CONNECT_TIMEOUT))
+        .map_err(fail)?;
+    let reader = stream
+        .try_clone_stream()
+        .map_err(|source| fail(FcgiError::Io(source)))?;
+
+    tracing::debug!(
+        backend = %name,
+        relay = %attach.relay,
+        "connected to an attached worker"
+    );
+
+    Ok((RelayWriter(stream), RelayReader(reader)))
+}
+
+/// The half of a boot that is the same whether the worker was spawned or attached.
+///
+/// Split out because it holds the *interesting* rules — install the call handler before the
+/// handshake, enforce the deadline, and turn a failure into the error that names the real cause —
+/// and two copies of them is exactly how a fix lands in one and not the other.
+fn finish_boot(
+    name: &str,
+    spec: &Spec,
+    mut link: Link,
+    mut channel: Channel,
+    handler: Option<&Arc<MethodRegistry>>,
+) -> Result<Ready> {
+    // The call handler goes on **before the handshake**, and the order matters. A worker may send
+    // a `CALL` at any point in its life, and the first thing it does after connecting is boot the
+    // application — which is exactly when a framework wants to ask the server something.
+    // Installing the handler after `HELLO_ACK` would leave that window answering "no call handler
+    // is installed", which is a refusal the worker cannot tell from a server that does not
+    // support calls at all.
+    install_call_handler(&mut channel, handler);
+
+    match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
+        Ok((channel, ack)) => {
+            // An attached worker's pid arrives with its handshake, and is the only handle an
+            // operator has on a process this server did not fork.
+            if let Link::Attached { pid } = &mut link {
+                *pid = ack.pid;
+            }
+            tracing::debug!(
+                backend = %name,
+                pid = link.id(),
+                php = %ack.php_version,
+                sapi = %ack.sapi,
+                target = %spec.describe(),
+                "worker ready"
+            );
+            Ok(Ready {
+                link,
+                exchange: ChannelExchange::start(channel),
+                ack,
+            })
+        }
+        Err(failure) => {
+            if matches!(failure, HandshakeFailure::TimedOut) {
+                // The reader thread is still blocked in a read; ending the process — or dropping
+                // the connection — is what ends it.
+                let _ = link.kill();
+            }
+            let status = link.wait().ok().flatten();
+
+            let source = match failure {
+                HandshakeFailure::TimedOut => WorkerError::Timeout(HANDSHAKE_TIMEOUT),
+                HandshakeFailure::Refused(err) => err,
+            };
+
+            Err(match (status, spec.binary()) {
+                // The worker exited instead of answering, so its own exit is the useful part of
+                // the story.
+                (Some(status), Some(binary)) => ServerError::StartupExited {
+                    binary: binary.clone(),
+                    status: status.to_string(),
+                    hint: Hint(transport_hint(spec)),
+                },
+                // An attached worker has no exit status this process can see; only its silence
+                // on the wire.
+                _ => ServerError::WorkerProtocol {
+                    backend: name.to_string(),
+                    source,
+                },
+            })
+        }
+    }
+}
+
+/// Start a worker and complete its handshake.
+fn boot_spawned(
+    name: &str,
+    spec: &Spec,
+    guard: &LifecycleGuard,
+    handler: Option<&Arc<MethodRegistry>>,
+) -> Result<Ready> {
+    let Launch::Spawn {
+        binary,
+        args,
+        working_dir,
+        env,
+        transport,
+    } = &spec.launch
+    else {
+        unreachable!("boot_spawned is only reached for a spawned pool")
+    };
+
     // A socket-transport worker is connected to a listener that has to exist *before* the
     // process starts, because the address is handed to it as an environment variable
     // rather than discovered by it. So the listener is bound first and the worker spawns
     // into a connection that is already waiting.
-    let listener = if spec.transport.is_pipe() {
+    let listener = if transport.is_pipe() {
         None
     } else {
         Some(
             TcpListener::bind(("127.0.0.1", 0)).map_err(|source| ServerError::Spawn {
-                binary: spec.binary.clone(),
+                binary: binary.clone(),
                 source,
             })?,
         )
     };
     let socket_address = match &listener {
         Some(listener) => Some(listener.local_addr().map_err(|source| ServerError::Spawn {
-            binary: spec.binary.clone(),
+            binary: binary.clone(),
             source,
         })?),
         None => None,
     };
 
-    let mut command = Command::new(&spec.binary);
+    let mut command = Command::new(binary);
     command
-        .stdin(if spec.transport.is_pipe() {
+        .stdin(if transport.is_pipe() {
             Stdio::piped()
         } else {
             // With the protocol on a socket, stdio is free to be nothing. Leaving stdin
@@ -183,7 +476,7 @@ pub(super) fn boot(
             // loudly rather than block, and `null` gives it immediate end-of-file.
             Stdio::null()
         })
-        .stdout(if spec.transport.is_pipe() {
+        .stdout(if transport.is_pipe() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -191,11 +484,11 @@ pub(super) fn boot(
         // Piped, never nulled: PHP writes its diagnostics here, and a worker
         // whose stderr pipe fills up blocks for ever on its next write.
         .stderr(Stdio::piped());
-    command.args(&spec.args);
-    if let Some(dir) = &spec.working_dir {
+    command.args(args);
+    if let Some(dir) = working_dir {
         command.current_dir(dir);
     }
-    for (key, value) in &spec.env {
+    for (key, value) in env {
         command.env(key, value);
     }
     if let Some(address) = socket_address {
@@ -208,7 +501,7 @@ pub(super) fn boot(
     configure_command(&mut command);
 
     let mut child = command.spawn().map_err(|source| ServerError::Spawn {
-        binary: spec.binary.clone(),
+        binary: binary.clone(),
         source,
     })?;
 
@@ -219,12 +512,12 @@ pub(super) fn boot(
         // failure, and saying "job object" would hide the real reason.
         return Err(match child.try_wait() {
             Ok(Some(status)) => ServerError::StartupExited {
-                binary: spec.binary.clone(),
+                binary: binary.clone(),
                 status: status.to_string(),
                 hint: Hint(transport_hint(spec)),
             },
             _ => ServerError::Spawn {
-                binary: spec.binary.clone(),
+                binary: binary.clone(),
                 source,
             },
         });
@@ -234,7 +527,7 @@ pub(super) fn boot(
         drain_stderr(name.to_string(), child.id(), stderr);
     }
 
-    let mut channel = match listener {
+    let channel = match listener {
         // The worker connects back to the listener bound above. The timeout matters: a
         // worker that never connects must fail here rather than hold startup for ever, and
         // it is bounded by the same budget the handshake gets.
@@ -252,7 +545,7 @@ pub(super) fn boot(
             // only add delay to a request that is written frame by frame.
             let _ = accepted.set_nodelay(true);
             let reader = accepted.try_clone().map_err(|source| ServerError::Spawn {
-                binary: spec.binary.clone(),
+                binary: binary.clone(),
                 source,
             })?;
             BoundedChannel::new(accepted, reader)
@@ -264,58 +557,7 @@ pub(super) fn boot(
         }
     };
 
-    // The call handler goes on **before the handshake**, and the order matters. A worker may send a
-    // `CALL` at any point in its life, and the first thing it does after connecting is boot the
-    // application — which is exactly when a framework wants to ask the server something. Installing
-    // the handler after `HELLO_ACK` would leave that window answering "no call handler is installed",
-    // which is a refusal the worker cannot tell from a server that does not support calls at all.
-    install_call_handler(&mut channel, handler);
-
-    match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
-        Ok((channel, ack)) => {
-            tracing::debug!(
-                backend = %name,
-                pid = child.id(),
-                php = %ack.php_version,
-                sapi = %ack.sapi,
-                transport = %spec.transport,
-                "worker ready"
-            );
-            Ok(Ready {
-                child,
-                exchange: ChannelExchange::start(channel),
-                ack,
-            })
-        }
-        Err(failure) => {
-            if matches!(failure, HandshakeFailure::TimedOut) {
-                // The reader thread is still blocked in a read; ending the
-                // process is what ends it.
-                let _ = crate::lifecycle::kill(&mut child);
-            }
-            let status = child.try_wait().ok().flatten();
-            let _ = child.wait();
-
-            let source = match failure {
-                HandshakeFailure::TimedOut => WorkerError::Timeout(HANDSHAKE_TIMEOUT),
-                HandshakeFailure::Refused(err) => err,
-            };
-
-            Err(match status {
-                // The worker exited instead of answering, so its own exit is the
-                // useful part of the story.
-                Some(status) => ServerError::StartupExited {
-                    binary: spec.binary.clone(),
-                    status: status.to_string(),
-                    hint: Hint(transport_hint(spec)),
-                },
-                None => ServerError::WorkerProtocol {
-                    backend: name.to_string(),
-                    source,
-                },
-            })
-        }
-    }
+    finish_boot(name, spec, Link::Process(child), channel, handler)
 }
 
 /// Why a boot handshake did not produce a `HELLO_ACK`.
@@ -329,7 +571,6 @@ enum HandshakeFailure {
 }
 
 /// Run the handshake on its own thread, so that it can have a deadline.
-///
 /// A pipe read has no portable timeout, so the deadline is enforced from the
 /// outside: this gives up, the caller kills the worker, and the pending read then
 /// fails — which is how the reader thread gets to exit. Nothing is closed from
@@ -415,12 +656,14 @@ use volucer_core::config::WorkerTransport;
 #[cfg(test)]
 fn bare_spec(transport: WorkerTransport) -> Spec {
     Spec {
-        binary: PathBuf::from("php"),
-        args: Vec::new(),
-        working_dir: None,
-        env: BTreeMap::new(),
+        launch: Launch::Spawn {
+            binary: PathBuf::from("php"),
+            args: Vec::new(),
+            working_dir: None,
+            env: BTreeMap::new(),
+            transport,
+        },
         checksum: Checksum::Optional,
-        transport,
         grpc_services: Vec::new(),
     }
 }

@@ -185,6 +185,12 @@ pub enum Backend {
     /// by the very pool whose workers are asking, and the dispatcher keeps a [`Weak`](std::sync::Weak)
     /// handle to it rather than a strong one. The `Arc` is not about sharing — nothing else holds it —
     /// and everything above this line would work with the pool inline.
+    ///
+    /// **`attach` uses this variant too**, and shares it deliberately: from a request's point of view
+    /// the two are the same thing — a persistent application, reached over the worker protocol, with a
+    /// per-slot exchange — and the only difference is that volucer dialled rather than forked. A
+    /// second variant would make every `match` above this line ask the same question twice and get
+    /// two answers that had to be kept in agreement.
     Worker { name: String, pool: Arc<WorkerPool> },
     /// An HTTP origin volucer proxies to.
     ///
@@ -267,6 +273,10 @@ impl Backend {
             BackendConfig::Worker(worker) => Ok(Backend::Worker {
                 name: name.to_string(),
                 pool: Arc::new(WorkerPool::start_with(name, worker, registry)?),
+            }),
+            BackendConfig::Attach(attach) => Ok(Backend::Worker {
+                name: name.to_string(),
+                pool: Arc::new(WorkerPool::start_attached(name, attach, registry)?),
             }),
             BackendConfig::Upstream(upstream) => {
                 // Validated rather than accepted on faith: `Config::validate` refuses a bad origin,

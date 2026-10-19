@@ -96,6 +96,56 @@ systemd already runs. A file still carrying `kind = "spawn_fpm"` is now rejected
 
 ### `attach`: a worker pool that `fork()`ed its own children
 
+`worker` spawns every worker with `exec`, so every worker maps **its own** OPcache segment and
+pays the framework boot itself. `fork()` shares both instead, and on PHP that is the only way to
+share them: an `exec`ed process cannot attach to an existing OPcache segment on Linux. The catch
+is that the fork has to happen in a PHP process, and a PHP process cannot hand a file descriptor
+to another process — `ext/sockets` has no `SCM_RIGHTS`. So the side that owns the socket has to be
+the side that owns the fork.
+
+That is the whole shape:
+
+```toml
+[backends.app]
+kind = "attach"
+# A path, not an address list: volucer dials it `workers` times and holds each connection as a slot.
+relay = "unix:/run/app/workers.sock"
+workers = 16
+```
+
+A supervisor boots the application once, forks, and listens on `relay`; volucer **connects** and
+does not start a process at all. Each connection is a slot, with the same handshake, exchange
+thread, recycling and metrics as a spawned worker. `worker.php --prefork unix:/run/app/workers.sock`
+in [`volucer-competition`](https://github.com/sailantis/volucer-competition) is a working
+supervisor: it accepts in the master and forks per connection, which is what keeps the assignment
+exact — N children sharing one listener accept unfairly, so one child can take two connections and
+another none.
+
+Measured on 12 cores, the same `/items` page, `w = 16`, `c = 64`, `wrk -t12`, three alternating
+runs each:
+
+| | rps | PSS, before load | PSS, after 10 s at c=64 |
+| --- | --- | --- | --- |
+| `worker`, 16 `exec`ed processes | 23,937 – 24,228 | 263 MB | 314 MB |
+| `attach`, supervisor + 16 children | **25,322 – 25,981** | **48 MB** | **69 MB** |
+
+The memory is the point: **263 MB against 48 MB**, because the interpreter and the OPcache
+segment exist once. Summed RSS cannot see this — it counts every shared page once per child and
+reports 314 MB against 758 MB, which understates the saving; PSS splits each page between its
+mappers, so summing it is what the machine actually holds.
+
+Two things about running it:
+
+- **`workers` has no default and `0` is refused.** A supervisor has already forked a specific
+  number, so there is no "one per CPU" to resolve; a connection count that differs from it either
+  leaves children idle or queues requests behind connections with nobody reading them.
+- **`max_requests` recycles by reconnecting**, not by killing. That is the only recycling
+  available for a process volucer did not start: closing the connection is the shutdown signal
+  the worker protocol already defines, and the supervisor forks a replacement. `memory_limit_mb`
+  does not exist for `attach` for the same reason.
+
+### `attach`: a worker pool that `fork()`ed its own children
+
 `worker` spawns every worker with `exec`, so every worker maps **its own** OPcache segment and pays
 the framework boot itself. `fork()` shares both instead, and on PHP that is the only way to share
 them: an `exec`ed process cannot attach to an existing OPcache segment on Linux. The catch is that

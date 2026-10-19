@@ -2735,7 +2735,7 @@ fn default_max_multirange() -> u64 {
     1024 * 1024
 }
 
-/// A backend is one of three shapes, tagged by `kind` in TOML.
+/// A backend is one of five shapes, tagged by `kind` in TOML.
 ///
 /// There was a fourth, `spawn_fpm`, which volucer would have started itself. It was
 /// never implemented — `Dispatcher` refused it — while `volucer version` advertised it
@@ -2748,6 +2748,27 @@ fn default_max_multirange() -> u64 {
 pub enum BackendConfig {
     /// Persistent PHP process speaking volucer's own framed protocol over pipes.
     Worker(WorkerConfig),
+    /// A worker pool whose processes somebody else started, reached over a `unix:` relay.
+    ///
+    /// The one thing a `worker` backend cannot do is share memory between its workers,
+    /// because it *executes* each one: an `exec`ed process maps its own OPcache segment, so N
+    /// workers pay the interpreter and the preloaded code N times. `fork()` shares all of it
+    /// copy-on-write, which measured **89% less resident memory** for the same 16 workers —
+    /// but the parent of a fork must be a PHP process, and a PHP process cannot hand a file
+    /// descriptor to another process (`ext/sockets` has no `SCM_RIGHTS`). So the side that
+    /// owns the socket has to be the side that owns the fork.
+    ///
+    /// This is the shape where nothing has to give. A supervisor boots the application once,
+    /// forks its children, and they serve connections on a relay it listens on; volucer
+    /// **dials that relay** and does not start a process at all. The protocol, the handshake
+    /// and the per-slot exchange are exactly a `worker`'s, because a child that connected to
+    /// us speaks the same frames — the only difference is which side opened the socket.
+    ///
+    /// It exists because the alternative is worse. A `spawn_cgi` supervisor would work today,
+    /// but it is FastCGI: a cold interpreter per request and no channel, measured at **8,292
+    /// rps where the warm pipe reached 24,336**. Attaching keeps the warm pipe and changes
+    /// only who calls `connect`.
+    Attach(AttachConfig),
     /// An already-running php-fpm (systemd-managed). Linux/macOS default.
     External(ExternalConfig),
     /// N `php-cgi` processes on N ports. The only option on Windows.
@@ -2756,8 +2777,8 @@ pub enum BackendConfig {
     ///
     /// Named by role rather than by language: a Node, Python or Go application served by an
     /// application server of its own is the same thing to volucer, which only has to hand it an
-    /// HTTP request and relay the answer. This is a *fourth* shape rather than a variation on the
-    /// three above because it shares none of their machinery: there is no CGI environment, no
+    /// HTTP request and relay the answer. This is a *fifth* shape rather than a variation on the
+    /// four above because it shares none of their machinery: there is no CGI environment, no
     /// FastCGI record and no volucer protocol, only hyper's client.
     Upstream(UpstreamConfig),
 }
@@ -2797,6 +2818,7 @@ impl BackendConfig {
     pub fn kind(&self) -> &'static str {
         match self {
             BackendConfig::Worker(_) => "worker",
+            BackendConfig::Attach(_) => "attach",
             BackendConfig::External(_) => "external",
             BackendConfig::SpawnCgi(_) => "spawn_cgi",
             BackendConfig::Upstream(_) => "upstream",
@@ -2811,10 +2833,25 @@ impl BackendConfig {
     /// Where a request's state is scoped for this backend.
     pub fn request_scope(&self) -> RequestScope {
         match self {
-            BackendConfig::Worker(_) => RequestScope::ApplicationScoped,
+            // An attached worker is a worker: somebody else started it, but it is still a
+            // persistent PHP process that clears its own request scope, which is the fact this
+            // answers. Who called `fork()` has no bearing on it.
+            BackendConfig::Worker(_) | BackendConfig::Attach(_) => {
+                RequestScope::ApplicationScoped
+            }
             BackendConfig::External(_) | BackendConfig::SpawnCgi(_) => RequestScope::PhpSapi,
             BackendConfig::Upstream(_) => RequestScope::OriginScoped,
         }
+    }
+
+    /// Whether this backend keeps a persistent application alive across requests.
+    ///
+    /// The answer for the two kinds that speak volucer's own protocol, whichever side opened the
+    /// socket. Stated as a method rather than as `matches!(kind)` at each call site because it is
+    /// the property the server asks about — gRPC delivery, calls, warm start — and it must not be
+    /// possible for one of them to be updated and the other forgotten.
+    pub fn is_worker(&self) -> bool {
+        matches!(self, BackendConfig::Worker(_) | BackendConfig::Attach(_))
     }
 
     /// Whether this backend interprets the path as a file to execute.
@@ -2833,8 +2870,8 @@ impl BackendConfig {
 
     /// The parsed origin, for an `upstream` backend.
     ///
-    /// `None` for the three CGI-shaped kinds. Parsed rather than stored because the configuration
-    /// model deserialises straight from TOML: a field holding a parsed value would have to be
+    /// `None` for the four CGI-and-worker-shaped kinds. Parsed rather than stored because the
+    /// configuration model deserialises straight from TOML: a field holding a parsed value would have to be
     /// filled in by hand after every load, and a reload reads the file again. This is called at
     /// startup, at `check`, and once per backend when its client is built — never per request.
     ///
@@ -3668,6 +3705,94 @@ impl ChecksumMode {
 pub struct ExternalConfig {
     /// php-fpm listener: `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`.
     pub socket: String,
+}
+
+/// A worker pool volucer connects to rather than starts.
+///
+/// See [`BackendConfig::Attach`] for why this exists. The short version: it is the only shape
+/// that lets a PHP process `fork()` its workers — and therefore share one OPcache and one booted
+/// container instead of N — while keeping volucer's warm framed protocol rather than dropping to
+/// FastCGI per request.
+///
+/// **The workers' own configuration is not here.** A supervisor that forked its children has
+/// already decided their count, their command line and their environment; repeating any of it
+/// would be a number volucer prints that nothing enforces. What is here is only what volucer
+/// genuinely owns: where to connect, how many connections to hold, when to recycle one, and what
+/// the attached workers may call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachConfig {
+    /// The relay the attached workers are reached on, e.g. `unix:/run/app/workers.sock`.
+    ///
+    /// **A path, not an address list.** The supervisor listens; volucer dials it `workers` times
+    /// and holds each connection for the life of a slot. `unix:` is the form that matters — an
+    /// `AF_UNIX` socket has no Nagle/delayed-ACK interaction, and a loopback TCP relay measured
+    /// **38.96 ms per request against 0.06 ms** for the same protocol until `TCP_NODELAY` was set
+    /// on both ends. A `host:port` is accepted because a supervisor may live in another
+    /// container, and it is not the documented default for that reason.
+    pub relay: String,
+
+    /// How many connections to the relay to hold, which is how many requests run at once.
+    ///
+    /// **No default, and `0` is refused.** `worker`'s `workers = 0` means "one per logical CPU",
+    /// and that is exactly the wrong answer here: the supervisor already forked a specific
+    /// number of children, so a volucer-side number that differed from it would either leave
+    /// children unused or queue requests behind connections that have no child to answer them.
+    /// The honest value is the number the supervisor forked, and only the operator knows it.
+    pub workers: u32,
+
+    /// Recycle a slot after this many requests, by closing the connection and dialling again.
+    ///
+    /// **`0` means never**, as it does for `max_requests` on a `worker` backend and
+    /// `pm.max_requests` in php-fpm. Recycling here is cheap — the supervisor's child is already
+    /// forked, so a reconnect costs a `connect` and a handshake rather than a framework boot —
+    /// which makes it the natural place to bound an application leak the supervisor cannot see.
+    #[serde(default)]
+    pub max_requests: Option<u64>,
+
+    /// Whether the per-frame `crc32c` is verified. Defaults to required, as for a `worker`.
+    #[serde(default)]
+    pub checksum: ChecksumMode,
+
+    /// Which control namespaces the attached workers may call.
+    ///
+    /// The same allow-list and the same reasoning as [`WorkerConfig::services`]: a connection is
+    /// a remote-execution surface, and the safe default is the empty one.
+    #[serde(default)]
+    pub services: Vec<String>,
+
+    /// Which gRPC services the attached workers may be asked to handle.
+    ///
+    /// The same allow-list and the same reasoning as [`WorkerConfig::grpc_services`].
+    #[serde(default)]
+    pub grpc_services: Vec<String>,
+}
+
+impl AttachConfig {
+    /// Refuse a table whose values cannot mean what they look like.
+    ///
+    /// Checked at configuration load so that a bad relay is a startup error naming the key,
+    /// rather than a pool of slots that all fail to connect on the first request.
+    pub fn validate(&self, backend: &str) -> std::result::Result<(), String> {
+        if self.workers == 0 {
+            return Err(format!(
+                "backends.{backend}.workers must be at least 1: a supervisor that forked its \
+                 children already decided how many there are, and a connection count of zero \
+                 would leave every one of them unreachable"
+            ));
+        }
+        let relay = self.relay.trim();
+        if relay.is_empty() {
+            return Err(format!(
+                "backends.{backend}.relay is empty; give the path the supervisor listens on, \
+                 e.g. \"unix:/run/app/workers.sock\""
+            ));
+        }
+        // The same parser the `external` and `spawn_cgi` sockets use, because it is the same
+        // question: is this a `unix:` path or a `host:port`, and is the path absolute?
+        parse_listener(relay).map_err(|err| format!("backends.{backend}.relay: {err}"))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4797,6 +4922,15 @@ impl Config {
             BackendConfig::External(e) => {
                 parse_listener(&e.socket)
                     .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
+            }
+            BackendConfig::Attach(a) => {
+                // Everything checkable is checkable here: a relay address is a path or an
+                // address, and a connection count of zero is a pool with nothing in it. The
+                // relay's *existence* is not checked, deliberately — it is created by a
+                // supervisor volucer does not own, and refusing to start before it appears
+                // would make the two processes' start order a configuration requirement.
+                // `preflight` warns about a missing path instead.
+                a.validate(name).map_err(Error::Config)?;
             }
             BackendConfig::SpawnCgi(c) => {
                 if let Some(socket) = &c.socket {

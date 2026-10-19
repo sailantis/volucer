@@ -382,6 +382,28 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                     }
                 }
             }
+            BackendConfig::Attach(attach) => {
+                // The same cheap check as `external`'s socket, and it means more here: an
+                // attached supervisor is a process volucer has never met, so a path that does
+                // not exist is the most likely reason a deployment starts and then 502s. The
+                // warning is not an error because the supervisor may legitimately be slower to
+                // start, and because a relay in another container is reached over TCP where
+                // nothing is checkable here.
+                if let Some(path) = attach.relay.trim().strip_prefix("unix:") {
+                    if !Path::new(path).exists() {
+                        warnings.push(Warning::with_hint(
+                            format!(
+                                "backends.{name}: nothing is listening on {} yet, so every \
+                                 connection to this pool will fail at startup",
+                                attach.relay.trim()
+                            ),
+                            "start the supervisor that forks this backend's workers — volucer \
+                             does not start it, which is the whole point of `attach` — or ignore \
+                             this if it starts first",
+                        ));
+                    }
+                }
+            }
             BackendConfig::Upstream(upstream) => {
                 // A unix socket is checked the same way the `external` backend's is, and for the
                 // same reason: a missing one is the common cause of a first-request 502, and it is
