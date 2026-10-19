@@ -3802,6 +3802,19 @@ pub struct SpawnCgiConfig {
     pub binary: PathBuf,
 
     /// Number of processes, and therefore number of ports. `0` means one per logical CPU.
+    ///
+    /// **Each of these is one process, and on Linux that is a deliberate choice rather than
+    /// the only option.** `php-cgi -b` with `PHP_FCGI_CHILDREN = n` preforking is a real
+    /// Linux feature — measured here, not assumed: `n = 4` produced exactly four children and
+    /// distributed twelve sequential requests round-robin across all four, and `SIGTERM` to
+    /// the master left none behind. The pool sets `PHP_FCGI_CHILDREN = 0` anyway (see
+    /// `pool.rs`), because `workers` has to be a number the pool can enforce: a slot that
+    /// hides twenty children looks idle while twenty requests run, cannot be recycled by
+    /// `max_requests`, and does not stop work when it is killed.
+    ///
+    /// The shape that would collect prefork's memory saving without losing that control is
+    /// [`BackendConfig::Attach`]: a supervisor that forks its own children and a server that
+    /// dials them, so no process hides anybody.
     #[serde(default = "default_workers")]
     pub workers: u32,
 
@@ -3817,8 +3830,9 @@ pub struct SpawnCgiConfig {
     ///
     /// This is a path **prefix**, not a finished path: slot `i` binds
     /// `<prefix>.<i>.sock`, for the same reason each TCP slot needs its own port
-    /// — `php-cgi` processes one request at a time, and one socket per process is
-    /// what lets a slot be recycled, counted and reasoned about on its own.
+    /// — one socket per process is what lets a slot be recycled, counted and
+    /// reasoned about on its own, whatever the process can or cannot do with
+    /// preforking (see [`SpawnCgiConfig::workers`]).
     ///
     /// `php-cgi -b` accepts an `AF_UNIX` path on any non-Windows platform because
     /// `fcgi_listen` (`main/fastcgi.c`) only falls back to TCP when the argument

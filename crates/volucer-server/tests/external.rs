@@ -110,15 +110,18 @@ impl Drop for ExternalServer {
 /// A FastCGI server that answers every connection at once, with nothing to
 /// serialise on.
 ///
-/// The `spawn_cgi` stand-in used by the other tests is a real `php-cgi -b`, and a
-/// single Linux `php-cgi` serves its connections **one at a time** however many
-/// are open: it takes the second request on the connection it is already holding,
-/// because the client asked for keep-alive (`PHP_FCGI_CHILDREN` is read only in the
-/// Windows branch of `sapi/cgi/cgi_main.c`, so there is no child pool to distribute
-/// to). A *real* `php-fpm` is a master over a child pool and answers as many at
-/// once as `pm.max_children` allows, which is the thing `ClientPool` exists for —
-/// so an `external` backend pointed at a lone `php-cgi` is a test fixture that
-/// cannot exhibit the property under test.
+/// The `spawn_cgi` stand-in used by the other tests is a real `php-cgi -b`, and one
+/// process serves one connection at a time however many are open: it takes the second
+/// request on the connection it is already holding, because the client asked for
+/// keep-alive. **That is about the process, not about `php-cgi` on Linux** — with
+/// `PHP_FCGI_CHILDREN` set, `php-cgi` preforking is real: measured here, `n = 4`
+/// produced four children serving twelve sequential requests round-robin, and this pool
+/// forces `PHP_FCGI_CHILDREN = 0` so that a slot really is one process (see
+/// `pool.rs`). A lone `php-cgi` started without that variable is therefore a test
+/// fixture that cannot exhibit the property under test, whatever the platform.
+///
+/// A *real* `php-fpm` is a master over a child pool and answers as many at once as
+/// `pm.max_children` allows, which is the thing `ClientPool` exists for.
 ///
 /// This server can. It accepts, reads a request, sleeps, and replies, all in a
 /// thread per connection, and it deliberately does **not** honour keep-alive: one

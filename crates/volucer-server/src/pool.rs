@@ -5,7 +5,13 @@
 //! (`docs/plan.md` §9):
 //!
 //! - `PHP_FCGI_CHILDREN` relies on `fork()`, so `php-cgi` cannot spawn its own
-//!   children on Windows. One process per slot is therefore mandatory.
+//!   children on Windows. One process per slot is therefore mandatory there.
+//! - On Linux it *can* prefork — measured, not assumed: `n = 4` gives four children
+//!   serving requests round-robin, and `SIGTERM` to the master takes them all down.
+//!   `spawn_slot` sets `PHP_FCGI_CHILDREN = 0` anyway, so one slot is one process on
+//!   both platforms and `workers` stays a number this pool can enforce. The backend
+//!   that does collect prefork's memory saving is `attach`, where a supervisor forks
+//!   and the server dials it rather than hiding children inside a slot.
 //! - Several processes cannot share one port via `SO_REUSEADDR` on Windows, so
 //!   each slot needs its own port.
 //! - FastCGI request ids would allow multiplexing, but `php-cgi` processes

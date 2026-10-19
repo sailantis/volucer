@@ -174,13 +174,30 @@ fflush(STDOUT);
 // That ordering is what makes each slot exact: N children sharing one listener accept unfairly,
 // so one can take two connections and another none - which for volucer means a slot whose
 // connection nobody is reading.
+//
+// **The `SIGCHLD` handler is as load-bearing as the fork.** A child that exits stays a zombie
+// until its parent waits for it, so a supervisor that only accepts and forks grows one per
+// connection - measured at exactly 10 zombies for 10 connections. `WNOHANG` in a loop is what
+// keeps the handler from blocking in the middle of the accept loop.
+pcntl_async_signals(true);
+pcntl_signal(SIGCHLD, static function (): void {
+    while (pcntl_waitpid(-1, $status, WNOHANG) > 0) {
+    }
+});
+
 while (true) {
     $connection = @stream_socket_accept($listener, -1);
     if ($connection === false) {
+        // A signal interrupted the accept, which happens once per exiting child.
         continue;
     }
 
     $pid = pcntl_fork();
+    if ($pid === -1) {
+        fclose($connection);
+
+        continue;
+    }
     if ($pid !== 0) {
         // The master must drop its copy, or the socket never reaches end-of-file when the child
         // exits and one fd leaks per connection.
@@ -392,6 +409,58 @@ fn each_connection_reaches_a_different_forked_child() {
     assert_ne!(
         first, second,
         "two concurrent requests must reach two children, not one"
+    );
+}
+
+/// A supervisor that forks per connection must reap its children, or a
+/// `max_requests`-recycling pool fills the process table with one zombie per connection.
+///
+/// This is not a style check. The measured failure was **exactly 10 zombies for 10
+/// connections**: a supervisor that only accepts and forks is correct as long as nobody
+/// looks, and a deployment that recycles on `max_requests` looks after a few minutes.
+/// `/proc/<pid>/task/<pid>/children` lists the supervisor's own children, so the assertion
+/// is about the process table rather than about what the fixture claims to do.
+#[test]
+fn a_prefork_supervisor_reaps_its_children() {
+    let _serial = serial();
+    require_php!();
+
+    let dir = TempDir::new("zombies");
+    let (supervisor, relay) = supervisor(&dir);
+    let pool = WorkerPool::start_attached("app", &attach_config(relay, 1, Some(1)), None)
+        .expect("attach to the supervisor's relay");
+
+    // Each request recycles the slot, which closes a connection and dials a new one: one
+    // child per request. Without the `SIGCHLD` handler every one of them stays unreaped.
+    for _ in 0..8 {
+        pool.request(&get("/health")).expect("the worker answered");
+    }
+
+    // The pool's own connections are closed by the recycle, so the children are already
+    // exiting when the last request ends. A moment for the kernel to deliver `SIGCHLD`.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let children = format!(
+        "/proc/{}/task/{}/children",
+        supervisor.child.id(),
+        supervisor.child.id()
+    );
+    let Ok(list) = std::fs::read_to_string(&children) else {
+        // `/proc` without `CONFIG_PROC_CHILDREN` is a kernel build this test cannot read.
+        eprintln!("skipping: {children} is unreadable");
+        return;
+    };
+
+    // Pids still listed are running *or* zombie: an exited child stays in this file until
+    // it is reaped, which is exactly the condition under test.
+    let live_or_zombie: Vec<&str> = list.split_whitespace().collect();
+
+    // A supervisor with a working reaper has at most the child currently serving, which is
+    // already closed here, so the honest ceiling is "not one per connection".
+    assert!(
+        live_or_zombie.len() < 4,
+        "the supervisor has {} unreaped children after 8 recycles: {list:?}",
+        live_or_zombie.len()
     );
 }
 
