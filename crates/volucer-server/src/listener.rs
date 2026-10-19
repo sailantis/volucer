@@ -761,6 +761,7 @@ mod tests {
                 volucer_core::config::BackendConfig::External(
                     volucer_core::config::ExternalConfig {
                         socket: "127.0.0.1:1".to_string(),
+                        max_connections: None,
                     },
                 ),
             )]

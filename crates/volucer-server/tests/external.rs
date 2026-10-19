@@ -185,6 +185,10 @@ fn serve_once(stream: Stream, sleep: Duration) {
 }
 
 fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
+    dispatcher_with(socket, root, None)
+}
+
+fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) -> Dispatcher {
     let config = Config {
         server: ServerConfig {
             http: Some("127.0.0.1:8080".to_string()),
@@ -194,6 +198,7 @@ fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
             "fpm".to_string(),
             BackendConfig::External(ExternalConfig {
                 socket: socket.to_string(),
+                max_connections,
             }),
         )]
         .into_iter()
@@ -299,9 +304,73 @@ fn an_external_backend_reuses_its_connection_across_requests() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A `max_connections` cap makes requests wait rather than open more connections.
+///
+/// The assertion is about *arrival*, not throughput: with a cap of 1, four concurrent requests
+/// must reach the server one after another, so the wall time is about four delays instead of
+/// one. The uncapped call is the control — without it this test would pass on any serialising
+/// bug, which is exactly the mistake `concurrent_requests_reach_the_backend_at_the_same_time`
+/// documents. It uses `ConcurrentServer` rather than a real `php-cgi` for the same reason that
+/// one does: a lone `php-cgi` serves a single connection at a time, so it would serialise the
+/// control arm and prove nothing about the cap.
 #[test]
-fn an_external_backend_reconnects_after_the_server_is_replaced() {
+fn a_connection_cap_serialises_requests_instead_of_refusing_them() {
     let _serial = serial();
+
+    const REQUESTS: usize = 4;
+    const SLEEP: Duration = Duration::from_millis(200);
+
+    let server = ConcurrentServer::start(SLEEP);
+
+    let run = |dispatcher: &Dispatcher| {
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..REQUESTS {
+                let dispatcher = &*dispatcher;
+                scope.spawn(move || {
+                    let request = Request {
+                        params: build_params(
+                            &RequestInfo {
+                                method: "POST".to_string(),
+                                uri: "/".to_string(),
+                                ..RequestInfo::default()
+                            },
+                            &Routing::default(),
+                        )
+                        .expect("params build"),
+                        body: b"x".to_vec(),
+                        keep_conn: true,
+                    };
+                    let response = dispatcher.dispatch(&request).expect("served");
+                    // Nothing was refused: a cap that answered 503 would be a different feature.
+                    assert_eq!(200, response.parse_status_headers().0);
+                });
+            }
+        });
+        started.elapsed()
+    };
+
+    let uncapped = dispatcher_with(&server.socket(), std::env::temp_dir().as_path(), None);
+    let overlapping = run(&uncapped);
+
+    let capped = dispatcher_with(&server.socket(), std::env::temp_dir().as_path(), Some(1));
+    let serialised = run(&capped);
+
+    // Loose bounds: this separates "at the same time" from "one after another", and is not a
+    // benchmark. Four sleeps of 200 ms is 800 ms serialised against 200 ms overlapped.
+    assert!(
+        overlapping < Duration::from_millis(600),
+        "without a cap the requests should overlap, took {overlapping:?}"
+    );
+    assert!(
+        serialised > Duration::from_millis(600),
+        "with a cap of 1 the requests must queue, took {serialised:?} \
+         (uncapped took {overlapping:?})"
+    );
+}
+
+#[test]
+fn an_external_backend_reconnects_after_the_server_is_replaced() {    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;

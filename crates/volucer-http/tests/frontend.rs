@@ -508,7 +508,10 @@ fn unreachable_config() -> Config {
         },
         backends: [(
             "fpm".to_string(),
-            BackendConfig::External(volucer_core::config::ExternalConfig { socket }),
+            BackendConfig::External(volucer_core::config::ExternalConfig {
+                socket,
+                max_connections: None,
+            }),
         )]
         .into_iter()
         .collect(),

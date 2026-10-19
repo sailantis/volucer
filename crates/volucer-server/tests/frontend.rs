@@ -258,6 +258,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
     // front-ends must not decide differently.
     let socket_of = |port: u16| volucer_core::config::ExternalConfig {
         socket: format!("127.0.0.1:{port}"),
+        max_connections: None,
     };
     let config = Config {
         server: ServerConfig {
@@ -511,6 +512,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
             "dead".to_string(),
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket: "127.0.0.1:1".to_string(),
+                max_connections: None,
             }),
         )]
         .into_iter()
@@ -716,6 +718,7 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
             "dead".to_string(),
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket: "127.0.0.1:1".to_string(),
+                max_connections: None,
             }),
         )]
         .into_iter()

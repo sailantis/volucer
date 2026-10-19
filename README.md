@@ -171,6 +171,16 @@ it as it reaches any FastCGI server. It measures 35 → 66 MB of PSS for 16 proc
 a cold interpreter per request. Fork buys the memory; only the warm protocol buys the throughput,
 which is what `attach` keeps.
 
+**`external` has no `workers` key, and no pool size for volucer to guess.** One FastCGI connection
+carries one request, so concurrency is one connection per request in flight and the far side's accept
+loop is the limit ? a `php-cgi` with `PHP_FCGI_CHILDREN=16` distributes 64 concurrent requests across
+exactly 16 children, and one with 2 across exactly 2. `max_connections` exists as opt-in
+back-pressure for a front-end that would otherwise pile up faster than the pool drains; it is off by
+default and `0` is refused. `FCGI_GET_VALUES` ? the protocol's own capacity channel ? is reported by
+`volucer check` and deliberately not used at runtime: php-cgi answers it correctly, php-fpm answers
+with an empty result, and neither enforces what it advertises. See the competition repository's
+README for the measurements.
+
 ### `upstream`: a reverse proxy to an HTTP origin
 
 For a runtime that already owns its HTTP loop, `kind = "upstream"` reaches it at its own address and

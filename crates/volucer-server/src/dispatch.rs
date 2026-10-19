@@ -1085,7 +1085,10 @@ mod tests {
         let listener = listener.expect("bind a probe port after 20 attempts");
         let socket = listener.local_addr().expect("address").to_string();
         drop(listener);
-        BackendConfig::External(ExternalConfig { socket })
+        BackendConfig::External(ExternalConfig {
+            socket,
+            max_connections: None,
+        })
     }
 
     fn config_with(backends: &[(&str, BackendConfig)], default: &str) -> Config {
@@ -1530,6 +1533,7 @@ url = "redis://127.0.0.1:6379"
                 "fpm",
                 BackendConfig::External(volucer_core::config::ExternalConfig {
                     socket: socket.to_string(),
+                    max_connections: None,
                 }),
             )],
             "fpm",

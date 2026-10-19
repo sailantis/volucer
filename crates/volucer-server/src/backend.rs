@@ -3,7 +3,7 @@
 //! One enum covers every backend shape from the configuration, so the
 //! dispatcher and both front-ends have exactly one thing to call.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use volucer_core::config::BackendConfig;
 use volucer_fcgi::{Endpoint, Request, Response};
@@ -46,25 +46,34 @@ const MAX_IDLE_CONNECTIONS: usize = 1;
 /// `docs/plan.md` hazard 22 records. This type is the fix: as many connections as
 /// there are requests in flight, each reused when it comes back.
 ///
-/// Connections themselves are not limited, because the number in flight is
-/// already bounded by the front-end's connection limit, and refusing to open a
-/// connection would turn a busy backend into a 503. Only *retention* is capped,
-/// at [`MAX_IDLE_CONNECTIONS`], which see for why the number is one.
+/// Connections are not limited *by volucer* unless [`ExternalConfig::max_connections`]
+/// says so, because the number in flight is already bounded by the front-end's
+/// connection limit and refusing to open a connection turns a busy backend into a
+/// 503. The optional cap is back-pressure for a front-end that would otherwise
+/// pile up faster than the pool can drain, not a declaration of the pool's size —
+/// see `ExternalConfig` for why volucer does not try to discover that.
 ///
-/// Public only because it is a field of the public [`Backend`] enum; every method
-/// below is private, so the only way to a connection is through the backend.
+/// Only *retention* is capped unconditionally, at [`MAX_IDLE_CONNECTIONS`], which
+/// see for why the number is one.
 #[derive(Debug)]
 pub struct ClientPool {
     endpoint: Endpoint,
     /// Warm connections, checked out by `acquire` and returned by `release`.
     idle: Mutex<Vec<volucer_fcgi::Client>>,
+    /// Requests in flight, when the operator asked for a ceiling.
+    ///
+    /// A counter with a condvar rather than an async semaphore, because the request path is
+    /// synchronous: a request over the cap has to *wait*, and waiting is the feature — the
+    /// alternative is another connection, which is what an unbounded client already does.
+    limit: Option<Arc<Limit>>,
 }
 
 impl ClientPool {
-    fn new(endpoint: Endpoint) -> Self {
+    fn new(endpoint: Endpoint, max_connections: Option<usize>) -> Self {
         ClientPool {
             endpoint,
             idle: Mutex::new(Vec::new()),
+            limit: max_connections.map(Limit::new),
         }
     }
 
@@ -79,7 +88,17 @@ impl ClientPool {
     /// sending something. `request_external` recovers from exactly that, so the
     /// pooled connection is handed out as-is rather than probed — a probe would
     /// cost the same round trip as the request it is trying to avoid.
-    fn acquire(&self, backend: &str) -> Result<volucer_fcgi::Client> {
+    ///
+    /// With a `max_connections` cap this waits for a permit first, and the returned
+    /// [`BackendPermit`] gives it back. The permit is held for the whole request, including
+    /// the reconnect a stale connection may need, because the cap is about how many requests
+    /// the backend is asked to do at once — not about how many sockets happen to exist.
+    fn acquire(&self, backend: &str) -> Result<(volucer_fcgi::Client, Option<BackendPermit>)> {
+        let permit = match &self.limit {
+            None => None,
+            Some(limit) => Some(limit.enter().map(|permit| BackendPermit { _permit: permit })?),
+        };
+
         let pooled = {
             let mut idle = self
                 .idle
@@ -88,13 +107,15 @@ impl ClientPool {
             idle.pop()
         };
         if let Some(client) = pooled {
-            return Ok(client);
+            return Ok((client, permit));
         }
 
-        volucer_fcgi::Client::connect(&self.endpoint, None).map_err(|source| ServerError::Worker {
-            backend: backend.to_string(),
-            source,
-        })
+        volucer_fcgi::Client::connect(&self.endpoint, None)
+            .map(|client| (client, permit))
+            .map_err(|source| ServerError::Worker {
+                backend: backend.to_string(),
+                source,
+            })
     }
 
     /// Give a connection back, or drop it when it cannot serve another request.
@@ -122,6 +143,80 @@ impl ClientPool {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         idle.clear();
+    }
+}
+
+/// One request's claim on the backend's `max_connections` budget.
+///
+/// Held for the life of the request and dropped at the end of it, which is what returns the
+/// permit — there is no `release` to forget to call.
+#[derive(Debug)]
+struct BackendPermit {
+    _permit: LimitPermit,
+}
+
+/// A blocking ceiling on how many requests reach one backend at once.
+///
+/// A counter and a condvar, not a semaphore: the request path is synchronous, and a request
+/// over the cap has to *block* — which is the point. Failing it instead would turn a
+/// deliberate back-pressure setting into a source of 503s.
+#[derive(Debug)]
+struct Limit {
+    state: Mutex<LimitState>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+struct LimitState {
+    in_flight: usize,
+    max: usize,
+}
+
+impl Limit {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Limit {
+            state: Mutex::new(LimitState { in_flight: 0, max }),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// Wait until a request is under the cap, then count it.
+    ///
+    /// A poisoned lock is recovered rather than propagated: a panic in one request must not
+    /// wedge every later one behind a condvar nobody will signal again.
+    fn enter(self: &Arc<Self>) -> std::result::Result<LimitPermit, volucer_fcgi::FcgiError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.in_flight >= state.max {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.in_flight += 1;
+        Ok(LimitPermit {
+            limit: Arc::clone(self),
+        })
+    }
+}
+
+/// Releases its place on drop, which is the only way the budget comes back.
+#[derive(Debug)]
+struct LimitPermit {
+    limit: Arc<Limit>,
+}
+
+impl Drop for LimitPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .limit
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight -= 1;
+        self.limit.changed.notify_one();
     }
 }
 
@@ -263,7 +358,7 @@ impl Backend {
                 })?;
                 Ok(Backend::External {
                     name: name.to_string(),
-                    pool: ClientPool::new(endpoint),
+                    pool: ClientPool::new(endpoint, external.max_connections),
                 })
             }
             BackendConfig::SpawnCgi(cgi) => Ok(Backend::SpawnCgi {
@@ -476,7 +571,7 @@ impl Backend {
             unreachable!("only called for the external backend")
         };
 
-        let mut client = pool.acquire(name)?;
+        let (mut client, _permit) = pool.acquire(name)?;
         let reused = client.is_reusable();
 
         for attempt in 0..2 {
@@ -616,6 +711,7 @@ mod tests {
             "fpm",
             &BackendConfig::External(ExternalConfig {
                 socket: "127.0.0.1:9000".to_string(),
+                max_connections: None,
             }),
         )
         .unwrap();
@@ -635,6 +731,7 @@ mod tests {
             "fpm",
             &BackendConfig::External(ExternalConfig {
                 socket: socket.to_string(),
+                max_connections: None,
             }),
         )
         .unwrap_err();

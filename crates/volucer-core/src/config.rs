@@ -2854,6 +2854,27 @@ impl BackendConfig {
         matches!(self, BackendConfig::Worker(_) | BackendConfig::Attach(_))
     }
 
+    /// How many requests this backend can run at once, as a phrase `volucer check` prints.
+    ///
+    /// A *description* rather than a number, because for `external` there is no number: the pool
+    /// belongs to php-fpm or a preforking `php-cgi`, and its size lives in configuration volucer
+    /// cannot read. Printing an invented figure would be worse than printing the rule — and the
+    /// rule is what an operator actually needs, because it says why there is no `workers` key to
+    /// tune. See [`ExternalConfig`] for the measurement behind it.
+    pub fn concurrency(&self) -> &'static str {
+        match self {
+            BackendConfig::Worker(_) | BackendConfig::Attach(_) => "`workers` connections",
+            // One FastCGI connection carries one request, so there is nothing to size: the far
+            // side's accept loop is the limit, and one connection per request in flight is what
+            // reaches it.
+            BackendConfig::External(_) => {
+                "one connection per request in flight; the pool's own max_children is the limit"
+            }
+            BackendConfig::SpawnCgi(_) => "one slot per process, `workers` of them",
+            BackendConfig::Upstream(_) => "the origin's own loop",
+        }
+    }
+
     /// Whether this backend interprets the path as a file to execute.
     ///
     /// The question a route's `skip_stat` turns on, and it is *not* the complement of
@@ -3700,11 +3721,61 @@ impl ChecksumMode {
     }
 }
 
+/// An already-running FastCGI server — php-fpm, or a preforking `php-cgi`.
+///
+/// **There is no pool size to discover and none to enforce**, which is what this type's shape
+/// says. The pool is somebody else's: its size lives in `pm.max_children` or `PHP_FCGI_CHILDREN`,
+/// in configuration volucer has no access to.
+///
+/// `FCGI_GET_VALUES` is the protocol's capacity channel and it is worth knowing what each server
+/// does with it, because the two PHP ones disagree — measured, not assumed:
+///
+/// | server | asked for `FCGI_MAX_CONNS` / `FCGI_MAX_REQS` |
+/// | --- | --- |
+/// | preforking `php-cgi` | answered, and correct: `4` for `PHP_FCGI_CHILDREN=4` |
+/// | `php-fpm` | answered with **nothing** — a present but empty result |
+///
+/// Nor does either *enforce* the figure: a `php-cgi` advertising 4 served 32 simultaneous requests
+/// across exactly 4 children with zero refusals, queuing the excess in the children's backlog. So
+/// the number is a hint about the pool's width, never a limit a client is held to.
+///
+/// Which is why volucer does not query it at runtime. There is a `get_values` client and it is
+/// deliberately not wired into `serve`: a discovery round trip on the accept path, against a
+/// server that answers `max_connections` with an empty result and needs 1.5 s after start before
+/// it answers anything at all, would trade a reliable queue for an unreliable gauge. It is
+/// available in `volucer check`, where a human is waiting, and only on request.
+///
+/// What volucer does instead is [`ExternalConfig::max_connections`]: an operator-supplied ceiling,
+/// off by default, for the case where a misbehaving front-end would otherwise pile up connections
+/// faster than the pool can drain them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalConfig {
     /// php-fpm listener: `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`.
+    ///
+    /// Also accepts a preforking `php-cgi -b`, which is the same FastCGI protocol and the same
+    /// fork model as php-fpm. It is reachable this way with no extra mode; what it does not offer
+    /// is the warm channel, so it measures like `spawn_cgi` rather than like `worker`.
     pub socket: String,
+
+    /// How many requests may be in flight against this backend at once. **Unset means no cap.**
+    ///
+    /// This is a *back-pressure* control, not a pool-size declaration: volucer still does not know
+    /// how many children the far side has, and setting this above that number changes nothing.
+    /// Setting it below is what makes it useful — a request beyond the cap waits for a slot
+    /// instead of opening another connection, which turns an unbounded pile-up into a queue the
+    /// front-end's own limits can drain.
+    ///
+    /// Unset is the default because the far side already queues: a `php-cgi` advertising 4 served
+    /// 32 simultaneous requests across exactly 4 children with no refusals. A cap therefore adds a
+    /// wait without removing anything a correct deployment would notice, and on a *wrong* one (a
+    /// front-end opening thousands of connections) it is the only thing that helps.
+    ///
+    /// `0` is refused rather than read as "no cap". `Option::None` already means that, and a zero
+    /// here would otherwise be a backend that can never serve a request, discovered on the first
+    /// one rather than at startup.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
 }
 
 /// A worker pool volucer connects to rather than starts.
@@ -4936,6 +5007,16 @@ impl Config {
             BackendConfig::External(e) => {
                 parse_listener(&e.socket)
                     .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
+                // `0` is refused rather than read as "unlimited". `max_connections` is an
+                // `Option`, so absent is how "no cap" is spelled; a zero would otherwise be a
+                // backend that can never serve anything, and it would be discovered on the first
+                // request instead of here.
+                if e.max_connections == Some(0) {
+                    return bad(format!(
+                        "backends.{name}.max_connections is 0, so no request could ever be \
+                         served; remove the key to leave the backend uncapped, which is the default"
+                    ));
+                }
             }
             BackendConfig::Attach(a) => {
                 // Everything checkable is checkable here: a relay address is a path or an
@@ -5516,6 +5597,58 @@ pub fn parse_listener(spec: &str) -> std::result::Result<Listener, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `max_connections` is off by default, and `0` is refused rather than read as "off".
+    ///
+    /// The two halves are one test because the mistake they prevent is the same one: a number
+    /// that means something other than what it looks like. `None` is how "no cap" is spelled, so
+    /// a `0` would be a backend that can never serve anything — and the failure would surface on
+    /// the first request rather than at startup.
+    #[test]
+    fn an_external_backend_is_uncapped_by_default_and_refuses_a_zero() {
+        let uncapped = r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+
+[backends.app]
+kind = "external"
+socket = "127.0.0.1:9000"
+"#;
+        let config = Config::from_toml(uncapped).expect("the fixture parses");
+        config.validate().expect("no cap is valid");
+        let external = config
+            .backends
+            .get("app")
+            .and_then(|backend| match backend {
+                BackendConfig::External(external) => Some(external),
+                _ => None,
+            })
+            .expect("the backend is external");
+        assert_eq!(
+            None, external.max_connections,
+            "the key being absent must mean no cap, not some default"
+        );
+
+        let zero = uncapped.replace(
+            r#"socket = "127.0.0.1:9000""#,
+            "socket = \"127.0.0.1:9000\"\nmax_connections = 0",
+        );
+        let err = Config::from_toml(&zero)
+            .expect("the file parses; the value is what is wrong")
+            .validate()
+            .expect_err("a cap of zero must not validate");
+        let message = err.to_string();
+        assert!(
+            message.contains("backends.app.max_connections"),
+            "the message names the key: {message}"
+        );
+        assert!(
+            message.contains("remove the key"),
+            "and points at the spelling of \"no cap\": {message}"
+        );
+    }
 
     /// A config with ACME, as a deployment would write it.
     fn acme_config(acme_body: &str) -> Config {

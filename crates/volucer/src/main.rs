@@ -2295,6 +2295,11 @@ fn check(
             "      per-request reset: {}",
             backend.request_scope().describe()
         );
+        // Concurrency, because it is the first thing an operator tunes and the one place where
+        // the answer differs between kinds for a reason that is invisible in the configuration.
+        // `external` has no `workers` key at all, and saying so is more useful than leaving the
+        // absence to be noticed.
+        println!("      concurrency:       {}", backend.concurrency());
         // The relay is the one thing an operator has to look at for an `attach` backend, and it
         // is the one thing volucer does not own: nothing in this process started it, so "is it
         // there" is a question for `preflight` rather than for `check`. Printing the address is
@@ -2302,6 +2307,26 @@ fn check(
         if let volucer_core::config::BackendConfig::Attach(attach) = backend {
             println!("      relay:             {}", attach.relay.trim());
             println!("      connections:       {}", attach.workers);
+        }
+        // And for `external`, the address, for the same reason: it is the other process's socket,
+        // nobody in this one created it, and an operator reading `check` should be able to see
+        // which php-fpm this backend is actually pointed at — plus the two things that decide
+        // whether the far side will keep up.
+        if let volucer_core::config::BackendConfig::External(external) = backend {
+            println!("      socket:            {}", external.socket.trim());
+            println!(
+                "      max connections:   {}",
+                match external.max_connections {
+                    Some(max) => format!("{max} (requests beyond it wait)"),
+                    None => "none (one connection per request in flight)".to_string(),
+                }
+            );
+            // What the far side says about itself, when it says anything. This is the only
+            // place volucer asks: a human is waiting, a round trip to a socket the operator
+            // just named is what they asked for, and the answer is printed rather than acted
+            // on. `serve` never queries it — see `ExternalConfig` for why a gauge that
+            // php-fpm answers with an empty result is not something to trust on the accept path.
+            print_advertised_capacity(external);
         }
         // A `kind = "upstream"` backend was reported here as "not served yet" for exactly one
         // commit — the one that built the client before any listener could reach it — and that line
@@ -2633,6 +2658,58 @@ fn check(
 
     println!("configuration OK");
     Ok(())
+}
+
+/// Ask an already-running FastCGI server what it says about its own capacity.
+///
+/// `FCGI_GET_VALUES` is the protocol's own channel for this, and the two PHP servers behave
+/// differently enough that the answer is worth printing rather than assuming — measured:
+/// a preforking `php-cgi` answers `FCGI_MAX_CONNS=4` for `PHP_FCGI_CHILDREN=4`, and `php-fpm`
+/// answers with an empty result even though `fpm_php.c` fills the same variables in.
+///
+/// **Only called from `check`.** It is a round trip to a socket the operator named, with a
+/// short timeout, made once while a human waits. `serve` never calls it: php-fpm only answers
+/// after a child has been forked to serve the connection (1.5 s after start on the bench host),
+/// so on the accept path this would trade a reliable queue for an unreliable gauge. The two
+/// numbers are reported, never acted on.
+fn print_advertised_capacity(external: &volucer_core::config::ExternalConfig) {
+    use std::time::Duration;
+
+    let Ok(endpoint) = volucer_fcgi::Endpoint::parse(&external.socket) else {
+        return;
+    };
+    let mut client = match volucer_fcgi::Client::connect(&endpoint, Some(Duration::from_secs(2))) {
+        Ok(client) => client,
+        // Not a warning: `preflight` already reports an unreachable socket, and `check` is not
+        // the place to say it twice in two different ways.
+        Err(_) => return,
+    };
+
+    let mut reported = Vec::new();
+    for name in [&b"FCGI_MAX_CONNS"[..], &b"FCGI_MAX_REQS"[..]] {
+        match client.get_values([name]) {
+            Ok(values) => {
+                for (key, value) in values {
+                    if !value.is_empty() {
+                        reported.push(format!(
+                            "{}={}",
+                            String::from_utf8_lossy(&key),
+                            String::from_utf8_lossy(&value)
+                        ));
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if reported.is_empty() {
+        println!(
+            "      advertised:        nothing (the server answers GET_VALUES with an empty result)"
+        );
+    } else {
+        println!("      advertised:        {}", reported.join(", "));
+    }
 }
 
 #[cfg(test)]
