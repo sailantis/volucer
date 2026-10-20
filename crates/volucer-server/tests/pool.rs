@@ -22,6 +22,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
         base_port,
         socket: None,
         max_requests: None,
+        children: 0,
     }
 }
 
@@ -71,8 +72,7 @@ fn fixture(name: &str) -> (PathBuf, String) {
 /// and `php-cgi`'s own `-b` is given a bare path rather than `host:port`.
 #[cfg(unix)]
 #[test]
-fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
-    let _serial = serial();
+fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;
@@ -87,6 +87,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
         base_port: 19_900,
         socket: Some(format!("unix:{prefix}")),
         max_requests: None,
+        children: 0,
     };
 
     let mut pool = CgiPool::start("unix-test", &config).expect("a unix-socket pool starts");
@@ -156,6 +157,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
         base_port: 19_920,
         socket: Some(prefix.clone()),
         max_requests: None,
+        children: 0,
     };
 
     let mut pool = CgiPool::start("pipe-test", &config).expect("a pipe pool starts");
@@ -206,6 +208,7 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
         base_port: 19_950,
         socket: Some(format!("unix:{prefix}")),
         max_requests: None,
+        children: 0,
     };
 
     let mut pool = CgiPool::start("unix-restart", &config).expect("pool starts");
@@ -229,9 +232,108 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `children > 0` must actually let one slot serve several requests at once.
+///
+/// **This is the claim Part B exists for, and it is the one a throughput number cannot
+/// establish.** With `children = 0` the slot's permit count is 1 and a second request blocks
+/// until the first finishes — which is correct and is what every earlier test already
+/// covers. With `children = 4` four requests must be *in flight together* against one
+/// address, and the only way to observe that is for the script to sleep: a serialised slot
+/// takes four sleeps, a concurrent one takes about one.
+///
+/// The negative control is the `children = 0` half: if the pool were secretly concurrent
+/// already, that half would be fast and would fail — which is what makes the timings mean
+/// something rather than both being "fast enough".
 #[test]
-fn starts_a_pool_and_serves_requests_through_every_slot() {
+fn children_lets_one_slot_serve_several_requests_at_once() {
+    use std::time::Instant;
+
     let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(2) else {
+        eprintln!("skipping: no run of free ports");
+        return;
+    };
+
+    const SLEEP_MS: u64 = 400;
+    const AT_ONCE: usize = 4;
+
+    let root = std::env::temp_dir().join(format!("volucer-pool-children-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    // Long enough that serialisation is unmistakable, short enough to keep the test quick.
+    //
+    // No trailing `$` and no heredoc: the first version of this fixture ended with a stray `$`,
+    // which made the script a parse error — php-cgi then answered in microseconds and the
+    // *control* assertion below is the only thing that noticed. A test whose fixture does not
+    // execute measures the interpreter's error path, which is exactly the shape plan hazard 34
+    // records.
+    let script = write_script(
+        &root,
+        "index.php",
+        &format!("<?php usleep({}); echo 'SLEPT';", SLEEP_MS * 1000),
+    );
+    assert!(script.is_file(), "the fixture script exists");
+
+    let time = |children: u32, port: u16| -> (Duration, String) {
+        let mut config = config_for(&binary, 1, port);
+        config.children = children;
+        let mut pool = CgiPool::start("children", &config).expect("pool starts");
+        let request = request_for(&root, "index.php", "");
+
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..AT_ONCE {
+                let pool = &pool;
+                let request = &request;
+                scope.spawn(move || {
+                    let response = pool.request(request).expect("a request was served");
+                    response.check_protocol().expect("completed");
+                    String::from_utf8_lossy(&response.stdout).into_owned()
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        // One more request to read the body, because a `scope` cannot return the values from
+        // its threads without collecting them and this is simpler.
+        let response = pool.request(&request).expect("a request was served");
+        let body = String::from_utf8_lossy(&response.stdout).into_owned();
+        pool.shutdown();
+        (elapsed, body)
+    };
+
+    // The control first, on its own port so a lingering socket cannot confuse the second.
+    let (serial, body) = time(0, base);
+    // The fixture must actually run. A parse error answers instantly, which makes the control
+    // assertion below fail *and* would make the preforked half look fast for the wrong reason.
+    assert!(
+        body.contains("SLEPT"),
+        "the fixture did not execute — a parse error would make both halves meaningless: {body:?}"
+    );
+    assert!(
+        serial >= Duration::from_millis(SLEEP_MS * AT_ONCE as u64 * 3 / 4),
+        "children=0 served {AT_ONCE} requests in {serial:?}, which is faster than {AT_ONCE} \
+         serialised {SLEEP_MS} ms requests — the control is not controlling anything"
+    );
+
+    let (preforked, _) = time(AT_ONCE as u32, base + 1);
+    // Half the serial time is a generous bound: four requests against four children should be
+    // about one sleep plus overhead, but CI machines are slow and the assertion should not
+    // flake on a bound the property does not need.
+    assert!(
+        preforked * 2 < serial,
+        "children={AT_ONCE} served {AT_ONCE} requests in {preforked:?} against {serial:?} \
+         serialised — the slot is still one request at a time, so `children` is not taking effect"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starts_a_pool_and_serves_requests_through_every_slot() {    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;

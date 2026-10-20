@@ -136,6 +136,7 @@ fn config(workers: u32) -> WorkerConfig {
         services: Vec::new(),
         grpc_services: Vec::new(),
         transport: Default::default(),
+        socket: None,
     }
 }
 
@@ -172,6 +173,7 @@ fn get(uri: &str) -> Request {
 fn socket_config(workers: u32) -> WorkerConfig {
     WorkerConfig {
         transport: volucer_core::config::WorkerTransport::Socket,
+        socket: None,
         ..config(workers)
     }
 }
@@ -185,6 +187,7 @@ fn socket_config(workers: u32) -> WorkerConfig {
 fn pipe_config(workers: u32) -> WorkerConfig {
     WorkerConfig {
         transport: volucer_core::config::WorkerTransport::Pipe,
+        socket: None,
         ..config(workers)
     }
 }
@@ -740,6 +743,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         services: Vec::new(),
         grpc_services: Vec::new(),
         transport: Default::default(),
+        socket: None,
     };
     let pool = WorkerPool::start("test", &config).expect("pool starts");
 
@@ -853,6 +857,7 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         services: Vec::new(),
         grpc_services: Vec::new(),
         transport: Default::default(),
+        socket: None,
     };
 
     let err = WorkerPool::start("test", &config).unwrap_err();
@@ -1019,6 +1024,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         services: Vec::new(),
         grpc_services: Vec::new(),
         transport: Default::default(),
+        socket: None,
     };
     let pool = WorkerPool::start("test", &config).expect("pool starts");
 
@@ -1143,6 +1149,7 @@ fn slow_pool(tag: &str, workers: u32, micros: u64, max_wait: Option<Duration>) -
         services: Vec::new(),
         grpc_services: Vec::new(),
         transport: Default::default(),
+        socket: None,
     };
     let mut pool = WorkerPool::start("test", &config).expect("pool starts");
     pool.set_max_wait(max_wait);
@@ -2074,6 +2081,7 @@ $worker->consume(static function (Job $job, Worker $worker): string|bool|null {{
         prefetch: 2,
         checksum: Default::default(),
         transport: Default::default(),
+        socket: None,
         working_dir: None,
         env: Default::default(),
     };
@@ -2614,6 +2622,7 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
         services: Vec::new(),
         grpc_services: Vec::new(),
         transport: Default::default(),
+        socket: None,
     };
     let pool = match WorkerPool::start("bound", &config) {
         Ok(pool) => pool,

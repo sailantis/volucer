@@ -84,6 +84,7 @@ use handshake::{boot, Link, Ready};
 use request::{encode_head, text_param};
 use response::render;
 use spec::Spec;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -446,6 +447,16 @@ pub struct WorkerPool {
     /// A plain `Mutex`, not an async one: the write is once per worker per metric and the read is once
     /// per scrape, so neither side is on a hot path, and nothing awaits inside the lock.
     pending_metrics: Mutex<PendingMetrics>,
+    /// The unix socket paths this pool bound, and therefore must unlink on the way out.
+    ///
+    /// Empty for a pipe, for an attached pool, and for a socket-transport pool on a loopback
+    /// port — the three cases where volucer binds no file. Empty is also what makes the cleanup
+    /// loop below free rather than guarded by a `cfg`.
+    ///
+    /// Collected from the spec at startup rather than accumulated per slot, so a path can only be
+    /// removed by the pool that asked for it: a second pool pointed at the same prefix is a
+    /// configuration error the bind reports, not a shutdown that unlinks somebody else's socket.
+    socket_paths: Vec<PathBuf>,
     /// Held for the life of the pool; dropping it reaps every worker.
     guard: LifecycleGuard,
     /// What this pool's workers may call, or `None` to grant nothing.
@@ -490,20 +501,17 @@ impl WorkerPool {
     /// sensible for it to grant. A consumer needing something from the server asks *through the
     /// application*, not through its own channel.
     pub fn start_consumers(name: &str, config: &JobsPoolConfig) -> Result<Self> {
-        Self::start_with(
+        // Through the spec rather than by hand-building a `WorkerConfig`: `Spec::from_jobs_config`
+        // is the one place the translation lives, so a field added to `[jobs.pool]` cannot be
+        // carried into the pool by one path and forgotten by the other. This is the same shape
+        // `start_with` takes, minus the call handler a consumer never has.
+        let spec = Spec::from_jobs_config(name, config)?;
+        Self::start_spec(
             name,
-            &WorkerConfig {
-                command: config.command.clone(),
-                workers: config.workers,
-                memory_limit_mb: config.memory_limit_mb,
-                max_requests: config.max_jobs,
-                working_dir: config.working_dir.clone(),
-                env: config.env.clone(),
-                services: Vec::new(),
-                grpc_services: Vec::new(),
-                checksum: config.checksum,
-                transport: config.transport,
-            },
+            spec,
+            worker_count(config.workers),
+            config.max_jobs,
+            config.memory_limit_mb,
             None,
         )
     }
@@ -575,20 +583,20 @@ impl WorkerPool {
         })?;
 
         let mut slots = Vec::with_capacity(count as usize);
-        for _ in 0..count {
+        for index in 0..count {
             // A failure here returns early, and `slots` is dropped — which kills
             // every worker that did start, so a partial pool leaves nothing
             // behind. That is why the booted workers are collected as `Slot`s and not
             // as the `Ready`s `boot` returns: `Slot::drop` reaps the process and
             // `Ready` has no `Drop` at all, so a vector of `Ready`s would leak every
             // PHP child this loop had already started.
-            slots.push(Mutex::new(Slot::from_boot(boot(
-                name,
-                &spec,
-                &guard,
-                call_handler.as_ref(),
-            )?)));
+            let ready = boot(name, &spec, index, &guard, call_handler.as_ref())?;
+            slots.push(Mutex::new(Slot::from_boot(ready, index)));
         }
+        // Collected after the loop rather than inside it, from the same spec that bound
+        // them, so the paths a pool unlinks are exactly the ones it asked to bind. Doing it
+        // inside the loop would need a second `?` path that also cleans up.
+        let socket_paths: Vec<PathBuf> = (0..count).filter_map(|i| spec.worker_socket(i)).collect();
 
         let pool = WorkerPool {
             name: name.to_string(),
@@ -612,6 +620,7 @@ impl WorkerPool {
             memory_limit_bytes: memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
             max_requests,
             pending_metrics: Mutex::new(PendingMetrics::default()),
+            socket_paths,
             guard,
             call_handler,
         };
@@ -620,7 +629,9 @@ impl WorkerPool {
             backend = %pool.name,
             workers = pool.slots.len(),
             // The command for a spawned pool, the relay for an attached one: the thing an
-            // operator looks for first when a pool misbehaves.
+            // operator looks for first when a pool misbehaves. A socket-transport pool's
+            // address is part of it, because the transport is invisible on the wire and the
+            // address is the one thing that has to be checked when no worker connects.
             target = %pool.spec.describe(),
             "worker pool started"
         );
@@ -918,6 +929,7 @@ impl WorkerPool {
             let outcome = respawn(
                 &self.name,
                 &self.spec,
+                index as u32,
                 &self.guard,
                 self.call_handler.as_ref(),
                 &mut slot,
@@ -1220,6 +1232,7 @@ impl WorkerPool {
             let outcome = respawn(
                 &self.name,
                 &self.spec,
+                index as u32,
                 &self.guard,
                 self.call_handler.as_ref(),
                 &mut slot,
@@ -1393,6 +1406,7 @@ impl WorkerPool {
         let outcome = respawn(
             &self.name,
             &self.spec,
+            index as u32,
             &self.guard,
             self.call_handler.as_ref(),
             &mut slot,
@@ -1431,6 +1445,22 @@ impl WorkerPool {
             slot.stop();
         }
         self.slots.clear();
+        // A stopped pool should not leave litter behind, and on Linux the unlinked file is
+        // what releases the name for the next run. `php-cgi` unlinks a stale path before
+        // binding, so a leftover is not fatal — but only for that backend, and the worker
+        // transport has no such reclamation of its own.
+        for path in std::mem::take(&mut self.socket_paths) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!(
+                    backend = %self.name,
+                    path = %path.display(),
+                    %err,
+                    "could not remove a worker socket"
+                ),
+            }
+        }
     }
 
     /// Take a slot, or refuse the request once `max_wait` is up.
@@ -1763,13 +1793,14 @@ fn invoke_job(
 fn respawn(
     name: &str,
     spec: &Spec,
+    index: u32,
     guard: &LifecycleGuard,
     call_handler: Option<&Arc<MethodRegistry>>,
     slot: &mut Slot,
 ) -> Result<()> {
     slot.terminate();
-    let ready = boot(name, spec, guard, call_handler)?;
-    *slot = Slot::from_boot(ready);
+    let ready = boot(name, spec, index, guard, call_handler)?;
+    *slot = Slot::from_boot(ready, index);
     Ok(())
 }
 
@@ -1786,7 +1817,7 @@ fn replace(
     call_handler: Option<&Arc<MethodRegistry>>,
     slot: &mut Slot,
 ) {
-    if let Err(err) = respawn(name, spec, guard, call_handler, slot) {
+    if let Err(err) = respawn(name, spec, slot.index, guard, call_handler, slot) {
         tracing::error!(
             backend = %name,
             pid = slot.link.id(),
@@ -1804,6 +1835,13 @@ fn replace(
 /// slot's lock is what keeps two requests off one worker.
 #[derive(Debug)]
 struct Slot {
+    /// This slot's position in the pool.
+    ///
+    /// Kept on the slot rather than passed to every replacement, because a replacement has to
+    /// reach the *same* address: on a unix socket the index is part of the path, so a
+    /// `respawn` that did not know it would bind a second socket and leave the pool dialling
+    /// the first.
+    index: u32,
     link: Link,
     exchange: Option<ChannelExchange>,
     /// The handshake answer, kept so a diagnostic can say which PHP and SAPI the
@@ -1833,8 +1871,9 @@ struct Slot {
 }
 
 impl Slot {
-    fn from_boot(ready: Ready) -> Self {
+    fn from_boot(ready: Ready, index: u32) -> Self {
         Slot {
+            index,
             link: ready.link,
             exchange: Some(ready.exchange),
             hello: ready.ack,

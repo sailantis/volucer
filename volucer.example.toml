@@ -412,6 +412,30 @@ working_dir = "."
                           # was 21x on the whole route. Set it only to override - and
                           # note a worker must call `Volucer\Worker::connect()`, not
                           # `create()`, to read a socket. See plan hazard 46.
+#
+# socket = "unix:/run/volucer/worker"
+                          # WHERE the socket transport listens. Only meaningful with
+                          # `transport = "socket"`, and refused beside "pipe" rather than
+                          # ignored -- a key read by nothing is the shape `spawn_fpm` was
+                          # removed for. Omitted means the loopback ephemeral port this
+                          # backend has always used, so an existing configuration is
+                          # unchanged.
+                          #
+                          # A PREFIX, not a finished path: worker i listens on
+                          # /run/volucer/worker.<i>.sock. One socket per worker is what
+                          # lets a worker be recycled, counted and reached on its own; a
+                          # shared socket would be one queue and `workers` would stop
+                          # meaning anything. The same suffix rule as `spawn_cgi`'s
+                          # `socket`.
+                          #
+                          # The directory must exist and be writable by the user running
+                          # volucer. `unix:` is required: a bare path is *relative*, so the
+                          # value copied from an `external` backend would bind a file named
+                          # `unix:/run/...` in the working directory rather than failing.
+                          #
+                          # There is no `\\.\pipe\` form here, unlike `spawn_cgi`: the
+                          # worker protocol needs the connection as a reader and a writer at
+                          # once, and a named pipe cannot be cloned into two halves.
 
 # ---------------------------------------------------------------------------
 # System php-fpm: the normal Linux/macOS deployment. volucer does not manage
@@ -557,6 +581,31 @@ base_port = 19001
 # this is a PREFIX — slot 0 becomes \\.\pipe\volucer-cgi.0 and slot 1 the next.
 # `bind_host`/`base_port` are then unused.
 # socket = '\\.\pipe\volucer-cgi'
+
+# `children = 0`
+# PHP processes per slot, sharing that slot's listening socket. 0 -- the default --
+# means one, which is what every configuration written before this key meant.
+#
+# This is PHP_FCGI_CHILDREN, and it is the measured memory win: with the PHP process
+# count held equal at 16, one master with 16 children measured 68 MB PSS against
+# 312 MB for 16 separate slots, with throughput within noise and slightly ahead --
+# because the compiled scripts exist once instead of sixteen times.
+#
+# It was 0 for a long time because a slot that hides children cannot be counted,
+# recycled or killed as a unit. What changed is that the pool now declares the slot's
+# capacity and its address, so the children are no longer hidden from it. What has
+# not changed is that php-cgi cannot multiplex requests on one connection, so this is
+# the only way to get more than one concurrent request out of a slot.
+#
+# `max_requests` stays slot-wide: each child counts its own requests and php-cgi
+# gives no way to read those from outside, so the count the pool acts on is the
+# slot's, and the whole group is replaced together.
+#
+# `children` counts CHILDREN, not processes: php-cgi forks them in addition to itself,
+# so `workers = m` and `children = n` is m masters plus m*n children -- m*(n+1)
+# processes. `children = 1` is therefore mapped to 0, because one child on top of one
+# master is two processes for a slot that still serves one request at a time. Size
+# `children` to the cores and `workers` to the memory you have.
 
 # ---------------------------------------------------------------------------
 # Metrics, in the Prometheus text format. The presence of this table is what

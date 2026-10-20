@@ -755,6 +755,7 @@ mod tests {
                 services: Vec::new(),
                 grpc_services: Vec::new(),
                 transport: Default::default(),
+                socket: None,
             }),
         )
         .unwrap_err();

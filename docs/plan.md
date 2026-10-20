@@ -2719,8 +2719,12 @@ request per connection.
   — **Corrected in hazard 17:** `fork()` is not the mechanism (Windows php-cgi re-spawns itself
   with `CreateProcess`, and does honour `PHP_FCGI_CHILDREN`), but the *conclusion* holds and one
   process per port is still right: the children share one socket, so the slot cannot be recycled,
-  counted or killed as a unit. The pool now forces `PHP_FCGI_CHILDREN=0` to say so explicitly
-  rather than relying on the host not having exported it.
+  counted or killed as a unit. **Superseded by hazard 86, which measured the trade and reversed
+  the conclusion for the case it was arguing against:** the children can be counted, recycled and
+  killed as a unit — the unit is the slot, and the pool declares its capacity — and forked
+  children share the OPcache segment, which measured **68 MB against 312 MB for the same 16 PHP
+  processes** (and 44 MB against 311 MB in an earlier, uncommitted run). `children` is now a real
+  key, defaulting to `0` so nothing changes unless an operator asks for it.
 - **The plan lives in `docs/` in the repo** so it can be opened and commented on in VS Code,
   which was the friction that blocked review of the previous plan.
 
@@ -2956,10 +2960,11 @@ had been exercised:
   pointed an `external` backend at a lone `php-cgi -b` and expected four concurrent
   responses. A single Linux `php-cgi` serves its connections **one at a time**: it takes
   the next request on the connection it is already holding, because the client asked for
-  keep-alive, and `PHP_FCGI_CHILDREN` is read only in the Windows branch of
-  `sapi/cgi/cgi_main.c` (`cgi_main.c:1972`; the Linux path calls
-  `fcgi_init_request(fcgi_fd, NULL, NULL, NULL)` at line 1969 with no accept hooks), so
-  there is no child pool to distribute to. The four request threads sat in `recv` inside
+  keep-alive, and there are no children to distribute to. **The mechanism originally stated
+  here was wrong and is corrected in hazard 86:** `PHP_FCGI_CHILDREN` *is* honoured on
+  Linux, by `fork()` at `cgi_main.c:1995-2081`, with the `CreateProcess` path at
+  `2083-2216` for Windows. The *observation* stands — with no children there is no pool to
+  distribute to — and was confirmed by the same probe the correction came from. The four request threads sat in `recv` inside
   `Stream::read` for **17 minutes** with no timeout set — three in `wait_woken`, one on
   the scope's join futex. Measured directly: one request passes in 0.3 s, **two hang past
   60 s**. A real `php-fpm` is a master over a child pool and answers as many at once as
@@ -5179,3 +5184,82 @@ is not right for, and a benchmark of one arm cannot see it.** The published swee
 `new-nostat` arm because the layer did not exist when it ran. A variant that differs by one setting
 is cheap evidence, and it is the difference between "the new code is slower" and "the new default
 is slower" — two claims that point at different fixes.
+
+
+**86. `spawn_cgi` can prefork, and suppressing it cost 4.5× the memory — because the reason for
+suppressing it was only half true.** `children = n` on a `spawn_cgi` backend sets
+`PHP_FCGI_CHILDREN=n`, and the pool admits `n` concurrent requests per slot instead of one.
+
+**The measurement, taken before any of it was written.** `external` already attaches to a
+preforking `php-cgi -b`, so the question "is this worth building?" was answerable with no code
+change. Shapes with the PHP process count held equal at 16, opcache on — the production case and
+the only case where shared compiled scripts exist — interleaved rounds, `wrk -t4`, 8 s per point,
+`/items`, on WSL2 with 12 cores and PHP 8.3.35:
+
+| shape | PHP procs | PSS after load | rps @ c=64 | pids that served |
+| --- | --- | --- | --- | --- |
+| 16 slots × 1 child (**the old shape**) | 16 | **300 – 313 MB** | 3668 / 3850 | 16 |
+| 1 master × 16 children | 16 | **68 – 70 MB** | 4543 / 4170 | 16 |
+| 1 master × 4 children | 4 | 27 – 37 MB | 1649 / 2281 / 597 | 4 |
+
+The first two rows are the two rounds in
+`volucer-competition/results/prefork-vs-slots.tsv`, which is the committed evidence and the file to
+check these numbers against. **The third row is from a separate earlier run and is not in that
+TSV** — it is here because four processes cannot fill twelve cores, and a shape that is correctly
+*worse* is what makes the C16 row credible rather than a lucky run. Its three rps figures are the
+three concurrency points it was measured at, not three rounds.
+
+**4.5–4.7× less memory for the same processes, throughput within noise and slightly ahead.** That
+is the OPcache segment existing once instead of sixteen times. An earlier run of the same
+comparison, at 10 s per point over 3 rounds, measured 311–314 MB against **44 MB** — the same
+conclusion with a larger gap. That run was not committed; it is quoted because the gap is larger,
+and the 8-second run above is the one the TSV records.
+
+**The reason `children` was forced to `0` was real but narrower than the comment said.** A slot
+that hides children cannot be counted, recycled or killed as a unit — true. What made it
+*fixable* rather than a permanent trade is that the pool can declare both halves of the contract:
+the slot's capacity (`SlotPermits`, `children.max(1)`) and the slot's address. `children` is then a
+number volucer chose and can enforce, not one `php-cgi` chose for itself.
+
+**Four things the measurement and the source corrected, each of which would have been a wrong
+design:**
+
+- **`PHP_FCGI_CHILDREN` is not Windows-only.** Hazard 43 and
+  `volucer-competition/scripts/diag-cgi-concurrency.sh` both said `cgi_main.c` reads it under
+  `#ifdef PHP_WIN32`. It does not: `cgi_main.c:1995-2081` is the `#ifndef PHP_WIN32` `fork()`
+  prefork path and `2083-2216` is the `CreateProcess` path. Hazard 43's *observation* — a lone
+  `php-cgi -b` serves one connection at a time — is correct, and the cause is simpler: with no
+  children there is nothing to distribute to. §9's "`PHP_FCGI_CHILDREN` relies on `fork()` and
+  cannot work [on Windows]", already marked corrected in hazard 17, is now corrected completely.
+- **`SIGKILL` to a preforked master leaves every child alive.** `fastcgi_cleanup`, the handler that
+  signals `-pgroup`, is installed only for `SIGTERM`/`SIGINT`/`SIGQUIT` (`cgi_main.c:2007-2016`).
+  Measured: 16 children before, 17 after. **Not a blocker**, because volucer never signals a master
+  by pid — `lifecycle::kill` derives the group and calls `killpg`.
+- **`killpg` does reach them, and the reason is an ignored error.** Reproduced volucer's exact
+  spawn shape: `process_group(0)` makes the child a process-group leader, and `cgi_main.c:2001`
+  then calls `setsid()`, which **fails with `EPERM` on a group leader**. The return value is not
+  checked, so the group never moves and `pgid == pid` still holds. Measured: 16 children before a
+  `killpg`, 0 after. The existing teardown was already sufficient; Part B needed to keep using it,
+  not replace it.
+- **`children = 1` is not `1`.** php-cgi spawns CHILDREN *in addition to itself*, so writing `1`
+  starts two processes — a master and a child — for a slot that can still serve one request,
+  because one child accepts one connection. Measured: two processes, one pid answering. The pool
+  now maps `children <= 1` to `0` (`SpawnCgiConfig::fcgi_children`), so `children = 1` is a
+  truthful alias for the default rather than a setting that silently costs double.
+
+**Two harness defects found while measuring, both of the shape hazard 34 records.** A probe that
+cannot observe the thing it claims to test:
+- **Counting by the wrapper's path counts nothing.** The bench wrapper `exec`s `php-cgi`, so the
+  wrapper's path appears in no process's `cmdline`; `pkill -f php-cgi-wrapped` found zero for a
+  reason unrelated to teardown, and children from every round accumulated. Counting by the `-b`
+  argument is what identifies the whole tree.
+- **A sequential pid probe reports one pid whatever the shape.** `external` retains
+  `MAX_IDLE_CONNECTIONS = 1`, so twenty sequential probes reuse one warm connection and one child
+  answers all of them — which agreed with the hypothesis the probe existed to test. 128
+  simultaneous requests, each body in its own file (the body is a bare pid with no trailing
+  newline, so `cat`ing them turns `447650` and `447651` into one number), reported exactly 16 pids
+  for a 16-child master.
+
+**Also measured, and worth stating because it invalidates a whole class of benchmark:** the same
+run against the application on `/mnt/c` reported ~130 rps for every shape. That is drvfs, not the
+fork shape, and it would have been read as "prefork makes no difference".

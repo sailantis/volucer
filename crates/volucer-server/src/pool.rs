@@ -1,30 +1,37 @@
-//! A pool of `php-cgi` processes, one per port.
+//! A pool of `php-cgi` slots, each a listening socket with a process tree behind it.
 //!
 //! This is the `spawn_cgi` backend, and on Windows it is the only way to get
 //! per-request SAPI reset at all. The shape is forced by the platform
 //! (`docs/plan.md` §9):
 //!
-//! - `PHP_FCGI_CHILDREN` relies on `fork()`, so `php-cgi` cannot spawn its own
-//!   children on Windows. One process per slot is therefore mandatory there.
-//! - On Linux it *can* prefork — measured, not assumed: `n = 4` gives four children
-//!   serving requests round-robin, and `SIGTERM` to the master takes them all down.
-//!   `spawn_slot` sets `PHP_FCGI_CHILDREN = 0` anyway, so one slot is one process on
-//!   both platforms and `workers` stays a number this pool can enforce. The backend
-//!   that does collect prefork's memory saving is `attach`, where a supervisor forks
-//!   and the server dials it rather than hiding children inside a slot.
-//! - Several processes cannot share one port via `SO_REUSEADDR` on Windows, so
-//!   each slot needs its own port.
-//! - FastCGI request ids would allow multiplexing, but `php-cgi` processes
-//!   sequentially, so multiplexing would add a demux table and buy nothing.
+//! - **A slot is an address with a capacity**, not a process. `children = 0` — the
+//!   default — is one process, which is what this pool was until hazard 86. `children = n`
+//!   is a preforked master plus `n` children, all sharing the one listening socket and the
+//!   one OPcache segment; each child accepts its own connections.
+//! - **`PHP_FCGI_CHILDREN` works on both platforms**, by different mechanisms: `fork()` on
+//!   Unix (`cgi_main.c:1995`) and `CreateProcess` on Windows (`cgi_main.c:2083`). An earlier
+//!   version of this comment — and of `docs/plan.md` hazard 43 — said the Linux path ignored
+//!   it, which was wrong; what is true is that a lone `php-cgi -b` with no children serves
+//!   its connections **one at a time**.
+//! - Several processes cannot share one port via `SO_REUSEADDR` on Windows, so each *slot*
+//!   needs its own port. Within a slot, the children share the one bound socket because the
+//!   master binds once and forks afterwards.
+//! - FastCGI request ids would allow multiplexing, but `php-cgi` refuses it outright —
+//!   `FCGI_MPXS_CONNS` is `0` (`main/fastcgi.c:490`) and the accept loop is one request at a
+//!   time (`cgi_main.c:2276`). So more concurrency out of one slot means more processes,
+//!   which is exactly what `children` is, and a demux table would buy nothing.
 //!
-//! The pool owns the processes, assigns the ports, health-checks by connecting,
-//! restarts a slot that died, and hands out a connected client per request.
+//! The pool owns the processes, assigns the addresses, health-checks by connecting,
+//! restarts a slot that died, and lends a connection per request. Concurrency within a slot
+//! is admitted by [`SlotPermits`] rather than by the slot's lock, so a slot's lock is held
+//! only for bookkeeping — which is what lets `children` requests be in flight against one
+//! address at once.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use volucer_core::config::SpawnCgiConfig;
@@ -47,16 +54,34 @@ const PORT_ATTEMPTS: usize = 10;
 /// Timeout for a single request to a slot.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One `php-cgi` process and the address it serves.
+/// One `php-cgi` listening socket, the process tree behind it, and its connections.
+///
+/// **A slot is an address with a capacity, not a process.** With `children = 0` the two are
+/// the same thing and this is what it always was — one process, one connection, the slot
+/// mutex serialising requests. With `children = n` the master has forked `n` children that
+/// share the listening socket, so it can answer `n` requests at once and needs `n`
+/// connections to do it. Everything the pool decides — recycle, restart, kill, count — stays
+/// per slot, which is what keeps `children` a number the pool declared and can therefore
+/// enforce rather than a number hidden inside a process.
 #[derive(Debug)]
 struct Slot {
+    /// The master process. With children it serves nothing itself: it forks, reaps and
+    /// replaces, and the children accept.
     child: Child,
     /// Loopback TCP or a unix socket, depending on the configuration.
     endpoint: Endpoint,
     /// Requests this slot has served, for `max_requests` recycling.
+    ///
+    /// **Slot-wide, not per child.** `php-cgi` gives no way to see a child's count from
+    /// outside, and the replacement unit is the group — which is the only thing `killpg` can
+    /// express. So this counter measures what the pool can act on.
     served: u64,
-    /// A live connection, reused while the backend allows it.
-    client: Option<Client>,
+    /// Live connections, up to the slot's capacity.
+    ///
+    /// A `Vec` rather than one `Option` because a preforked master can answer several
+    /// requests at once, and one connection carries one request: `FCGI_MPXS_CONNS` is `0` and
+    /// the accept loop is one request at a time. An idle connection here is one warm child.
+    clients: Vec<Client>,
 }
 
 impl Slot {
@@ -73,51 +98,64 @@ impl Slot {
         slot_address_of(&self.endpoint)
     }
 
-    /// Send one request over this slot, reconnecting if the backend closed.
-    fn request(&mut self, request: &Request) -> Result<Response> {
-        // Reuse the connection only when the previous request said it may be
-        // reused; `php-cgi` may close after every request, and assuming
-        // otherwise is how a pool ends up writing into a dead socket.
-        let endpoint = self.endpoint.clone();
-        if self.client.as_ref().is_some_and(|c| !c.is_reusable()) {
-            self.client = None;
-        }
-        if self.client.is_none() {
-            self.client = Some(Client::connect(&endpoint, Some(REQUEST_TIMEOUT)).map_err(
-                |source| ServerError::Worker {
-                    backend: "spawn_cgi".to_string(),
-                    source,
-                },
-            )?);
-        }
+    /// Drop every connection that the backend refused to keep.
+    ///
+    /// Separate from [`exchange`] because it has to run before a connection is taken,
+    /// and doing it in one pass is cheaper than testing each one twice.
+    fn prune_dead_clients(&mut self) {
+        self.clients.retain(|client| client.is_reusable());
+    }
+}
 
-        let client = self.client.as_mut().expect("client just connected");
-        let mut attempt = 0;
-        loop {
-            match client.request(request) {
-                Ok(response) => {
-                    self.served += 1;
-                    return Ok(response);
-                }
-                // One retry on a transport error: a slot may have recycled
-                // between requests without the port changing, and php-cgi closes
-                // the connection even when keep-alive was requested.
-                Err(err) if attempt == 0 && retryable(&err) => {
-                    attempt += 1;
-                    *client =
-                        Client::connect(&endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
-                            ServerError::Worker {
-                                backend: "spawn_cgi".to_string(),
-                                source,
-                            }
-                        })?;
-                }
-                Err(source) => {
-                    return Err(ServerError::Worker {
+/// Send one request over a slot's address, returning the connection it used.
+///
+/// **A free function rather than a `Slot` method**, and that is what makes `children` work:
+/// the slot's lock is not held here, so several requests can be in flight against one address
+/// at once. Everything the request needs about the slot is its `endpoint`, which is copied
+/// before this is called.
+///
+/// `take` is a connection this slot already owned, or `None` to open one. Returning the
+/// connection rather than storing it keeps the slot free of state that would have to be
+/// synchronised across a request.
+fn exchange(
+    endpoint: &Endpoint,
+    request: &Request,
+    take: Option<Client>,
+) -> Result<(Response, Client)> {
+    // Reuse the connection only when the previous request said it may be
+    // reused; `php-cgi` may close after every request, and assuming
+    // otherwise is how a pool ends up writing into a dead socket.
+    let mut client = match take {
+        Some(client) if client.is_reusable() => client,
+        _ => Client::connect(endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
+            ServerError::Worker {
+                backend: "spawn_cgi".to_string(),
+                source,
+            }
+        })?,
+    };
+
+    let mut attempt = 0;
+    loop {
+        match client.request(request) {
+            Ok(response) => return Ok((response, client)),
+            // One retry on a transport error: a slot may have recycled
+            // between requests without the port changing, and php-cgi closes
+            // the connection even when keep-alive was requested.
+            Err(err) if attempt == 0 && retryable(&err) => {
+                attempt += 1;
+                client = Client::connect(endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
+                    ServerError::Worker {
                         backend: "spawn_cgi".to_string(),
                         source,
-                    })
-                }
+                    }
+                })?;
+            }
+            Err(source) => {
+                return Err(ServerError::Worker {
+                    backend: "spawn_cgi".to_string(),
+                    source,
+                })
             }
         }
     }
@@ -125,6 +163,20 @@ impl Slot {
 
 fn is_connection_error(err: &volucer_fcgi::FcgiError) -> bool {
     crate::backend::is_transport_error(err)
+}
+
+/// Gives a slot's place back on drop, on every path out of a request.
+///
+/// A guard rather than a call before each `return`: `?` accounts for three of the exits, and
+/// a missed release shrinks the slot permanently — a failure that only shows up as a pool
+/// that gets slower and never recovers.
+#[derive(Debug)]
+struct PermitGuard<'a>(&'a SlotPermits);
+
+impl Drop for PermitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
 }
 
 /// The retry predicate, kept named so the intent is visible at the call site.
@@ -196,18 +248,91 @@ fn slot_address_of(endpoint: &Endpoint) -> SlotAddress {
 pub struct CgiPool {
     name: String,
     /// Each slot behind its own lock, so the pool serves as many requests at once
-    /// as it has slots. `php-cgi` processes one request at a time, so the lock is
-    /// per process rather than per pool.
+    /// as it has slots and their capacity allows.
+    ///
+    /// The lock is per *slot*, not per process: with `children > 0` one slot is several
+    /// processes behind one address, and the slot's [`SlotPermits`] is what bounds concurrent
+    /// requests to that address. The lock is only held while a connection is taken or
+    /// returned, never across a request — which is the difference between "one request per
+    /// slot" and "`children` requests per slot".
     slots: Vec<Mutex<Slot>>,
+    /// Admission per slot, so a slot's capacity is enforced without holding its lock.
+    ///
+    /// Sized to the slot count and created from `config.children`, so a slot's permit count
+    /// and the number of processes `php-cgi` was told to fork are the same number read from
+    /// the same place ([`SpawnCgiConfig::slot_capacity`]).
+    permits: Vec<SlotPermits>,
     /// Round-robin position, so work and therefore memory are spread evenly.
     cursor: AtomicUsize,
     binary: PathBuf,
     bind_host: String,
     /// Socket paths this pool bound and therefore must unlink on the way out.
     socket_paths: Vec<PathBuf>,
+    /// `PHP_FCGI_CHILDREN` for every slot: `0` for one process, `n` for a preforked master.
+    ///
+    /// Stored because a *replacement* slot must fork what the slot it replaces forked, and
+    /// read from the configuration at startup rather than per spawn so a respawn cannot
+    /// disagree with the pool's own capacity. Already mapped through
+    /// [`SpawnCgiConfig::fcgi_children`], so `1` never reaches php-cgi as "a master plus one
+    /// child".
+    children: u32,
     max_requests: Option<u64>,
     /// Held for the life of the pool; dropping it reaps every slot.
     _guard: LifecycleGuard,
+}
+
+/// How many requests one slot may serve at once.
+///
+/// A counter and a condvar, mirroring `backend::Limit` for an `external` backend's
+/// `max_connections`: the request path is synchronous, so a request over capacity has to
+/// *block*, and blocking is the feature — the alternative is opening a connection no child
+/// is there to accept, which queues in the listen backlog where nothing counts it.
+///
+/// The capacity is `children.max(1)`. With `children = 0` this is 1, so the observable
+/// behaviour of an existing configuration is exactly what it was.
+#[derive(Debug)]
+struct SlotPermits {
+    state: Mutex<usize>,
+    released: Condvar,
+    capacity: usize,
+}
+
+impl SlotPermits {
+    fn new(capacity: usize) -> Self {
+        SlotPermits {
+            state: Mutex::new(0),
+            released: Condvar::new(),
+            capacity,
+        }
+    }
+
+    /// Wait until this slot is under capacity, then count the request.
+    ///
+    /// A poisoned lock is recovered rather than propagated: a panic in one request must not
+    /// wedge every later one behind a condvar nobody will signal again.
+    fn enter(&self) {
+        let mut in_flight = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight >= self.capacity {
+            in_flight = self
+                .released
+                .wait(in_flight)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *in_flight += 1;
+    }
+
+    /// Give the place back, which is what wakes a waiting request.
+    fn leave(&self) {
+        let mut in_flight = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        self.released.notify_one();
+    }
 }
 
 impl CgiPool {
@@ -228,13 +353,16 @@ impl CgiPool {
         })?;
 
         let count = worker_count(config.workers);
+        let capacity = config.slot_capacity();
         let mut pool = CgiPool {
             name: name.to_string(),
             slots: Vec::with_capacity(count as usize),
+            permits: (0..count).map(|_| SlotPermits::new(capacity)).collect(),
             cursor: AtomicUsize::new(0),
             binary: config.binary.clone(),
             bind_host: config.bind_host.clone(),
             socket_paths: Vec::new(),
+            children: config.fcgi_children(),
             max_requests: config.max_requests,
             _guard: guard,
         };
@@ -374,37 +502,26 @@ impl CgiPool {
         command
             .arg("-b")
             .arg(address.bind_argument(&self.bind_host))
-            // php-cgi's own preforking, which does not compose with this pool.
+            // php-cgi's own preforking, which the pool now *declares* rather than suppresses.
             //
-            // A `php-cgi` started with `-b` is not one process: it is a parent
-            // that spawns `PHP_FCGI_CHILDREN` children, all sharing the one bound
-            // socket, and the parent's accept loop distributes connections
-            // between them. Left at its default that is 20 on a 12-core machine
-            // — measured here, and inherited, because php-cgi reads the variable
-            // from *its* environment (sapi/cgi/cgi_main.c) and a deployment that
-            // sets it for php-fpm hands it to us too.
+            // A `php-cgi` started with `-b` is not necessarily one process: it is a parent
+            // that forks (or, on Windows, `CreateProcess`es) `PHP_FCGI_CHILDREN` children,
+            // all sharing the one bound socket, and each child accepts its own connections.
+            // The variable is read from php-cgi's *own* environment (`cgi_main.c:1964`), so
+            // leaving it unset inherits whatever a deployment exported for php-fpm — measured
+            // at 20 on a 12-core machine, which made `workers` a lie.
             //
-            // The pool already decides how many PHP processes exist, and each
-            // slot is meant to be one process with one port so it can be
-            // recycled, counted and reasoned about. 20 hidden children under it
-            // make `workers` a lie: the slot looks idle while 20 requests run,
-            // `max_requests` never matches what php-fpm would call a request
-            // count, killing a slot does not stop the work its children are
-            // doing, and every test silently starts 21 processes instead of 1.
+            // So the value is always written, and it is always the pool's own decision:
+            // `children`, or `0` to mean one process per slot. `0` rather than `1` because
+            // php-cgi spawns CHILDREN *in addition to itself* — measured against php-cgi
+            // 8.3.31, `0` gives exactly one process and `1` gives two.
             //
-            // `0`, not `1`: php-cgi spawns "CHILDREN" *children in addition to
-            // itself*, so `1` means two processes per slot. Measured against
-            // php-cgi 8.3.31 — `0` gives exactly one process, `1` gives two.
-            //
-            // `max_requests = 0` is the matching statement on the child side:
-            // php-cgi exits a child after 500 requests by default, and its own
-            // check is `if (max_requests && requests == max_requests)`, so 0
-            // means never. Recycling is the pool's decision here, so that
-            // `max_requests` means the same thing for every backend — and that
-            // meaning is php-fpm's, where `0` is also "never": see
-            // `WorkerConfig::max_requests` for why the pool treats 0 that way
-            // rather than recycling after every request.
-            .env("PHP_FCGI_CHILDREN", "0")
+            // `fcgi_children()`, not `children`: php-cgi spawns CHILDREN *in addition to
+            // itself*, so `children = 1` would be a master plus a child — two PHP boots for a
+            // slot that can still serve one request, because one child accepts one connection.
+            // Measured: `1` gave two processes and one pid answering. The accessor maps
+            // `children <= 1` to `0`, so `children = 1` means what it looks like.
+            .env("PHP_FCGI_CHILDREN", self.children.to_string())
             .env("PHP_FCGI_MAX_REQUESTS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -428,7 +545,7 @@ impl CgiPool {
             child,
             endpoint: address.endpoint(&self.bind_host)?,
             served: 0,
-            client: None,
+            clients: Vec::new(),
         };
         wait_until_listening(&mut slot, &self.binary, STARTUP_TIMEOUT)?;
         Ok(slot)
@@ -445,9 +562,13 @@ impl CgiPool {
 
     /// Send a request through the pool.
     ///
-    /// Takes `&self`, so one request per slot runs at a time and a request to a
-    /// free slot does not wait for a busy one. Replacing the child process is
-    /// `restart`'s job.
+    /// Takes `&self`. Admission is per slot and *outside* the slot's lock: a request first
+    /// waits for a place in a slot (`children` places, or one when prefork is off), and only
+    /// then takes the lock to borrow a connection. That is what lets `children = n` serve `n`
+    /// requests at once from one address while still leaving the pool able to recycle, count
+    /// and kill the slot as one unit.
+    ///
+    /// Replacing the child process is `restart`'s job.
     pub fn request(&self, request: &Request) -> Result<Response> {
         if self.slots.is_empty() {
             return Err(ServerError::NoWorker {
@@ -456,25 +577,63 @@ impl CgiPool {
         }
 
         let index = self.next_slot_index();
-        let mut slot = self.slots[index]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let response = slot.request(request)?;
+        let permits = &self.permits[index];
+
+        // Blocking rather than refusing: the front-end's own connection limit is where a
+        // request is refused, and turning a full slot into an error here would make a pool
+        // that is merely busy into a source of 502s. With `children = 0` the capacity is one,
+        // so this is a mutex by another name — exactly what it replaces.
+        permits.enter();
+        // Given back on every path out, including the `?` below. A `Drop` guard is the only
+        // way to get that right without a `catch_unwind`, and a leaked permit would shrink
+        // the slot for the life of the process.
+        let _permit = PermitGuard(permits);
+
+        // The lock covers *bookkeeping only* — take a warm connection, note the endpoint —
+        // and is released before any I/O. Holding it across the request is what used to make
+        // a slot strictly one request at a time; with `children > 0` that would throw away
+        // the whole point, because the far side can answer several at once.
+        let (endpoint, taken) = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.prune_dead_clients();
+            (slot.endpoint.clone(), slot.clients.pop())
+        };
+
+        let (response, client) = exchange(&endpoint, request, taken)?;
+
+        let served = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The connection goes back so the next request to this slot is warm. Retention is
+            // per slot and bounded by capacity, which *is* the number of processes behind the
+            // address — so a warm connection is one warm child and cannot starve a sibling.
+            slot.clients.push(client);
+            slot.served += 1;
+            slot.served
+        };
 
         // Recycle on the request count, mirroring `pm.max_requests`: this is what
         // bounds the effect of any leak in the application under test. `0` means
         // never, as it does for php-fpm — see `WorkerConfig::max_requests`.
+        //
+        // Slot-wide, and deliberately: with children each counts its own requests and php-cgi
+        // offers no way to read those from outside, so the only count that exists is the one
+        // this slot has served. Replacing the slot replaces the group, which is the unit
+        // `killpg` can express anyway.
         if let Some(max) = self.max_requests.filter(|max| *max > 0) {
-            if slot.served >= max {
-                let address = slot.address();
-                let mut replacement = self.spawn_slot(&address)?;
-                replacement.served = 0;
-                let old = std::mem::replace(&mut *slot, replacement);
-                let mut old = old;
-                // The group, so a `php-cgi` reached through a wrapper script does not leave
-                // the interpreter it started behind. See `lifecycle::kill`.
-                let _ = crate::lifecycle::kill(&mut old.child);
-                let _ = old.child.wait();
+            if served >= max {
+                let mut slot = self.slots[index]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Re-checked under the lock: two concurrent requests can both reach the
+                // threshold, and the second must not replace a slot the first has already
+                // replaced — that would kill a group that has served nothing.
+                if slot.served >= max {
+                    self.replace_locked(&mut slot)?;
+                }
             }
         }
         Ok(response)
@@ -844,6 +1003,7 @@ mod tests {
             bind_host: "127.0.0.1".to_string(),
             base_port: 19_700,
             socket: None,
+            children: 0,
             max_requests: None,
         };
         let err = CgiPool::start("test", &config).unwrap_err();

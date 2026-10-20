@@ -610,6 +610,15 @@ pub struct JobsPoolConfig {
     #[serde(default)]
     pub transport: WorkerTransport,
 
+    /// Where the server listens for the socket transport, when this consumer is not on a pipe.
+    ///
+    /// The same key, with the same meaning, as [`WorkerConfig::socket`]: a `unix:` path prefix
+    /// with a per-consumer suffix appended. Kept in step deliberately, because the transport
+    /// default is shared and a consumer that could not say where to listen would be forced onto
+    /// the pipe on the platform where the pipe is the slow one.
+    #[serde(default)]
+    pub socket: Option<String>,
+
     /// Working directory for the consumer process.
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
@@ -2864,6 +2873,8 @@ impl BackendConfig {
     /// tune. See [`ExternalConfig`] for the measurement behind it.
     pub fn concurrency(&self) -> &'static str {
         match self {
+            // `socket` changes the address, not the count: one connection per worker either way,
+            // so this line stays true whether the pool binds loopback ports or unix sockets.
             BackendConfig::Worker(_) | BackendConfig::Attach(_) => "`workers` connections",
             // One FastCGI connection carries one request, so there is nothing to size: the far
             // side's accept loop is the limit, and one connection per request in flight is what
@@ -2871,7 +2882,7 @@ impl BackendConfig {
             BackendConfig::External(_) => {
                 "one connection per request in flight; the pool's own max_children is the limit"
             }
-            BackendConfig::SpawnCgi(_) => "one slot per process, `workers` of them",
+            BackendConfig::SpawnCgi(_) => "one slot per listening socket, `children` requests each",
             BackendConfig::Upstream(_) => "the origin's own loop",
         }
     }
@@ -3611,6 +3622,31 @@ pub struct WorkerConfig {
     /// smaller, so the pipe stays the default there. See `docs/plan.md` hazard 46.
     #[serde(default)]
     pub transport: WorkerTransport,
+
+    /// Where the server listens for the [`WorkerTransport::Socket`] transport: a unix
+    /// socket path **prefix**, not a finished path.
+    ///
+    /// **`transport` decides the kind of transport; this decides the address.** Omitting it
+    /// keeps the loopback ephemeral port this backend has always used, so no existing
+    /// configuration changes meaning — which is why this is a second key rather than a third
+    /// [`WorkerTransport`] variant. A variant would have had to describe an address too, and
+    /// `socket = "unix:/run/x"` already reads the same way here as it does for `external`,
+    /// `attach` and `spawn_cgi`.
+    ///
+    /// The value is a prefix because the pool appends `.<slot>.sock`, for the reason
+    /// [`SpawnCgiConfig::socket`] gives at length: one socket per worker is what lets an
+    /// individual worker be reached, recycled and reasoned about on its own. A single shared
+    /// socket would be one queue, and `workers` would stop meaning anything.
+    ///
+    /// `unix:` is required and a bare path is refused. A bare path is a *relative* path, so
+    /// the same string copied from an `external` backend's `socket` would bind a file
+    /// literally named `unix:/run/php/php8.3-fpm.sock` in the working directory rather than
+    /// failing — the one mistake this key exists to make impossible.
+    ///
+    /// Refused beside [`WorkerTransport::Pipe`] rather than ignored: a key that is read by
+    /// nothing looks supported and is not, which is why `spawn_fpm` was removed.
+    #[serde(default)]
+    pub socket: Option<String>,
 }
 
 /// How a worker process is connected to the server.
@@ -3974,6 +4010,41 @@ pub struct SpawnCgiConfig {
     #[serde(default)]
     pub socket: Option<String>,
 
+    /// PHP processes per slot, sharing that slot's listening socket. `0` — the default
+    /// — means one, which is what every configuration written before this key meant.
+    ///
+    /// **This is `PHP_FCGI_CHILDREN`, and it is measured rather than asserted.** A
+    /// `php-cgi -b` master forks this many children (or `CreateProcess`es them on
+    /// Windows) *after* binding, and every one of them inherits the listening socket
+    /// **and the OPcache segment**. Holding the PHP process count equal at 16, one
+    /// master with 16 children measured **44 MB PSS against 311 MB for 16 separate
+    /// slots**, with throughput within noise and slightly ahead — because the compiled
+    /// scripts exist once instead of sixteen times. See `docs/plan.md` hazard 86.
+    ///
+    /// **Why this was `0` for so long, and why the reason no longer holds.** A slot
+    /// that hides children cannot be counted, recycled or killed as a unit — that is a
+    /// real problem and it is why the pool forced `PHP_FCGI_CHILDREN=0`. What changed
+    /// is the measurement: the pool can hold a slot's capacity (`children`) and a
+    /// slot's address, so the children are no longer hidden from it. What has *not*
+    /// changed is that `php-cgi` cannot multiplex — `FCGI_MPXS_CONNS` is `0`
+    /// (`main/fastcgi.c:490`) and the accept loop is one request at a time per process
+    /// (`sapi/cgi/cgi_main.c:2276`) — so prefork is the only way to get more than one
+    /// concurrent request out of a slot, and this key is that way.
+    ///
+    /// **`max_requests` stays slot-wide.** Each child counts its own requests and the
+    /// pool cannot see them, so the count this pool acts on is the slot's; the whole
+    /// group is replaced together, which is the only unit `killpg` can express anyway.
+    ///
+    /// **`SIGKILL` to a master leaves its children running** — `fastcgi_cleanup`, the
+    /// handler that signals the group, is installed for `SIGTERM`/`SIGINT`/`SIGQUIT`
+    /// only (`cgi_main.c:2007`). That is not a reason to avoid this key: volucer kills
+    /// by **process group**, not by pid, and `killpg` reaches every child. Measured:
+    /// 16 children before, 0 after. The Linux master's own `setsid()` is a no-op here
+    /// because `configure_command` has already made it a process-group leader, where
+    /// `setsid()` fails with `EPERM` — its return value is ignored at `cgi_main.c:2001`.
+    #[serde(default)]
+    pub children: u32,
+
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
     /// `pm.max_requests`. **`0` means never recycle**, as it does there.
     #[serde(default)]
@@ -3986,6 +4057,35 @@ fn default_bind_host() -> String {
 
 fn default_base_port() -> u16 {
     19_001
+}
+
+impl SpawnCgiConfig {
+    /// How many requests this slot can serve at once.
+    ///
+    /// `children.max(1)`, and the `max(1)` is the whole point: `children = 0` means
+    /// "do not turn prefork on", which is one process and therefore one request. Written
+    /// here rather than at the call site so the pool's capacity and the number of
+    /// processes php-cgi was told to start cannot be computed differently in two places.
+    pub fn slot_capacity(&self) -> usize {
+        self.children.max(1) as usize
+    }
+
+    /// The value to write to `PHP_FCGI_CHILDREN` for each slot.
+    ///
+    /// **`children <= 1` is `0`**, and that is not the same thing as `children`. php-cgi
+    /// spawns CHILDREN *children in addition to itself*, so `1` is a master plus one child —
+    /// two processes and two PHP boots for a slot that can still only serve one request at a
+    /// time, because one child accepts one connection. Measured: `1` gave two processes and
+    /// one pid answering. Writing `0` instead gives the one process the capacity asks for,
+    /// and keeps `children = 1` a truthful alias for the default rather than a setting that
+    /// silently costs double.
+    pub fn fcgi_children(&self) -> u32 {
+        if self.children <= 1 {
+            0
+        } else {
+            self.children
+        }
+    }
 }
 
 impl Config {
@@ -4367,6 +4467,15 @@ impl Config {
                              key for the one-at-a-time default"
                                 .to_string(),
                         ));
+                    }
+                    // The same key and the same rules as a backend's, because a consumer's transport
+                    // default is the backend's and the address has to be expressible wherever the
+                    // transport can be. A jobs pool that could choose the socket transport but not
+                    // say where to listen would be forced onto loopback TCP and a fresh ephemeral
+                    // port per consumer.
+                    if let Some(socket) = &pool.socket {
+                        validate_worker_socket(socket, pool.transport)
+                            .map_err(|err| Error::Config(format!("jobs.pool.socket: {err}")))?;
                     }
                 }
                 (None, true) => {}
@@ -5062,6 +5171,14 @@ impl Config {
                         return bad(format!("grpc_services names {service:?} twice"));
                     }
                 }
+
+                // Where the server listens, when it is not a pipe. Checked here rather than
+                // discovered at bind time for the reason every other address is: a typo is a
+                // startup message naming the key, not a bind error after the pool half exists.
+                if let Some(socket) = &w.socket {
+                    validate_worker_socket(socket, w.transport)
+                        .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
+                }
             }
             BackendConfig::External(e) => {
                 parse_listener(&e.socket)
@@ -5095,6 +5212,22 @@ impl Config {
                     return bad(format!(
                         "bind_host {:?} is not loopback; php-cgi should never be exposed",
                         c.bind_host
+                    ));
+                }
+                // A typo here is expensive in a way no other key is: `children = 16000`
+                // would ask php-cgi to fork sixteen thousand processes before the pool
+                // accepted its first request, and the failure would be a machine that has
+                // stopped responding rather than a message. The ceiling is well above any
+                // sane deployment — a slot is meant to be roughly core-sized — and low
+                // enough that a decimal-point mistake is a refusal.
+                const MAX_CHILDREN_PER_SLOT: u32 = 1024;
+                if c.children > MAX_CHILDREN_PER_SLOT {
+                    return bad(format!(
+                        "children is {}, above the {MAX_CHILDREN_PER_SLOT} this pool will start \
+                         per slot; a preforked master forks that many processes on startup, so \
+                         this is almost certainly a typo — `workers` is how many slots, `children` \
+                         is how many PHP processes share each one",
+                        c.children
                     ));
                 }
             }
@@ -5610,7 +5743,83 @@ pub fn validate_cgi_socket(spec: &str) -> std::result::Result<(), String> {
             "unix sockets are not available on this platform, so {spec:?} cannot be used"
         ));
     }
-    // `.<slot>.sock`: a dot, up to 10 digits of `u32`, then ".sock".
+    check_per_slot_length(path)
+}
+
+/// Validate a `worker` (or `[jobs.pool]`) `socket` prefix.
+///
+/// Shares [`check_per_slot_length`] with [`validate_cgi_socket`] rather than carrying
+/// a second copy of the arithmetic: the two settings append the identical
+/// `.<slot>.sock`, so two copies of the bound could disagree, and the one that is
+/// wrong is the one that truncates a path in the kernel.
+///
+/// Three things are refused rather than warned about, and each is a configuration
+/// that looks reasonable in a file:
+///
+/// - **A bare path.** A bare path is *relative*, so `socket = "unix:/run/x"` copied
+///   from an `external` backend would bind a file named `unix:/run/x` in the working
+///   directory. Requiring the prefix makes that a startup error.
+/// - **A bare path beside `transport = "pipe"`.** The transport would win and the
+///   key would be read by nothing — the `spawn_fpm` shape, which is why that backend
+///   was removed rather than left parsing.
+/// - **`host:port`.** The loopback transport picks its own ephemeral port, so an
+///   explicit one is a request this setting cannot honour; naming the alternative is
+///   more useful than binding something else.
+///
+/// Windows refuses `unix:` here, exactly as `spawn_cgi` does: there is no unix
+/// socket to bind. A named pipe is not offered for the *worker* transport because the
+/// protocol needs the connection in two halves and a pipe is not cloneable — see
+/// `volucer_fcgi::transport::Stream::try_clone_stream`.
+pub fn validate_worker_socket(spec: &str, transport: WorkerTransport) -> std::result::Result<(), String> {
+    if transport.is_pipe() {
+        return Err(format!(
+            "{spec:?} is set beside `transport = \"pipe\"`, which reads stdio and never opens a \
+             socket, so the address would be ignored; set `transport = \"socket\"` to use it, or \
+             remove the key"
+        ));
+    }
+
+    let path = spec.strip_prefix("unix:").ok_or_else(|| {
+        if spec.contains(':') && !spec.starts_with('/') {
+            return format!(
+                "{spec:?} is an address, but this key takes a unix socket path prefix; the \
+                 loopback transport picks its own ephemeral port, so remove the key to let it — \
+                 or write `unix:/run/volucer/worker` to listen on a unix socket"
+            );
+        }
+        format!(
+            "{spec:?} must start with `unix:`, e.g. `unix:/run/volucer/worker`. A bare path is \
+             relative, so it would bind a file in the working directory rather than the path it \
+             looks like"
+        )
+    })?;
+
+    if path.is_empty() {
+        return Err("unix socket path is empty".to_string());
+    }
+    if !path.starts_with('/') {
+        return Err(format!(
+            "unix socket path {path:?} must be absolute; the worker's working directory is not ours"
+        ));
+    }
+    if path.contains('\0') {
+        return Err("unix socket path contains a NUL byte".to_string());
+    }
+    if cfg!(not(unix)) {
+        return Err(format!(
+            "unix sockets are not available on this platform, so {spec:?} cannot be used; use \
+             `transport = \"socket\"` with no `socket` key for a loopback port"
+        ));
+    }
+    check_per_slot_length(path)
+}
+
+/// The length bound shared by every per-slot socket prefix.
+///
+/// `.<slot>.sock`: a dot, up to 10 digits of `u32`, then `.sock`. Kept in one place
+/// because both the CGI pool and the worker pool append it, and a second copy of this
+/// arithmetic is a second chance to be wrong about the same kernel limit.
+fn check_per_slot_length(path: &str) -> std::result::Result<(), String> {
     let worst_case = path.len() + 1 + 10 + 5;
     if worst_case > UNIX_SOCKET_PATH_MAX {
         return Err(format!(
@@ -5632,6 +5841,20 @@ pub fn cgi_socket_path(prefix: &str, index: u32) -> PathBuf {
     if let Some(name) = prefix.strip_prefix(r"\\.\pipe\") {
         return PathBuf::from(format!(r"\\.\pipe\{name}.{index}"));
     }
+    let base = prefix.strip_prefix("unix:").unwrap_or(prefix);
+    PathBuf::from(format!("{base}.{index}.sock"))
+}
+
+/// The unix socket slot `index` binds for the worker transport, given a prefix.
+///
+/// The same suffix rule as [`cgi_socket_path`] and deliberately not a second copy: a
+/// worker slot and a `php-cgi` slot are the same problem — one address per process, so
+/// that a process can be reached, recycled and reasoned about on its own.
+///
+/// No pipe arm. Unlike `php-cgi -b`, the worker transport cannot use a named pipe: the
+/// protocol needs the connection as a reader and a writer at once, and
+/// `Stream::try_clone_stream` cannot clone a pipe's `OVERLAPPED` state.
+pub fn worker_socket_path(prefix: &str, index: u32) -> PathBuf {
     let base = prefix.strip_prefix("unix:").unwrap_or(prefix);
     PathBuf::from(format!("{base}.{index}.sock"))
 }
@@ -6553,6 +6776,203 @@ socket = "unix:/run/volucer/cgi"
             }
             other => panic!("expected spawn_cgi, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_a_worker_unix_socket() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+transport = "socket"
+socket = "unix:/run/volucer/worker"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        match &config.backends["app"] {
+            BackendConfig::Worker(worker) => {
+                assert_eq!(worker.socket.as_deref(), Some("unix:/run/volucer/worker"));
+                assert_eq!(worker.transport, WorkerTransport::Socket);
+            }
+            other => panic!("expected worker, got {other:?}"),
+        }
+    }
+
+    /// A worker with no `socket` key keeps the ephemeral loopback port.
+    ///
+    /// This is the compatibility property that makes the new key a key rather than a
+    /// new transport variant: a configuration written before it exists still means
+    /// exactly what it meant.
+    #[test]
+    fn an_omitted_worker_socket_keeps_the_loopback_port() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+transport = "socket"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("a socket transport with no address is valid");
+        match &config.backends["app"] {
+            BackendConfig::Worker(worker) => assert!(worker.socket.is_none()),
+            other => panic!("expected worker, got {other:?}"),
+        }
+    }
+
+    /// The three mistakes this key exists to make impossible, each refused by name.
+    #[test]
+    fn a_worker_socket_is_validated() {
+        let with = |socket: &str, transport: &str| {
+            format!(
+                r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+transport = "{transport}"
+socket = "{socket}"
+"#
+            )
+        };
+        let err = |socket: &str, transport: &str| {
+            Config::from_toml(&with(socket, transport))
+                .expect("the file parses; the refusal is validation")
+                .validate()
+                .expect_err("must be refused")
+                .to_string()
+        };
+
+        // A bare path is relative, so it would bind a file named `unix:/run/x`.
+        let message = err("/run/volucer/worker", "socket");
+        assert!(message.contains("unix:"), "{message}");
+
+        // Ignored, not honoured: the transport never opens a socket.
+        let message = err("unix:/run/volucer/worker", "pipe");
+        assert!(message.contains("transport"), "{message}");
+
+        // The loopback transport picks its own port, so an explicit one is not a thing
+        // this key can do.
+        let message = err("127.0.0.1:9000", "socket");
+        assert!(message.contains("ephemeral"), "{message}");
+
+        if cfg!(unix) {
+            Config::from_toml(&with("unix:/run/volucer/worker", "socket"))
+                .expect("parses")
+                .validate()
+                .expect("a valid unix socket prefix is accepted");
+        }
+    }
+
+    /// `[jobs.pool]` takes the same key, because a consumer's transport default is the
+    /// same one and an address has to be expressible wherever the transport can be.
+    #[test]
+    fn a_jobs_pool_socket_is_validated() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "memory"
+[jobs.pool]
+command = "php consumer.php"
+transport = "socket"
+socket = "unix:/run/volucer/consumer"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        if cfg!(unix) {
+            config.validate().expect("a valid consumer socket prefix is accepted");
+        }
+        let pool = config.jobs.as_ref().and_then(|jobs| jobs.pool.as_ref()).expect("pool");
+        assert_eq!(pool.socket.as_deref(), Some("unix:/run/volucer/consumer"));
+
+        let bad = text.replace("unix:/run/volucer/consumer", "/run/volucer/consumer");
+        let message = Config::from_toml(&bad)
+            .expect("parses")
+            .validate()
+            .expect_err("a bare path is refused")
+            .to_string();
+        assert!(message.contains("jobs.pool.socket"), "{message}");
+    }
+
+    /// The per-slot suffix, so a worker and a `php-cgi` slot cannot disagree about it.
+    #[test]
+    fn a_worker_socket_path_uses_the_same_suffix_rule_as_cgi() {
+        for index in [0u32, 1, 12, u32::MAX] {
+            let cgi = cgi_socket_path("unix:/run/volucer/cgi", index);
+            let worker = worker_socket_path("unix:/run/volucer/cgi", index);
+            assert_eq!(cgi, worker, "the two slot paths must be the same for {index}");
+        }
+        assert_eq!(
+            worker_socket_path("unix:/run/volucer/worker", 3),
+            PathBuf::from("/run/volucer/worker.3.sock")
+        );
+    }
+
+    /// `children` decides both the pool's capacity and `PHP_FCGI_CHILDREN`, and the two must
+    /// agree — which means `children = 1` must not ask php-cgi for "a master plus one child".
+    ///
+    /// The failure this pins was measured, not hypothetical: with the raw value written
+    /// through, `children = 1` started **two** processes and served one pid, so an operator
+    /// who wrote `1` got two PHP boots for one request's worth of capacity. The mapping lives
+    /// in `fcgi_children` and this is the test that keeps it there.
+    #[test]
+    fn children_decides_process_count_and_capacity_together() {
+        fn config(children: u32) -> SpawnCgiConfig {
+            SpawnCgiConfig {
+                binary: PathBuf::from("/usr/bin/php-cgi"),
+                workers: 1,
+                bind_host: "127.0.0.1".to_string(),
+                base_port: 19_001,
+                socket: None,
+                children,
+                max_requests: None,
+            }
+        }
+
+        // `0` and `1` are one process and one request: php-cgi spawns CHILDREN *in addition
+        // to itself*, so writing `1` would be two processes for no extra capacity.
+        for children in [0, 1] {
+            let c = config(children);
+            assert_eq!(c.fcgi_children(), 0, "children={children} must mean one process");
+            assert_eq!(c.slot_capacity(), 1, "children={children} must mean one request");
+        }
+
+        // Above that, the two numbers are the same number, and `n` children means `n`
+        // processes behind the master and `n` requests at once.
+        for children in [2u32, 4, 16, 1024] {
+            let c = config(children);
+            assert_eq!(c.fcgi_children(), children);
+            assert_eq!(c.slot_capacity(), children as usize);
+        }
+    }
+
+    /// A `children` value that would fork a machine to death is refused rather than obeyed.
+    #[test]
+    fn an_absurd_children_count_is_refused() {
+        let text = r#"
+default_backend = "cgi"
+[server]
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "php-cgi"
+children = 100000
+"#;
+        let err = Config::from_toml(text)
+            .expect("parses; the refusal is validation")
+            .validate()
+            .expect_err("must be refused")
+            .to_string();
+        assert!(err.contains("children"), "{err}");
+        assert!(err.contains("typo"), "the message must say what it probably is: {err}");
     }
 
     #[test]

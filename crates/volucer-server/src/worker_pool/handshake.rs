@@ -9,7 +9,7 @@ use crate::calls::MethodRegistry;
 use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
 use crate::lifecycle::{configure_command, LifecycleGuard};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -17,6 +17,11 @@ use std::time::{Duration, Instant};
 use volucer_core::config::WORKER_SOCKET_ENV;
 use volucer_fcgi::{Endpoint, FcgiError, Stream};
 use volucer_worker::{BoundedChannel, Checksum, HelloAck, WorkerError};
+
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// How long a worker gets to complete the `HELLO` / `HELLO_ACK` handshake.
 ///
@@ -164,6 +169,125 @@ impl Read for RelayReader {
     }
 }
 
+/// The listener a socket-transport worker connects back to.
+///
+/// One type rather than two code paths, because everything below the bind is identical: an
+/// `accept` with a deadline, a poll interval, and the same two error shapes. The address is
+/// either an ephemeral loopback port — which the kernel chooses, so it has to be read back after
+/// binding — or a unix socket path from the configuration.
+#[derive(Debug)]
+enum WorkerListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener, PathBuf),
+}
+
+impl WorkerListener {
+    /// Bind the listener a spawned worker will connect back to.
+    ///
+    /// The unix arm unlinks a stale path first, for the reason the SDK supervisors document: a
+    /// socket path is a *file*, and binding one that already exists fails with `EADDRINUSE`, so a
+    /// server restarted after a crash could never come up. It is safe here because this process is
+    /// meant to be the only listener on that path — a live server would hold the socket and the
+    /// bind would fail rather than two processes sharing one address.
+    fn bind(spec: &Spec, index: u32) -> Result<Option<Self>> {
+        let Launch::Spawn { transport, .. } = &spec.launch else {
+            return Ok(None);
+        };
+        if transport.is_pipe() {
+            return Ok(None);
+        }
+        let binary = spec
+            .binary()
+            .expect("a socket-transport listener only exists for a spawned pool");
+        let spawn_err = |source| ServerError::Spawn {
+            binary: binary.clone(),
+            source,
+        };
+
+        match spec.worker_socket(index) {
+            None => TcpListener::bind(("127.0.0.1", 0))
+                .map(|listener| Some(WorkerListener::Tcp(listener)))
+                .map_err(spawn_err),
+            Some(path) => {
+                #[cfg(unix)]
+                {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        // Not fatal by itself — the bind below is the authority — but it means
+                        // something is at the path that is not ours, and the bind failure would
+                        // report only "address in use".
+                        Err(err) => {
+                            return Err(ServerError::Misconfigured {
+                                backend: "worker".to_string(),
+                                reason: format!(
+                                    "could not remove the stale worker socket {}: {err}",
+                                    path.display()
+                                ),
+                            })
+                        }
+                    }
+                    UnixListener::bind(&path)
+                        .map(|listener| Some(WorkerListener::Unix(listener, path.clone())))
+                        .map_err(spawn_err)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(ServerError::Misconfigured {
+                        backend: "worker".to_string(),
+                        reason: "unix sockets are not available on this platform".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// The address to hand the worker, in the form `VOLUCER_WORKER_SOCKET` carries.
+    ///
+    /// A unix socket keeps the `unix:` prefix, which is the same convention the configuration
+    /// uses for `relay` and `external.socket`. The SDKs already treat this variable's value as
+    /// opaque, so the prefix is what tells them which wrapper to use.
+    fn address(&self) -> Result<String> {
+        match self {
+            WorkerListener::Tcp(listener) => listener
+                .local_addr()
+                .map(|address| address.to_string())
+                .map_err(ServerError::Io),
+            #[cfg(unix)]
+            WorkerListener::Unix(_, path) => Ok(format!("unix:{}", path.display())),
+        }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            WorkerListener::Tcp(listener) => listener.set_nonblocking(nonblocking),
+            #[cfg(unix)]
+            WorkerListener::Unix(listener, _) => listener.set_nonblocking(nonblocking),
+        }
+    }
+
+    /// Accept one connection, or report that none is waiting yet.
+    fn accept(&self) -> std::io::Result<(Stream, bool)> {
+        match self {
+            WorkerListener::Tcp(listener) => listener
+                .accept()
+                .map(|(stream, _)| (Stream::Tcp(stream), true)),
+            #[cfg(unix)]
+            WorkerListener::Unix(listener, _) => listener
+                .accept()
+                .map(|(stream, _)| (Stream::Unix(stream), false)),
+        }
+    }
+
+    /// A human-readable address for an error message, when one can be produced.
+    fn describe(&self) -> String {
+        self.address()
+            .unwrap_or_else(|_| "the worker socket".to_string())
+    }
+}
+
 /// Wait for a socket-transport worker to connect back, and give up rather than hang.
 ///
 /// A blocking `accept` here has no deadline, and the failure it waits for is a quiet one: a
@@ -177,11 +301,11 @@ impl Read for RelayReader {
 /// per worker at startup, so the 2 ms granularity is not on any request path. The accepted
 /// stream is put back to blocking, which is what the exchange thread wants.
 fn accept_with_deadline(
-    listener: &TcpListener,
+    listener: &WorkerListener,
     spec: &Spec,
     child: &mut Child,
     timeout: Duration,
-) -> Result<TcpStream> {
+) -> Result<Stream> {
     let binary = spec
         .binary()
         .expect("a socket-transport listener only exists for a spawned pool");
@@ -197,7 +321,17 @@ fn accept_with_deadline(
         match listener.accept() {
             Ok((stream, _)) => {
                 // Restore blocking before the stream is handed to the exchange thread.
-                let _ = stream.set_nonblocking(false);
+                match &stream {
+                    Stream::Tcp(tcp) => {
+                        let _ = tcp.set_nonblocking(false);
+                    }
+                    #[cfg(unix)]
+                    Stream::Unix(unix) => {
+                        let _ = unix.set_nonblocking(false);
+                    }
+                    #[cfg(windows)]
+                    Stream::Pipe(_) => {}
+                }
                 return Ok(stream);
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -214,10 +348,7 @@ fn accept_with_deadline(
                 if Instant::now() >= deadline {
                     return Err(ServerError::StartupTimeout {
                         binary: binary.clone(),
-                        address: listener
-                            .local_addr()
-                            .map(|found| found.to_string())
-                            .unwrap_or_else(|_| "the worker socket".to_string()),
+                        address: listener.describe(),
                         timeout,
                         hint: Hint(Some(SOCKET_WORKER_HINT)),
                     });
@@ -279,14 +410,17 @@ fn transport_hint(spec: &Spec) -> Option<&'static str> {
 ///
 /// `handler` is the method registry this backend's workers may call, or `None` to grant nothing.
 /// It is installed on the channel before the handshake; see [`install_call_handler`].
+///
+/// `index` is the slot's position, used only for the per-slot suffix on a unix socket path.
 pub(super) fn boot(
     name: &str,
     spec: &Spec,
+    index: u32,
     guard: &LifecycleGuard,
     handler: Option<&Arc<MethodRegistry>>,
 ) -> Result<Ready> {
     match &spec.launch {
-        Launch::Spawn { .. } => boot_spawned(name, spec, guard, handler),
+        Launch::Spawn { .. } => boot_spawned(name, spec, index, guard, handler),
         Launch::Attach(attach) => boot_attached(name, spec, attach, handler),
     }
 }
@@ -427,9 +561,14 @@ fn finish_boot(
 }
 
 /// Start a worker and complete its handshake.
+///
+/// `index` is the slot's position in the pool, and it is needed for exactly one thing: the
+/// per-slot suffix on a unix socket path, which is what gives each worker an address of its own
+/// rather than putting them all behind one queue.
 fn boot_spawned(
     name: &str,
     spec: &Spec,
+    index: u32,
     guard: &LifecycleGuard,
     handler: Option<&Arc<MethodRegistry>>,
 ) -> Result<Ready> {
@@ -439,6 +578,7 @@ fn boot_spawned(
         working_dir,
         env,
         transport,
+        ..
     } = &spec.launch
     else {
         unreachable!("boot_spawned is only reached for a spawned pool")
@@ -448,21 +588,9 @@ fn boot_spawned(
     // process starts, because the address is handed to it as an environment variable
     // rather than discovered by it. So the listener is bound first and the worker spawns
     // into a connection that is already waiting.
-    let listener = if transport.is_pipe() {
-        None
-    } else {
-        Some(
-            TcpListener::bind(("127.0.0.1", 0)).map_err(|source| ServerError::Spawn {
-                binary: binary.clone(),
-                source,
-            })?,
-        )
-    };
+    let listener = WorkerListener::bind(spec, index)?;
     let socket_address = match &listener {
-        Some(listener) => Some(listener.local_addr().map_err(|source| ServerError::Spawn {
-            binary: binary.clone(),
-            source,
-        })?),
+        Some(listener) => Some(listener.address()?),
         None => None,
     };
 
@@ -491,12 +619,16 @@ fn boot_spawned(
     for (key, value) in env {
         command.env(key, value);
     }
-    if let Some(address) = socket_address {
+    if let Some(address) = &socket_address {
         // Set *after* the configured `env`, so the address always wins. A configuration
         // that carries its own `env` map would otherwise be able to point the worker at a
         // different address than the listener we are about to accept on, and the failure
         // would be a worker that boots and never connects.
-        command.env(WORKER_SOCKET_ENV, address.to_string());
+        //
+        // The value is the transport's own spelling — `host:port` or `unix:/path` — and it is
+        // the SDK that decides which wrapper to open. That keeps one variable with one meaning
+        // rather than a second variable whose absence would mean "TCP".
+        command.env(WORKER_SOCKET_ENV, address);
     }
     configure_command(&mut command);
 
@@ -542,9 +674,13 @@ fn boot_spawned(
                     }
                 };
             // The protocol is latency-sensitive and its frames are small; Nagle would
-            // only add delay to a request that is written frame by frame.
-            let _ = accepted.set_nodelay(true);
-            let reader = accepted.try_clone().map_err(|source| ServerError::Spawn {
+            // only add delay to a request that is written frame by frame. A unix socket has
+            // no Nagle to disable — `set_nodelay` on one is `ENOPROTOOPT`, which is why this
+            // is only done on the TCP arm rather than ignored on both.
+            if let Stream::Tcp(tcp) = &accepted {
+                let _ = tcp.set_nodelay(true);
+            }
+            let reader = accepted.try_clone_stream().map_err(|source| ServerError::Spawn {
                 binary: binary.clone(),
                 source,
             })?;
@@ -644,7 +780,6 @@ fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {
 #[cfg(test)]
 use std::collections::BTreeMap;
 #[cfg(test)]
-use std::path::PathBuf;
 #[cfg(test)]
 use volucer_core::config::WorkerTransport;
 
@@ -657,11 +792,12 @@ use volucer_core::config::WorkerTransport;
 fn bare_spec(transport: WorkerTransport) -> Spec {
     Spec {
         launch: Launch::Spawn {
-            binary: PathBuf::from("php"),
+            binary: std::path::PathBuf::from("php"),
             args: Vec::new(),
             working_dir: None,
             env: BTreeMap::new(),
             transport,
+            socket: None,
         },
         checksum: Checksum::Optional,
         grpc_services: Vec::new(),
@@ -685,7 +821,7 @@ mod tests {
     /// fast; the deadline arithmetic is the same either way.
     #[test]
     fn a_socket_worker_that_never_connects_times_out_rather_than_hanging() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = WorkerListener::Tcp(TcpListener::bind(("127.0.0.1", 0)).unwrap());
         // A process that has already exited, standing in for the worker that failed to
         // connect — this is the case where waiting out the deadline would be the wrong
         // answer, and the one `boot` must recognise by exit status.
@@ -732,8 +868,9 @@ mod tests {
     /// The timeout path itself: a live worker that never dials back.
     #[test]
     fn a_live_socket_worker_that_never_connects_hits_the_startup_timeout() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = tcp.local_addr().unwrap();
+        let listener = WorkerListener::Tcp(tcp);
 
         // Long enough to outlive the deadline below, and silent on both streams.
         let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sleep" })

@@ -124,6 +124,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
                 base_port,
                 socket: None,
                 max_requests: None,
+                children: 0,
             }),
         )]
         .into_iter()

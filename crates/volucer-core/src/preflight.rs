@@ -316,6 +316,42 @@ fn check_pem(label: &str, path: &Path, what: &str, warnings: &mut Vec<Warning>) 
     }
 }
 
+/// Warn when a per-slot socket prefix names a directory that is not there.
+///
+/// The directory, not the finished path: the pool appends `.<slot>.sock`, so a missing
+/// parent is what a bind fails on, and the ENOENT the operator would otherwise see names a
+/// path they never typed. A prefix whose directory exists is not checked further — whether
+/// this process may write there is the bind's question, and answering it here would mean
+/// creating and removing a probe file on every `check`.
+///
+/// Shared by `spawn_cgi` and the worker transport because the suffix rule is shared, so the
+/// two warnings cannot disagree about which directory matters.
+fn warn_about_socket_prefix(warnings: &mut Vec<Warning>, where_: &str, prefix: &str) {
+    #[cfg(windows)]
+    if prefix.starts_with(r"\\.\pipe\") {
+        // A pipe is a namespace, not a path, so there is no directory to be missing.
+        return;
+    }
+    let Some(path) = prefix.strip_prefix("unix:") else {
+        return;
+    };
+    let Some(dir) = Path::new(path).parent() else {
+        return;
+    };
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return;
+    }
+    warnings.push(Warning::with_hint(
+        format!(
+            "{where_}: the directory {} for socket {prefix} does not exist",
+            dir.display()
+        ),
+        "create it before serving, or point `socket` at a directory that exists — the pool \
+         appends `.<slot>.sock` to the prefix, so the directory has to be writable by the \
+         user running volucer",
+    ));
+}
+
 /// Report every configured program that cannot be started.
 ///
 /// This is the check `check` was missing: a mistyped `binary` is the mistake a
@@ -330,8 +366,7 @@ fn check_pem(label: &str, path: &Path, what: &str, warnings: &mut Vec<Warning>) 
 /// and refusing to report anything else because one binary is not there yet
 /// would be the wrong trade. The value is that the mistake is reported once,
 /// here, instead of as a startup failure the operator has to go looking for.
-fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
-    for (name, backend) in &config.backends {
+fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {    for (name, backend) in &config.backends {
         match backend {
             BackendConfig::Worker(worker) => {
                 let (program, _) = match split_command(&worker.command) {
@@ -355,6 +390,14 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                          with `command`, not with `binary`, so the two are independent settings",
                     ));
                 }
+                // Where the pool will listen, when it is not a pipe. A directory that does
+                // not exist is the one mistake that is both cheap to check and confusing to
+                // diagnose later: the bind fails after the pool has already resolved its
+                // program, and the message that reaches the operator is a bare ENOENT from a
+                // path they did not type — the pool appends `.<slot>.sock`.
+                if let (Some(socket), false) = (&worker.socket, worker.transport.is_pipe()) {
+                    warn_about_socket_prefix(warnings, &format!("backends.{name}"), socket);
+                }
             }
             BackendConfig::SpawnCgi(cgi) => {
                 if !cgi.binary.is_file() {
@@ -363,6 +406,9 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                         "point `binary` at the php-cgi executable for this host — \
                          `volucer check` lists every PHP binary it found above",
                     ));
+                }
+                if let Some(socket) = &cgi.socket {
+                    warn_about_socket_prefix(warnings, &format!("backends.{name}"), socket);
                 }
             }
             BackendConfig::External(external) => {

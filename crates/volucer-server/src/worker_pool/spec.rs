@@ -6,7 +6,9 @@
 use crate::error::{Result, ServerError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use volucer_core::config::{AttachConfig, ChecksumMode, WorkerConfig, WorkerTransport};
+use volucer_core::config::{
+    AttachConfig, ChecksumMode, JobsPoolConfig, WorkerConfig, WorkerTransport,
+};
 use volucer_core::program::{resolve_program, split_command};
 use volucer_worker::Checksum;
 
@@ -29,6 +31,16 @@ pub(super) enum Launch {
         env: BTreeMap<String, String>,
         /// How to connect to the worker. See [`WorkerTransport`].
         transport: WorkerTransport,
+        /// A `unix:` path **prefix** when the socket transport is on a unix socket.
+        ///
+        /// `None` means the loopback ephemeral port, which is what every configuration written
+        /// before this key existed means. The slot index is appended to make one address per
+        /// worker; the pool does that, not this struct, because the index is the pool's knowledge.
+        ///
+        /// On the spec rather than passed to `boot` for the same reason `checksum` is: a
+        /// *replaced* worker must be reached the same way as the one it replaces, and a slot that
+        /// respawned onto a different address would be a slot whose connection had moved.
+        socket: Option<String>,
     },
     /// Somebody else started the process; volucer connects to it.
     Attach(AttachSpec),
@@ -109,10 +121,37 @@ impl Spec {
                 working_dir: config.working_dir.clone(),
                 env: config.env.clone(),
                 transport: config.transport,
+                socket: config.socket.clone(),
             },
             checksum: checksum_of(config.checksum),
             grpc_services: config.grpc_services.clone(),
         })
+    }
+
+    /// Read a `[jobs.pool]` table into the same spec.
+    ///
+    /// A consumer pool is the same pool — boot, handshake, lease, recycle — so it is described by
+    /// the same [`Spec`] rather than by a second one. The translation is the whole of the
+    /// function, and it exists here rather than in `mod.rs` so that the fields which *are* a
+    /// property of reaching a process (`transport`, `socket`) stay next to the code that acts on
+    /// them.
+    pub(super) fn from_jobs_config(name: &str, config: &JobsPoolConfig) -> Result<Self> {
+        Self::from_config(
+            name,
+            &WorkerConfig {
+                command: config.command.clone(),
+                workers: config.workers,
+                memory_limit_mb: config.memory_limit_mb,
+                max_requests: config.max_jobs,
+                working_dir: config.working_dir.clone(),
+                env: config.env.clone(),
+                services: Vec::new(),
+                grpc_services: Vec::new(),
+                checksum: config.checksum,
+                transport: config.transport,
+                socket: config.socket.clone(),
+            },
+        )
     }
 
     /// Read an `attach` backend's table.
@@ -158,17 +197,53 @@ impl Spec {
     }
 
     /// What this pool reaches, as an operator would name it: a command or a relay address.
+    ///
+    /// A socket-transport pool appends where it listens, because the transport is invisible on
+    /// the wire and the address is the one thing an operator has to check when a worker will not
+    /// connect. The prefix is shown rather than a slot's finished path: it is what the file says.
     pub(super) fn describe(&self) -> String {
         match &self.launch {
-            Launch::Spawn { binary, args, .. } => {
+            Launch::Spawn {
+                binary,
+                args,
+                transport,
+                socket,
+                ..
+            } => {
                 let mut line = binary.display().to_string();
                 for arg in args {
                     line.push(' ');
                     line.push_str(arg);
                 }
+                if !transport.is_pipe() {
+                    match socket {
+                        Some(socket) => {
+                            line.push_str(&format!(" ({} on {socket}.<slot>.sock)", transport));
+                        }
+                        // The loopback port is picked at bind time, so there is nothing to name
+                        // here — saying "loopback" is still more than the transport alone says.
+                        None => line.push_str(&format!(" ({transport} on a loopback port)")),
+                    }
+                }
                 line
             }
             Launch::Attach(spec) => format!("{} (attached)", spec.relay),
+        }
+    }
+
+    /// The worker socket bound by slot `index`, when this pool listens on unix sockets.
+    ///
+    /// `None` for a pipe, for an attached pool, and for a socket-transport pool whose address is
+    /// a loopback port — the three cases in which volucer either binds nothing or lets the kernel
+    /// choose.
+    pub(super) fn worker_socket(&self, index: u32) -> Option<PathBuf> {
+        match &self.launch {
+            Launch::Spawn {
+                transport, socket, ..
+            } if !transport.is_pipe() => socket
+                .as_deref()
+                .map(|prefix| volucer_core::config::worker_socket_path(prefix, index)),
+            _ => None,
         }
     }
 
@@ -209,6 +284,7 @@ mod tests {
             services: Vec::new(),
             grpc_services: Vec::new(),
             transport: Default::default(),
+            socket: Default::default(),
         }
     }
 

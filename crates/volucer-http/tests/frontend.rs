@@ -136,6 +136,7 @@ fn worker_config(workers: u32) -> Config {
                 services: Vec::new(),
                 grpc_services: Vec::new(),
                 transport: Default::default(),
+                socket: None,
             }),
         )]
         .into_iter()

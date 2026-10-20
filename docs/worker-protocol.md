@@ -31,15 +31,42 @@ So volucer models the same proven header shape and owns a message set.
 
 ## Transport
 
-The channel is the child process's **stdin/stdout pipe**. That is portable, needs no port per
-worker, and cannot exhaust sockets. `stderr` is *not* part of the protocol: it is free for the
-worker to write to, and the supervisor drains it so the pipe buffer cannot fill and block the
+The channel is the child process's **stdin/stdout pipe** by default. That is portable, needs no
+port per worker, and cannot exhaust sockets. `stderr` is *not* part of the protocol: it is free for
+the worker to write to, and the supervisor drains it so the pipe buffer cannot fill and block the
 child.
 
 ```
   volucer ──HELLO/REQUEST/CONTROL/PING/CALL──►  php worker  (stdin)
             ◄─HELLO_ACK/RESPONSE/BODY/RETURN ──  … ──LOG/METRIC/EVENT─  (stdout)
 ```
+
+`transport = "socket"` moves the same frames onto a socket, because on Windows PHP's stream layer
+takes ~8 ms median to return from a blocking read on a *pipe* and ~0.09 ms on a *socket* (plan
+hazard 46). **Nothing in this document changes** — the frames, the handshake and the ordering are
+identical; only the file descriptor they travel on differs.
+
+The server picks the socket and tells the worker where it is, in `VOLUCER_WORKER_SOCKET`. That
+variable carries either form, and the SDK decides from the prefix:
+
+| value | transport |
+| --- | --- |
+| `127.0.0.1:34567` | loopback TCP, an ephemeral port the server bound |
+| `unix:/run/volucer/worker.0.sock` | a unix socket, from the backend's `socket` key |
+
+The `unix:` prefix is the same one the server's configuration uses for `external`, `attach` and
+`spawn_cgi`, so it is one convention rather than a fourth. A unix socket is the Linux/macOS
+recommendation when this transport is wanted at all: it removes the loopback hop, needs no port,
+and has no Nagle/delayed-ACK interaction to disable.
+
+A worker that ignores the variable reads `php://stdin`, which the socket transport has set to
+end-of-file, and exits during its handshake. That is a **startup** failure and the server reports
+it as one, naming `connect()` (or `transport = "pipe"`) as the fix — but it is worth knowing that
+this is the failure a pinned, older SDK produces.
+
+A **named pipe** is deliberately not offered here, unlike `spawn_cgi`'s `socket`: the protocol
+needs the connection as a reader and a writer at once, and a Windows pipe's `OVERLAPPED` state is
+per connection, so it cannot be duplicated into two halves.
 
 The protocol is **symmetric**: the same codec reads what it wrote, so the PHP SDK mirrors this
 document rather than inverting it.

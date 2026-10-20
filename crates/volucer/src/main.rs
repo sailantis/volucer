@@ -2336,6 +2336,50 @@ fn check(
             // php-fpm answers with an empty result is not something to trust on the accept path.
             print_advertised_capacity(external);
         }
+        // A socket-transport worker backend prints *where*, because the transport is invisible on
+        // the wire: a pool on the wrong one answers every request with a 200, only slower. The
+        // resolved form is printed — `unix:…<slot>.sock` — rather than the prefix, because the
+        // prefix is what the file says and the operator already has the file.
+        if let volucer_core::config::BackendConfig::Worker(worker) = backend {
+            if !worker.transport.is_pipe() {
+                println!(
+                    "      transport:         {} on {}",
+                    worker.transport,
+                    match &worker.socket {
+                        Some(prefix) => {
+                            format!("{}<slot>.sock", prefix.trim_end_matches(".sock"))
+                        }
+                        None => "a loopback ephemeral port".to_string(),
+                    }
+                );
+            }
+        }
+        // And a preforked `php-cgi` slot prints its width, because `workers` alone stopped being
+        // the process count when `children` existed: `workers × (children + 1)` is what the
+        // machine will run, and a reader tuning memory needs that number rather than the two
+        // factors to multiply themselves.
+        if let volucer_core::config::BackendConfig::SpawnCgi(cgi) = backend {
+            if cgi.children > 0 {
+                // `workers = 0` means one per core, so the slot count has to be resolved the
+                // same way the pool resolves it; printing the configured `0` would understate
+                // the process count by the width of the machine.
+                let slots = if cgi.workers > 0 {
+                    cgi.workers as u64
+                } else {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u64)
+                        .unwrap_or(1)
+                };
+                println!(
+                    "      prefork:           children = {} per slot ({} PHP processes across {} \
+                     slot{})",
+                    cgi.children,
+                    slots * (cgi.children as u64 + 1),
+                    slots,
+                    if slots == 1 { "" } else { "s" }
+                );
+            }
+        }
         // A `kind = "upstream"` backend was reported here as "not served yet" for exactly one
         // commit — the one that built the client before any listener could reach it — and that line
         // went away with the same commit that added the request path below it. Both existed so that

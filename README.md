@@ -374,13 +374,46 @@ slot, restarts one that died, and recycles on `max_requests` — the equivalent 
 own process group; on Windows they are adopted into a job object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running if `volucer` dies.
 
-One `spawn_cgi` slot is **one process on one port**, and volucer enforces that by setting
-`PHP_FCGI_CHILDREN=0` for each child. `php-cgi -b` is otherwise not one process: it spawns
-`PHP_FCGI_CHILDREN` children that all share the single bound socket, and the count is read from its
-inherited environment — so a host that exports it for `php-fpm` would silently give every slot 20
-hidden workers, making `workers` a lie and `max_requests` unaccountable. `PHP_FCGI_MAX_REQUESTS=0`
-goes with it, because php-cgi's own default is to retire a child after 500 requests; recycling here
-is the pool's decision, so `max_requests` means the same thing for every backend.
+One `spawn_cgi` slot is **one listening socket**, and `children` decides how many PHP processes
+are behind it. `children = 0` — the default — is one process, and the pool enforces that by
+setting `PHP_FCGI_CHILDREN=0` for each child. `php-cgi -b` is otherwise not one process: it forks
+`PHP_FCGI_CHILDREN` children that all share the single bound socket, and the count is read from
+its inherited environment — so a host that exports it for `php-fpm` would silently give every slot
+20 hidden workers. `PHP_FCGI_MAX_REQUESTS=0` goes with it, because php-cgi's own default is to
+retire a child after 500 requests; recycling here is the pool's decision, so `max_requests` means
+the same thing for every backend.
+
+**`children > 0` is prefork, and it is worth about 4.5× the memory.** `php-cgi` cannot serve two
+requests on one connection — `FCGI_MPXS_CONNS` is `0` in its own source, and the accept loop is one
+request at a time per process — so more than one concurrent request out of a slot means more than
+one process. Forked children inherit the listening socket **and the OPcache segment**, so the
+compiled scripts exist once: measured with the PHP process count held equal at 16, **68 MB PSS
+against 312 MB** for 16 separate slots, throughput within noise and slightly ahead. An earlier run
+of the same comparison showed a wider gap (44 MB against 311 MB); the committed table is
+`volucer-competition/results/prefork-vs-slots.md`.
+
+```toml
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+workers = 1        # one listening socket
+children = 16      # 16 children behind that master, sharing its OPcache
+```
+
+**`children` counts children, not processes.** `php-cgi` spawns them *in addition to itself*, so
+`children = 16` is 17 processes and `workers × (children + 1)` is the process count on the host.
+`children = 1` would therefore be two processes for a slot that can still only serve one request at
+a time, so it is mapped to `0` and stays a truthful alias for the default.
+
+The pool still owns the slot as one unit: `max_requests` counts the slot, `restart` replaces the
+whole group, and teardown kills the **process group** rather than the master's pid — which matters
+because `SIGKILL` to a preforked master leaves its children running (`php-cgi` only installs the
+group-signalling handler for `SIGTERM`). Measured: 16 children before a `killpg`, 0 after.
+
+This was `children = 0` unconditionally for a long time, and the reason was real: a slot that
+hides children cannot be counted, recycled or killed as a unit. What changed is that the pool now
+declares the slot's capacity, so the children are not hidden — `children` is a number volucer
+chose and can therefore enforce, rather than one `php-cgi` chose for itself.
 
 `worker` is implemented too, and it is the interesting case. Its `command` is a command line
 (`php worker.php`), split without a shell — double quotes group, and a backslash is kept unless it
@@ -422,6 +455,28 @@ worker that still calls `Worker::create()` cannot read the socket, so it is refu
 with a message naming the fix — the failure is a startup error rather than a mystery on the first
 request. See [`docs/plan.md`](docs/plan.md) hazard 46 for the measurements and the alternatives
 that were ruled out.
+
+`socket` says **where** that transport listens, and it is the same key, with the same dialect, as
+`external`, `attach` and `spawn_cgi`:
+
+```toml
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+transport = "socket"
+socket = "unix:/run/volucer/worker"   # a PREFIX: worker i listens on ...worker.<i>.sock
+```
+
+Omit it and nothing changes: the pool binds a loopback ephemeral port, exactly as it always has.
+The value is a prefix because one socket per worker is what lets a worker be recycled, counted
+and reached on its own — the same argument `spawn_cgi`'s `socket` makes. `unix:` is required: a
+bare path is *relative*, so the value copied from an `external` backend would bind a file named
+`unix:/run/php/php8.3-fpm.sock` in the working directory instead of failing.
+
+Two mis-spellings are refused at startup rather than ignored, because a key that is read by
+nothing looks supported and is not: `socket` beside `transport = "pipe"` (the transport would
+win), and a `host:port` address (the loopback transport picks its own port). `[jobs.pool]` takes
+the same key, for the same reason.
 
 ```toml
 default_backend = "app"
