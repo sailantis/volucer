@@ -1922,7 +1922,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "volucer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-acme"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "rustls",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-fcgi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-jobs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "redis",
  "thiserror 2.0.21",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-kv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "redis",
  "thiserror 2.0.21",
@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-lock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "redis",
@@ -2045,14 +2045,14 @@ dependencies = [
 
 [[package]]
 name = "volucer-metrics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "volucer-observe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "httpdate",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-otlp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -2078,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-upstream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -2125,7 +2125,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-watch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "volucer-core",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "volucer-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "serde",
