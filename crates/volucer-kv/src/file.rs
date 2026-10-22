@@ -2,7 +2,7 @@
 //!
 //! # What a directory buys that Redis does not, and what it costs
 //!
-//! The argument for this driver is in `docs/plugins.md` §1.4 beside `boltdb`: a cache that survives a
+//! The argument for this driver is in `internal/plugins.md` §1.4 beside `boltdb`: a cache that survives a
 //! restart **without a dependency**. A single node with a session store or a fragment cache does not
 //! want a server, a port and a backup policy for it, and the memory driver loses everything on
 //! deploy — which for a session store is every user logged out. So this is the driver for the
@@ -21,7 +21,7 @@
 //! directory means the kernel's own directory index, and `get` is one `open`.
 //!
 //! The file name is the **SHA-256 of the key**, hex-encoded, because a key is arbitrary bytes
-//! (`docs/plugins.md` §6.2: the wire carries opaque bytes) and a filesystem name is not. A key with a
+//! (`internal/plugins.md` §6.2: the wire carries opaque bytes) and a filesystem name is not. A key with a
 //! `/` in it would otherwise be a path, and a key with a `..` would be a traversal — the one bug this
 //! whole design exists to not have. Hashing also fixes the length problem: a maximum-length key is
 //! 64 characters of file name whatever the key was.
@@ -58,7 +58,7 @@
 //!
 //! # Permissions are `0600`, and the check is on the file
 //!
-//! `docs/plugins.md` §6.2 records RoadRunner's `permissions: 0755` default on a boltdb file as a
+//! `internal/plugins.md` §6.2 records RoadRunner's `permissions: 0755` default on a boltdb file as a
 //! hazard, and this is the driver that hazard is about. A cache holds session data and fragments of
 //! pages behind a login, so every file this driver writes is readable only by its owner. The mode is
 //! set **on each file**, not only on the directory, because a directory's mode does not follow a
@@ -1143,7 +1143,7 @@ mod tests {
 
     /// On unix, every file this driver writes is `0600`.
     ///
-    /// The hazard `docs/plugins.md` §6.2 records about RoadRunner's `0755` default, asserted where it
+    /// The hazard `internal/plugins.md` §6.2 records about RoadRunner's `0755` default, asserted where it
     /// is fixed rather than trusted to the code that sets it.
     #[cfg(unix)]
     #[test]

@@ -22,7 +22,7 @@ volucer-observe.workspace = true
 volucer-metrics.workspace = true
 # The store trait and the in-memory driver, for the `kv` namespace. A leaf crate with one dependency,
 # so a deployment using only the memory driver does not link a Redis to serve it — which is the whole
-# argument of `docs/plugins.md` §5 about features being grouped per driver.
+# argument of `internal/plugins.md` §5 about features being grouped per driver.
 volucer-kv.workspace = true
 # The lock trait and the in-memory driver, for the `lock` namespace. A leaf crate like the one above and
 # for the same reason, plus one of its own: a lock is named by its *resource*, so there is one lock
@@ -56,7 +56,7 @@ tracing.workspace = true
 [features]
 default = []
 # Enables the `redis` KV driver and the Redis client that serves it — and, in time, the lock in
-# `docs/plugins.md` §6.3, which shares the client. A build without it links no Redis at all.
+# `internal/plugins.md` §6.3, which shares the client. A build without it links no Redis at all.
 redis = ["volucer-kv/redis", "volucer-core/redis", "volucer-lock/redis", "volucer-jobs/redis"]
 [dev-dependencies]
 # An empty request body, so an upstream test needs no listener to make one.

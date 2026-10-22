@@ -1,6 +1,6 @@
 //! Configuration model.
 //!
-//! The shape mirrors the design in `docs/plan.md`: one or two listeners, a set
+//! The shape mirrors the design in `internal/plan.md`: one or two listeners, a set
 //! of named backends, a route table selecting between them, and an optional
 //! static-content layer in front of the whole thing.
 
@@ -244,7 +244,7 @@ impl TelemetryConfig {
 /// # Why a tagged enum and not `driver` plus an untyped table
 ///
 /// This is the one place the document says outright that it diverges from RoadRunner's shape
-/// (`docs/plugins.md` §6.2), and the reason is the same one [`BackendConfig`] gives: RR's
+/// (`internal/plugins.md` §6.2), and the reason is the same one [`BackendConfig`] gives: RR's
 /// `driver = "redis"` plus a free-form `config` table means `adress` is a key that parses, is
 /// ignored, and leaves an operator with a Redis client pointed at the default port and no message
 /// saying why. A tag and a typed arm make every one of those a parse error naming the key.
@@ -682,7 +682,7 @@ impl JobsConfig {
 
 /// The Redis URL and pool rules, applied identically to every table that names a Redis.
 ///
-/// **One function, because there are now two tables and there will be three** (`docs/plugins.md` §6.4
+/// **One function, because there are now two tables and there will be three** (`internal/plugins.md` §6.4
 /// wants a jobs driver on the same client). A second copy of these checks is a second place for the
 /// credential rule to be written slightly differently — and the credential rule is the one where a
 /// divergence is a password on the wire in the clear.
@@ -759,7 +759,7 @@ impl Config {
 
 /// A gRPC call's address, split out of the `:path` it arrived on.
 ///
-/// gRPC's own routing rule is a string and nothing more, which is `docs/plugins.md` §6.6's first
+/// gRPC's own routing rule is a string and nothing more, which is `internal/plugins.md` §6.6's first
 /// row: `:path` is `/pkg.Service/Method`, and reading it needs no descriptor and no schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrpcPath<'a> {
@@ -2750,7 +2750,7 @@ fn default_max_multirange() -> u64 {
 /// There was a fourth, `spawn_fpm`, which volucer would have started itself. It was
 /// never implemented — `Dispatcher` refused it — while `volucer version` advertised it
 /// and the preflight check warned that it would not start, so the key looked supported
-/// and could not work. It is gone rather than built: `docs/plan.md` §9 says not to
+/// and could not work. It is gone rather than built: `internal/plan.md` §9 says not to
 /// reimplement what php-fpm already does, and `external` attaches to the php-fpm that
 /// systemd already supervises, which is the better version of the same feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2950,7 +2950,7 @@ pub struct UpstreamConfig {
     /// gRPC's transport *is* HTTP/2, so a plaintext or unix-socket gRPC backend needs h2c — there is
     /// no ALPN to negotiate it on a transport without a handshake. The alternative considered and
     /// refused was inferring it from the route that selected the backend
-    /// (`docs/plugins.md` §10 item 3): that needs no key, but it makes an origin's *protocol* depend
+    /// (`internal/plugins.md` §10 item 3): that needs no key, but it makes an origin's *protocol* depend
     /// on where a request came from, which is the kind of implicit coupling this project refuses
     /// elsewhere. Stated here, it is one fact about one origin that an operator can read.
     ///
@@ -2980,7 +2980,7 @@ pub struct UpstreamConfig {
     /// restarts it if it dies, and makes sure it does not outlive the server.
     ///
     /// This is the whole of what a runtime like Django or Rails needs to run behind volucer —
-    /// see `docs/plugins.md` §7.1. It is deliberately **not** a `kind = "python"` backend: HTTP
+    /// see `internal/plugins.md` §7.1. It is deliberately **not** a `kind = "python"` backend: HTTP
     /// framing is a real cost and it is the cost every Rails and Django deployment already pays,
     /// so there is nothing for a new backend kind to do that this key does not.
     ///
@@ -3549,7 +3549,7 @@ pub struct WorkerConfig {
     /// Which control namespaces this backend's workers may call.
     ///
     /// **Absent means none, and that is the whole point of the key.** A worker's channel is a
-    /// remote-execution surface — see `docs/plugins.md` §4.5 — and the only thing protecting it
+    /// remote-execution surface — see `internal/plugins.md` §4.5 — and the only thing protecting it
     /// is which methods the server agreed to answer. So a backend that faces the public gets a
     /// registry without `workers`, and therefore cannot restart its siblings, while an operator's
     /// worker gets one that can. A process-wide registry would give every worker every
@@ -3583,7 +3583,7 @@ pub struct WorkerConfig {
     /// Only a `worker` backend has the key. A `worker` has a channel the server agreed to install a
     /// handler on and a process that outlives a request; `external` and `spawn_cgi` reset per request
     /// and have no such contract, and an `upstream` speaks gRPC itself and needs no permission from
-    /// here — see `docs/plugins.md` §6.6 for the tiers.
+    /// here — see `internal/plugins.md` §6.6 for the tiers.
     ///
     /// **Service names, not paths and not methods.** `"greeter.Greeter"` is a service; a method
     /// underneath it (`SayHello`) is the application's business, because a method the application
@@ -3617,7 +3617,7 @@ pub struct WorkerConfig {
     /// returns in 0.010 ms, and RoadRunner — a different server with a different protocol —
     /// measured the same 15 ms, so the cost is PHP's pipe read on Windows rather than
     /// anything volucer does. On Linux the ordering is the other way round and much
-    /// smaller, so the pipe stays the default there. See `docs/plan.md` hazard 46.
+    /// smaller, so the pipe stays the default there. See `internal/plan.md` hazard 46.
     #[serde(default)]
     pub transport: WorkerTransport,
 
@@ -3740,9 +3740,9 @@ pub const RELAY_SOCKET_ENV: &str = "VOLUCER_RELAY_SOCKET";
 /// in the same file, by [`Config::is_a_call_service`]. Adding a fixed service means adding a name
 /// here, which is the one place a reviewer has to look to see the whole surface a worker can reach.
 pub const CALL_NAMESPACES: &[&str] = &[
-    // The deployment's own description, redacted. `docs/plugins.md` §4.6.
+    // The deployment's own description, redacted. `internal/plugins.md` §4.6.
     "config",
-    // The pools: `workers.list` and `worker.reset`. `docs/plugins.md` §4.4.
+    // The pools: `workers.list` and `worker.reset`. `internal/plugins.md` §4.4.
     "workers",
 ];
 
@@ -4017,7 +4017,7 @@ pub struct SpawnCgiConfig {
     /// **and the OPcache segment**. Holding the PHP process count equal at 16, one
     /// master with 16 children measured **44 MB PSS against 311 MB for 16 separate
     /// slots**, with throughput within noise and slightly ahead — because the compiled
-    /// scripts exist once instead of sixteen times. See `docs/plan.md` hazard 86.
+    /// scripts exist once instead of sixteen times. See `internal/plan.md` hazard 86.
     ///
     /// **Why this was `0` for so long, and why the reason no longer holds.** A slot
     /// that hides children cannot be counted, recycled or killed as a unit — that is a
@@ -9015,7 +9015,7 @@ driver = "memory"
             path.display()
         );
         // And for the lock table, which is the one place the fencing warning has to be readable by
-        // the person about to configure it — `docs/plugins.md` §9.2 asks for it in the README, and a
+        // the person about to configure it — `internal/plugins.md` §9.2 asks for it in the README, and a
         // deployment never reads the README before copying the example.
         assert!(
             text.contains("# [lock]"),
@@ -11386,7 +11386,7 @@ script_extensions = []
 
     #[test]
     fn a_plaintext_origin_can_be_declared_to_speak_h2_and_a_tls_one_cannot() {
-        // The transport decision of `docs/plugins.md` §10 item 3. gRPC's transport is HTTP/2, and on
+        // The transport decision of `internal/plugins.md` §10 item 3. gRPC's transport is HTTP/2, and on
         // a transport with no handshake there is no ALPN to negotiate it — so the configuration has
         // to say it, and this is where that answer is checked.
         let config = Config::from_toml(&upstream_config(

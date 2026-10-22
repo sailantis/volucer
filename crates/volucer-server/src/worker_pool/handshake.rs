@@ -368,7 +368,7 @@ fn accept_with_deadline(
 /// Install what answers a worker's call, if anything does.
 ///
 /// `handler` is `None` for a worker whose backend granted no `services`, and the channel then refuses
-/// every call by name. That refusal is deliberate and is the security boundary `docs/plugins.md` §4.5
+/// every call by name. That refusal is deliberate and is the security boundary `internal/plugins.md` §4.5
 /// describes: a worker facing the public reaches no namespace at all, and the only thing saying so is
 /// the absence of a handler rather than a list that has to be consulted correctly on every call.
 ///
@@ -750,7 +750,7 @@ fn handshake_with_timeout(
 /// It must run on its own thread, and that is not incidental: reading `stderr` to
 /// end-of-file blocks until the worker exits, so doing it inline would deadlock
 /// the boot — the worker waits for `HELLO` while we wait for a line that will
-/// never come. This is the hazard in `docs/plan.md` §5, "drain `STDERR` for every
+/// never come. This is the hazard in `internal/plan.md` §5, "drain `STDERR` for every
 /// backend, always", seen from the other side: draining it on the caller's thread
 /// is the same bug with a different shape.
 fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {

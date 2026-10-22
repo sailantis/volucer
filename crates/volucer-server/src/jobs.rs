@@ -3,7 +3,7 @@
 //!
 //! # What this is, in one paragraph
 //!
-//! `docs/plugins.md` §6.4's concrete integration. A consumer is a persistent process that booted once and
+//! `internal/plugins.md` §6.4's concrete integration. A consumer is a persistent process that booted once and
 //! is handed work repeatedly, which is exactly what [`WorkerPool`] already does — so there is no second
 //! pool, no second supervision and no second recycling rule. This module owns the one thing the pool does
 //! not have an opinion about: **which job, from which pipeline, and what the answer means for the queue.**
@@ -45,7 +45,7 @@
 //!
 //! # What is deliberately absent
 //!
-//! No retry count, no backoff, no dead-letter queue and no delay between attempts. `docs/plugins.md` §6.4
+//! No retry count, no backoff, no dead-letter queue and no delay between attempts. `internal/plugins.md` §6.4
 //! says why: RoadRunner leaves those to the application, and a server-side policy would make two
 //! applications' semantics fight. What the server does provide is the *number* — `attempts` is on every
 //! job, incremented by the driver on every reservation — so an application can implement whatever policy it
@@ -98,7 +98,7 @@ fn prefetch_or_one(prefetch: usize) -> usize {
 /// and the two settings that decide how it behaves. Built once at startup and moved onto the poller thread.
 pub struct Consumers {
     /// The consumers' worker pool. One pool for every consumed pipeline, which is what `[jobs.pool]`
-    /// describes — see `docs/plugins.md` §6.4 on why a pool per pipeline is not offered.
+    /// describes — see `internal/plugins.md` §6.4 on why a pool per pipeline is not offered.
     pool: Arc<WorkerPool>,
     /// The pipelines to poll, each with its driver, in the configuration's order.
     pipelines: Vec<(String, Arc<dyn Driver>)>,

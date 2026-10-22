@@ -1,6 +1,6 @@
 //! Can the upstream client speak HTTP/2 to a plaintext origin?
 //!
-//! `docs/plugins.md` §6.6's first gRPC tier routes a call to a Unix-socket or `http://` origin, and gRPC
+//! `internal/plugins.md` §6.6's first gRPC tier routes a call to a Unix-socket or `http://` origin, and gRPC
 //! *is* HTTP/2. The measurement in `crates/volucer-upstream/tests/trailers.rs` found that
 //! `negotiated_h2` is set from the ALPN result alone, so those origins are pinned to HTTP/1.1 today.
 //! This is the other half of that question, and it is the one that decides how large tier A really is:

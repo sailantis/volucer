@@ -253,7 +253,7 @@ fn site_asks_for_statics(site: &SiteConfig, server: &StaticsSetting) -> bool {
 /// request that is not a real file is the application's, so for a document root holding no
 /// asset the layer answers `NotAFile` on every request — after a `stat` and a hop to the
 /// blocking pool. Measured on the competition host, same binary, `GET /items` at c=32: 33,043
-/// rps with the layer on against 42,142 with it off. See hazard 85 in `docs/plan.md`.
+/// rps with the layer on against 42,142 with it off. See hazard 85 in `internal/plan.md`.
 ///
 /// Three things keep this from being the silent behaviour change the warning was written to
 /// avoid:

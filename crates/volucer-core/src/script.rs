@@ -17,7 +17,7 @@
 //! that read it; the third had its own copy. This module is that constant made a
 //! *value*, so a site can widen it for a non-PHP worker and all three move
 //! together. Widening only the router would turn every newly-routable extension
-//! into a source disclosure — see `docs/plan.md` step 38.
+//! into a source disclosure — see `internal/plan.md` step 38.
 //!
 //! Lives in `volucer-core` because `volucer-fcgi` and `volucer-watch` both
 //! depend on it, and putting it anywhere else would be a dependency cycle.

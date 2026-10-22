@@ -2,7 +2,7 @@
 //!
 //! This is the `spawn_cgi` backend, and on Windows it is the only way to get
 //! per-request SAPI reset at all. The shape is forced by the platform
-//! (`docs/plan.md` §9):
+//! (`internal/plan.md` §9):
 //!
 //! - **A slot is an address with a capacity**, not a process. `children = 0` — the
 //!   default — is one process, which is what this pool was until hazard 86. `children = n`
@@ -10,7 +10,7 @@
 //!   one OPcache segment; each child accepts its own connections.
 //! - **`PHP_FCGI_CHILDREN` works on both platforms**, by different mechanisms: `fork()` on
 //!   Unix (`cgi_main.c:1995`) and `CreateProcess` on Windows (`cgi_main.c:2083`). An earlier
-//!   version of this comment — and of `docs/plan.md` hazard 43 — said the Linux path ignored
+//!   version of this comment — and of `internal/plan.md` hazard 43 — said the Linux path ignored
 //!   it, which was wrong; what is true is that a lone `php-cgi -b` with no children serves
 //!   its connections **one at a time**.
 //! - Several processes cannot share one port via `SO_REUSEADDR` on Windows, so each *slot*

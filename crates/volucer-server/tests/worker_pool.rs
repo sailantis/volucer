@@ -1314,7 +1314,7 @@ fn a_workers_own_metric_reaches_the_registry() {
     let registry = volucer_metrics::Registry::new();
     // Declared, because the registry refuses a name nobody described — and declaring it here rather
     // than in the pool is the point: a worker publishing a metric is publishing a name the *operator*
-    // has to have decided to accept. `docs/plugins.md` §6.1 has the `[metrics] collect` table that will
+    // has to have decided to accept. `internal/plugins.md` §6.1 has the `[metrics] collect` table that will
     // make this a configuration entry rather than a call a test makes by hand.
     registry.describe_histogram(
         "example_request_total",
@@ -1370,7 +1370,7 @@ fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
 
 /// A metric a deployment declares in `[metrics.collect]` is the one an emitted sample lands in.
 ///
-/// **This is the gap the row in `docs/plugins.md` §1.4 called done.** The two tests above declare
+/// **This is the gap the row in `internal/plugins.md` §1.4 called done.** The two tests above declare
 /// `example_request_total` by hand, which is exactly what an operator cannot do — so they proved the wire
 /// worked while the feature did not. A registry refuses a name nobody described, and the only names
 /// the process described were `rr_http_*`, so every `emitMetric` in a real deployment was decoded,
@@ -1444,7 +1444,7 @@ help = "Requests the example worker counted"
 /// code that assembles them in production unexercised. The consequence is visible in the assertions — the
 /// worker's own `backend` name in `workers.list` comes from the directory the dispatcher filled in.
 ///
-/// The path exercised is the whole of `docs/plugins.md` §4 end to end: application code inside a request
+/// The path exercised is the whole of `internal/plugins.md` §4 end to end: application code inside a request
 /// handler writes a frame the server did not ask for, the server's exchange thread — mid-request, holding
 /// the pipes — recognises it as a call rather than a protocol error, dispatches it into the registry, and
 /// the worker reads the answer out of a stream that still owes it a response.
@@ -1976,7 +1976,7 @@ $worker->run(static function (Request $request, Worker $worker) use (&$held): Re
 ///
 /// # Why this test is the one that matters for the consumer half
 ///
-/// `docs/plugins.md` §8 records the pattern four times: `set_call_handler`, `build_stores`, `build_locks`,
+/// `internal/plugins.md` §8 records the pattern four times: `set_call_handler`, `build_stores`, `build_locks`,
 /// `build_queues` — **the wiring between two tested things is where the untested bug lives**, and an
 /// end-to-end test through the entry point a *deployment* uses is not optional for a service added to the
 /// registry. This is the fifth instance and it is a slightly different shape, which is why it is worth

@@ -293,7 +293,7 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
     }
 
     if consumed.is_empty() && !jobs.pipelines.is_empty() {
-        // Not a warning: a producer-only node is a documented deployment, and `docs/plugins.md` §6.4 says
+        // Not a warning: a producer-only node is a documented deployment, and `internal/plugins.md` §6.4 says
         // so. Logged at info because it is the answer to "why is nothing consuming", which is a question
         // an operator will otherwise ask of a queue with jobs piling up in it.
         tracing::info!(
@@ -598,7 +598,7 @@ impl Dispatcher {
         //
         // A registry is built **per worker backend**, from that backend's own `services` list, so a
         // worker facing the public gets one that cannot restart its siblings. That is
-        // `docs/plugins.md` §4.5, and building it once for the whole process would be the shape it
+        // `internal/plugins.md` §4.5, and building it once for the whole process would be the shape it
         // refuses.
         // The stores are built before any backend, because a backend's registry needs them: a worker
         // granted `kv.sessions` has to find the store already there. Built once and shared, so two
@@ -693,7 +693,7 @@ impl Dispatcher {
     ///
     /// The one accessor that answers a question about the *deployment* rather than about a request, and it
     /// exists because the dispatcher itself has to answer a call: `volucer workers` and `volucer reset`
-    /// on the command line are clients of this same machinery (`docs/plugins.md` §4.6), and a CLI
+    /// on the command line are clients of this same machinery (`internal/plugins.md` §4.6), and a CLI
     /// that re-derived "which pool is worker 3 in" would be a second implementation of the one rule
     /// `worker.reset` exists to get right.
     pub fn pools(&self) -> Option<Arc<PoolDirectory>> {
@@ -907,7 +907,7 @@ impl Dispatcher {
     /// `None` for every case that is not "a worker this deployment agreed may serve this service":
     /// a non-`worker` backend, a path that is not a gRPC path, and a service absent from that
     /// backend's own list. The caller turns all of them into the same `UNIMPLEMENTED`, which is what
-    /// gRPC means by "this server does not implement that method" — see `docs/plugins.md` §6.6.
+    /// gRPC means by "this server does not implement that method" — see `internal/plugins.md` §6.6.
     pub fn granted_grpc_call<'a>(
         &self,
         backend: &str,

@@ -1,7 +1,7 @@
 //! Supervising the process behind an `upstream` origin.
 //!
 //! Everything else in this tree either *is* the server or is reached by it. An `upstream` backend
-//! is the one kind that reaches somebody else's process — and, since `docs/plugins.md` §7.1, the
+//! is the one kind that reaches somebody else's process — and, since `internal/plugins.md` §7.1, the
 //! one kind that can be asked to *start* it.
 //!
 //! Why this exists rather than a `kind = "python"` backend: every Python and Ruby application

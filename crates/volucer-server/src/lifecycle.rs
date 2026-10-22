@@ -1,6 +1,6 @@
 //! Platform process lifecycle handling.
 //!
-//! The hazard this exists for (`docs/plan.md` §5.3): if the master dies, its
+//! The hazard this exists for (`internal/plan.md` §5.3): if the master dies, its
 //! `php-cgi` children survive as orphans holding their ports, which makes the
 //! development loop miserable. Every platform has its own mechanism.
 //!

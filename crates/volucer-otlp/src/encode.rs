@@ -2,7 +2,7 @@
 //!
 //! # Why this is written by hand, and what the plan got wrong about it
 //!
-//! `docs/plugins.md` §6.7 says OTLP/HTTP on 4318 "avoids `tonic`/`prost` entirely". Half of that is
+//! `internal/plugins.md` §6.7 says OTLP/HTTP on 4318 "avoids `tonic`/`prost` entirely". Half of that is
 //! true and half is not, and the difference decides this file's existence. Measured from
 //! `opentelemetry-otlp` 0.33.1's own manifest:
 //!

@@ -13,7 +13,7 @@
 //! table, both of which are `Arc`s handed in at construction. That is deliberate rather than a
 //! simplification: the request path's HTTP listener may be TLS-only and faces the public, and an
 //! endpoint that inherited any of its configuration would be one misconfiguration away from being
-//! unreachable — or public. See `docs/plugins.md` §6.1.
+//! unreachable — or public. See `internal/plugins.md` §6.1.
 //!
 //! # Two endpoints, and the difference is the one an orchestrator acts on
 //!

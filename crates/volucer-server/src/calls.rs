@@ -16,7 +16,7 @@
 //!
 //! `workers.list`, `worker.reset` and `config.describe` read machinery that already exists, so a control
 //! plane is available from the first commit that installs a handler rather than after KV is written.
-//! That was the argument for making the call path the foundation of `docs/plugins.md` §4, and this is
+//! That was the argument for making the call path the foundation of `internal/plugins.md` §4, and this is
 //! where it pays.
 //!
 //! # Capability is per backend
@@ -141,7 +141,7 @@ impl MethodRegistry {
 /// read the deployment's credentials can leak them, and the leak looks like nothing at all in a log.
 ///
 /// So the redaction is applied *here*, on the way out, rather than being each namespace's
-/// responsibility. `docs/plugins.md` §9.5 is the divergence: RoadRunner's `rpc.Config` returns the
+/// responsibility. `internal/plugins.md` §9.5 is the divergence: RoadRunner's `rpc.Config` returns the
 /// parsed document, and this deliberately does not.
 pub struct ConfigNamespace {
     /// What to describe, already assembled. The caller does the assembly so that what is describable is
@@ -1649,7 +1649,7 @@ impl KvNamespace {
     ///
     /// **The one method in this namespace that is not a cache operation.** It reaches the store's
     /// `set_if_absent`, which is atomic per driver (`create_new`, a shard lock, `SET NX`), and it is
-    /// the answer `docs/plugins.md` §6.3 gives to an application that needs to protect an invariant:
+    /// the answer `internal/plugins.md` §6.3 gives to an application that needs to protect an invariant:
     /// a lock has no fencing token and cannot stop a late writer, and a conditional write can because
     /// the *storage* decides.
     ///
@@ -2208,7 +2208,7 @@ const METHODS: &str =
 ///
 /// `jobs.push`, `jobs.push_batch`, `jobs.size` and `jobs.pipelines`. A worker cannot *reserve* a job
 /// through the call plane, and the reason is the design rather than an omission: a reservation is what a
-/// consumer's own channel is for (`docs/plugins.md` §6.4), because a reserved job's lease starts ticking
+/// consumer's own channel is for (`internal/plugins.md` §6.4), because a reserved job's lease starts ticking
 /// the moment it is handed out — and a job handed into a *request* would be held by a worker that is
 /// already busy with something else, with its lease running down while it finishes.
 ///
@@ -2504,7 +2504,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 ///
 /// # Why it is a *separate* registry entry and not part of `config`
 ///
-/// Because capability is per backend (`docs/plugins.md` §4.5). A worker serving the public gets a registry
+/// Because capability is per backend (`internal/plugins.md` §4.5). A worker serving the public gets a registry
 /// with no `workers` namespace, so it cannot restart its siblings; an operator's worker gets one that can.
 /// Splitting the namespaces is what makes that a configuration decision rather than a code change.
 pub struct WorkersNamespace {

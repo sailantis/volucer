@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 # The only mandatory dependency, and only for the refusals a store reports. A leaf crate that linked a
 # client for every driver would make `cargo install volucer` pull in a Redis and a Memcached for a
-# deployment using the in-memory one, which is the mistake `docs/plugins.md` §5 names — so every driver
+# deployment using the in-memory one, which is the mistake `internal/plugins.md` §5 names — so every driver
 # past `memory` is behind a feature, and `memory` is always available.
 tracing.workspace = true
 thiserror.workspace = true

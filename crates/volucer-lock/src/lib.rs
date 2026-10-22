@@ -2,7 +2,7 @@
 //!
 //! # Read this first: a lock is not a correctness primitive
 //!
-//! `docs/plugins.md` §9.2 is the position this crate is built to, and it is worth restating where
+//! `internal/plugins.md` §9.2 is the position this crate is built to, and it is worth restating where
 //! somebody will actually read it rather than only in a design document:
 //!
 //! A TTL lock has no fencing token. A worker that stalls past its TTL — a pause, a swap storm, a
@@ -15,7 +15,7 @@
 //! So a lock here is for **coordinating work**: collapsing a cache miss, keeping two workers from
 //! rendering the same PDF twice, making a retry cheap. It is not for protecting an invariant whose
 //! violation corrupts data. For that the answer is the storage's own conditional write — Redis
-//! `SET NX`, a unique index, a compare-and-swap — which is why `docs/plugins.md` §6.3 asks KV to grow
+//! `SET NX`, a unique index, a compare-and-swap — which is why `internal/plugins.md` §6.3 asks KV to grow
 //! a `set_if_absent`, and why this module does not pretend to be it.
 //!
 //! Everything below is written so that an application *can* be correct about this rather than only
@@ -303,7 +303,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The same reason `volucer_kv::Store` is: a call is answered on the worker's exchange thread, and
 /// making this `async` would mean either blocking on a runtime from a synchronous thread or moving the
 /// whole call path onto one. A slow backend blocks the worker that asked and no other — see
-/// `docs/plugins.md` §6.2, and §10 item 9 for the deadline that is still open.
+/// `internal/plugins.md` §6.2, and §10 item 9 for the deadline that is still open.
 pub trait Locks: Send + Sync + std::fmt::Debug {
     /// The driver's name, as it is written in configuration. For logs and for `config.describe`.
     fn name(&self) -> &'static str;

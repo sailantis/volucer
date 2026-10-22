@@ -1,6 +1,6 @@
 //! Do an origin's HTTP trailers survive the proxy?
 //!
-//! `docs/plugins.md` §6.6 rests on the claim that they do, and on it rests the argument that the
+//! `internal/plugins.md` §6.6 rests on the claim that they do, and on it rests the argument that the
 //! first gRPC tier is small: an origin's trailers are already carried, so what is missing is only
 //! the code that **constructs** one. That claim was derived by reading three files —
 //! `incoming_body` preserving frames, `translate_response` never touching them, and the front-end

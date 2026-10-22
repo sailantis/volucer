@@ -1943,7 +1943,7 @@ fn a_slow_origin_is_served_concurrently_rather_than_thread_at_a_time() {
 // ---------------------------------------------------------------------------
 // A supervised origin: the origin's *process* is volucer's.
 //
-// The seam pattern `docs/plugins.md` §8 records applies here in its original form: every layer of
+// The seam pattern `internal/plugins.md` §8 records applies here in its original form: every layer of
 // this — the config, the supervisor, the readiness gate, the client — was tested on its own, and
 // none of those tests could see that the dispatcher was building a `Supervisor` at all. So this one
 // goes through the entry point a *deployment* uses: a `Config` built from TOML, a `Dispatcher`, a
@@ -2145,7 +2145,7 @@ origin = "http://{}"
 
 /// **A failed gRPC call is a `200` with the status in the trailers, not a `502`.**
 ///
-/// The mapping `docs/plugins.md` §6.6 lists as the remaining half of tier A, driven through the
+/// The mapping `internal/plugins.md` §6.6 lists as the remaining half of tier A, driven through the
 /// deployment's entry point: a real listener, a real request, and a backend whose origin is
 /// deliberately not there.
 ///

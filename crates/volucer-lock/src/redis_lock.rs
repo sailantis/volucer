@@ -20,7 +20,7 @@
 //!
 //! # An unknown state is produced here, and it took care to make it *possible*
 //!
-//! This is the driver `docs/plugins.md` §6.3 was written for: a command that fails or times out during
+//! This is the driver `internal/plugins.md` §6.3 was written for: a command that fails or times out during
 //! an acquisition may or may not have run, and the caller has to be told that rather than told "not
 //! held". Three things produce it, all in [`RedisLocks::classify`]:
 //!

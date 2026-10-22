@@ -7,7 +7,7 @@
 //! static is a cache with a hit rate of `1 / workers` and no way to invalidate. This makes one
 //! process's memory addressable from all of them, over the channel that is already open.
 //!
-//! That is also what `docs/plugins.md` §6.2 means by "useful on its own for single-node caching":
+//! That is also what `internal/plugins.md` §6.2 means by "useful on its own for single-node caching":
 //! it needs no Redis, no new listener and no new dependency.
 //!
 //! # Sharded, because the callers are concurrent
