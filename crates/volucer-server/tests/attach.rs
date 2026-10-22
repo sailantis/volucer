@@ -16,6 +16,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use volucer_core::config::{AttachConfig, BackendConfig, Config};
 use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
@@ -104,14 +105,24 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let base = std::env::temp_dir().join(format!(
-            "volucer-attach-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        // A unix socket path is at most `SUN_LEN` bytes (104 on macOS, 108 on
+        // Linux), and the whole path counts - not just the file name. macOS
+        // puts `TMPDIR` under `/var/folders/<two>/<long>/T/`, which is
+        // already 54 bytes, so a directory name built from the test's name
+        // and a nanosecond stamp does not fit: the socket cannot be created
+        // and the test fails with "path must be shorter than SUN_LEN".
+        //
+        // The name is therefore short, and the uniqueness comes from a
+        // counter instead of from a timestamp: a nanosecond stamp is 19
+        // bytes that the path cannot spare. The tag is kept because it is
+        // what makes a leftover directory identifiable, and it is short
+        // enough to keep - it is the timestamp, not the tag, that did not
+        // fit. A counter is enough for uniqueness: the directory is
+        // created, used and removed inside one test, and the process id
+        // keeps two processes apart.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("va-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&base).expect("create the temp dir");
         TempDir(base)
     }
