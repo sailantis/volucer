@@ -58,7 +58,10 @@ fn skip_reason() -> Option<String> {
     // else it could do. Asking the binary directly is the only honest check, because the
     // extension can be compiled in or loaded from a scan directory.
     let output = Command::new(&php)
-        .args(["-r", "echo function_exists('pcntl_fork') ? 'fork' : 'nofork';"])
+        .args([
+            "-r",
+            "echo function_exists('pcntl_fork') ? 'fork' : 'nofork';",
+        ])
         .output()
         .ok()?;
     let answer = String::from_utf8_lossy(&output.stdout);
@@ -395,11 +398,17 @@ fn each_connection_reaches_a_different_forked_child() {
     let (a, b) = std::thread::scope(|scope| {
         let first = scope.spawn({
             let pool = std::sync::Arc::clone(&pool);
-            move || pool.request(&get("/health")).expect("the first worker answered")
+            move || {
+                pool.request(&get("/health"))
+                    .expect("the first worker answered")
+            }
         });
         let second = scope.spawn({
             let pool = std::sync::Arc::clone(&pool);
-            move || pool.request(&get("/health")).expect("the second worker answered")
+            move || {
+                pool.request(&get("/health"))
+                    .expect("the second worker answered")
+            }
         });
         (first.join().unwrap(), second.join().unwrap())
     });
@@ -529,9 +538,10 @@ fn the_dispatcher_serves_a_route_from_an_attached_backend() {
         },
         ..Default::default()
     };
-    config
-        .backends
-        .insert("app".to_string(), BackendConfig::Attach(attach_config(relay, 1, None)));
+    config.backends.insert(
+        "app".to_string(),
+        BackendConfig::Attach(attach_config(relay, 1, None)),
+    );
     config.default_backend = Some("app".to_string());
 
     let dispatcher = Dispatcher::from_config(&config, Routing::default())

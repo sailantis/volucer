@@ -72,7 +72,8 @@ fn fixture(name: &str) -> (PathBuf, String) {
 /// and `php-cgi`'s own `-b` is given a bare path rather than `host:port`.
 #[cfg(unix)]
 #[test]
-fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {    let _serial = serial();
+fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
+    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;
@@ -333,7 +334,8 @@ fn children_lets_one_slot_serve_several_requests_at_once() {
 }
 
 #[test]
-fn starts_a_pool_and_serves_requests_through_every_slot() {    let _serial = serial();
+fn starts_a_pool_and_serves_requests_through_every_slot() {
+    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;

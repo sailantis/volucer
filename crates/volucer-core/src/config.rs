@@ -2846,9 +2846,7 @@ impl BackendConfig {
             // An attached worker is a worker: somebody else started it, but it is still a
             // persistent PHP process that clears its own request scope, which is the fact this
             // answers. Who called `fork()` has no bearing on it.
-            BackendConfig::Worker(_) | BackendConfig::Attach(_) => {
-                RequestScope::ApplicationScoped
-            }
+            BackendConfig::Worker(_) | BackendConfig::Attach(_) => RequestScope::ApplicationScoped,
             BackendConfig::External(_) | BackendConfig::SpawnCgi(_) => RequestScope::PhpSapi,
             BackendConfig::Upstream(_) => RequestScope::OriginScoped,
         }
@@ -5770,7 +5768,10 @@ pub fn validate_cgi_socket(spec: &str) -> std::result::Result<(), String> {
 /// socket to bind. A named pipe is not offered for the *worker* transport because the
 /// protocol needs the connection in two halves and a pipe is not cloneable — see
 /// `volucer_fcgi::transport::Stream::try_clone_stream`.
-pub fn validate_worker_socket(spec: &str, transport: WorkerTransport) -> std::result::Result<(), String> {
+pub fn validate_worker_socket(
+    spec: &str,
+    transport: WorkerTransport,
+) -> std::result::Result<(), String> {
     if transport.is_pipe() {
         return Err(format!(
             "{spec:?} is set beside `transport = \"pipe\"`, which reads stdio and never opens a \
@@ -6817,7 +6818,9 @@ command = "php worker.php"
 transport = "socket"
 "#;
         let config = Config::from_toml(text).expect("config parses");
-        config.validate().expect("a socket transport with no address is valid");
+        config
+            .validate()
+            .expect("a socket transport with no address is valid");
         match &config.backends["app"] {
             BackendConfig::Worker(worker) => assert!(worker.socket.is_none()),
             other => panic!("expected worker, got {other:?}"),
@@ -6888,9 +6891,15 @@ socket = "unix:/run/volucer/consumer"
 "#;
         let config = Config::from_toml(text).expect("parses");
         if cfg!(unix) {
-            config.validate().expect("a valid consumer socket prefix is accepted");
+            config
+                .validate()
+                .expect("a valid consumer socket prefix is accepted");
         }
-        let pool = config.jobs.as_ref().and_then(|jobs| jobs.pool.as_ref()).expect("pool");
+        let pool = config
+            .jobs
+            .as_ref()
+            .and_then(|jobs| jobs.pool.as_ref())
+            .expect("pool");
         assert_eq!(pool.socket.as_deref(), Some("unix:/run/volucer/consumer"));
 
         let bad = text.replace("unix:/run/volucer/consumer", "/run/volucer/consumer");
@@ -6908,7 +6917,10 @@ socket = "unix:/run/volucer/consumer"
         for index in [0u32, 1, 12, u32::MAX] {
             let cgi = cgi_socket_path("unix:/run/volucer/cgi", index);
             let worker = worker_socket_path("unix:/run/volucer/cgi", index);
-            assert_eq!(cgi, worker, "the two slot paths must be the same for {index}");
+            assert_eq!(
+                cgi, worker,
+                "the two slot paths must be the same for {index}"
+            );
         }
         assert_eq!(
             worker_socket_path("unix:/run/volucer/worker", 3),
@@ -6941,8 +6953,16 @@ socket = "unix:/run/volucer/consumer"
         // to itself*, so writing `1` would be two processes for no extra capacity.
         for children in [0, 1] {
             let c = config(children);
-            assert_eq!(c.fcgi_children(), 0, "children={children} must mean one process");
-            assert_eq!(c.slot_capacity(), 1, "children={children} must mean one request");
+            assert_eq!(
+                c.fcgi_children(),
+                0,
+                "children={children} must mean one process"
+            );
+            assert_eq!(
+                c.slot_capacity(),
+                1,
+                "children={children} must mean one request"
+            );
         }
 
         // Above that, the two numbers are the same number, and `n` children means `n`
@@ -6972,7 +6992,10 @@ children = 100000
             .expect_err("must be refused")
             .to_string();
         assert!(err.contains("children"), "{err}");
-        assert!(err.contains("typo"), "the message must say what it probably is: {err}");
+        assert!(
+            err.contains("typo"),
+            "the message must say what it probably is: {err}"
+        );
     }
 
     #[test]

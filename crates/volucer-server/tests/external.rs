@@ -370,7 +370,8 @@ fn a_connection_cap_serialises_requests_instead_of_refusing_them() {
 }
 
 #[test]
-fn an_external_backend_reconnects_after_the_server_is_replaced() {    let _serial = serial();
+fn an_external_backend_reconnects_after_the_server_is_replaced() {
+    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;

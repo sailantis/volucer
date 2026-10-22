@@ -28,7 +28,9 @@ use std::time::Duration;
 use volucer_fcgi::{Client, Endpoint};
 
 fn addr() -> Option<String> {
-    std::env::var("FCGI_ADDR").ok().filter(|value| !value.is_empty())
+    std::env::var("FCGI_ADDR")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 /// Ask a running server what it can take, and print what it said.

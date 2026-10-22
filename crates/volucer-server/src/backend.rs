@@ -96,7 +96,11 @@ impl ClientPool {
     fn acquire(&self, backend: &str) -> Result<(volucer_fcgi::Client, Option<BackendPermit>)> {
         let permit = match &self.limit {
             None => None,
-            Some(limit) => Some(limit.enter().map(|permit| BackendPermit { _permit: permit })?),
+            Some(limit) => Some(
+                limit
+                    .enter()
+                    .map(|permit| BackendPermit { _permit: permit })?,
+            ),
         };
 
         let pooled = {

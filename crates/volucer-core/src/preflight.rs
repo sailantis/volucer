@@ -366,7 +366,8 @@ fn warn_about_socket_prefix(warnings: &mut Vec<Warning>, where_: &str, prefix: &
 /// and refusing to report anything else because one binary is not there yet
 /// would be the wrong trade. The value is that the mistake is reported once,
 /// here, instead of as a startup failure the operator has to go looking for.
-fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {    for (name, backend) in &config.backends {
+fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
+    for (name, backend) in &config.backends {
         match backend {
             BackendConfig::Worker(worker) => {
                 let (program, _) = match split_command(&worker.command) {

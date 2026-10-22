@@ -471,9 +471,7 @@ fn connect_relay(name: &str, attach: &AttachSpec) -> Result<(RelayWriter, RelayR
     };
 
     let endpoint = Endpoint::parse(&attach.relay).map_err(fail)?;
-    let stream = endpoint
-        .connect(Some(CONNECT_TIMEOUT))
-        .map_err(fail)?;
+    let stream = endpoint.connect(Some(CONNECT_TIMEOUT)).map_err(fail)?;
     let reader = stream
         .try_clone_stream()
         .map_err(|source| fail(FcgiError::Io(source)))?;
@@ -680,10 +678,12 @@ fn boot_spawned(
             if let Stream::Tcp(tcp) = &accepted {
                 let _ = tcp.set_nodelay(true);
             }
-            let reader = accepted.try_clone_stream().map_err(|source| ServerError::Spawn {
-                binary: binary.clone(),
-                source,
-            })?;
+            let reader = accepted
+                .try_clone_stream()
+                .map_err(|source| ServerError::Spawn {
+                    binary: binary.clone(),
+                    source,
+                })?;
             BoundedChannel::new(accepted, reader)
         }
         None => {
