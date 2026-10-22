@@ -269,7 +269,7 @@ user, so they need the same.
 
 ## Upgrading
 
-1. Read the release notes for the version you are moving to.
+1. Read the [changelog](../CHANGELOG.md) for the version you are moving to.
 2. Install the new binary alongside the old one, or replace it.
 3. Run `volucer check --config volucer.toml` with the new binary. It reports what the new
    build resolves, and refuses a configuration the new build will not accept.

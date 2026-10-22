@@ -170,6 +170,14 @@ struct Server {
     /// banner is where a deployment learns that. A test that only asked the request path would
     /// not be able to tell "the layer answered no" from "the layer never ran".
     banner: String,
+    /// What the server wrote to stderr, read by [`Server::diagnostics`].
+    ///
+    /// **A failed test needs a reason, and this is where the reason is.** These tests assert on
+    /// status codes, and a 502 is the server saying "the backend failed" — the *why* is a log
+    /// line. With `Stdio::null` on stderr, a 502 arrived with no explanation at all, and the only
+    /// way to diagnose it was to guess and rerun, which is exactly what happened to
+    /// `Test (windows-latest)` in run 39829499236.
+    diagnostics: Option<std::thread::JoinHandle<String>>,
 }
 
 impl Server {
@@ -202,11 +210,23 @@ impl Server {
             .arg(config)
             .args(extra)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
-        let child = command.spawn().ok()?;
+        let mut child = command.spawn().ok()?;
+
+        // Drained on its own thread, from the moment the process exists. A pipe nobody reads
+        // eventually fills and blocks the server on its next log line, which would turn a
+        // diagnostic into a hang — so this has to start here, before the banner is read.
+        let diagnostics = child.stderr.take().map(|stderr| {
+            std::thread::spawn(move || {
+                let mut buffer = String::new();
+                let mut reader = BufReader::new(stderr);
+                let _ = reader.read_to_string(&mut buffer);
+                buffer
+            })
+        });
 
         let mut server = Server {
             child,
@@ -215,6 +235,7 @@ impl Server {
             https_address: None,
             status_address: None,
             banner: String::new(),
+            diagnostics,
         };
         let stdout = server.child.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
@@ -286,6 +307,37 @@ impl Server {
     /// The banner `serve` printed before it started listening.
     fn banner(&self) -> &str {
         &self.banner
+    }
+
+    /// What the server logged to stderr, after asking it to stop.
+    ///
+    /// **`&mut self`, and it ends the server**, because reading a pipe to the end needs the writer
+    /// closed: killing the child here is what turns "wait for EOF" into a bounded call. That is why
+    /// the callers are failure paths — the message is worth more than the running server.
+    fn diagnostics(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let Some(handle) = self.diagnostics.take() else {
+            return String::new();
+        };
+        let collected = handle.join().unwrap_or_else(|_| String::new());
+        if collected.trim().is_empty() {
+            return String::new();
+        }
+        collected
+    }
+
+    /// A failure message that carries the server's own log, or says there was none.
+    ///
+    /// One helper rather than `format!` at each assertion, so every failure in this file is
+    /// diagnosable the same way and none of them silently omits the log.
+    fn failure(&mut self, what: &str) -> String {
+        let log = self.diagnostics();
+        if log.trim().is_empty() {
+            format!("{what}: the server wrote nothing to stderr")
+        } else {
+            format!("{what}\nthe server's stderr:\n{log}")
+        }
     }
 
     /// Whether the banner said this, which is how a startup *decision* is asserted.
@@ -781,10 +833,6 @@ fn a_backend_response_is_compressed_only_when_it_is_asked_for() {
         eprintln!("skipping: no php-cgi on PATH");
         return;
     };
-    let Some(base_port) = free_port_run(2) else {
-        eprintln!("skipping: no run of two free ports");
-        return;
-    };
 
     let root = std::env::temp_dir().join(format!("volucer-compress-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -801,8 +849,14 @@ echo $which === 'big' ? str_repeat('volucer ', 4000) : 'small';
     .expect("write the front controller");
 
     let config_path = root.join("volucer.toml");
-    let config = format!(
-        r#"
+    // The port and the pool's `base_port` both live *inside* the file, so a fresh range means a
+    // fresh file — hence the closure rather than `start_server_on_a_free_port`. Without the retry,
+    // a port taken between the probe and the bind is a run that fails at the first assertion with
+    // a 502 and no explanation.
+    let config_for = || {
+        let base_port = free_port_run(2).expect("a free run of two ports");
+        format!(
+            r#"
 default_backend = "cgi"
 
 [server]
@@ -820,18 +874,21 @@ workers = 1
 bind_host = "127.0.0.1"
 base_port = {base_port}
 "#,
-        port = base_port,
-        root = toml_string(&root.display().to_string()),
-        php_cgi = toml_string(&php_cgi.display().to_string()),
-        base_port = base_port + 1,
-    );
-    std::fs::write(&config_path, config).expect("write the config");
-
-    let Some(server) = Server::start(&binary, &config_path) else {
-        eprintln!("skipping: the server did not start");
-        let _ = std::fs::remove_dir_all(&root);
-        return;
+            // The listener takes the first port of the run and the pool starts at the second, so
+            // reusing one number for both would have the backend bind what the front-end holds.
+            port = base_port,
+            root = toml_string(&root.display().to_string()),
+            php_cgi = toml_string(&php_cgi.display().to_string()),
+            base_port = base_port + 1,
+        )
     };
+
+    let mut server = start_server_with_config(
+        &binary,
+        &config_path,
+        &config_for,
+        "a compression configuration",
+    );
     let address = server
         .http_address
         .clone()
@@ -839,7 +896,12 @@ base_port = {base_port}
 
     // 1. No `Accept-Encoding`: the bytes are the application's own.
     let plain = http_get(&address, "/?which=big");
-    assert_eq!(200, plain.status);
+    assert_eq!(
+        200,
+        plain.status,
+        "{}",
+        server.failure(&format!("the plain request failed: {plain:?}"))
+    );
     assert_eq!(
         None,
         plain.header("content-encoding"),

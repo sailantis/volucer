@@ -54,6 +54,30 @@ const PORT_ATTEMPTS: usize = 10;
 /// Timeout for a single request to a slot.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to wait after the startup probe connects before believing the address is ours.
+///
+/// **What this detects, and why it can be short.** The port a slot is about to use was freed by a
+/// `port_is_free` probe and is bound by `php-cgi` a moment later, so between the two a sibling
+/// process can take it. A connect then succeeds against *somebody else's* listener, the slot is
+/// recorded as healthy, and the first real request comes back a 502 — which is exactly what
+/// `Test (windows-latest)` reported: a green banner and a 502 on the first request.
+///
+/// What has to become visible here is one thing only: a `php-cgi` that **lost the bind exits**.
+/// That is an `exit()` after a failed `bind()`, which is microseconds of work, not a PHP boot. So
+/// the window only has to cover a process exit plus one trip through the scheduler.
+///
+/// It was briefly 50 ms, on the reasoning that CI is slow. That was a guess, and with
+/// `workers = 32` it cost 1.6 s of start-up for a window nothing needed — see
+/// [`CgiPool::start`], which now spawns slots concurrently so the per-slot cost is not multiplied.
+///
+/// **Why not a FastCGI handshake instead?** Tried, measured, rejected as the primary guard.
+/// `php-cgi` binds its listening socket *before* its children are ready to accept, so a
+/// `GET_VALUES` probe arriving in that window blocks until it times out and the settle runs
+/// anyway: a 32-child start-up measured 372 ms against 91 ms for this. The handshake proves more,
+/// but it costs a timeout on every slot in the ordinary case, which is the wrong trade for a
+/// question the process's own exit status already answers.
+const SETTLE_AFTER_CONNECT: Duration = Duration::from_millis(10);
+
 /// One `php-cgi` listening socket, the process tree behind it, and its connections.
 ///
 /// **A slot is an address with a capacity, not a process.** With `children = 0` the two are
@@ -367,9 +391,43 @@ impl CgiPool {
             _guard: guard,
         };
 
+        pool.spawn_every_slot(config)?;
+
+        tracing::info!(
+            backend = %pool.name,
+            slots = pool.slots.len(),
+            binary = %pool.binary.display(),
+            "php-cgi pool started"
+        );
+        Ok(pool)
+    }
+
+    /// Spawn every slot, **concurrently**.
+    ///
+    /// The slots are independent — each owns its own address and its own process tree, and nothing
+    /// in this loop reads another's state — so starting them one at a time was a serialisation
+    /// with no purpose. What it cost was every per-slot wait, multiplied: the settle after each
+    /// connect (see [`SETTLE_AFTER_CONNECT`]) plus each child's own boot. At `workers = 32` that
+    /// turned a fixed cost into a linear one, and it is start-up latency on a deployment that is
+    /// not yet serving.
+    ///
+    /// **Ports are still allocated serially, and that has to be the case.** `port_is_free` is a
+    /// probe-then-bind: two threads probing at once would both be told the same port is free and
+    /// hand it to two children. So the *addresses* are chosen here, in order, and only the spawn
+    /// and the wait happen in parallel. That keeps the allocation's single-threaded semantics
+    /// exactly as they were.
+    ///
+    /// Results are collected **in index order**, so a failure reports the slot it belongs to and
+    /// the pool is all-or-nothing: a partial pool would be a server that silently serves with
+    /// fewer slots than its configuration asked for.
+    fn spawn_every_slot(&mut self, config: &SpawnCgiConfig) -> Result<()> {
+        let count = self.permits.len() as u32;
+
+        // Addresses, decided up front so the port arithmetic stays single-threaded.
+        let mut addresses = Vec::with_capacity(count as usize);
         let mut port = config.base_port;
         for index in 0..count {
-            let slot_address = match &config.socket {
+            let address = match &config.socket {
                 Some(prefix) => {
                     let path = volucer_core::config::cgi_socket_path(prefix, index);
                     #[cfg(windows)]
@@ -387,43 +445,64 @@ impl CgiPool {
                     // *probe* is only a hint — php-cgi binds the port itself a
                     // moment later, so it can still lose it — which is what
                     // `spawn_port_slot` handles.
-                    while !port_is_free(&pool.bind_host, port) {
+                    while !port_is_free(&self.bind_host, port) {
                         port = port
                             .checked_add(1)
                             .ok_or_else(|| ServerError::Misconfigured {
-                                backend: name.to_string(),
+                                backend: self.name.clone(),
                                 reason: "ran out of ports while allocating slots".to_string(),
                             })?;
                     }
-                    let port_to_try = port;
-                    // Advanced by one *before* the spawn, so a retry that loses this
-                    // port continues from the next free one rather than re-probing
-                    // the port it just lost.
+                    let chosen = port;
                     port = port
                         .checked_add(1)
                         .ok_or_else(|| ServerError::Misconfigured {
-                            backend: name.to_string(),
+                            backend: self.name.clone(),
                             reason: "ran out of ports while allocating slots".to_string(),
                         })?;
-                    let slot = pool.spawn_port_slot(port_to_try)?;
-                    pool.slots.push(Mutex::new(slot));
-                    continue;
+                    SlotAddress::Port(chosen)
                 }
             };
-            let slot = pool.spawn_slot(&slot_address)?;
-            if let SlotAddress::Socket(path) = &slot_address {
-                pool.socket_paths.push(path.clone());
-            }
-            pool.slots.push(Mutex::new(slot));
+            addresses.push(address);
         }
 
-        tracing::info!(
-            backend = %pool.name,
-            slots = pool.slots.len(),
-            binary = %pool.binary.display(),
-            "php-cgi pool started"
-        );
-        Ok(pool)
+        let mut spawned: Vec<Result<Slot>> = std::thread::scope(|scope| {
+            let pool: &CgiPool = self;
+            let handles: Vec<_> = addresses
+                .iter()
+                .map(|address| {
+                    // `&self` is borrowed immutably and shared by every thread: spawning reads
+                    // the binary, the bind host and the lifecycle guard, and mutates none of
+                    // them. `CgiPool::start` has not published this pool to anyone yet.
+                    scope.spawn(move || match address {
+                        SlotAddress::Port(first) => pool.spawn_port_slot(*first),
+                        other => pool.spawn_slot(other),
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(ServerError::Misconfigured {
+                            backend: "spawn".to_string(),
+                            reason: "a slot-spawning thread panicked".to_string(),
+                        })
+                    })
+                })
+                .collect()
+        });
+
+        // Index order, so the error names the slot it came from rather than whichever thread
+        // happened to finish first.
+        for (index, result) in spawned.drain(..).enumerate() {
+            let slot = result?;
+            if let SlotAddress::Socket(path) = &addresses[index] {
+                self.socket_paths.push(path.clone());
+            }
+            self.slots.push(Mutex::new(slot));
+        }
+        Ok(())
     }
 
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
@@ -806,7 +885,31 @@ fn port_is_free(host: &str, port: u16) -> bool {
 /// slot bound a port or a unix socket — and it is the only startup probe that
 /// proves the *client* can reach the address, rather than that something is
 /// listening somewhere.
+///
+/// **A connect that succeeds is not yet proof that *our* child is the one listening.** See
+/// [`SETTLE_AFTER_CONNECT`] for the failure this guards: a foreign listener on the same address,
+/// a healthy-looking slot, and a 502 on the first real request. A successful connect is therefore
+/// followed by one settle, and then the child itself is asked whether it survived — which is the
+/// only evidence that distinguishes "our backend is up" from "somebody else is on our port".
 fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Result<()> {
+    wait_until_listening_with(slot, binary, timeout, &mut |_| {
+        std::thread::sleep(SETTLE_AFTER_CONNECT)
+    })
+}
+
+/// The same probe, with the settle injected.
+///
+/// Exists so the guard can be **falsified** rather than merely exercised. A test that raced a real
+/// child against a real clock would pass whether or not the guard ran — the child would usually
+/// still be alive 10 ms after a successful connect — which is the "a test that cannot fail on the
+/// machine it runs on is not evidence" defect `internal/plan.md` keeps recording. Taking the
+/// settle as a closure lets a test make the child exit *inside* the window, deterministically.
+fn wait_until_listening_with(
+    slot: &mut Slot,
+    binary: &Path,
+    timeout: Duration,
+    settle: &mut dyn FnMut(&mut Child),
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match slot.child.try_wait() {
@@ -825,7 +928,31 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
             .connect(Some(Duration::from_millis(250)))
             .is_ok()
         {
-            return Ok(());
+            // The settle: long enough for a child whose bind lost the race to exit, and no
+            // longer, because that is the only thing it is waiting for.
+            settle(&mut slot.child);
+            match slot.child.try_wait() {
+                // Still running, so the listener we just reached is ours.
+                Ok(None) => return Ok(()),
+                // It exited between the connect and now: it never held the port, so the
+                // address belongs to somebody else. Reported as the bind failure it is, which
+                // is the one error the caller retries on a fresh port.
+                Ok(Some(status)) => {
+                    tracing::debug!(
+                        binary = %binary.display(),
+                        address = %slot.endpoint,
+                        %status,
+                        "the slot exited just after its address answered; the listener was \
+                         somebody else's"
+                    );
+                    return Err(ServerError::StartupExited {
+                        binary: binary.to_path_buf(),
+                        status: status.to_string(),
+                        hint: Hint::default(),
+                    });
+                }
+                Err(source) => return Err(ServerError::Io(source)),
+            }
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -993,6 +1120,66 @@ mod tests {
                 "port_is_free called {port} taken on all 10 attempts after releasing it"
             );
         }
+    }
+
+    /// The startup probe must not mistake *somebody else's* listener for its own child.
+    ///
+    /// **This is the falsification of the guard, not a test of the happy path.** The defect it
+    /// pins: a slot's port is freed by a probe and bound by `php-cgi` a moment later, so another
+    /// process can be on it. A connect then succeeds, the slot is recorded as healthy, and the
+    /// first real request comes back a 502 — which is what `Test (windows-latest)` reported in
+    /// run 39829499236.
+    ///
+    /// The settle is injected so the child can be made to exit *inside* the window,
+    /// deterministically. With the guard removed this test fails, because the slot is reported
+    /// healthy; with it, the exit is seen and the error is the one the caller retries on.
+    #[test]
+    fn a_listener_that_is_not_ours_is_not_mistaken_for_a_started_slot() {
+        let _serial = port_lock();
+
+        // A stand-in for the foreign process: something listening on the port that is not the
+        // child, and that will never answer a FastCGI record.
+        let squatter = TcpListener::bind("127.0.0.1:0").expect("bind the squatted port");
+        let port = squatter.local_addr().expect("address").port();
+
+        // A child that has already ended, which is exactly the state a `php-cgi` that lost the
+        // bind is in.
+        let child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "exit", "3"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        } else {
+            Command::new("true").spawn()
+        }
+        .expect("spawn a child that exits immediately");
+
+        let mut slot = Slot {
+            child,
+            endpoint: Endpoint::Tcp(format!("127.0.0.1:{port}")),
+            served: 0,
+            clients: Vec::new(),
+        };
+
+        // The settle waits for the child to be gone, so the test does not depend on how long
+        // that takes on a loaded runner.
+        let err = wait_until_listening_with(
+            &mut slot,
+            Path::new("php-cgi-that-lost-the-bind"),
+            Duration::from_secs(5),
+            &mut |child| {
+                let _ = child.wait();
+            },
+        )
+        .expect_err("a listener belonging to another process is not a started slot");
+
+        assert!(
+            matches!(err, ServerError::StartupExited { .. }),
+            "a lost bind has to look like one, because that is the only error the caller retries \
+             on a fresh port: {err:?}"
+        );
+        drop(squatter);
     }
 
     #[test]
