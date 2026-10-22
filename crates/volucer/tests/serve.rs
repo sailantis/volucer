@@ -153,6 +153,12 @@ struct Server {
     address: String,
     /// The HTTP listener's address, when the configuration asked for one.
     http_address: Option<String>,
+    /// The HTTPS listener's address, when the configuration asked for one.
+    ///
+    /// Separate from `http_address` because they are separate listeners: `http` stays
+    /// plaintext when `https` is set, so folding one into the other would make a test
+    /// believe a cleartext listener existed when only a TLS one did.
+    https_address: Option<String>,
     /// The metrics and status listener's address, when a `[metrics]` or `[status]` table asked for
     /// one. Read from the banner for the same reason the other two are: a test that guessed a port
     /// would be testing its own ability to find a free one.
@@ -206,6 +212,7 @@ impl Server {
             child,
             address: String::new(),
             http_address: None,
+            https_address: None,
             status_address: None,
             banner: String::new(),
         };
@@ -239,6 +246,14 @@ impl Server {
                 if !address.is_empty() && address != "(disabled)" {
                     server.http_address = Some(address.to_string());
                 }
+            } else if let Some(rest) = trimmed.strip_prefix("https:") {
+                // A listener in its own right, so it counts as one: a configuration with
+                // only `https` has a live socket, and waiting for a `http:` line that will
+                // never come would kill the server and report "did not start".
+                let address = rest.split_whitespace().next().unwrap_or("");
+                if !address.is_empty() && address != "(disabled)" {
+                    server.https_address = Some(address.to_string());
+                }
             } else if let Some(rest) = trimmed.strip_prefix("metrics:") {
                 // `serve` prints the metrics/status listener under `metrics:` whichever of the two
                 // tables configured it, because they share one listener.
@@ -256,6 +271,7 @@ impl Server {
                 // the deadline above is never re-checked while it blocks.
                 if server.address.is_empty()
                     && server.http_address.is_none()
+                    && server.https_address.is_none()
                     && server.status_address.is_none()
                 {
                     break;
@@ -3728,6 +3744,97 @@ fn the_worker_list_and_the_reset_agree_about_a_worker_in_a_second_pool() {
     // answer `curl -f` can act on without parsing the body.
     let missing = http_request(&status_address, "POST", "/workers/9/reset", &[]);
     assert_eq!(missing.status, 404, "{missing:?}");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_https_only_configuration_starts_a_listener() {
+    // `https` is an independently bound listener, so a configuration that states only
+    // `https` has one. `serve` used to test `http` and `fastcgi` and refuse everything
+    // else — while `validate` accepted an `https`-only file, so `volucer check` replied
+    // `configuration OK` and `serve` then died with "no listener is configured". A
+    // deployment whose whole point is to answer on :443 only could not start at all.
+    //
+    // The assertion is on the banner rather than on a request: the certificate here is
+    // self-signed, and proving the handshake works is a different test. What this one
+    // pins is that the listener exists, which is the fact that was wrong.
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary has not been built");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: php-cgi was not found");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-https-only-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("public")).expect("create the document root");
+    std::fs::write(
+        root.join("public/index.php"),
+        "<?php header('Content-Type: text/plain'); echo 'ok';",
+    )
+    .expect("write the front controller");
+
+    // A certificate and key, generated with the same `openssl` a reader would use. Without
+    // one, `[server.tls]` is a startup error, which would make this test pass for the
+    // wrong reason.
+    let certs = root.join("certs");
+    std::fs::create_dir_all(&certs).expect("create the certificate directory");
+    let made = Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        ])
+        .arg("-keyout")
+        .arg(certs.join("default.key"))
+        .arg("-out")
+        .arg(certs.join("default.crt"))
+        .args(["-subj", "/CN=localhost"])
+        .output();
+    match made {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            eprintln!("skipping: openssl is not available to make a certificate");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+    }
+
+    let config = root.join("volucer.toml");
+    let php_cgi = toml_string(&php_cgi.display().to_string());
+    let config_path = config.clone();
+    let config_for = move || {
+        let port = free_port_run(1).expect("reserve a port");
+        format!(
+            "default_backend = \"cgi\"\n\
+             \n\
+             [server]\n\
+             https = \"127.0.0.1:{port}\"\n\
+             document_root = \"./public\"\n\
+             front_controller = \"index.php\"\n\
+             \n\
+             [server.tls]\n\
+             certificate = \"certs/default.crt\"\n\
+             key = \"certs/default.key\"\n\
+             \n\
+             [backends.cgi]\n\
+             kind = \"spawn_cgi\"\n\
+             binary = {php_cgi}\n\
+             workers = 1\n"
+        )
+    };
+
+    let server = start_server_with_config(&binary, &config_path, &config_for, "an https-only file");
+    let banner = server.banner();
+    assert!(
+        banner.contains("https:") && banner.contains("(https)"),
+        "the https listener was not announced; the banner says:\n{banner}"
+    );
+    assert!(
+        banner.contains("http:             (disabled)"),
+        "no plaintext listener was configured, so none should be announced:\n{banner}"
+    );
 
     drop(server);
     let _ = std::fs::remove_dir_all(&root);

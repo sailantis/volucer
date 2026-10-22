@@ -112,7 +112,7 @@ pub enum ServerError {
     #[error(transparent)]
     Config(#[from] volucer_core::Error),
 
-    #[error("no listener is configured; set server.fastcgi or server.http")]
+    #[error("no listener is configured; set server.http, server.https or server.fastcgi")]
     NoListener,
 
     #[error("a listener could not start: {reason}")]

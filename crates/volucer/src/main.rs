@@ -275,7 +275,10 @@ fn version() {
         "  php floor:        {}",
         volucer_server::MINIMUM_PHP_VERSION
     );
-    println!("  backends:         worker, external fpm, spawn_cgi, upstream");
+    // All five `kind` values, in the order `BackendConfig` declares them. `attach` belongs
+    // here even though it is the least-used: it is a shape the configuration accepts, and a
+    // capability list that omits one is a list an operator cannot check a config against.
+    println!("  backends:         worker, attach, external fpm, spawn_cgi, upstream");
     // ACME is advertised only as *available*, because whether it is in use is a property of the
     // configuration rather than of the build — `volucer check` is where a deployment's own answer
     // is printed. Saying "TLS-ALPN-01" rather than "ACME" matters: it is the one challenge this
@@ -718,7 +721,11 @@ fn serve(
     ));
     let http_address = config.server.http.clone();
     let fastcgi_address = config.server.fastcgi.clone();
-    if http_address.is_none() && fastcgi_address.is_none() {
+    // `https` counts: it is an independently bound TLS listener, so a configuration that
+    // states only `https` has a listener. Checking `http` and `fastcgi` alone refused a
+    // deployment whose whole point was to answer on :443 only — and `validate` accepts it,
+    // so the refusal arrived here, after `check` had already said OK.
+    if http_address.is_none() && fastcgi_address.is_none() && config.server.https.is_none() {
         return Err(ServerError::NoListener);
     }
 
