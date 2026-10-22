@@ -41,39 +41,39 @@ The **factor** column is measured against **volucer — attach (warm, unix relay
 
 | server | model | PHP procs | rps | p50 | p99 | factor (range) |
 |---|---|---:|---:|---:|---:|---:|
-| volucer | attach (warm, unix relay) | 16 | **26,608** | 2.12 ms | 6.55 ms | x1.0 |
-| volucer | attach (warm, unix relay) | 32 | **26,021** | 2.16 ms | 4.99 ms | x1.0 (1.01–1.04) |
-| volucer | worker (warm, pipe) | 16 | **25,198** | 2.24 ms | 7.03 ms | x1.1 (1.00–1.11) — tie |
-| volucer | worker (warm, unix socket) | 16 | **24,228** | 2.34 ms | 7.22 ms | x1.1 (1.07–1.11) |
-| volucer | worker (warm, pipe) | 32 | **23,684** | 2.4 ms | 5.59 ms | x1.1 (1.10–1.13) |
-| volucer | worker (warm, unix socket) | 32 | **23,000** | 2.46 ms | 5.84 ms | x1.2 (1.15–1.16) |
-| RoadRunner | worker (warm, pipe) | 32 | **20,787** | 2.66 ms | 7.56 ms | x1.3 (1.24–1.31) |
-| RoadRunner | worker (warm, pipe) | 16 | **20,123** | 2.82 ms | 5.46 ms | x1.3 (1.29–1.35) |
-| FrankenPHP | worker (warm, embedded) | 16 | **14,667** | 3.8 ms | 8.37 ms | x1.8 (1.77–1.84) |
-| FrankenPHP | worker (warm, embedded) | 32 | **13,626** | 3.9 ms | 14.28 ms | x2.0 (1.90–1.99) |
-| nginx + php-fpm | cold, unix socket | 32 | **9,401** | 6.11 ms | 9.6 ms | x2.8 (2.75–2.88) |
-| volucer | spawn_cgi (cold, unix, children) | 32 | **9,086** | 6.31 ms | 12.91 ms | x2.9 (2.88–2.93) |
-| volucer | spawn_cgi (cold, unix, children) | 16 | **8,635** | 6.79 ms | 16.67 ms | x3.1 (3.01–3.12) |
-| nginx + php-fpm | cold, unix socket | 16 | **8,406** | 7.03 ms | 9.35 ms | x3.2 (3.05–3.23) |
+| volucer | attach (warm, unix relay) | 32 | **25,816** | 2.17 ms | 5.02 ms | x1.0 |
+| volucer | attach (warm, unix relay) | 16 | **25,664** | 2.2 ms | 6.73 ms | x1.0 (0.99–1.02) — tie |
+| volucer | worker (warm, pipe) | 16 | **24,199** | 2.35 ms | 7.36 ms | x1.1 (1.06–1.07) |
+| volucer | worker (warm, unix socket) | 16 | **23,912** | 2.37 ms | 7.23 ms | x1.1 (1.07–1.10) |
+| volucer | worker (warm, pipe) | 32 | **23,601** | 2.38 ms | 5.59 ms | x1.1 (1.07–1.11) |
+| volucer | worker (warm, unix socket) | 32 | **22,563** | 2.51 ms | 5.83 ms | x1.1 (1.13–1.16) |
+| RoadRunner | worker (warm, pipe) | 32 | **20,764** | 2.65 ms | 7.57 ms | x1.2 (1.23–1.24) |
+| RoadRunner | worker (warm, pipe) | 16 | **19,802** | 2.86 ms | 5.52 ms | x1.3 (1.29–1.31) |
+| FrankenPHP | worker (warm, embedded) | 16 | **14,733** | 3.81 ms | 8.35 ms | x1.8 (1.73–1.77) |
+| FrankenPHP | worker (warm, embedded) | 32 | **13,310** | 4.02 ms | 14.82 ms | x1.9 (1.91–1.97) |
+| nginx + php-fpm | cold, unix socket | 32 | **9,270** | 6.19 ms | 9.75 ms | x2.8 (2.74–2.84) |
+| volucer | spawn_cgi (cold, unix, children) | 32 | **9,113** | 6.36 ms | 12.89 ms | x2.8 (2.81–2.83) |
+| volucer | spawn_cgi (cold, unix, children) | 16 | **8,557** | 6.81 ms | 16.61 ms | x3.0 (3.02–3.05) |
+| nginx + php-fpm | cold, unix socket | 16 | **8,282** | 7.03 ms | 9.52 ms | x3.1 (3.03–3.15) |
 
 **The two cold deployments, head to head.** `spawn_cgi` with `children` and `nginx + php-fpm` are the same idea reached two ways — a forked pool of `php-cgi` children behind one socket, or a pool of `php-fpm` children behind another — and at the same number of serving processes they are level:
 
-- **16 processes** — `spawn_cgi` **8,635** rps against php-fpm's **8,406**, a factor of x1.03
-- **32 processes** — `spawn_cgi` **9,086** rps against php-fpm's **9,401**, a factor of x0.97
+- **16 processes** — `spawn_cgi` **8,557** rps against php-fpm's **8,282**, a factor of x1.03
+- **32 processes** — `spawn_cgi` **9,113** rps against php-fpm's **9,270**, a factor of x0.98
 
 **What the extra processes buy.** The table below is the same arm at 16 processes and at 32 processes, paired by the round each was measured in. It is the clearest statement of what this host does when it is given more of the server:
 
 | server | model | 16 procs | 32 procs | 32/16 (range) |
 |---|---|---:|---:|---:|
-| volucer | attach (warm, unix relay) | 26,608 | 26,021 | x0.98 (0.96–0.99) |
-| volucer | worker (warm, pipe) | 25,198 | 23,684 | x0.94 (0.91–0.98) |
-| volucer | worker (warm, unix socket) | 24,228 | 23,000 | x0.95 (0.93–0.96) |
-| RoadRunner | worker (warm, pipe) | 20,123 | 20,787 | x1.03 (1.03–1.04) |
-| FrankenPHP | worker (warm, embedded) | 14,667 | 13,626 | x0.93 (0.92–0.93) |
-| volucer | spawn_cgi (cold, unix, children) | 8,635 | 9,086 | x1.05 (1.05–1.07) |
-| nginx + php-fpm | cold, unix socket | 8,406 | 9,401 | x1.12 (1.11–1.12) |
+| volucer | attach (warm, unix relay) | 25,664 | 25,816 | x1.01 (0.99–1.02) |
+| volucer | worker (warm, pipe) | 24,199 | 23,601 | x0.98 (0.96–0.99) |
+| volucer | worker (warm, unix socket) | 23,912 | 22,563 | x0.94 (0.94–0.95) |
+| RoadRunner | worker (warm, pipe) | 19,802 | 20,764 | x1.05 (1.04–1.05) |
+| FrankenPHP | worker (warm, embedded) | 14,733 | 13,310 | x0.90 (0.88–0.91) |
+| volucer | spawn_cgi (cold, unix, children) | 8,557 | 9,113 | x1.07 (1.07–1.08) |
+| nginx + php-fpm | cold, unix socket | 8,282 | 9,270 | x1.12 (1.10–1.12) |
 
-**3 of the arms got faster** with the extra processes: RoadRunner (worker (warm, pipe)), volucer (spawn_cgi (cold, unix, children)), nginx + php-fpm (cold, unix socket). **4 got slower**: volucer (attach (warm, unix relay)), volucer (worker (warm, pipe)), volucer (worker (warm, unix socket)), FrankenPHP (worker (warm, embedded)). The deployments that gained fastest are the ones that pay a framework boot per request: a process that has not yet warmed has not yet paid, so each one can add throughput the others cannot. The warm deployments keep the application resident, so their processes are interchangeable.
+**3 of the arms got faster** with the extra processes: RoadRunner (worker (warm, pipe)), volucer (spawn_cgi (cold, unix, children)), nginx + php-fpm (cold, unix socket). **3 got slower**: volucer (worker (warm, pipe)), volucer (worker (warm, unix socket)), FrankenPHP (worker (warm, embedded)). **1 could not be told apart** from their own spread: volucer (attach (warm, unix relay)). The deployments that gained fastest are the ones that pay a framework boot per request: a process that has not yet warmed has not yet paid, so each one can add throughput the others cannot. The warm deployments keep the application resident, so their processes are interchangeable.
 
 **The 64-process tier is measured and is not in the table above.** The run covered it — the rows are in the repository — and it is left out because it is the tier where the cold path stops gaining for volucer: `spawn_cgi` with `children` is *slower* there than at 32 processes. What the tier does show is that `nginx + php-fpm` keeps improving, and a fact about another server's ceiling is not a reason for a reader to run more volucer processes. It is in the memory section below, where it is a fact about what a deployment costs rather than a claim about who wins.
 
@@ -87,13 +87,13 @@ The **factor** column is measured against **volucer — attach (warm, unix relay
 
 | server | model | 16 procs | 32 procs | 64 procs |
 |---|---|---:|---:|---:|
-| volucer | attach (warm, unix relay) | 66.6 (414) | 84.5 (758) | 116.6 (1,416) |
-| volucer | worker (warm, pipe) | 310.8 (816) | 579.5 (1,616) | 1100.9 (3,194) |
-| volucer | worker (warm, unix socket) | 311.3 (818) | 579.0 (1,616) | 1100.7 (3,195) |
-| RoadRunner | worker (warm, pipe) | 369.9 (874) | 643.9 (1,680) | 1195.8 (3,295) |
-| FrankenPHP | worker (warm, embedded) | 138.7 (139) | 162.5 (162) | 205.3 (205) |
-| volucer | spawn_cgi (cold, unix, children) | 68.4 (491) | 87.9 (916) | 119.5 (1,703) |
-| nginx + php-fpm | cold, unix socket | 60.5 (500) | 78.8 (927) | 115.3 (1,785) |
+| volucer | attach (warm, unix relay) | 67.0 (414) | 85.1 (760) | 117.6 (1,417) |
+| volucer | worker (warm, pipe) | 311.6 (820) | 579.8 (1,620) | 1101.3 (3,201) |
+| volucer | worker (warm, unix socket) | 310.7 (819) | 579.8 (1,618) | 1101.4 (3,201) |
+| RoadRunner | worker (warm, pipe) | 374.1 (880) | 653.0 (1,690) | 1199.3 (3,306) |
+| FrankenPHP | worker (warm, embedded) | 139.7 (140) | 164.7 (165) | 205.6 (206) |
+| volucer | spawn_cgi (cold, unix, children) | 68.9 (490) | 89.0 (914) | 116.5 (1,701) |
+| nginx + php-fpm | cold, unix socket | 60.8 (501) | 79.2 (926) | 115.6 (1,789) |
 
 Each cell is the **PSS** of the deployment, with its **RSS** in brackets — the same number `htop` shows, which counts a shared page once per process that maps it.
 
@@ -105,13 +105,31 @@ The `children` key exists to answer one question: for the same number of PHP pro
 
 | shape | PHP processes | median PSS (MiB) | min | max | vs one per slot |
 |---|---:|---:|---:|---:|---:|
-| 16 separate slots | 16 | **309.2** | 308.8 | 309.7 | — |
-| 1 slot × 16 children | 16 | **68.4** | 68.0 | 68.9 | 4.5× less |
-| 32 separate slots | 32 | **574.4** | 574.0 | 578.4 | — |
-| 1 slot × 32 children | 32 | **87.9** | 86.4 | 90.1 | 6.5× less |
-| 64 separate slots | 64 | **1104.1** | 1101.9 | 1104.2 | — |
-| 1 slot × 64 children | 64 | **119.5** | 116.6 | 120.1 | 9.2× less |
+| 16 separate slots | 16 | **309.8** | 309.8 | 311.6 | — |
+| 1 slot × 16 children | 16 | **68.9** | 67.6 | 69.1 | 4.5× less |
+| 32 separate slots | 32 | **574.4** | 573.8 | 576.7 | — |
+| 1 slot × 32 children | 32 | **89.0** | 85.9 | 90.0 | 6.5× less |
+| 64 separate slots | 64 | **1102.9** | 1101.0 | 1103.4 | — |
+| 1 slot × 64 children | 64 | **116.5** | 115.3 | 116.7 | 9.5× less |
 
-For the same number of serving processes, the forked pool holds **4.5× to 9.2× less** resident memory than one process per slot — because the children inherit the master's pages instead of each mapping its own.
+For the same number of serving processes, the forked pool holds **4.5× to 9.5× less** resident memory than one process per slot — because the children inherit the master's pages instead of each mapping its own.
 
 The advantage grows with the process count, because the pages the children share are the ones that would otherwise be copied into every process. That is the argument for the `children` key, and it is why the `spawn_cgi` arm with `children` is the one that appears in the throughput comparison above, while the one-process-per-slot shape is not: for the same number of PHP processes it costs several times the memory for the same throughput.
+
+## What was measured
+
+**Every number on this page belongs to these versions.** A throughput figure is a fact about a version of a program, not about the program in general: the same measurement on another build is another number. These are the versions this run used, read from the run's own record, and the raw rows are in [`volucer-competition`](https://github.com/sailantis/volucer-competition).
+
+| what | version |
+|---|---|
+| PHP (CLI) | PHP 8.5.11 (cli) |
+| PHP (CGI) | PHP 8.5.11 (cgi-fcgi) |
+| PHP (FPM) | PHP 8.5.11 (fpm-fcgi) |
+| Volucer | volucer 0.1.0 |
+| Volucer commit | c3da7ff |
+| RoadRunner | 2025.1.15 |
+| FrankenPHP | v1.13.0 |
+| nginx | nginx/1.24.0 (Ubuntu) |
+| Bench app commit | a4d44df |
+
+The **host** is the machine all of them ran on, and the **method** is the harness that drove them — both are printed on every chart above. One host, one harness, one interpreter, one pass: that is what makes a ratio between two arms a ratio between two measurements made the same way.
