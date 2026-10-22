@@ -1683,7 +1683,7 @@ Later, and deliberately not part of Phase 8:
     "plugins" are statically linked Go packages resolved by a compile-time DI container
     (`container/plugins.go`; there is no `plugin.Open` anywhere), so there is no ABI in RR to copy.
     The Rust-shaped equivalent — a compile-time service registry plus cargo features — is
-    described in `docs/plugins.md` §5 and is not a step this plan needs to schedule. The enum
+    described in `plugins.md` §5 and is not a step this plan needs to schedule. The enum
     backend kind stays the extension point.
 40. `route-policy` — **done** (`5709b03`). `RouteConfig` gains `policy` (`all` | `backend` |
     `static`) and `backend` becomes optional, so a route is a location rather than only a backend
@@ -2425,7 +2425,7 @@ the workflow is the same one, but it finally has an output, so it stops being de
 
 73. `django-and-rails` — **done, and both needed no adapter, which was not the expected answer.**
     The plan carried Django and Rails as "the real work" of a native worker, with per-runtime
-    reset code to write (the table in `docs/plugins.md` §7.2 says Django needs
+    reset code to write (the table in `plugins.md` §7.2 says Django needs
     `close_old_connections()` and transaction cleanup, and Rails needs
     `Rails.application.executor.wrap`). **Both claims are false for a plain application call**,
     and this step exists because a prediction in a plan is not evidence.

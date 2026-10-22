@@ -213,8 +213,9 @@ server does** rather than something it reports. The `outcome` field is one of th
 | `reject` | **Settles the reservation without recording a failure** | Not done, and it must not come back |
 
 `reject` is the arm worth reading twice. Nacking it would bring the job back for ever, and the server
-imposes no retry count, no backoff and no dead-lettering — see `docs/plugins.md` §6.4 for why those stay
-the application's. What makes the policy writable is that the driver increments `attempts` on every
+imposes no retry count, no backoff and no dead-lettering — those stay the application's, because only
+the application knows what a retry means for its own job. What makes the policy writable is that the
+driver increments `attempts` on every
 reservation, so an application that wants "give up after three" reads the number it is given rather than
 keeping a counter of its own.
 
@@ -378,7 +379,7 @@ handled a fatal error reports `keep_alive = false` and is replaced instead of re
 ### gRPC calls, over the same exchange
 
 A gRPC call is delivered as an ordinary `REQUEST`, and this is a decision rather than a shortcut:
-**the server never parses a gRPC message** (`docs/plugins.md` §6.6), so a call is a request whose
+**the server never parses a gRPC message**, so a call is a request whose
 body happens to be length-delimited framed messages instead of a form. Reusing `REQUEST` is what
 makes that true rather than merely claimed — there is no second exchange to teach about framing, and
 the one-request-in-flight invariant is untouched, because a gRPC call *is* the request in flight.

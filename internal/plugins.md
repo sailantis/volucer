@@ -5,7 +5,7 @@
 This document exists because the question "can volucer also do gRPC / KV / locks / jobs /
 metrics, and can it run Django and Rails?" deserves an answer that is a design rather than a
 shrug. It is a **plan, not a description of the code**: nothing in it is built unless a section
-says so. `docs/plan.md` remains the record of what exists, and its §10 is the list to read for the
+says so. `plan.md` remains the record of what exists, and its §10 is the list to read for the
 current state.
 
 Read §1 if you want the survey, §2–§4 if you want the decisions that everything else depends on,
@@ -263,7 +263,7 @@ PHP app would otherwise have to change code, which is a different thing from par
 
 Reasons, none of which are about effort:
 
-- **It is already the settled position.** `docs/plan.md` §3 and §4 chose an own protocol over
+- **It is already the settled position.** `plan.md` §3 and §4 chose an own protocol over
   goridge ("adopting its semantics means becoming a RoadRunner clone"), TOML over YAML, and a
   config model with `#[serde(deny_unknown_fields)]` on every table. Reading `.rr.yaml` would add a
   second configuration language, a YAML dependency, and a versioning commitment to somebody else's
@@ -1152,7 +1152,7 @@ only a *deployment* would have:
   for a poll interval on a job that is ready right now. Same shape as the memory driver's correction, and
   the test fails either way, which is what a shared rule is for.
 - **Redis Cluster is not supported and is not claimed to be.** The keys of one pipeline share no hash tag,
-  so the reserve script spans keys a cluster would refuse to co-locate. `docs/plugins.md` §9.4 records that
+  so the reserve script spans keys a cluster would refuse to co-locate. `plugins.md` §9.4 records that
   as a decision.
 
 **PHP integration is the point of the feature for this organisation.** `sailantis/azera-queue`
@@ -1185,7 +1185,7 @@ question, and it belongs with whichever step next touches the jobs path.
 
 ### 6.6 gRPC — three tiers, and the schema is not the server's problem
 
-`docs/plan.md` §6 (*"gRPC — a named non-goal"*) settled the shape and recorded a trigger. This
+`plan.md` §6 (*"gRPC — a named non-goal"*) settled the shape and recorded a trigger. This
 section answers the question it left open — *static or dynamic `.proto`?* — and the answer is that
 **it is a false choice**. The build step belongs to the *application*, and the server can route,
 frame and answer without parsing a single `.proto`. The only thing that genuinely needs descriptors
@@ -1549,7 +1549,7 @@ worker-as-work question: **L** on its own, and no longer on the critical path fo
 ### 6.7 OTLP export — **done**, and two of this section's own premises were false
 
 Not on the original list, and adjacent to `metrics` in a way that invites confusion, so it is named
-so it can be excluded on purpose. `docs/plan.md` §6 decided the shape: an exporter on top of the
+so it can be excluded on purpose. `plan.md` §6 decided the shape: an exporter on top of the
 existing request ids and trace context, over **OTLP/HTTP on 4318**, which is what RoadRunner
 defaults to. It lands **after** metrics, because the metric registry is what makes the service bag
 and the listener pattern exist, and **before** gRPC, because gRPC spans are the reason anyone asks
@@ -2149,7 +2149,7 @@ reaching for belongs to the *deployment* (a `manage.py`-less entry point, a `con
 - **Not FastCGI for Python or Ruby.** FastCGI exists here and would need no new code, but the
   Python bridges (`flup`) are unmaintained and Ruby's are legacy. Recommending a dead bridge
   because it is free is how a plan becomes technical debt.
-- **Not an embedded interpreter.** `docs/plan.md` §1 rejected embedding PHP for reasons that apply
+- **Not an embedded interpreter.** `plan.md` §1 rejected embedding PHP for reasons that apply
   verbatim to CPython and MRI (no C-level SAPI, lost isolation, a rebuild per version), and hazard
   53 measured the spawn path against the embedded one. The answer for Python and Ruby is the same
   as it was for PHP.
@@ -2461,7 +2461,7 @@ need to be in the message path to be useful.
 
 ### 9.7 The gate is the construction side of trailers, not gRPC itself
 
-`docs/plan.md` §6 recorded "every call would look failed" as the reason gRPC was gated. That was
+`plan.md` §6 recorded "every call would look failed" as the reason gRPC was gated. That was
 correct about *the code* and wrong about *the effort*, and the distinction is worth keeping
 because it is the kind of claim that gets quoted long after the code has moved. What the tree
 lacks is any code that **constructs** a trailer; what it already has is hyper surfacing them on
