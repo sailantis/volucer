@@ -207,6 +207,19 @@ An issued certificate is cached, and a **restart with a valid cached certificate
 immediately and spends no rate limit**. The cache is a directory beside the configuration
 file (`acme-cache` by default), and the account lives there too.
 
+That directory holds the ACME **account key** and the certificate's **private key**, so volucer
+creates it `0700` and tightens any file already in it to `0600` on every start — including a
+cache directory made by an older version, or by hand, which is why the mode is applied at
+startup rather than only when the directory is first created. On a shared host that is the
+difference between the keys being readable by every local user and by none but the service
+account, and it matches what the file-backed KV driver does for the same reason. There is no
+equivalent on Windows, where a file's ACL comes from its parent directory and a cache under a
+user's profile is already private.
+
+If the `cache` path exists as a *file* rather than a directory, startup fails and names the
+path: every later write would fail anyway, and reporting it here is what keeps it from
+surfacing later as a network error from a CA.
+
 ```bash
 kill -HUP $(pidof volucer)     # pick up a certificate you replaced by hand
 volucer check --config volucer.toml

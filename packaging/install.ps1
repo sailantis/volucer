@@ -33,19 +33,41 @@ Replace an existing binary.
 
 The base the assets are fetched from. Exists so this can be tested against a fixture release
 rather than only against GitHub.
+
+.PARAMETER Verify
+
+`auto` (default), `require` or `off` - whether to check the build provenance attestation.
+`auto` checks when `gh` is installed and authenticated and the archive came from GitHub;
+`require` refuses to install without the check; `off` skips it.
 #>
 [CmdletBinding()]
 param(
     [string] $Version,
     [string] $InstallDir,
     [switch] $Force,
-    [string] $BaseUrl = 'https://github.com/sailantis/volucer/releases/download'
+    [string] $BaseUrl = 'https://github.com/sailantis/volucer/releases/download',
+    [string] $Verify = $env:VOLUCER_VERIFY
 )
+
+if (-not $Verify) {
+    $Verify = 'auto'
+}
 
 $ErrorActionPreference = 'Stop'
 
 $App = 'volucer'
 $Repository = 'sailantis/volucer'
+
+# Checked before anything is downloaded: an installer that fetches 5 MB and then reports that its
+# own argument was misspelled has spent the operator's time to learn something it could have said
+# immediately. Below `$Repository`, because the origin comparison needs it.
+if ($Verify -notin @('auto', 'require', 'off')) {
+    throw "install: Verify is '$Verify'; expected 'auto', 'require' or 'off'"
+}
+
+if ($Verify -eq 'require' -and $BaseUrl -ne "https://github.com/$Repository/releases/download") {
+    throw "install: Verify is 'require', but $BaseUrl is not the GitHub release origin; there is no attestation to check there"
+}
 
 function Write-Note {
     param([string] $Message)
@@ -169,6 +191,48 @@ try {
         Stop-Install "the checksum does not match. expected $expected, got $actual. Nothing was installed."
     }
     Write-Note 'checksum verified'
+
+    # The checksum proves the archive matches a file on *the same server*, not that the file came
+    # from this repository's release workflow: whoever can replace the archive can replace the
+    # `.sha256` beside it. The build provenance attestation is signed by GitHub's OIDC identity
+    # and recorded in Sigstore's transparency log, so `gh attestation verify` checks it against a
+    # trust root the download origin does not control. A *failed* verification is fatal - that is
+    # the one case where it must stop - and `-Verify off` is the deliberate way past it.
+    if ($Verify -ne 'off') {
+        $fromGitHub = $BaseUrl -eq "https://github.com/$Repository/releases/download"
+        $gh = Get-Command gh -ErrorAction SilentlyContinue
+
+        if (-not $fromGitHub) {
+            Write-Note "provenance not checked: $BaseUrl is not the GitHub release origin"
+        } elseif (-not $gh) {
+            if ($Verify -eq 'require') {
+                Stop-Install "Verify is 'require', but the GitHub CLI (gh) is not installed; it is what verifies the attestation"
+            }
+            Write-Note 'provenance not checked: the GitHub CLI (gh) is not installed, so the archive is verified only against the checksum beside it'
+        } else {
+            # `gh auth status` rather than trying the verify and reading the error: an
+            # unauthenticated `gh` fails with a 401 that is indistinguishable from a genuine
+            # attestation mismatch, and treating those the same would either refuse every install
+            # or accept a forged archive.
+            & gh auth status *> $null
+            if ($LASTEXITCODE -ne 0) {
+                if ($Verify -eq 'require') {
+                    Stop-Install "Verify is 'require', but gh is not authenticated; run 'gh auth login'"
+                }
+                Write-Note 'provenance not checked: gh is not authenticated, so the archive is verified only against the checksum beside it'
+            } else {
+                & gh attestation verify $archive --repo $Repository *> $null
+                if ($LASTEXITCODE -ne 0) {
+                    # Fatal, and the wording names both causes rather than asserting the worse
+                    # one: a digest with no attestation is what a replaced archive looks like, and
+                    # a failed API call looks the same from here because gh reports both as a
+                    # non-zero exit. Either way the check did not pass.
+                    Stop-Install "the build provenance of $asset could not be verified: the archive is not attested as built by this repository's release workflow, or the attestation could not be fetched. Nothing was installed. (Pass -Verify off to skip this check.)"
+                }
+                Write-Note 'provenance verified'
+            }
+        }
+    }
 
     Expand-Archive -Path $archive -DestinationPath $work -Force
     $staged = Join-Path $work "$App-$numeric-$target\$App.exe"

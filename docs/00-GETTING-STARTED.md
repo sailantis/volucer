@@ -50,6 +50,19 @@ Both scripts resolve the newest release, download the archive for your platform,
 SHA-256 **before** extracting anything, and only then put the binary in place. A failure at
 any step leaves your existing binary exactly as it was.
 
+A SHA-256 fetched from the same server as the archive proves the archive was not corrupted in
+transit; it cannot prove the archive came from this repository, because whoever can replace one
+file can replace the other. Every release is therefore attested with
+`actions/attest-build-provenance`, and both installers check that attestation when they can —
+with `gh attestation verify`, against a signature GitHub's OIDC identity made and Sigstore's
+transparency log records, which a compromised or hostile download origin cannot forge.
+
+That check needs the GitHub CLI and a GitHub login, which a `curl | sh` cannot assume, so it is
+best-effort by default and the installer says plainly which of the two guarantees you got. Set
+`VOLUCER_VERIFY=require` (or `-Verify require` on PowerShell) to make it mandatory: the install
+then refuses to proceed when the attestation cannot be checked. A *failed* verification is fatal
+in every mode except `off`.
+
 They read their settings from environment variables, because `curl | sh` and `irm | iex`
 cannot pass arguments. Both scripts read the same names:
 
@@ -60,6 +73,11 @@ cannot pass arguments. Both scripts read the same names:
 | `VOLUCER_FORCE=1` | Replace an existing binary. |
 | `VOLUCER_DOWNLOAD_URL` | A mirror, a GitHub Enterprise host, or an air-gapped host. |
 | `VOLUCER_API` | The release API root. |
+| `VOLUCER_VERIFY` | `auto` (default), `require` or `off` — whether to check the build provenance attestation. |
+
+`install.ps1` takes the same settings as parameters (`-Version`, `-InstallDir`, `-Force`,
+`-BaseUrl`, `-Verify`) and falls back to the environment variables, so a one-liner that can only
+set environment variables behaves the same as one that passes parameters.
 
 The shell script also honours `VOLUCER_LIBC` (`gnu` or `musl`) and `VOLUCER_ARCH`
 (`x86_64` or `aarch64`).

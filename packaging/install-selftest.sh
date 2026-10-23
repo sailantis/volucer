@@ -306,6 +306,55 @@ if [ "$os" != windows ]; then
         check fail 'the overwrite refusal failed for the wrong reason'
         sed 's/^/      /' "${work}/out-overwrite.sh" >&2
     fi
+
+    # The provenance gate. The fixture origin is not GitHub, so `auto` must say it did not check
+    # rather than pretending it did - a silent skip is the failure mode a verification step is
+    # most likely to acquire - and `require` must refuse, because there is nothing to verify
+    # against. Neither may fail the install on a mirror, which is the documented override.
+    echo "== install.sh reports that provenance is not checked on a mirror"
+    if VOLUCER_VERSION="$tag" \
+        VOLUCER_INSTALL_DIR="${work}/bin-verify-auto" \
+        VOLUCER_DOWNLOAD_URL="$base_url" \
+        VOLUCER_VERIFY=auto \
+        "$VOLUCER_SH" packaging/install.sh >"${work}/out-verify-auto.sh" 2>&1; then
+        if grep -q 'provenance not checked' "${work}/out-verify-auto.sh"; then
+            check ok 'auto says plainly that provenance was not checked'
+        else
+            check fail 'auto installed from a mirror without saying provenance was unchecked'
+            sed 's/^/      /' "${work}/out-verify-auto.sh" >&2
+        fi
+    else
+        check fail 'auto refused to install from a mirror; that is a supported override'
+        sed 's/^/      /' "${work}/out-verify-auto.sh" >&2
+    fi
+
+    echo "== install.sh requires provenance when it is asked to"
+    if VOLUCER_VERSION="$tag" \
+        VOLUCER_INSTALL_DIR="${work}/bin-verify-require" \
+        VOLUCER_DOWNLOAD_URL="$base_url" \
+        VOLUCER_VERIFY=require \
+        "$VOLUCER_SH" packaging/install.sh >"${work}/out-verify-require.sh" 2>&1; then
+        check fail 'require installed from a mirror, where nothing could be verified'
+    elif grep -q 'no attestation to check' "${work}/out-verify-require.sh"; then
+        check ok 'require refuses a mirror by name'
+    else
+        check fail 'the require refusal failed for the wrong reason'
+        sed 's/^/      /' "${work}/out-verify-require.sh" >&2
+    fi
+
+    echo "== install.sh rejects an unknown verification mode"
+    if VOLUCER_VERSION="$tag" \
+        VOLUCER_INSTALL_DIR="${work}/bin-verify-bad" \
+        VOLUCER_DOWNLOAD_URL="$base_url" \
+        VOLUCER_VERIFY=sometimes \
+        "$VOLUCER_SH" packaging/install.sh >"${work}/out-verify-bad.sh" 2>&1; then
+        check fail 'an unknown VOLUCER_VERIFY was accepted'
+    elif grep -q 'expected "auto"' "${work}/out-verify-bad.sh"; then
+        check ok 'an unknown VOLUCER_VERIFY is refused by name'
+    else
+        check fail 'the unknown-mode refusal failed for the wrong reason'
+        sed 's/^/      /' "${work}/out-verify-bad.sh" >&2
+    fi
 else
     echo "== install.sh is not exercised on Windows (it is the Unix half)"
 fi
@@ -399,6 +448,63 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
         else
             check fail 'the PowerShell overwrite refusal failed for the wrong reason'
             sed 's/^/      /' "${work}/out-ps-overwrite.txt" >&2
+        fi
+
+        # The provenance gate, asserted here for the same reason the corrupted archive is: a
+        # verification step that silently does nothing is indistinguishable from one that passed.
+        # The fixture origin is not GitHub, so `auto` must say so and `require` must refuse — and
+        # both before the download, which is why the negative case asserts the absence of
+        # 'downloading' as well as the message.
+        if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Stop'
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-auto' -BaseUrl '${base_url}' -Verify auto
+        " >"${work}/out-ps-verify-auto.txt" 2>&1; then
+            if grep -qi 'provenance not checked' "${work}/out-ps-verify-auto.txt"; then
+                check ok 'install.ps1 says plainly that provenance was not checked on a mirror'
+            else
+                check fail 'install.ps1 installed from a mirror without saying provenance was unchecked'
+                sed 's/^/      /' "${work}/out-ps-verify-auto.txt" >&2
+            fi
+        else
+            check fail 'install.ps1 refused to install from a mirror, which is a supported override'
+            sed 's/^/      /' "${work}/out-ps-verify-auto.txt" >&2
+        fi
+
+        if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Stop'
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-require' -BaseUrl '${base_url}' -Verify require
+        " >"${work}/out-ps-verify-require.txt" 2>&1; then
+            check fail 'install.ps1 -Verify require installed from a mirror, where nothing could be verified'
+        elif grep -qi 'no attestation to check' "${work}/out-ps-verify-require.txt"; then
+            check ok 'install.ps1 -Verify require refuses a mirror by name'
+        else
+            check fail 'the require refusal failed for the wrong reason'
+            sed 's/^/      /' "${work}/out-ps-verify-require.txt" >&2
+        fi
+
+        if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Stop'
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-bad' -BaseUrl '${base_url}' -Verify sometimes
+        " >"${work}/out-ps-verify-bad.txt" 2>&1; then
+            check fail 'install.ps1 accepted an unknown -Verify value'
+        elif grep -qi "expected 'auto'" "${work}/out-ps-verify-bad.txt"; then
+            check ok 'install.ps1 rejects an unknown -Verify value by name'
+        else
+            check fail 'the unknown -Verify refusal failed for the wrong reason'
+            sed 's/^/      /' "${work}/out-ps-verify-bad.txt" >&2
+        fi
+
+        # `off` must say nothing at all. Not a `check ok` on the message but on the *absence* of
+        # one: a mode that is documented as skipping the check must not leave an operator
+        # wondering whether it ran.
+        "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Continue'
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-off' -BaseUrl '${base_url}' -Verify off
+        " >"${work}/out-ps-verify-off.txt" 2>&1 || true
+        if grep -qi 'provenance' "${work}/out-ps-verify-off.txt"; then
+            check fail 'install.ps1 -Verify off still reported on provenance'
+        else
+            check ok 'install.ps1 -Verify off says nothing about provenance'
         fi
 
         # A pinned version must be resolved *without* the network, and must be the version

@@ -44,6 +44,18 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
 - **`VOLUCER_VERSION` is set for every process volucer starts**, after the configured `env`, so
   it cannot be shadowed. A `php-cgi` per-request process and a supervised origin have no channel
   to ask the server what it is, which is why the variable exists; nothing in the SDK reads it.
+- **The installers check the build provenance attestation.** `VOLUCER_VERIFY` (`install.ps1`:
+  `-Verify`) takes `auto` (default), `require` or `off`. `auto` verifies the attestation the
+  release workflow already writes with `actions/attest-build-provenance` — signed by GitHub's
+  OIDC identity and recorded in Sigstore's transparency log, so a hostile download origin cannot
+  forge it — when the GitHub CLI is installed, authenticated, and the archive came from the GitHub
+  release origin, and otherwise **prints plainly that the archive was checked only against the
+  checksum beside it**. `require` refuses to install when the attestation cannot be checked, for a
+  deployment that must not take the weaker guarantee; `off` does not mention it. A *failed*
+  verification is fatal in every mode, and `off` is the deliberate way past it. The mode is
+  validated before the download, because an installer that fetches five megabytes and then
+  reports that its own argument was misspelled has spent the operator's time to learn something
+  it could have said immediately.
 
 ### Changed
 
@@ -83,6 +95,33 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
 
 ### Fixed
 
+- **A path containing `..` could reach a script outside the document root, and php-cgi ran it.**
+  `route()` refused any percent-decoded path that climbed out of the root, but `route_or_dispatch()`
+  — the function the server actually calls for a route that has already claimed a backend — treated
+  that `NotFound` as "names no script" and built a fallback `SCRIPT_FILENAME` from the path, with
+  no second check. So `/../secret.php` composed with the root and escaped it, and on Windows
+  `/C:/Windows/Temp/evil.php` was worse: `Path::join` discards the root for a drive-prefixed
+  component, so the script could be anywhere on the volume. A deployment that lets a request reach
+  a path-interpreting backend through a route with a script-extension `path_suffix` could be made
+  to execute a `.php` file the site never pointed at — an uploaded file, or one belonging to
+  another site on the same host — as the service account. The same refusal `route()` makes is now
+  made again inside the fallback, with the reason in the comment: every path arriving there has
+  already been answered `NotFound`, so the check has to be repeated rather than assumed.
+- **The ACME cache published the account key and the certificate's private key.** The cache holds
+  both, and `rustls-acme`'s `DirCache` writes them with the process umask — `0644` in a `0755`
+  directory on a stock system — so any local user on the host could read the key to the site's
+  certificate, and with the account key could order certificates as that deployment. The cache
+  directory is now `0700` and the files in it `0600`, applied on **every** start rather than only
+  when the directory is first created, because "already exists" is the case that is already wrong:
+  an upgrading deployment finds a `0755` directory and `0644` keys, and a renewal is up to sixty
+  days away. A `cache` path that is a file rather than a directory is refused at startup by name,
+  instead of surfacing later as a network error from a CA.
+- **The installers trusted a checksum fetched from the same server as the archive.** That detects
+  corruption and nothing else: whoever can replace the archive can replace the `.sha256` beside
+  it, and the default path is `releases/latest/`, which moves. The provenance attestation above
+  closes that gap. The `wget` path also gained `--https-only` where the flag exists, which is the
+  GNU-wget-only equivalent of the `--proto '=https'` the `curl` path already had, and it is
+  guarded so a BusyBox wget without the flag is not broken by it.
 - **A `spawn_cgi` slot could adopt a stranger's listener and answer 502.** The port a slot was
   about to use was freed by a `port_is_free` probe and bound by `php-cgi` a moment later, so
   between the two another process could take it. The startup probe connected successfully

@@ -276,6 +276,9 @@ pub fn climbs_out(path: &str) -> bool {
 /// - Anything else is left as `NotFound`. A route matching `path_suffix = ".json"` does
 ///   not turn the document root into a file server; the path is application *input* and
 ///   belongs to whichever script the front controller names.
+///
+/// A path that [`climbs_out`] is refused before any of that, including with a front
+/// controller — the one case where this function does not answer what [`route`] would.
 pub fn route_or_dispatch(path: &str, routing: &Routing) -> Route {
     match route(path, routing) {
         Route::NotFound => dispatch_fallback(path, routing),
@@ -285,12 +288,24 @@ pub fn route_or_dispatch(path: &str, routing: &Routing) -> Route {
 
 /// [`route_or_dispatch`]'s fallback, with the *site's* script list.
 ///
-/// Split from [`dispatch_fallback`] so the reason is visible: the answer here is "which script
+/// Split from [`route_or_dispatch`] so the reason is visible: the answer here is "which script
 /// does this backend get", and for a widened list the script may be `/app.py` rather than
 /// `/index.php`.
 fn dispatch_fallback(path: &str, routing: &Routing) -> Route {
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let decoded = percent_decode_cow(path);
+
+    // The same refusal [`route`] makes, and it has to be made *again* here rather than
+    // inherited from it: every path that reaches this function is one `route` answered
+    // `NotFound` for, so its refusal is indistinguishable from "names no script" and
+    // arrives as the very cue to build a fallback answer. Without this, `/../secret.php`
+    // (or `/C:/Windows/Temp/evil.php`, which `Path::join` discards the root for) becomes a
+    // `SCRIPT_FILENAME` *outside* the document root, and php-cgi executes it. A traversal
+    // is never a fallback: there is no script outside the root that this site may run.
+    if climbs_out(&decoded) {
+        return Route::NotFound;
+    }
+
     let relative = decoded.trim_start_matches('/');
 
     if let Some(front) = &routing.front_controller {
@@ -1147,6 +1162,65 @@ mod tests {
             assert!(
                 matches!(route(path, &routing), Route::Script { .. }),
                 "{path} must still route"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_dispatch_fallback_refuses_a_path_that_climbs_out() {
+        // The regression this test exists for: `route` answering `NotFound` is the *cue*
+        // for `route_or_dispatch` to build a fallback `SCRIPT_FILENAME`, so its refusal of
+        // a traversal was indistinguishable from "names no script" and the guard was lost
+        // exactly where a backend was guaranteed to be reached. `/../secret.php` composed
+        // with the root and escaped it; `/C:/…` is worse, because `Path::join` discards the
+        // root for a drive prefix and hands php-cgi a script anywhere on the volume.
+        let root = fixture(
+            "fallback-traversal",
+            &[("index.php", "<?php"), ("app.php", "<?php")],
+        );
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: None,
+            ..Routing::default()
+        };
+
+        for path in [
+            "/../secret.php",
+            "/a/../../secret.php",
+            "/%2e%2e/secret.php",
+            "/%2E%2E/secret.php",
+            "/a/%2e%2e/%2e%2e/secret.php",
+            "/..\\secret.php",
+            "/C:/Windows/Temp/evil.php",
+            "/C:/Windows/win.ini",
+        ] {
+            assert_eq!(
+                route_or_dispatch(path, &routing),
+                Route::NotFound,
+                "{path} must not reach a backend"
+            );
+
+            // Also with a front controller, where the fallback would otherwise answer the
+            // front controller's script and carry the traversal in as `PATH_INFO`.
+            let fronted = Routing {
+                front_controller: Some("index.php".to_string()),
+                ..routing.clone()
+            };
+            assert_eq!(
+                route_or_dispatch(path, &fronted),
+                Route::NotFound,
+                "{path} must not reach a front controller either"
+            );
+        }
+
+        // The fallback still does its own job: a path the router cannot resolve because it
+        // skipped the `stat` is handed over, and a `..` inside a file name is not a climb.
+        for path in ["/app.php", "/anything.php", "/a..b/c.php"] {
+            assert!(
+                matches!(route_or_dispatch(path, &routing), Route::Script { .. }),
+                "{path} must still be dispatched"
             );
         }
 

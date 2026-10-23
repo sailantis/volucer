@@ -28,6 +28,10 @@
 #   VOLUCER_API          the API root used to resolve the newest tag
 #   VOLUCER_DOWNLOAD_URL the base the assets are fetched from
 #   VOLUCER_FORCE        set to 1 to replace an existing binary
+#   VOLUCER_VERIFY       `auto` (default), `require` or `off` - whether to check the build
+#                        provenance attestation. `auto` checks when `gh` is installed and
+#                        authenticated and the archive came from GitHub; `require` refuses to
+#                        install without it; `off` skips the check.
 #   VOLUCER_LIBC         `gnu` or `musl`, overriding detection. Not a feature for installing a
 #                        foreign binary: it exists so the musl branch, which is the one that
 #                        fails silently at the loader rather than at the installer, can be
@@ -68,6 +72,19 @@ curl_proto() {
     esac
 }
 
+# wget's half of `curl_proto`, which is not the same problem: wget has no `--proto` at all, and
+# `--https-only` - the flag that refuses a redirect to plain text - exists only in GNU wget.
+# BusyBox's does not have it, and an installer that died because an appliance's wget did not
+# know a flag would be worse than one that fetched over TLS without the redirect guard. So the
+# flag is passed where it exists and the scheme of the URL is what decides whether it applies,
+# which is the same rule `curl_proto` states.
+wget_flags() {
+    if [ "$(curl_proto "$1")" = '=https' ] &&
+        wget --help 2>&1 | grep -q -- '--https-only'; then
+        printf '%s' '--https-only'
+    fi
+}
+
 # curl first, wget second. BusyBox systems frequently have only wget, and a container
 # built FROM scratch has neither - which is why the failure names both rather than
 # reporting "command not found" for whichever one was tried.
@@ -80,7 +97,10 @@ fetch() {
         # which names the symptom and not the cause.
         curl -fsSL --retry 3 --proto "$(curl_proto "$_url")" --tlsv1.2 "$_url" -o "$_dest"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$_dest" "$_url"
+        # Unquoted on purpose: the expansion is empty or exactly one flag, and no word it can
+        # produce contains a space or a glob character.
+        # shellcheck disable=SC2046
+        wget $(wget_flags "$_url") -q -O "$_dest" "$_url"
     else
         die 'neither curl nor wget is installed; one of them is required'
     fi
@@ -157,6 +177,26 @@ else
     note "platform linux/${arch} (${libc}) -> ${target}"
 fi
 
+# ----------------------------------------------------------------- verify mode
+
+# Validated here, before the download, for the reason an argument is validated anywhere: an
+# installer that fetches five megabytes and then reports that its own mode was misspelled has
+# spent the operator's time to learn something it could have said immediately. The check itself
+# lives in `verify_provenance`; this is only its early refusal.
+case "${VOLUCER_VERIFY:-auto}" in
+    auto | require | off) ;;
+    *)
+        die "VOLUCER_VERIFY is \"${VOLUCER_VERIFY}\"; expected \"auto\", \"require\" or \"off\""
+        ;;
+esac
+
+# `require` against an origin that publishes no attestations cannot succeed, and saying so now
+# beats downloading an archive first to reach the same conclusion.
+if [ "${VOLUCER_VERIFY:-auto}" = require ] &&
+    [ "${DOWNLOAD_URL}" != "https://github.com/${REPOSITORY}/releases/download" ]; then
+    die "VOLUCER_VERIFY=require, but ${DOWNLOAD_URL} is not the GitHub release origin; there is no attestation to check there"
+fi
+
 # ----------------------------------------------------------------- version
 
 # The tag is resolved before the asset name, because the asset name contains the version:
@@ -230,6 +270,79 @@ if [ "$actual" != "$expected" ]; then
     die "the checksum does not match. expected ${expected}, got ${actual}. Nothing was installed."
 fi
 note 'checksum verified'
+
+# ------------------------------------------------------------------ provenance
+
+# The checksum above proves the archive matches a file on *the same server*. It does not prove
+# that file came from this repository's release workflow: whoever can replace the archive can
+# replace the `.sha256` beside it, and the default download path is `releases/latest/`, which
+# moves. What closes that is the build provenance attestation the release workflow writes with
+# `actions/attest-build-provenance` - signed by GitHub's OIDC identity and recorded in Sigstore's
+# transparency log, so it is verifiable against a trust root the download origin does not control.
+#
+# `gh attestation verify` does that verification. It needs a `gh` binary and a GitHub token,
+# which an installer running under `curl | sh` cannot assume, and it cannot say anything about a
+# mirror or an air-gapped host, whose releases were not built by that workflow. So:
+#
+#   auto (default)  verify when `gh` is present, authenticated and the asset came from the
+#                   default GitHub origin; otherwise say plainly what was *not* checked
+#   require         verify, or refuse to install. For a deployment that must not take the
+#                   weaker guarantee
+#   off             do not verify, and do not comment on it
+#
+# **A failed verification is fatal, not a warning.** The one case where this matters is the one
+# where it must stop: an archive that does not match its attestation. `VOLUCER_VERIFY=off` is the
+# deliberate way past it, which is a decision an operator makes rather than one a network hiccup
+# makes for them.
+verify_provenance() {
+    _archive=$1
+    _mode=${VOLUCER_VERIFY:-auto}
+
+    # Already validated before the download; `off` is the only one that short-circuits.
+    case "$_mode" in
+        off) return 0 ;;
+        auto | require) ;;
+    esac
+
+    # Only the GitHub origin has attestations to check. A mirror is not a failure - it is the
+    # documented override, and the operator who named it knows where the bytes came from.
+    case "${DOWNLOAD_URL}" in
+        "https://github.com/${REPOSITORY}/releases/download") ;;
+        *)
+            [ "$_mode" = require ] &&
+                die "VOLUCER_VERIFY=require, but ${DOWNLOAD_URL} is not the GitHub release origin; there is no attestation to check there"
+            note "provenance not checked: ${DOWNLOAD_URL} is not the GitHub release origin"
+            return 0
+            ;;
+    esac
+
+    if ! command -v gh >/dev/null 2>&1; then
+        [ "$_mode" = require ] &&
+            die 'VOLUCER_VERIFY=require, but the GitHub CLI (`gh`) is not installed; it is what verifies the attestation'
+        note 'provenance not checked: the GitHub CLI (`gh`) is not installed, so the archive is verified only against the checksum beside it'
+        return 0
+    fi
+
+    if ! gh auth status >/dev/null 2>&1; then
+        [ "$_mode" = require ] &&
+            die 'VOLUCER_VERIFY=require, but `gh` is not authenticated; run `gh auth login`'
+        note 'provenance not checked: `gh` is not authenticated, so the archive is verified only against the checksum beside it'
+        return 0
+    fi
+
+    if gh attestation verify "$_archive" --repo "$REPOSITORY" >/dev/null 2>&1; then
+        note 'provenance verified'
+        return 0
+    fi
+
+    # Fatal, and the wording names both causes rather than asserting the worse one: a digest with
+    # no attestation is what a replaced archive looks like, and a failed API call looks the same
+    # from here because `gh` reports both as a non-zero exit. Either way the check did not pass,
+    # and installing on a check that did not pass is the thing this step exists to prevent.
+    die "the build provenance of ${asset} could not be verified: the archive is not attested as built by this repository's release workflow, or the attestation could not be fetched. Nothing was installed. (VOLUCER_VERIFY=off skips this check.)"
+}
+
+verify_provenance "$archive"
 
 # Extracted here and not beside the destination: `tar` would write into whatever directory
 # the operator happened to be standing in, which `stage-archive.sh` deliberately avoids by

@@ -5263,3 +5263,106 @@ cannot observe the thing it claims to test:
 **Also measured, and worth stating because it invalidates a whole class of benchmark:** the same
 run against the application on `/mnt/c` reported ~130 rps for every shape. That is drvfs, not the
 fork shape, and it would have been read as "prefork makes no difference".
+
+
+**87. `route()` refused a traversal and `route_or_dispatch()` turned that refusal into an
+execution.** A security review of the tree found that `/../secret.php` — and, on Windows,
+`/C:/Windows/Temp/evil.php` — reached `SCRIPT_FILENAME` outside the document root and was handed to
+php-cgi to run.
+
+**The mechanism is that the guard's answer was the fallback's cue.** `route()` percent-decodes and
+returns `Route::NotFound` for any path where `climbs_out` is true. `route_or_dispatch()` exists for
+a backend a route has already claimed, where "names no script" must not be a 404 — so it treats
+`NotFound` as *"build a fallback answer"* and calls `dispatch_fallback`, which decodes the path
+again and joins it onto the document root with no further check. A refusal and a miss were the same
+value, so the one path the guard existed to stop was the one path that went on to the fallback. The
+second variant is worse than the first: `Path::join` discards the root entirely for a drive-prefixed
+component, so `/C:/…` names a file anywhere on the volume rather than climbing relative to the root.
+
+**Reproduced before it was fixed, through the real crate.** A throwaway integration test in
+`volucer-fcgi` printed `SCRIPT_FILENAME = ...\public\../secret.php` for `/../secret.php` and
+`C:/Windows/Temp/evil.php` for the drive form, having first asserted that `route()` answered
+`NotFound` for both — so the defect was demonstrated in the gap between the two functions and not
+in a hypothesis about it.
+
+**Why the existing test did not catch it.** `a_path_that_climbs_out_of_the_root_is_never_routed`
+is thorough — encoded, backslash and drive-prefix forms, plus the negative cases — and calls
+`route()` only. The function the server actually uses is `route_or_dispatch`, and the test named
+the property the router had rather than the one the request path had. **A guard is only tested
+where it is composed**, and the composition was the line the test did not reach.
+
+**The fix is three lines** — the same `climbs_out` refusal at the top of `dispatch_fallback` — and
+the reason it could not simply be inherited is the reason it needed its own comment: every path
+arriving there has already been answered `NotFound`, so the check must be repeated rather than
+assumed. The regression test asserts both routings, with and without a front controller, because
+the front-controller branch is where the traversal survived as `PATH_INFO`. It was verified to fail
+against the unfixed code before being kept.
+
+**The general rule: a function that reinterprets another's refusal must re-run the check that
+produced it.** `NotFound` carried two meanings — *forbidden* and *absent* — and collapsing them was
+safe only as long as nothing acted on the absent one. The fallback did, so the two meanings had to
+be separated at the point of use.
+
+
+**88. The ACME cache published the account key and the certificate key, because `DirCache` writes
+with the process umask.** `rustls-acme`'s `DirCache` is `create_dir_all` and `fs::write` with no
+mode, so the cache — which holds the ACME **account key** and the **certificate private key** —
+landed at `0644` inside `0755` on a stock umask. Any local user on the host could read the key to
+the site's certificate, and with the account key could order certificates as that deployment.
+
+**The class was already known and already solved one crate over.** `volucer-kv`'s file driver sets
+the directory `0o700` and every file `0o600`, with a comment naming the hazard. The ACME engine
+called into a third-party cache and so inherited whatever that crate did — which is the shape of
+the mistake: **a wrapper that delegates a security property inherits the delegate's answer, not its
+own.** The property was ours to hold because the keys are ours.
+
+**Fixed where it can be enforced, not where it would be tidy.** A wrapper cache implementing
+`CertCache`/`AccountCache` would set the mode on each write, but it would still be a second
+implementation of file naming that must not drift from the one the engine reads back with. Making
+the *directory* `0700` covers every file written into it, whenever the crate writes it, and one
+`set_permissions` at construction is what the property needs. Files already in the cache are
+tightened too: an upgrade finds a `0755` directory and `0644` keys, and a renewal is up to sixty
+days away, so waiting for the next write would leave exactly the existing deployments exposed.
+
+Applied on **every** start rather than only when the directory is created, because "already
+exists" is the normal case and the one that is already wrong. A cache path that is a file is
+refused by name at startup rather than surfacing later as a network error from a CA.
+
+The test asserts the directory mode and a **pre-existing** file's mode, and was confirmed to fail
+against the unfixed code (`0755` where `0700` was asserted) — on Linux, through WSL, because the
+permission model it checks is not the one the development host has.
+
+
+**89. The installer checked the archive against a checksum from the same server.** Both installers
+fetched `<asset>.sha256` from the same origin as `<asset>`, which detects corruption and nothing
+else: whoever can replace the archive can replace the digest beside it, and the default path is
+`releases/latest/`, which moves. The release workflow already wrote a build provenance attestation
+with `actions/attest-build-provenance`; nothing verified it.
+
+**A check that cannot always run must still say whether it ran.** `gh attestation verify` is what
+verifies the attestation, and it needs the GitHub CLI plus a login — neither of which `curl | sh`
+can assume — and it means nothing for a mirror or an air-gapped host whose release that workflow
+did not build. So the default is `auto`: verify when all three hold, and otherwise print plainly
+that the archive was checked only against the checksum beside it. `require` refuses to install when
+the attestation cannot be checked, for deployments that must not take the weaker guarantee; `off`
+does not mention it. **A failed verification is fatal in every mode**, since that is the one case
+where stopping is the point, and `off` is the deliberate way past it.
+
+The mode is validated before the download rather than after the checksum, because an installer that
+fetches five megabytes and then reports that its own argument was misspelled has spent the
+operator's time to learn something it could have said immediately. That ordering was itself found
+by running it: the first version validated after the download, and a test with an unreachable
+`BaseUrl` reported the connection error instead of the argument error.
+
+**Verified against real releases, not a stub, in both directions.** With `gh` authenticated,
+`VOLUCER_VERIFY=require` downloads, checksums, verifies provenance and installs — and the
+PowerShell installer does the same on Windows. A tampered archive fails with a 404 from the
+attestations API and installs nothing. `wget` gained `--https-only` where it exists, which is the
+GNU-wget-only flag the `curl` path already had as `--proto '=https'`, guarded so BusyBox's wget
+is not broken by it.
+
+**The general rule: a signature checked by a different origin than the artifact is the difference
+between integrity and authenticity, and an honest installer says which one it delivered.**
+Both halves are asserted in `install-selftest.sh` — the message is present in `auto` and the
+refusal is present in `require` — because a verification step's likely failure mode is silently
+doing nothing, which looks exactly like passing.

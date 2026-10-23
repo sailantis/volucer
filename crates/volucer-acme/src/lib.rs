@@ -24,7 +24,7 @@
 //! and [`ChallengeResolver`] is the only shape this crate hands out — a caller cannot install it
 //! so that it answers a normal handshake.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::server::ClientHello;
@@ -156,6 +156,9 @@ pub enum AcmeError {
     #[error("an ACME-managed deployment needs at least one name to issue for")]
     NoDomains,
 
+    #[error("the ACME cache directory {path} could not be secured: {reason}")]
+    Cache { path: PathBuf, reason: String },
+
     #[error("the ACME state could not be started")]
     State,
 }
@@ -274,6 +277,14 @@ impl Engine {
             return Err(AcmeError::NoDomains);
         }
         let cache_dir = cache_dir.into();
+        // Before anything is ordered, because the first thing that happens after this is a write
+        // of the account key. `rustls-acme`'s `DirCache` is `create_dir_all` plus `fs::write` with
+        // no mode of its own, so both the directory and every file in it inherit the process umask
+        // — `0755`/`0644` on a stock system. That publishes the account key and, on every renewal,
+        // the certificate's private key, to every local user on the host. Secured here rather than
+        // by a wrapper cache because the files are written after `Engine::new` returns and by a
+        // type this crate does not own; making the directory private is what covers them.
+        secure_cache_dir(&cache_dir)?;
         let config = rustls_acme::AcmeConfig::new(domains.clone())
             .contact(contact)
             .cache(rustls_acme::caches::DirCache::new(cache_dir.clone()))
@@ -452,6 +463,71 @@ impl Engine {
             }
         }
     }
+}
+
+/// Create the cache directory if needed and make it private to this account.
+///
+/// The files `rustls-acme` writes there are the ACME **account key** and the **certificate private
+/// key**, and its `DirCache` gives neither a mode: it is `create_dir_all` and `fs::write`, so both
+/// land at `0666 & !umask` — `0644` on a stock system — inside a `0755` directory. On a shared
+/// host that is a local user reading the key to the site's TLS certificate, and with the account
+/// key, a local user able to order certificates as this deployment. `volucer-kv` sets `0o700` and
+/// `0o600` for exactly this reason; this is the same rule for the same class of file.
+///
+/// Applied on every start rather than only at creation, because a cache directory created by an
+/// earlier version — or by hand, as the documentation suggests — is already `0755`, and tightening
+/// it only on the "created it myself" path would leave every existing deployment exposed.
+///
+/// Files already inside are tightened too. New ones inherit the directory's mode only for the
+/// group/other bits the umask leaves; a file written before this ran is `0644` regardless, and a
+/// renewal is up to 60 days away, so waiting for the next write would leave those readable for
+/// that long.
+///
+/// Windows has no equivalent: a file's ACL comes from its parent directory, so a cache under a
+/// user's profile is already private to that user. The mode calls are `cfg(unix)` and the function
+/// is a directory creation there.
+fn secure_cache_dir(dir: &Path) -> Result<(), AcmeError> {
+    let cache = |path: &Path, reason: String| AcmeError::Cache {
+        path: path.to_path_buf(),
+        reason,
+    };
+
+    // A cache path that exists as a *file* is a configuration mistake rather than a transient
+    // failure: every later write would fail, and the engine would report it as a networking error
+    // from the ACME step that tried to store. Refusing here names the path instead.
+    if let Ok(metadata) = std::fs::metadata(dir) {
+        if !metadata.is_dir() {
+            return Err(cache(dir, "it exists and is not a directory".to_string()));
+        }
+    } else if let Err(err) = std::fs::create_dir_all(dir) {
+        return Err(cache(dir, format!("could not create it: {err}")));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| cache(dir, format!("could not set its mode to 0700: {err}")))?;
+
+        // A read that fails is not fatal. The directory is private *now*, so nothing new can learn
+        // the names; an entry this cannot stat is one that disappeared between the read and the
+        // metadata call, which is the ACME task's own temporary file and not a key.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    // Deliberately not an error: a file owned by another user — a deployment
+                    // re-run as a different account — cannot be tightened, and refusing to start
+                    // would turn a permission that was already wrong into an outage. The
+                    // directory mode is the guard that matters, and it is set above.
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -714,5 +790,102 @@ mod tests {
                 "the error must say what is missing: {err}"
             ),
         }
+    }
+
+    /// The cache holds the account key and the certificate's private key, and neither may be
+    /// readable by any other account on the host.
+    ///
+    /// `rustls-acme`'s `DirCache` writes both with `fs::write` and no mode, so on a stock umask they
+    /// are `0644` in a `0755` directory. Both halves are asserted, because the directory alone is
+    /// not enough — a file already on disk keeps its own mode — and the *pre-existing* case is the
+    /// one that matters in practice, since a deployment upgrading is already exposed.
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_directory_and_its_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("volucer-acme-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the cache");
+
+        // A key written *before* this ran, which is what an upgrade finds.
+        let stale = dir.join("cached_account_stale");
+        std::fs::write(&stale, b"private").expect("write a stale file");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644))
+            .expect("make it world-readable");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("make the directory world-readable");
+
+        let sink = Arc::new(Recording::default()) as Arc<dyn CertificateSink>;
+        Engine::new(
+            vec!["example.test".to_string()],
+            Authority::Staging,
+            &dir,
+            Vec::new(),
+            sink,
+        )
+        .expect("an engine for one name");
+
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("the path exists")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode(&dir),
+            0o700,
+            "the cache directory must not be readable by others"
+        );
+        assert_eq!(
+            mode(&stale),
+            0o600,
+            "a key already in the cache must be tightened, not left for the next renewal"
+        );
+
+        // A file written *after* the engine exists still lands in a private directory, which is
+        // the guarantee that covers every later write by `DirCache`.
+        let fresh = dir.join("cached_cert_fresh");
+        std::fs::write(&fresh, b"private").expect("write a fresh file");
+        assert_eq!(mode(&dir), 0o700, "the directory must stay private");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cache path that is a file, rather than a directory, is refused by name.
+    ///
+    /// The alternative is every `store_cert` failing later and being reported by the ACME task as a
+    /// network step that went wrong, which sends an operator looking at the CA rather than at the
+    /// configuration.
+    #[test]
+    fn a_cache_path_that_is_not_a_directory_is_refused() {
+        let path = std::env::temp_dir().join(format!("volucer-acme-notdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::write(&path, b"a file, not a cache").expect("write the file");
+
+        let sink = Arc::new(Recording::default()) as Arc<dyn CertificateSink>;
+        match Engine::new(
+            vec!["example.test".to_string()],
+            Authority::Staging,
+            &path,
+            Vec::new(),
+            sink,
+        ) {
+            Ok(_) => panic!("a cache path that is a file must be refused"),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("not a directory"),
+                    "the error must name the problem: {message}"
+                );
+                assert!(
+                    message.contains(&path.display().to_string()),
+                    "the error must name the path: {message}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }
