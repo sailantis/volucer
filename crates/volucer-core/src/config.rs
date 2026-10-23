@@ -3839,10 +3839,8 @@ pub const RELAY_SOCKET_ENV: &str = "VOLUCER_RELAY_SOCKET";
 /// in the same file, by [`Config::is_a_call_service`]. Adding a fixed service means adding a name
 /// here, which is the one place a reviewer has to look to see the whole surface a worker can reach.
 pub const CALL_NAMESPACES: &[&str] = &[
-    // The deployment's own description, redacted.
-    "config",
-    // The pools: `workers.list` and `worker.reset`.
-    "workers",
+    // The deployment's own description, redacted. The pools: `workers.list` and `worker.reset`.
+    "config", "workers",
 ];
 
 /// How strictly the worker protocol's per-frame `crc32c` is enforced.
