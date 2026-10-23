@@ -32,6 +32,7 @@ You can mix them. A route picks a backend, so one process can serve a `/api` rou
 resident worker and a `/admin` route from `php-fpm`:
 
 ```toml
+[server]
 default_backend = "app"
 
 [backends.app]
@@ -42,7 +43,7 @@ command = "php worker.php"
 kind = "external"
 socket = "unix:/run/php/php8.3-fpm.sock"
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/legacy"
 backend = "fpm"
 ```

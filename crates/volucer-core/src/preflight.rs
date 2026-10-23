@@ -525,8 +525,8 @@ mod tests {
         let exe = std::env::current_exe().expect("the test binary path");
         let text = format!(
             r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -608,8 +608,8 @@ command = "{}"
 
         let text = format!(
             r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 static_files = {{ enabled = true }}
 
@@ -645,8 +645,8 @@ command = "{}"
     fn config_with_worker_command(command: &str) -> Config {
         let text = format!(
             r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -719,8 +719,8 @@ command = "{command}"
         let root = Fixture::new("bad-binary");
         root.write("index.php");
         let text = r#"
-default_backend = "cgi"
 [server]
+default_backend = "cgi"
 http = "127.0.0.1:8080"
 [backends.cgi]
 kind = "spawn_cgi"
@@ -769,8 +769,8 @@ binary = "C:/definitely/not/php-cgi.exe"
     #[test]
     fn the_removed_spawn_fpm_backend_is_rejected_by_name() {
         let text = r#"
-default_backend = "fpm"
 [server]
+default_backend = "fpm"
 http = "127.0.0.1:8080"
 [backends.fpm]
 kind = "spawn_fpm"
@@ -1067,8 +1067,8 @@ key = "shop.key"
         let root = Fixture::new("upstream-plaintext");
         root.write("index.php");
         let text = r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"
@@ -1102,8 +1102,8 @@ origin = "http://10.0.0.5:3000"
         root.write("index.php");
 
         let local = r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"
@@ -1111,8 +1111,8 @@ origin = "http://127.0.0.1:3000"
 "#;
         // `10.0.0.5` with TLS: across a network, but encrypted, so there is nothing to say.
         let tls = r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"
@@ -1141,8 +1141,8 @@ origin = "https://10.0.0.5:8443"
         let socket = root.path().join("nothing-here.sock");
         let text = format!(
             r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"

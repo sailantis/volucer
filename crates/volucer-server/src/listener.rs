@@ -751,6 +751,8 @@ mod tests {
         let config = volucer_core::config::Config {
             server: volucer_core::config::ServerConfig {
                 fastcgi: Some(address.clone()),
+                default_backend: Some("fpm".to_string()),
+                routes: Vec::new(),
                 ..Default::default()
             },
             // Nothing here has to start: the dispatcher is built but never used,
@@ -767,8 +769,6 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            default_backend: Some("fpm".to_string()),
-            routes: Vec::new(),
             sites: BTreeMap::new(),
             ..volucer_core::config::Config::default()
         };

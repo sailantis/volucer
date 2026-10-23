@@ -47,6 +47,17 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
 
 ### Changed
 
+- **`default_backend` and `routes` moved into `[server]`.** They were the only two bare keys at
+  the top of the file, and that is where the confusion came from: every other key is a table, so
+  a reader met `default_backend = "app"` alone above `[server]` and had to be told *why* it
+  could not go below it (TOML reads everything after a `[table]` header as belonging to that
+  table). Both are site settings, and `[server]` **is** the unnamed site — the docs have said so
+  since `sites` existed — so they belong beside `document_root` and `front_controller`, which is
+  also the table `[sites.<name>]` inherits from. The precedence is unchanged in either spelling;
+  only the table changed. **A configuration using the old spelling is refused at startup with a
+  message naming the new one**, rather than with toml's `unknown field 'default_backend'`: the
+  key did not disappear, it moved one table down, and an operator who pastes their existing file
+  into a new binary deserves that sentence. The shim is removed in the release after this one.
 - **`config.describe` now redacts two things it previously let through.** The rule was a
   sensitive *key name* only, so a credential that arrived inside a **value** passed straight to
   a worker. Two structural rules are added: the values of any `env` or `headers` map

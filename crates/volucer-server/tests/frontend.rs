@@ -113,6 +113,8 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
             fastcgi: Some("127.0.0.1:0".to_string()),
+            default_backend: Some("cgi".to_string()),
+            routes: Vec::new(),
             ..Default::default()
         },
         backends: [(
@@ -130,8 +132,6 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("cgi".to_string()),
-        routes: Vec::new(),
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     };
@@ -265,6 +265,14 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
     let config = Config {
         server: ServerConfig {
             fastcgi: Some("127.0.0.1:0".to_string()),
+            default_backend: Some("default_pool".to_string()),
+            routes: vec![volucer_core::config::RouteConfig {
+                path_prefix: Some("/api".to_string()),
+                path_suffix: None,
+                host: None,
+                policy: volucer_core::config::RoutePolicy::All,
+                backend: Some("api_pool".to_string()),
+            }],
             ..Default::default()
         },
         backends: [
@@ -279,14 +287,6 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
         ]
         .into_iter()
         .collect(),
-        default_backend: Some("default_pool".to_string()),
-        routes: vec![volucer_core::config::RouteConfig {
-            path_prefix: Some("/api".to_string()),
-            path_suffix: None,
-            host: None,
-            policy: volucer_core::config::RoutePolicy::All,
-            backend: Some("api_pool".to_string()),
-        }],
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     };
@@ -308,7 +308,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
     };
 
     let err = dispatcher
-        .dispatch_with_routes(&config.routes, &request_with("/api/users"))
+        .dispatch_with_routes(&config.server.routes, &request_with("/api/users"))
         .expect_err("nothing listens on either port");
     assert!(
         err.to_string().contains("api_pool"),
@@ -316,7 +316,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
     );
 
     let err = dispatcher
-        .dispatch_with_routes(&config.routes, &request_with("/other"))
+        .dispatch_with_routes(&config.server.routes, &request_with("/other"))
         .expect_err("nothing listens on either port");
     assert!(
         err.to_string().contains("default_pool"),
@@ -415,9 +415,8 @@ fn a_reload_moves_the_fastcgi_front_ends_site_table_too() {
     let config_for = |pool: &str, socket: &str, root: &Path, path_suffix: &str| {
         let text = format!(
             r#"
-default_backend = "unreachable"
-
 [server]
+default_backend = "unreachable"
 http = "127.0.0.1:0"
 fastcgi = "127.0.0.1:0"
 document_root = {root:?}
@@ -430,7 +429,7 @@ socket = "{socket}"
 kind = "external"
 socket = "127.0.0.1:9"
 
-[[routes]]
+[[server.routes]]
 path_suffix = "{path_suffix}"
 backend = "{pool}"
 "#,
@@ -508,6 +507,8 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
     let config = Config {
         server: ServerConfig {
             fastcgi: Some("127.0.0.1:0".to_string()),
+            default_backend: Some("dead".to_string()),
+            routes: Vec::new(),
             ..Default::default()
         },
         backends: [(
@@ -519,8 +520,6 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("dead".to_string()),
-        routes: Vec::new(),
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     };
@@ -714,6 +713,7 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
         server: ServerConfig {
             fastcgi: Some("127.0.0.1:0".to_string()),
             max_body_bytes: Some(16),
+            default_backend: Some("dead".to_string()),
             ..Default::default()
         },
         backends: [(
@@ -725,7 +725,6 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("dead".to_string()),
         ..volucer_core::config::Config::default()
     };
     config.validate().expect("a stated limit is valid");
@@ -871,9 +870,8 @@ fn a_rate_limited_fastcgi_request_is_a_429_with_a_retry_after_and_keeps_the_conn
 
     let text = format!(
         r#"
-default_backend = "unreachable"
-
 [server]
+default_backend = "unreachable"
 fastcgi = "127.0.0.1:0"
 document_root = {root:?}
 "#,

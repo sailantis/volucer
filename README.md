@@ -42,12 +42,11 @@ Or take a prebuilt archive from the [releases page](https://github.com/sailantis
 Then write a `volucer.toml` and serve:
 
 ```toml
-default_backend = "app"
-
 [server]
 http = "0.0.0.0:8080"
 document_root = "public"
 front_controller = "index.php"
+default_backend = "app"
 
 [backends.app]
 kind = "worker"

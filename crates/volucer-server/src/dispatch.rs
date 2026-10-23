@@ -667,7 +667,7 @@ impl Dispatcher {
         // agree about the file — `check` reports it as a warning, because a server
         // that can answer nothing but static files is usually a configuration
         // still being written rather than a finished one.
-        let default = match config.default_backend.clone() {
+        let default = match config.server.default_backend.clone() {
             Some(name) => name,
             None if backends.is_empty() => String::new(),
             None => {
@@ -689,7 +689,7 @@ impl Dispatcher {
             backends,
             default,
             routing,
-            routes: config.routes.clone(),
+            routes: config.server.routes.clone(),
             directory,
             queues: jobs,
         })
@@ -1101,14 +1101,14 @@ mod tests {
         Config {
             server: ServerConfig {
                 http: Some("127.0.0.1:8080".to_string()),
+                default_backend: Some(default.to_string()),
+                routes: Vec::new(),
                 ..Default::default()
             },
             backends: backends
                 .iter()
                 .map(|(name, config)| (name.to_string(), config.clone()))
                 .collect(),
-            default_backend: Some(default.to_string()),
-            routes: Vec::new(),
             sites: BTreeMap::new(),
             // Named rather than `..Default::default()` would be shorter, but listing every field
             // is what made adding one a compile error in four test files. A test that asserts on
@@ -1556,7 +1556,7 @@ url = "redis://127.0.0.1:6379"
             ],
             "app",
         );
-        config.routes = vec![RouteConfig {
+        config.server.routes = vec![RouteConfig {
             policy: RoutePolicy::All,
             path_prefix: Some("/api".to_string()),
             path_suffix: None,
@@ -1592,7 +1592,7 @@ url = "redis://127.0.0.1:6379"
             ],
             "app",
         );
-        config.routes = vec![
+        config.server.routes = vec![
             RouteConfig {
                 policy: RoutePolicy::All,
                 path_prefix: Some("/api".to_string()),
@@ -1726,8 +1726,8 @@ url = "redis://127.0.0.1:6379"
         // Two routes, and the *default* is a third. That matters: several of the assertions below
         // compare against the default, so a test whose default was one of the routes would pass
         // even if a query-bearing path failed to match a route at all.
-        config.default_backend = Some("fallback".to_string());
-        config.routes = vec![
+        config.server.default_backend = Some("fallback".to_string());
+        config.server.routes = vec![
             RouteConfig {
                 policy: RoutePolicy::All,
                 host: None,
@@ -1749,6 +1749,7 @@ url = "redis://127.0.0.1:6379"
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
 
         let fallback = config
+            .server
             .default_backend
             .clone()
             .expect("the fixture states one");

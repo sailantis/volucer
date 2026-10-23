@@ -455,7 +455,7 @@ fn start_server(
     let config_path = root.join("volucer.toml");
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {binary:?}\nworkers = {workers}\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        "[server]\ndefault_backend = \"cgi\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {binary:?}\nworkers = {workers}\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
         binary = php_cgi.display().to_string(),
     );
     std::fs::write(&config_path, config).expect("write the config");
@@ -550,7 +550,7 @@ fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
     let command = toml_string(&format!("php \"{}\"", script.display()));
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+        "[server]\ndefault_backend = \"app\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start(binary, &config_path)
@@ -568,7 +568,7 @@ fn start_dual_listener_server(binary: &Path, root: &Path) -> Option<Server> {
     let command = toml_string(&format!("php \"{}\"", script.display()));
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+        "[server]\ndefault_backend = \"app\"\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start(binary, &config_path)
@@ -754,9 +754,8 @@ fn a_route_policy_decides_which_layer_answers() {
     let config_path = root.join("volucer.toml");
     let config = format!(
         r#"
-default_backend = "cgi"
-
 [server]
+default_backend = "cgi"
 http = "127.0.0.1:{port}"
 document_root = {root}
 front_controller = "index.php"
@@ -768,7 +767,7 @@ workers = 1
 bind_host = "127.0.0.1"
 base_port = {base_port}
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/assets"
 policy = "backend"
 backend = "cgi"
@@ -857,9 +856,8 @@ echo $which === 'big' ? str_repeat('volucer ', 4000) : 'small';
         let base_port = free_port_run(2).expect("a free run of two ports");
         format!(
             r#"
-default_backend = "cgi"
-
 [server]
+default_backend = "cgi"
 http = "127.0.0.1:{port}"
 document_root = {root}
 front_controller = "index.php"
@@ -1252,7 +1250,7 @@ fn start_static_server(binary: &Path, root: &Path) -> Option<Server> {
     let command = toml_string(&format!("php \"{}\"", example_worker().display()));
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[server.static_files]\nenabled = true\ncache_control = \"public, max-age=60\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+        "[server]\ndefault_backend = \"app\"\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[server.static_files]\nenabled = true\ncache_control = \"public, max-age=60\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start_with(binary, &config_path, &[])
@@ -1357,7 +1355,7 @@ fn a_root_with_no_assets_serves_no_files_even_though_the_default_is_on() {
     let command = toml_string(&format!("php \"{}\"", example_worker().display()));
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = \
+        "[server]\ndefault_backend = \"app\"\nhttp = \"127.0.0.1:0\"\ndocument_root = \
          {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
@@ -1423,7 +1421,7 @@ fn the_command_line_document_root_overrides_the_one_in_the_file() {
     let config_path = root.join("volucer.toml");
     let document_root = toml_string(&from_file.display().to_string());
     let config = format!(
-        "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {cgi:?}\nworkers = 1\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        "[server]\ndefault_backend = \"cgi\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {cgi:?}\nworkers = 1\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
         cgi = php_cgi.display().to_string(),
     );
     std::fs::write(&config_path, config).expect("write the config");
@@ -1489,7 +1487,7 @@ fn a_relative_document_root_keeps_working_after_the_first_request() {
     // fixture rather than against wherever the test runner happens to be.
     let config_path = root.join("volucer.toml");
     let config = format!(
-        "default_backend = \"cgi\"\n\n[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = \"public\"\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {cgi:?}\nworkers = 1\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        "[server]\ndefault_backend = \"cgi\"\nhttp = \"127.0.0.1:0\"\ndocument_root = \"public\"\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {cgi:?}\nworkers = 1\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
         cgi = php_cgi.display().to_string(),
     );
     std::fs::write(&config_path, config).expect("write the config");
@@ -1572,9 +1570,8 @@ fn check_describes_the_sites_and_the_routes_that_skip_the_stat() {
     let config_path = root.join("volucer.toml");
     let config = format!(
         r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = {root}
 
@@ -1586,15 +1583,15 @@ command = "php worker.php"
 kind = "spawn_cgi"
 binary = 'C:\php\php-cgi.exe'
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "app"
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/legacy"
 backend = "cgi"
 
-[[routes]]
+[[server.routes]]
 path_suffix = ".php"
 backend = "cgi"
 
@@ -1692,9 +1689,8 @@ fn check_describes_an_upstream_and_skips_the_stat_for_its_routes() {
     let config_path = root.join("volucer.toml");
     let config = format!(
         r#"
-default_backend = "node"
-
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 document_root = {root}
 
@@ -1707,12 +1703,12 @@ kind = "spawn_cgi"
 binary = 'C:\php\php-cgi.exe'
 
 # A prefix route: it proves nothing about the extension, so a *CGI* backend keeps the stat.
-[[routes]]
+[[server.routes]]
 path_prefix = "/legacy"
 backend = "cgi"
 
 # The same shape pointed at the upstream: the path is the origin's business, so no stat.
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "node"
 "#,
@@ -1927,8 +1923,8 @@ fn serve_reaches_an_http_origin_and_relays_its_answer() {
         &config_path,
         format!(
             r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:0"
 document_root = {root}
 [backends.node]
@@ -2038,8 +2034,8 @@ fn widening_the_script_list_stops_the_static_layer_serving_the_source() {
             &config_path,
             format!(
                 r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:0"
 document_root = {root}
 front_controller = "front.php"
@@ -2152,8 +2148,8 @@ fn a_proxy_trust_list_decides_whether_a_forwarded_address_is_believed() {
     let config_for = |trusted: bool| {
         format!(
             r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:0"
 document_root = {root}
 [server.proxy]
@@ -2218,8 +2214,8 @@ base_port = {port}
     // the append rule alone puts it there.
     let upstream_config = format!(
         r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:0"
 document_root = {root}
 [server.proxy]
@@ -2285,8 +2281,8 @@ fn a_request_body_reaches_an_origin_with_the_right_length() {
         &config_path,
         format!(
             r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:0"
 document_root = {root}
 [backends.node]
@@ -2362,8 +2358,8 @@ fn an_unreachable_origin_is_a_502_and_a_silent_one_is_a_504() {
         &config_path,
         format!(
             r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:0"
 document_root = {root}
 [backends.node]
@@ -2503,11 +2499,13 @@ fn sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing() {
     // Parses, and does not validate. A different code path from the first refusal: valid TOML and
     // a bad configuration is the mistake an operator is more likely to make. This one names the
     // *other* root too, so applying it despite the invalid key would be visible in the answer.
-    std::fs::write(
-        &config_path,
-        format!("default_backend = \"nope\"\n\n{}", config_for(&second)),
-    )
-    .expect("write an invalid config");
+    //
+    // The bad key goes *inside* `[server]`, where it lives now: written at the top level it would
+    // be the pre-0.3 spelling, and the server would refuse it for having moved rather than for
+    // naming no backend — a different refusal than the one this half is about.
+    let unvalidatable =
+        config_for(&second).replace("[server]\n", "[server]\ndefault_backend = \"nope\"\n");
+    std::fs::write(&config_path, unvalidatable).expect("write an invalid config");
     signal(&server.child, SIGHUP).expect("the server is still running");
     assert_eq!(
         http_get(&address, "/whoami.txt").text(),
@@ -3741,8 +3739,7 @@ fn the_worker_list_and_the_reset_agree_about_a_worker_in_a_second_pool() {
     // index 0 locally. That is the whole defect: the two numbers differ by exactly the first pool's
     // size, and reporting the local one sends an operator to the wrong process.
     let config = format!(
-        "default_backend = \"app\"\n\n\
-         [server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
+        "[server]\ndefault_backend = \"app\"\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
          [backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 1\n\n\
          [backends.jobs]\nkind = \"worker\"\ncommand = {command}\nworkers = 1\n\n\
          [status]\naddress = \"127.0.0.1:0\"\nallow_worker_reset = true\n"
@@ -3869,9 +3866,8 @@ fn an_https_only_configuration_starts_a_listener() {
     let config_for = move || {
         let port = free_port_run(1).expect("reserve a port");
         format!(
-            "default_backend = \"cgi\"\n\
-             \n\
-             [server]\n\
+            "[server]\n\
+             default_backend = \"cgi\"\n\
              https = \"127.0.0.1:{port}\"\n\
              document_root = \"./public\"\n\
              front_controller = \"index.php\"\n\

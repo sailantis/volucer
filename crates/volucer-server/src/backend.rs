@@ -774,8 +774,8 @@ mod tests {
         // variant is gone the file cannot be written at all, which is the point of a
         // removed key: it should be noticed by whoever wrote it.
         let text = r#"
-default_backend = "own"
 [server]
+default_backend = "own"
 http = "127.0.0.1:8080"
 [backends.own]
 kind = "spawn_fpm"

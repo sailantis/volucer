@@ -121,6 +121,8 @@ fn worker_config(workers: u32) -> Config {
     Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
+            default_backend: Some("app".to_string()),
+            routes: Vec::new(),
             ..Default::default()
         },
         backends: [(
@@ -141,8 +143,6 @@ fn worker_config(workers: u32) -> Config {
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("app".to_string()),
-        routes: Vec::new(),
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     }
@@ -505,6 +505,8 @@ fn unreachable_config() -> Config {
     Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
+            default_backend: Some("fpm".to_string()),
+            routes: Vec::new(),
             ..Default::default()
         },
         backends: [(
@@ -516,8 +518,6 @@ fn unreachable_config() -> Config {
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("fpm".to_string()),
-        routes: Vec::new(),
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     }
@@ -1711,6 +1711,8 @@ fn upstream_config(origin: &Origin) -> Config {
     Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
+            default_backend: Some("node".to_string()),
+            routes: Vec::new(),
             ..Default::default()
         },
         backends: [(
@@ -1722,8 +1724,6 @@ fn upstream_config(origin: &Origin) -> Config {
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("node".to_string()),
-        routes: Vec::new(),
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     }
@@ -2013,8 +2013,8 @@ fn a_configured_origin_command_is_started_waited_for_reached_and_stopped() {
 
     let text = format!(
         r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:0"
 [backends.app]
 kind = "upstream"
@@ -2095,8 +2095,8 @@ fn a_configured_h2c_origin_is_spoken_to_in_http2_and_a_plain_one_is_not() {
             .unwrap_or_default();
         let text = format!(
             r#"
-default_backend = "grpc"
 [server]
+default_backend = "grpc"
 http = "127.0.0.1:0"
 [backends.grpc]
 kind = "upstream"
@@ -2287,8 +2287,8 @@ fn a_grpc_call_reaches_a_php_worker_and_its_status_comes_back_in_the_trailers() 
     let script = example_worker();
     let text = format!(
         r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:0"
 [backends.app]
 kind = "worker"

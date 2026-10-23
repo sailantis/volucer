@@ -191,12 +191,11 @@ composer require sailantis/azera-volucer
 Point a `worker` backend at the entry point the package provides:
 
 ```toml
-default_backend = "app"
-
 [server]
 http = "0.0.0.0:8001"
 document_root = "/srv/app/public"
 front_controller = "index.php"
+default_backend = "app"
 
 [backends.app]
 kind = "worker"

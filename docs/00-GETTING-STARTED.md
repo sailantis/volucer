@@ -154,27 +154,25 @@ Volucer reads a TOML file called `volucer.toml` by default. This is the smallest
 one:
 
 ```toml
-default_backend = "app"
-
 [server]
 http = "127.0.0.1:8080"
 document_root = "./public"
+default_backend = "app"
 
 [backends.app]
 kind = "external"
 socket = "unix:/run/php/php8.3-fpm.sock"
 ```
 
-`default_backend` comes first on purpose: TOML reads everything after a `[table]` header as
-belonging to that table, so a bare key written below `[backends.app]` is read as a backend
-key and refused.
-
 Three things are in there:
 
-- **`[server]`** — the listeners and where your application lives.
+- **`[server]`** — the listeners, where your application lives, and which backend answers a
+  request that matches no route.
 - **`[backends.app]`** — how PHP gets run. This one attaches to a `php-fpm` that is
   already running, so the behaviour is exactly what you have today.
-- **`default_backend`** — the backend used when a request matches no route.
+- **`default_backend`** — the backend used when a request matches no route. It is one of
+  `[server]`'s keys rather than a top-level one, because `[server]` **is** the unnamed site:
+  a `[sites.<name>]` table overrides it for one host, exactly as it overrides `document_root`.
 
 That is a complete FastCGI deployment. It behaves like `nginx` in front of `php-fpm`,
 except there is no `nginx` to configure.

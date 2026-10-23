@@ -553,7 +553,7 @@ fn the_dispatcher_serves_a_route_from_an_attached_backend() {
         "app".to_string(),
         BackendConfig::Attach(attach_config(relay, 1, None)),
     );
-    config.default_backend = Some("app".to_string());
+    config.server.default_backend = Some("app".to_string());
 
     let dispatcher = Dispatcher::from_config(&config, Routing::default())
         .expect("an attach backend builds without a program to resolve");

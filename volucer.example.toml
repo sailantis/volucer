@@ -16,11 +16,12 @@
 # because an empty listener address is a server that binds nothing for a reason
 # nothing logs. See docs/01-CONFIGURATION.md.
 
-# The backend used when a request matches no route.
-default_backend = "app"
-
+# The backend used when a request matches no route. It belongs to `[server]`, which is the
+# unnamed site: `[sites.<name>]` overrides it for one host, exactly as it overrides
+# `document_root` or `front_controller`.
 [server]
 http = "127.0.0.1:8080"
+default_backend = "app"
 # nginx-facing listener; use a unix socket on Linux/macOS.
 fastcgi = "127.0.0.1:9080"
 
@@ -586,16 +587,21 @@ socket = "unix:/run/php/php-fpm.sock"
 # ---------------------------------------------------------------------------
 # Routes. The most specific matching route wins: a route stating both a host and
 # a path beats one stating only a path, and ties go to the earlier entry. A
-# request that matches no route goes to default_backend.
+# request that matches no route goes to `server.default_backend`.
+#
+# **They are `[[server.routes]]`, not `[[routes]]`**: routing is what the unnamed
+# site does, so the table lives beside that site's `document_root` rather than at
+# the top of the file. A `[sites.<name>]` table states its own `routes`, which
+# *replaces* this list rather than adding to it.
 #
 # `path_prefix` is a textual prefix, like nginx's `location`. `host` is a bare
 # host name with no port, and is compared case-insensitively.
 # ---------------------------------------------------------------------------
-# [[routes]]
+# [[server.routes]]
 # path_prefix = "/api"
 # backend = "cgi"
 #
-# [[routes]]
+# [[server.routes]]
 # host = "admin.example.com"
 # path_prefix = "/"
 # backend = "fpm"

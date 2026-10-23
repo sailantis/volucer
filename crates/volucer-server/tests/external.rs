@@ -192,6 +192,8 @@ fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) ->
     let config = Config {
         server: ServerConfig {
             http: Some("127.0.0.1:8080".to_string()),
+            default_backend: Some("fpm".to_string()),
+            routes: Vec::new(),
             ..Default::default()
         },
         backends: [(
@@ -203,8 +205,6 @@ fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) ->
         )]
         .into_iter()
         .collect(),
-        default_backend: Some("fpm".to_string()),
-        routes: Vec::new(),
         sites: BTreeMap::new(),
         ..volucer_core::config::Config::default()
     };

@@ -769,8 +769,8 @@ fn serve(
             .unwrap_or("(none: only real .php files are served)")
     );
     println!("  backends:         {}", config.backends.len());
-    if !config.routes.is_empty() {
-        println!("  routes:           {}", config.routes.len());
+    if !config.server.routes.is_empty() {
+        println!("  routes:           {}", config.server.routes.len());
     }
     if !config.sites.is_empty() {
         println!("  sites:            {}", config.sites.len());
@@ -2300,7 +2300,7 @@ fn check(
         println!("    (none)");
     }
     for (name, backend) in &config.backends {
-        let default = if config.default_backend.as_deref() == Some(name.as_str()) {
+        let default = if config.server.default_backend.as_deref() == Some(name.as_str()) {
             " (default)"
         } else {
             ""
@@ -2481,11 +2481,11 @@ fn check(
         volucer_core::Sites::from_config_with(&config, &document_root, front_controller.as_deref());
 
     println!("  routes:");
-    if config.routes.is_empty() {
+    if config.server.routes.is_empty() {
         println!("    (none: every request goes to the default backend)");
     }
     let default_extensions = sites.default_site().script_extensions.clone();
-    for route in &config.routes {
+    for route in &config.server.routes {
         print_route(
             route,
             route.backend.as_deref().is_some_and(interprets_path),

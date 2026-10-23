@@ -1506,7 +1506,10 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     });
     let configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
 
@@ -1655,7 +1658,10 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     });
     let mut configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
     configured.kv.insert(
@@ -1769,7 +1775,10 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     });
     let mut configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
     for name in ["sessions", "secrets"] {
@@ -1905,7 +1914,10 @@ $worker->run(static function (Request $request, Worker $worker) use (&$held): Re
         });
         let mut configured = Config {
             backends: [("app".to_string(), backend)].into_iter().collect(),
-            default_backend: Some("app".to_string()),
+            server: volucer_core::config::ServerConfig {
+                default_backend: Some("app".to_string()),
+                ..Default::default()
+            },
             ..Config::default()
         };
         configured.lock = Some(LockConfig::Redis(volucer_core::config::RedisLockConfig {
@@ -2056,7 +2068,10 @@ $worker->consume(static function (Job $job, Worker $worker): string|bool|null {{
     // through the configuration is what makes this a test of the *wiring* rather than of a struct.
     let mut configured = Config {
         backends: Default::default(),
-        default_backend: None,
+        server: volucer_core::config::ServerConfig {
+            default_backend: None,
+            ..Default::default()
+        },
         ..Config::default()
     };
     configured.jobs = Some(volucer_core::config::JobsConfig {
@@ -2246,7 +2261,10 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
     });
     let mut configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
     configured.jobs = Some(volucer_core::config::JobsConfig {
@@ -2430,7 +2448,10 @@ $worker->run(static function (Request $request, Worker $worker) use (&$held, &$h
     });
     let mut configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
     configured.lock = Some(LockConfig::Memory(MemoryLockConfig {}));
@@ -2536,7 +2557,10 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
     });
     let mut configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
     // The table is there; the *grant* is what is missing, which is the distinction that makes this a
@@ -2731,7 +2755,10 @@ $worker->run(static function (Request $request, Worker $worker) use ($kv): Respo
         });
         let mut configured = Config {
             backends: [("app".to_string(), backend)].into_iter().collect(),
-            default_backend: Some("app".to_string()),
+            server: volucer_core::config::ServerConfig {
+                default_backend: Some("app".to_string()),
+                ..Default::default()
+            },
             ..Config::default()
         };
         configured.kv.insert(
@@ -2842,7 +2869,10 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     });
     let mut configured = Config {
         backends: [("app".to_string(), backend)].into_iter().collect(),
-        default_backend: Some("app".to_string()),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
         ..Config::default()
     };
     configured.kv.insert(

@@ -58,8 +58,6 @@ would actually start — including the expansion's own failures.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `default_backend` | string | — | The backend used when a request matches no route. |
-| `routes` | array of tables | empty | The routing rules. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `backends` | table of tables | empty | The named backends. See [Backends](02-BACKENDS.md). |
 | `sites` | table of tables | empty | Per-host applications. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `server` | table | all defaults | Listeners, paths and HTTP behaviour. |
@@ -107,6 +105,8 @@ certificate, or you have ACME configured to get one.
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
+| `default_backend` | string | — | The backend used when a request matches no route. |
+| `routes` | array of tables | empty | The routing rules for the unnamed site. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `env` | table | empty | Environment variables every started process inherits. |
 | `tls` | table | absent | TLS configuration. Presence enables it. |
 | `acme` | table | absent | Automatic certificates. Presence enables it. |
@@ -309,7 +309,7 @@ you still get per-client limits.
 client that varies it gets a fresh bucket per request. Use a value the *proxy* sets — an
 API key it vouched for, a tenant it routed.
 
-## `[[routes]]`
+## `[[server.routes]]`
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -318,6 +318,14 @@ API key it vouched for, a tenant it routed.
 | `host` | string | absent | Match this `Host` header. |
 | `policy` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
 | `backend` | string | absent | The backend for matched requests. Required unless `policy = "static"`. |
+
+Routes belong to the unnamed site, so they are written as `[[server.routes]]` next to
+`[server]`'s other keys. A `[sites.<name>]` table states its own `routes`, which **replaces**
+this list rather than adding to it.
+
+**Before 0.3.0 these were `[[routes]]` and `default_backend` at the top of the file.** Both
+moved into `[server]`; the old spelling is refused at startup with a message naming the new
+one, so an upgrade that misses it stops with a sentence rather than an unknown-field error.
 
 ## `[sites.<name>]`
 
@@ -576,12 +584,11 @@ and failing later.
 ## A complete example
 
 ```toml
-default_backend = "app"
-
 [server]
 http = "127.0.0.1:8080"
 document_root = "./public"
 front_controller = "index.php"
+default_backend = "app"
 max_body_bytes = 33554432
 redirect_to_https = false
 
@@ -620,7 +627,7 @@ max_requests = 1000
 services = ["kv", "lock", "jobs"]
 grpc_services = ["greeter.Greeter"]
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "api"
 

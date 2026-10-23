@@ -818,8 +818,8 @@ mod tests {
         // and a validator that checks "was this key set" are not compatible, and only a test that
         // parses the ordinary configuration catches it.
         let text = r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"

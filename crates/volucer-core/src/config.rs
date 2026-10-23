@@ -31,14 +31,22 @@ pub struct Config {
     #[serde(default)]
     pub backends: BTreeMap<String, BackendConfig>,
 
-    /// Backend used when a request does not match a route.
-    #[serde(default)]
-    pub default_backend: Option<String>,
+    /// The pre-0.3 spelling of [`ServerConfig::default_backend`].
+    ///
+    /// Accepted by the parser and refused by [`Config::validate`] with a sentence naming the new
+    /// location. Without it an upgrading operator reads `unknown field 'default_backend'` from
+    /// `toml`, which is true and explains nothing: the key did not disappear, it moved one table
+    /// down. Removed in the release after this one.
+    ///
+    /// **Never serialized.** It exists to be read once and refused, and a shim that appeared in
+    /// `config.describe` would tell a worker the deployment has a `default_backend` at the top
+    /// level — a claim that is only true for a file the server will not start with.
+    #[serde(default, rename = "default_backend", skip_serializing)]
+    pub legacy_default_backend: Option<String>,
 
-    /// Route table, in the order written. See [`RouteConfig`] for the
-    /// precedence rule.
-    #[serde(default)]
-    pub routes: Vec<RouteConfig>,
+    /// The pre-0.3 spelling of [`ServerConfig::routes`]. See [`Config::legacy_default_backend`].
+    #[serde(default, rename = "routes", skip_serializing)]
+    pub legacy_routes: Option<Vec<RouteConfig>>,
 
     /// Sites, by name. Empty means one site: what `[server]` describes.
     ///
@@ -1708,7 +1716,7 @@ impl Config {
     ///    request.
     /// 3. Anything still tied is settled by declaration order.
     pub fn route_backend(&self, host: Option<&str>, path: &str) -> Option<&str> {
-        select_backend(&self.routes, host, path)
+        select_backend(&self.server.routes, host, path)
     }
 }
 
@@ -1835,6 +1843,27 @@ pub struct ServerConfig {
     /// What this deployment serves; see [`ServeOnly`]. Defaults to everything.
     #[serde(default)]
     pub serve_only: ServeOnly,
+
+    /// The backend a request that matches no route is answered by.
+    ///
+    /// It lives here rather than at the top level because `[server]` **is** the unnamed site — see
+    /// [`Config::sites`] — and this is a site setting, exactly like `document_root` and
+    /// `front_controller`. `[sites.<name>]` overrides it for one host, and the inheritance runs in
+    /// the same direction as every other per-site key: the more specific table wins.
+    ///
+    /// Required once `[backends]` is non-empty, and refused when it names no configured backend:
+    /// backends nothing can select are a typo, and a name that matches nothing is a configuration
+    /// that parses and then fails every request.
+    #[serde(default)]
+    pub default_backend: Option<String>,
+
+    /// The route table, in the order written. See [`RouteConfig`] for the precedence rule.
+    ///
+    /// Here for the reason [`ServerConfig::default_backend`] is: routing is what the unnamed site
+    /// does, not what the process does. A site's own `routes` **replaces** this list rather than
+    /// merging with it, so a host that states one route does not inherit the other twenty.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
 
     /// Environment variables every process this deployment starts inherits.
     ///
@@ -4726,7 +4755,25 @@ impl Config {
             ));
         }
 
-        match &self.default_backend {
+        // The two keys that moved into `[server]` in 0.3.0. Refused by name and with the new
+        // location, because `deny_unknown_fields` would otherwise report them as unknown — true,
+        // and useless to an operator whose file says exactly what it used to.
+        if self.legacy_default_backend.is_some() {
+            return Err(Error::Config(
+                "default_backend moved into the [server] table in 0.3.0; write it as \
+                 `[server]` + `default_backend = \"...\"` (the top-level key is no longer read)"
+                    .to_string(),
+            ));
+        }
+        if self.legacy_routes.is_some() {
+            return Err(Error::Config(
+                "routes moved into the [server] table in 0.3.0; write `[[server.routes]]` instead \
+                 of `[[routes]]` (the top-level key is no longer read)"
+                    .to_string(),
+            ));
+        }
+
+        match &self.server.default_backend {
             None => {
                 // Backends without a `default_backend` is a typo: nothing could
                 // select them. No backends at all is the static-only deployment,
@@ -4745,8 +4792,8 @@ impl Config {
             Some(_) => {}
         }
 
-        for (index, route) in self.routes.iter().enumerate() {
-            validate_route(route, "routes", index, &self.backends)?;
+        for (index, route) in self.server.routes.iter().enumerate() {
+            validate_route(route, "server.routes", index, &self.backends)?;
         }
 
         self.validate_sites()?;
@@ -6108,9 +6155,8 @@ mod tests {
     #[test]
     fn an_external_backend_is_uncapped_by_default_and_refuses_a_zero() {
         let uncapped = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 
 [backends.app]
@@ -6648,9 +6694,8 @@ domain = ["example.com"]
     #[test]
     fn parses_a_complete_config() {
         let text = r#"
-default_backend = "fpm"
-
 [server]
+default_backend = "fpm"
 http = "127.0.0.1:8080"
 fastcgi = "unix:/run/volucer.sock"
 
@@ -6671,7 +6716,7 @@ memory_limit_mb = 256
         let config = Config::from_toml(text).expect("config parses");
         config.validate().expect("config validates");
 
-        assert_eq!(config.default_backend.as_deref(), Some("fpm"));
+        assert_eq!(config.server.default_backend.as_deref(), Some("fpm"));
         assert_eq!(config.backends.len(), 3);
 
         let fpm = &config.backends["fpm"];
@@ -6702,8 +6747,8 @@ memory_limit_mb = 256
     #[test]
     fn rejects_unknown_backend_as_default() {
         let text = r#"
-default_backend = "nope"
 [server]
+default_backend = "nope"
 http = "127.0.0.1:8080"
 "#;
         let config = Config::from_toml(text).expect("config parses");
@@ -6714,8 +6759,8 @@ http = "127.0.0.1:8080"
     #[test]
     fn rejects_non_loopback_php_cgi_bind() {
         let text = r#"
-default_backend = "win"
 [server]
+default_backend = "win"
 http = "127.0.0.1:8080"
 [backends.win]
 kind = "spawn_cgi"
@@ -6747,8 +6792,8 @@ bind_host = "0.0.0.0"
         // The default matters more than the option: a configuration written before this
         // setting existed must keep the old wire behaviour, which is `required`.
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6761,8 +6806,8 @@ command = "php worker.php"
         }
 
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6787,8 +6832,8 @@ checksum = "optional"
         // socket, which was 21× on the whole route. The assertion is platform-conditional
         // rather than a fixed value because the correct answer is.
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6820,8 +6865,8 @@ command = "php worker.php"
         ] {
             let text = format!(
                 r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6845,8 +6890,8 @@ transport = "{written}"
         // say, or the `none` a reader might guess at — must not silently mean `required`.
         // Guessing either way is wrong, so the field is denied rather than defaulted.
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6865,8 +6910,8 @@ checksum = "none"
     #[test]
     fn parses_a_spawn_cgi_unix_socket() {
         let text = r#"
-default_backend = "cgi"
 [server]
+default_backend = "cgi"
 http = "127.0.0.1:8080"
 [backends.cgi]
 kind = "spawn_cgi"
@@ -6887,8 +6932,8 @@ socket = "unix:/run/volucer/cgi"
     #[test]
     fn parses_a_worker_unix_socket() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6914,8 +6959,8 @@ socket = "unix:/run/volucer/worker"
     #[test]
     fn an_omitted_worker_socket_keeps_the_loopback_port() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -6938,8 +6983,8 @@ transport = "socket"
         let with = |socket: &str, transport: &str| {
             format!(
                 r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -7084,8 +7129,8 @@ socket = "unix:/run/volucer/consumer"
     #[test]
     fn an_absurd_children_count_is_refused() {
         let text = r#"
-default_backend = "cgi"
 [server]
+default_backend = "cgi"
 http = "127.0.0.1:8080"
 [backends.cgi]
 kind = "spawn_cgi"
@@ -7169,9 +7214,8 @@ children = 100000
 
     fn routed_config() -> Config {
         let text = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 
 [backends.app]
@@ -7182,11 +7226,11 @@ command = "php worker.php"
 kind = "worker"
 command = "php legacy.php"
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "legacy"
 
-[[routes]]
+[[server.routes]]
 host = "admin.example"
 path_prefix = "/"
 backend = "legacy"
@@ -7224,9 +7268,8 @@ backend = "legacy"
         // Both routes match `admin.example/api`; the one that states two
         // constraints beats the one that states a path alone.
         let text = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 
 [backends.app]
@@ -7241,11 +7284,11 @@ command = "php path.php"
 kind = "worker"
 command = "php both.php"
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "path_only"
 
-[[routes]]
+[[server.routes]]
 host = "admin.example"
 path_prefix = "/"
 backend = "both"
@@ -7261,13 +7304,13 @@ backend = "both"
     #[test]
     fn rejects_a_route_naming_an_unknown_backend() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
 command = "php worker.php"
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "missing"
 "#;
@@ -7285,13 +7328,13 @@ backend = "missing"
         let with_route = |route: &str| {
             format!(
                 r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
 command = "php worker.php"
-[[routes]]
+[[server.routes]]
 path_prefix = "/assets"
 {route}
 "#
@@ -7322,19 +7365,19 @@ path_prefix = "/assets"
         // The compatibility claim, asserted rather than assumed: every route written before
         // `policy` existed must behave exactly as it did.
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
 command = "php worker.php"
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"
 backend = "app"
 "#;
         let config = Config::from_toml(text).expect("config parses");
         config.validate().expect("valid");
-        let route = &config.routes[0];
+        let route = &config.server.routes[0];
         assert_eq!(RoutePolicy::All, route.policy);
         assert_eq!(Some("app"), route.backend.as_deref());
         assert!(route.policy.serves_files(), "all serves files");
@@ -7375,13 +7418,13 @@ backend = "app"
     #[test]
     fn rejects_a_route_that_matches_everything() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
 command = "php worker.php"
-[[routes]]
+[[server.routes]]
 backend = "app"
 "#;
         let config = Config::from_toml(text).expect("config parses");
@@ -7395,13 +7438,13 @@ backend = "app"
     #[test]
     fn rejects_a_path_prefix_without_a_leading_slash() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
 command = "php worker.php"
-[[routes]]
+[[server.routes]]
 path_prefix = "api"
 backend = "app"
 "#;
@@ -7955,8 +7998,8 @@ addres = "typo"
     #[test]
     fn a_misspelled_namespace_in_services_is_refused_by_name() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -7986,8 +8029,8 @@ services = ["workes"]
     #[test]
     fn a_namespace_listed_twice_in_services_is_refused() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -8100,8 +8143,8 @@ services = ["config", "config"]
     #[test]
     fn only_a_granted_service_reaches_a_worker_backend() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -8136,8 +8179,8 @@ grpc_services = ["greeter.Greeter"]
     #[test]
     fn grpc_services_is_absent_by_default_and_absent_grants_nothing() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -8165,8 +8208,8 @@ command = "php worker.php"
         let with = |service: &str| {
             let text = format!(
                 r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -8200,8 +8243,8 @@ grpc_services = ["{service}"]
     #[test]
     fn a_grpc_service_listed_twice_is_refused() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -8222,8 +8265,8 @@ grpc_services = ["a.B", "a.B"]
     #[test]
     fn grpc_services_beside_a_kind_that_has_no_channel_is_refused() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "external"
@@ -8247,8 +8290,8 @@ grpc_services = ["a.B"]
     #[test]
     fn a_worker_without_the_services_key_may_call_nothing() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -8278,8 +8321,8 @@ command = "php worker.php"
     #[test]
     fn a_services_entry_naming_a_kv_storage_must_match_a_configured_table() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [kv.sessions]
 driver = "memory"
@@ -8317,8 +8360,8 @@ services = ["kv.sessions"]
     #[test]
     fn a_bare_kv_service_is_refused_because_it_does_not_say_which_storage() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [kv.sessions]
 driver = "memory"
@@ -8345,8 +8388,8 @@ services = ["kv"]
     #[test]
     fn a_jobs_service_needs_a_jobs_table_and_a_jobs_table_is_enough() {
         let with_table = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [jobs]
 consume = ["emails"]
@@ -8644,8 +8687,8 @@ url = "redis://127.0.0.1:6379"
     #[test]
     fn an_unknown_kv_driver_is_refused_rather_than_ignored() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [kv.cache]
 driver = "redys"
@@ -8783,8 +8826,8 @@ pool_size = 0
     #[test]
     fn a_lock_service_needs_a_lock_table_and_a_lock_table_is_enough() {
         let with_table = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [lock]
 driver = "memory"
@@ -8988,8 +9031,8 @@ url = "redis://127.0.0.1:6379"
     #[test]
     fn an_unknown_key_in_a_kv_table_is_refused_rather_than_ignored() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [kv.cache]
 driver = "memory"
@@ -9010,8 +9053,8 @@ adress = "redis://127.0.0.1:6379"
     #[test]
     fn a_zero_kv_bound_is_refused_with_the_default_quoted_back() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [kv.cache]
 driver = "memory"
@@ -9052,8 +9095,8 @@ max_bytes = 0
     #[test]
     fn the_kv_driver_name_matches_its_tag() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [kv.cache]
 driver = "memory"
@@ -9697,8 +9740,8 @@ enable = true
         // The point of these keys: a systemd unit or a container image should not
         // have to carry a command line to say where the application lives.
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = "./public"
 front_controller = "public/index.php"
@@ -9746,8 +9789,8 @@ front_controller = "index.php"
     #[test]
     fn a_backends_own_env_wins_over_the_servers_baseline() {
         let text = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [server.env]
 APP_ENV = "production"
@@ -9806,8 +9849,7 @@ binary = "/usr/bin/php-cgi"
     /// which is a startup failure an operator cannot trace to a line in their file.
     #[test]
     fn an_unusable_env_entry_is_refused_by_name() {
-        let base = "default_backend = \"app\"\n\
-                    [server]\nhttp = \"127.0.0.1:8080\"\n\
+        let base = "[server]\ndefault_backend = \"app\"\nhttp = \"127.0.0.1:8080\"\n\
                     [backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"\n";
         // Each case names the table *and* declares whatever makes that table reachable, because a
         // table that never loads is a fixture that says nothing.
@@ -9883,9 +9925,8 @@ document_root = ""
     /// A two-site configuration, which is the shape this whole key exists for.
     fn two_sites() -> Config {
         let text = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = "/srv/default"
 front_controller = "index.php"
@@ -9919,6 +9960,47 @@ static_files = { precompressed = true }
         let config = Config::from_toml(text).expect("config parses");
         config.validate().expect("config validates");
         config
+    }
+
+    /// The two keys that moved in 0.3.0 are refused **by name**, not as unknown fields.
+    ///
+    /// This is the difference between an upgrade and a puzzle. `deny_unknown_fields` reports
+    /// `unknown field 'default_backend'`, which is accurate and tells an operator nothing: their
+    /// key did not disappear, it moved one table down, and the file they pasted is one line from
+    /// correct. Both halves are asserted — that the message names `[server]`, and that the *new*
+    /// spelling is accepted — because a shim that rejected both would pass the first assertion.
+    #[test]
+    fn the_pre_0_3_spelling_is_refused_with_the_new_location() {
+        let base = "http = \"127.0.0.1:8080\"\n\
+                    [backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"\n";
+
+        let old_backend = format!("default_backend = \"app\"\n[server]\n{base}");
+        let config = Config::from_toml(&old_backend).expect("the old key still parses");
+        let err = config
+            .validate()
+            .expect_err("the old spelling must not be silently accepted");
+        assert!(err.to_string().contains("[server]"), "{err}");
+        assert!(err.to_string().contains("0.3.0"), "{err}");
+
+        let old_routes = format!(
+            "[server]\ndefault_backend = \"app\"\n{base}\n\
+             [[routes]]\npath_prefix = \"/x\"\nbackend = \"app\"\n"
+        );
+        let config = Config::from_toml(&old_routes).expect("the old table still parses");
+        let err = config
+            .validate()
+            .expect_err("the old table must not be silently accepted");
+        assert!(err.to_string().contains("[[server.routes]]"), "{err}");
+
+        // And the new spelling, which is the half that makes the message trustworthy.
+        let new = format!(
+            "[server]\ndefault_backend = \"app\"\n{base}\n\
+             [[server.routes]]\npath_prefix = \"/x\"\nbackend = \"app\"\n"
+        );
+        let config = Config::from_toml(&new).expect("the new spelling parses");
+        config.validate().expect("the new spelling validates");
+        assert_eq!(config.server.default_backend.as_deref(), Some("app"));
+        assert_eq!(config.server.routes.len(), 1);
     }
 
     #[test]
@@ -10041,9 +10123,8 @@ static_files = false
 
     fn routed_suffix_config() -> Config {
         let text = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 
 [backends.app]
@@ -10054,7 +10135,7 @@ command = "php worker.php"
 kind = "spawn_cgi"
 binary = 'C:\php\php-cgi.exe'
 
-[[routes]]
+[[server.routes]]
 path_suffix = ".php"
 backend = "legacy"
 "#;
@@ -10068,9 +10149,8 @@ backend = "legacy"
         // Both routes state one constraint and both match `admin.example.com`; the
         // exact name is the more specific claim, so it wins regardless of order.
         let text = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 
 [backends.app]
@@ -10086,11 +10166,11 @@ kind = "worker"
 command = "php worker.php"
 
 # Declared first, so order alone would pick it — which is what the test is about.
-[[routes]]
+[[server.routes]]
 host = "*.example.com"
 backend = "wild"
 
-[[routes]]
+[[server.routes]]
 host = "admin.example.com"
 backend = "exact"
 "#;
@@ -10113,14 +10193,14 @@ backend = "exact"
         for suffix in ["php", "*php", "php/"] {
             let text = format!(
                 r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
 command = "php worker.php"
 
-[[routes]]
+[[server.routes]]
 path_suffix = {suffix:?}
 backend = "app"
 "#
@@ -10187,8 +10267,8 @@ http = "127.0.0.1:8080"
     #[test]
     fn rejects_a_site_naming_an_unknown_backend_or_escaping_its_root() {
         let base = r#"
-default_backend = "app"
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
@@ -11168,8 +11248,8 @@ key = "c.key"
     fn upstream_config(backend_body: &str) -> String {
         format!(
             r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"
@@ -11363,8 +11443,8 @@ kind = "upstream"
     #[test]
     fn an_https_origin_accepts_its_tls_table() {
         let text = r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 http = "127.0.0.1:8080"
 [backends.node]
 kind = "upstream"
@@ -11438,8 +11518,8 @@ sni = "node.internal"
         // front-end to hand it a request, so without an HTTP listener the backend starts, the
         // sockets bind, and nothing ever reaches the origin. Silent otherwise, so it is an error.
         let text = r#"
-default_backend = "node"
 [server]
+default_backend = "node"
 fastcgi = "127.0.0.1:9080"
 [backends.node]
 kind = "upstream"
@@ -11536,9 +11616,8 @@ binary = "/usr/bin/php-cgi"
         // read two different answers.
         let config = Config::from_toml(
             r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = "/srv/default"
 script_extensions = [".py", "rb"]

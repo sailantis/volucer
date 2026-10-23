@@ -130,8 +130,8 @@ impl Sites {
             static_files: default_statics.clone(),
             static_files_suppressed: false,
             compression: default_compression.clone(),
-            routes: config.routes.clone(),
-            default_backend: config.default_backend.clone(),
+            routes: config.server.routes.clone(),
+            default_backend: config.server.default_backend.clone(),
         };
         suppress_unused_static_layer(
             &mut default,
@@ -151,8 +151,8 @@ impl Sites {
                 config.server.serve_only,
                 &default_statics,
                 &default_compression,
-                &config.routes,
-                config.default_backend.as_deref(),
+                &config.server.routes,
+                config.server.default_backend.as_deref(),
             );
             suppress_unused_static_layer(
                 &mut resolved,
@@ -410,9 +410,8 @@ mod tests {
     }
 
     const TWO_SITES: &str = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = "/srv/default"
 front_controller = "index.php"
@@ -463,9 +462,8 @@ front_controller = false
         // there — this test is the one that would catch a walk running shortest-first.
         let config = config(
             r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = "/srv/default"
 
@@ -616,9 +614,8 @@ static_files = false
         // that omits `routes` inherits them, which is what makes one application on
         // several hosts one configuration.
         let text = r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 document_root = "/srv/default"
 
@@ -630,7 +627,7 @@ command = "php worker.php"
 kind = "worker"
 command = "php worker.php"
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/admin"
 backend = "admin"
 
@@ -664,9 +661,8 @@ document_root = "/srv/a"
     fn front_controller_config(extra: &str) -> Config {
         let text = format!(
             r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 {extra}
 
@@ -786,9 +782,8 @@ http = "127.0.0.1:8080"
 
         let text = format!(
             r#"
-default_backend = "app"
-
 [server]
+default_backend = "app"
 http = "127.0.0.1:8080"
 
 [backends.app]

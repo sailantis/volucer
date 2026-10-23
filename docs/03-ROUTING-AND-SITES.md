@@ -9,17 +9,19 @@ A route selects a backend. One process can serve a worker-backed API and a
 `php-cgi`-backed legacy area at the same time.
 
 ```toml
+[server]
+http = "127.0.0.1:8080"
 default_backend = "app"
 
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"        # a textual prefix, like nginx's `location`
 backend = "app"
 
-[[routes]]
+[[server.routes]]
 path_suffix = ".php"        # every PHP entry point, wherever it lives
 backend = "cgi"
 
-[[routes]]
+[[server.routes]]
 host = "admin.example.com"  # a bare name, or `*.example.com`; no port, case-insensitive
 path_prefix = "/"
 backend = "fpm"
@@ -59,11 +61,11 @@ entry point to one backend. That is the usual answer for a project with more tha
 front controller:
 
 ```toml
-[[routes]]
+[[server.routes]]
 path_prefix = "/api"                # a framework API on the persistent worker pool
 backend = "app"
 
-[[routes]]
+[[server.routes]]
 path_suffix = ".php"                # each real script on the CGI pool
 backend = "cgi"
 ```
@@ -107,6 +109,7 @@ One process can serve several hosts, each with its own document root.
 http             = "127.0.0.1:8080"
 document_root    = "/srv/default/public"   # the fallback site
 front_controller = "index.php"
+default_backend  = "app"                   # the unnamed site's routing
 
 [backends.app]
 kind    = "worker"
@@ -119,7 +122,6 @@ binary  = 'C:\php-8.3.31\php-cgi.exe'
 [sites.example_com]
 hosts            = ["example.com", "www.example.com", "*.shop.example.com"]
 document_root    = "/srv/example/public"
-default_backend  = "app"
 
 [sites.corp]
 hosts            = ["corp.internal", "*.corp.internal"]
@@ -154,7 +156,11 @@ that states only a root and a host list inherits the rest.
 `static_files` falls back **per key**: a site naming `precompressed` keeps the server's
 `cache_control`. The same is true of `compression` and `acme`.
 
-A site's `routes` **replaces** the global route list. It is not merged.
+A site's `routes` **replaces** `[server.routes]`. It is not merged, so a host that states
+one route does not inherit the other twenty.
+
+`default_backend` inherits the same way and is what `/assets/missing.png` falls to when a
+`policy = "static"` route names no backend of its own.
 
 ### `front_controller = false`
 
