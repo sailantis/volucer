@@ -113,7 +113,7 @@ pub fn route(path: &str, routing: &Routing) -> Route {
 
     // Whether this path names a script. The list is the site's, so a site serving a Python
     // worker resolves `/app.py` here rather than handing it to the front controller as
-    // `PATH_INFO` — which is the whole point of step 38.
+    // `PATH_INFO` — which is the whole point of making the list configurable.
     if routing.script_extensions.matches(relative) {
         let candidate = routing.document_root.join(relative);
         if candidate.is_file() {
@@ -265,8 +265,7 @@ pub fn climbs_out(path: &str) -> bool {
 ///
 /// The fallback is deliberately narrow, because building `SCRIPT_FILENAME` from a path
 /// that names an existing non-script file is how the document root becomes a file server
-/// — `php-cgi` will happily emit `config.json` verbatim with a 200, which is hazard 19.
-/// So:
+/// — `php-cgi` will happily emit `config.json` verbatim with a 200. So:
 ///
 /// - With a **front controller**, the request is that script's, exactly as [`route`]
 ///   would have decided.

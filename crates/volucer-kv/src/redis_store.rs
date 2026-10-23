@@ -5,7 +5,7 @@
 //! `redis`'s `ConnectionManager` reconnects a dropped connection for you and is the obvious thing to
 //! reach for — and it is **async**, so using it would mean either driving a `tokio` runtime from the
 //! worker exchange threads, which is how one slow Redis stalls a whole pool, or moving the call path onto
-//! a runtime, which `internal/plugins.md` §6.2 refuses. So this is the synchronous [`redis::Connection`], with
+//! a runtime, which the exchange thread's design refuses. So this is the synchronous [`redis::Connection`], with
 //! a pool the size of the worker pool and one reconnect-and-retry when a connection itself fails.
 //!
 //! The retry is a real feature rather than a nicety: Redis restarts, a network blips, a failover moves the
@@ -249,8 +249,8 @@ impl Store for RedisStore {
     fn set_if_absent(&self, key: &[u8], value: Vec<u8>, ttl: Option<Duration>) -> Result<bool> {
         // **`SET ... NX` is the atomicity, and this is the one driver where it is a single word.** Redis
         // evaluates the existence check and the write in one command, so there is no window at all — which
-        // is what `internal/plugins.md` §6.3 means by "Redis `SET NX`" when it tells an application that a lock
-        // cannot protect an invariant and a conditional write can. This is the reason the section asked for
+        // is what "Redis `SET NX`" means when an application is told that a lock
+        // cannot protect an invariant and a conditional write can. This is the reason the API asks for
         // this method rather than for a better lock.
         if ttl.is_some_and(|ttl| ttl.is_zero()) {
             return Err(Error::BadKey {

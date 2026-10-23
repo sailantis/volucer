@@ -1,7 +1,8 @@
 //! Do an origin's HTTP trailers survive the proxy?
 //!
-//! `internal/plugins.md` §6.6 rests on the claim that they do, and on it rests the argument that the
-//! first gRPC tier is small: an origin's trailers are already carried, so what is missing is only
+//! The whole of the first gRPC tier rests on the claim that an origin's trailers do survive the
+//! proxy, and on it rests the argument that the
+//! tier is small: an origin's trailers are already carried, so what is missing is only
 //! the code that **constructs** one. That claim was derived by reading three files —
 //! `incoming_body` preserving frames, `translate_response` never touching them, and the front-end
 //! handing the body straight out — and reading three files is not a measurement.
@@ -178,7 +179,7 @@ async fn a_plaintext_origins_trailers_reach_the_caller() {
 }
 
 /// The control. Without this, a `trailers()` that returned `Some` for any reason at all would pass
-/// the test above — which is the shape of hazard 67: a verification that cannot fail is not a
+/// the test above — which is the shape of a vacuous verification: one that cannot fail is not a
 /// verification.
 #[tokio::test]
 async fn a_response_with_no_trailers_reports_none() {

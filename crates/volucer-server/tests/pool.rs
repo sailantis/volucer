@@ -346,8 +346,8 @@ fn children_lets_one_slot_serve_several_requests_at_once() {
     // No trailing `$` and no heredoc: the first version of this fixture ended with a stray `$`,
     // which made the script a parse error — php-cgi then answered in microseconds and the
     // *control* assertion below is the only thing that noticed. A test whose fixture does not
-    // execute measures the interpreter's error path, which is exactly the shape plan hazard 34
-    // records.
+    // execute measures the interpreter's error path, which is exactly the shape this defect
+    // takes.
     let script = write_script(
         &root,
         "index.php",

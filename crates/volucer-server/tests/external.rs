@@ -458,7 +458,7 @@ fn a_socket_that_is_not_listening_fails_the_request_not_the_startup() {
 fn concurrent_requests_reach_the_backend_at_the_same_time() {
     let _serial = serial();
 
-    // The regression test for `internal/plan.md` hazard 22. The backend used to hold
+    // The regression test for the one-connection-per-backend defect. The backend used to hold
     // one `Mutex<Option<Client>>` for the whole request, so a pool of any size
     // served exactly one request at a time. A backend that can only be talked to
     // through one connection is invisible to a sequential test — every request

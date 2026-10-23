@@ -41,8 +41,7 @@
 //! to be atomic is one script and every operation that does not is one command — which is what keeps the
 //! cost of a push at one round trip and a reserve at two (`TIME` for the deadline, then the script).
 //! Redis Cluster is not supported and is not claimed to be: the keys of one pipeline share no hash tag,
-//! so a cluster would refuse the script that spans them. `internal/plugins.md` §9.4 records that as a
-//! decision rather than an oversight.
+//! so a cluster would refuse the script that spans them. That is a decision rather than an oversight.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,7 +121,7 @@ mod field {
 ///
 /// The job's own key is built from `ARGV[4]`, because Redis's scripting is only allowed to construct keys
 /// from arguments outside cluster mode — and this driver does not support cluster mode, which
-/// `internal/plugins.md` §9.4 records as a decision. Declaring the key as `KEYS[4]` would have been wrong:
+/// is a decision rather than an oversight. Declaring the key as `KEYS[4]` would have been wrong:
 /// the id is only known *after* the pop, so the key cannot exist before the script runs.
 const RESERVE_SCRIPT: &str = r#"
 local ready = KEYS[1]

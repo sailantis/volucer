@@ -42,8 +42,8 @@ child.
 ```
 
 `transport = "socket"` moves the same frames onto a socket, because on Windows PHP's stream layer
-takes ~8 ms median to return from a blocking read on a *pipe* and ~0.09 ms on a *socket* (plan
-hazard 46). **Nothing in this document changes** — the frames, the handshake and the ordering are
+takes ~8 ms median to return from a blocking read on a *pipe* and ~0.09 ms on a *socket*.
+**Nothing in this document changes** — the frames, the handshake and the ordering are
 identical; only the file descriptor they travel on differs.
 
 The server picks the socket and tells the worker where it is, in `VOLUCER_WORKER_SOCKET`. That

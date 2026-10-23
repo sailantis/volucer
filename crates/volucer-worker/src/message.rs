@@ -267,7 +267,7 @@ pub struct Call {
     /// The `traceparent` this call belongs to, so a span can continue across the call.
     ///
     /// Carried from the start rather than added later, because it costs a field now and is a protocol
-    /// change once anything is deployed. `internal/plugins.md` §6.5 is where that argument lives.
+    /// change once anything is deployed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
 }
@@ -296,8 +296,8 @@ pub struct Return {
     /// the call may or may not have taken effect: a lock acquired before the reply was lost, a write
     /// that was sent and not acknowledged. The caller must resolve that by asking, and an API that
     /// collapsed the two would make "the write failed" and "the write may have happened" the same
-    /// answer — which is how a retry duplicates a side effect. This is the ambiguity `internal/plugins.md`
-    /// §6.3 records RoadRunner's own lock implementation as having, modelled explicitly rather than
+    /// answer — which is how a retry duplicates a side effect. This is the ambiguity RoadRunner's
+    /// own lock implementation has, modelled explicitly rather than
     /// left to a comment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unknown: bool,
@@ -366,7 +366,7 @@ pub struct JobHeader {
     /// How many times this job has been reserved, counting this one.
     ///
     /// The number an application's retry policy reads. The server neither sets a limit nor acts on it:
-    /// see `internal/plugins.md` §6.4 for why retry, backoff and dead-lettering stay the application's.
+    /// retry, backoff and dead-lettering stay the application's.
     #[serde(default)]
     pub attempts: u32,
     /// How many payload bytes follow in `BODY` frames.

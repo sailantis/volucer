@@ -353,8 +353,8 @@ mod tests {
     /// with `EINVAL` and which `arm_immediate_ack` deliberately ignores. A `setsockopt`
     /// that returns -1 is invisible at every call site, so it is checked here instead.
     ///
-    /// The effect itself is verified by measurement, not by a unit test: see hazard 30
-    /// in `internal/plan.md` for the 42.005 ms -> 1.238 ms before/after on a real php-cgi.
+    /// The effect itself is verified by measurement, not by a unit test: on a real php-cgi it
+    /// was 42.005 ms before and 1.238 ms after.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_immediate_ack_option_is_accepted_by_a_real_socket() {

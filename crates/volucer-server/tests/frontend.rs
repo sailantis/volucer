@@ -5,7 +5,7 @@
 //!     â”€â”€FastCGIâ”€â”€â–º volucer front-end â”€â”€â–º dispatcher â”€â”€FastCGIâ”€â”€â–º php-cgi
 //! ```
 //!
-//! This is the Phase 6 milestone from `internal/plan.md`. The client role is played
+//! This is the milestone the whole chain was built for. The client role is played
 //! by the same codec volucer uses as a client, which is legitimate here: the
 //! point is to prove the front-end parses a real FastCGI request, resolves the
 //! script through the CGI environment, gets a response from a real PHP process,

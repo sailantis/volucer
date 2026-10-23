@@ -30,7 +30,7 @@
 //! through the environment builder. The allocations are real and the count is honestly four per
 //! header; the *time* is not there.
 //!
-//! Recorded rather than done, for the same reason hazard 41 recorded the checksum option: the
+//! Recorded rather than done, for the same reason the checksum option was recorded: the
 //! evidence is about the framing path, and no throughput number is claimed.
 //!
 //! The tests below therefore pin **the measurement and the reasoning**, not the shape of an

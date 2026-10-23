@@ -1527,7 +1527,7 @@ document_root = {app:?}
     }
 
     // And the reload took effect, which is what keeps the assertions above from passing against a
-    // reload that applied nothing at all — hazard 57's vacuity.
+    // reload that applied nothing at all — a vacuous assertion.
     assert_eq!(
         get_as(&address, "app.test", "/whoami.txt").text(),
         "second",
@@ -1943,7 +1943,7 @@ fn a_slow_origin_is_served_concurrently_rather_than_thread_at_a_time() {
 // ---------------------------------------------------------------------------
 // A supervised origin: the origin's *process* is volucer's.
 //
-// The seam pattern `internal/plugins.md` §8 records applies here in its original form: every layer of
+// The seam pattern applies here in its original form: every layer of
 // this — the config, the supervisor, the readiness gate, the client — was tested on its own, and
 // none of those tests could see that the dispatcher was building a `Supervisor` at all. So this one
 // goes through the entry point a *deployment* uses: a `Config` built from TOML, a `Dispatcher`, a
@@ -2145,7 +2145,7 @@ origin = "http://{}"
 
 /// **A failed gRPC call is a `200` with the status in the trailers, not a `502`.**
 ///
-/// The mapping `internal/plugins.md` §6.6 lists as the remaining half of tier A, driven through the
+/// The mapping that is the remaining half of a gRPC proxy, driven through the
 /// deployment's entry point: a real listener, a real request, and a backend whose origin is
 /// deliberately not there.
 ///
@@ -2196,7 +2196,7 @@ fn a_failed_grpc_call_is_a_200_with_the_status_in_the_trailers() {
 
     // A one-message gRPC body: compression flag 0, a big-endian length of 5, then five bytes. The
     // framing is what makes this a *gRPC* request rather than an HTTP one with an unusual content
-    // type, and nothing here parses it — which is the whole of §6.6's claim.
+    // type, and nothing here parses it — which is the whole of the claim.
     let call = "POST /pkg.Service/Method HTTP/1.1\r\nHost: example.test\r\n\
                 Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: 5\r\n\
                 Connection: close\r\n\r\n\x00\x00\x00\x00\x05";
@@ -2267,9 +2267,9 @@ fn exchange_raw(address: &str, request: &[u8]) -> Vec<u8> {
 /// 1. the `grpc_services` allow-list is read from the file and admits the call, so a granted service
 ///    reaches a worker at all;
 /// 2. the body crosses the CGI environment, the worker protocol and back **unframed and unparsed** —
-///    the server carries gRPC's bytes without decoding them, which is §6.6's whole claim;
+///    the server carries gRPC's bytes without decoding them, which is the whole claim;
 /// 3. the application's `grpc-status` header becomes a **trailer**, not a header, and the reply is an
-///    HTTP 200 — the construction half tier A built, now carrying a real application's answer;
+///    HTTP 200 — the construction half a gRPC proxy needs, now carrying a real application's answer;
 /// 4. **an HTTP route on the same worker still works.** The two protocols share one pool, so a change
 ///    that made every request gRPC would pass 1–3 and break the ordinary case.
 ///

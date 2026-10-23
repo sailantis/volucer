@@ -69,7 +69,7 @@ pub fn is_never_forwarded(name: &str) -> bool {
 /// Whether this request is a gRPC call.///
 /// By `content-type`, which is the only thing that says so: gRPC's media type is `application/grpc`
 /// with optional suffixes (`+proto`, `+json`, and the `-web`/`-web-text` forms), and
-/// `internal/plugins.md` §6.6 is explicit that the server never parses a message — so this is a prefix
+/// the server never parses a message — so this is a prefix
 /// test and nothing more. A `:path` shaped like `/pkg.Service/Method` is *not* the test, because an
 /// HTTP route can be spelled that way and must keep working.
 ///
@@ -318,7 +318,7 @@ impl GrpcOutcome {
 ///   complete and never poll for a trailer section at all. That is `GrpcReplyBody::size_hint`.
 ///
 /// The application's own bytes are passed through untouched: the server carries gRPC's
-/// length-delimited framing without decoding it, which is `internal/plugins.md` §6.6's "the schema is
+/// length-delimited framing without decoding it, which is the whole of "the schema is
 /// not the server's problem". A message the application forgot to frame is a message the client
 /// rejects, and that is the application's bug to see rather than one this server could fix by
 /// guessing at the bytes.
@@ -514,8 +514,8 @@ impl hyper::body::Body for GrpcReplyBody {
 /// HTTP error status. A proxy that answers `502` for a gRPC call has produced something no gRPC
 /// client can read — the client sees an HTTP status it was not expecting and cannot map to a gRPC
 /// status code, so the failure an operator needs to see becomes "unexpected status". This type is
-/// the mapping, and it is the second of the two things `internal/plugins.md` §6.6 lists as the whole of
-/// what tier A still needed once the transport worked.
+/// the mapping, and it is the second of the two things a proxy needs to build for a gRPC call once
+/// the transport works.
 ///
 /// The numbers are the specification's, not invented here: `0` `OK`, `12` `UNIMPLEMENTED`,
 /// `13` `INTERNAL`, `14` `UNAVAILABLE`. Only four, because **these are the four a proxy can
@@ -632,9 +632,9 @@ pub fn grpc_error(status: GrpcStatus) -> (hyper::StatusCode, HeaderMap, GrpcErro
 /// The trailer fields that carry a gRPC status.
 ///
 /// Constructed rather than forwarded, and this is the header this tier exists to be able to write:
-/// `internal/plugins.md` §6.6 lists *"write `grpc-status` and `grpc-message` as trailers"* as the row
-/// that needs no schema, and §9.7 records that the tree had no code that constructed a trailer at
-/// all. `crates/volucer-upstream/tests/trailers.rs` had already measured the other direction — that
+/// *"write `grpc-status` and `grpc-message` as trailers"* is the row
+/// that needs no schema. `crates/volucer-upstream/tests/trailers.rs` had already measured the other
+/// direction — that
 /// an origin's trailers cross this proxy untouched — so this is the missing half.
 pub fn grpc_trailers(status: GrpcStatus) -> HeaderMap {
     let mut trailers = HeaderMap::new();
@@ -803,7 +803,8 @@ mod tests {
 
     #[test]
     fn a_grpc_failure_is_http_200_with_the_status_in_the_trailers() {
-        // The mapping `internal/plugins.md` §6.6 calls the whole of tier A's remaining work. Every
+        // The mapping that is the whole of what a gRPC proxy still needs once the transport works.
+        // Every
         // assertion here is a different way for a gRPC client to be unable to read the answer:
         //
         // - a `502` is unreadable, because gRPC reports outcomes in trailers and the client never
@@ -916,7 +917,7 @@ mod tests {
 
     #[test]
     fn a_grpc_call_is_recognised_by_its_content_type_and_nothing_else() {
-        // The server never parses a message (`internal/plugins.md` §6.6), so `content-type` is the whole
+        // The server never parses a message, so `content-type` is the whole
         // of what identifies a gRPC call — including the `-web` and `+json` forms, which are still
         // gRPC's framing and still need the h2 path and the trailer handling.
         let with = |value: &str| {

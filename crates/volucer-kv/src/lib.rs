@@ -10,7 +10,7 @@
 //! means the server holds the codec and therefore sees the plaintext of everything an application
 //! stores. An application that wants to encrypt what it caches cannot, because the encryption would
 //! have to happen below the serializer and the serializer is on the server. So the wire carries
-//! **opaque bytes**, `internal/plugins.md` §6.2 says so, and this crate takes it seriously: there is no
+//! **opaque bytes**, and this crate takes it seriously: there is no
 //! `serde` anywhere in it, and [`Store::get`] cannot fail because a stored value was unreadable.
 //!
 //! # Keys are bytes, not `String`
@@ -23,12 +23,15 @@
 //!
 //! A call arrives on a worker's exchange thread and is answered there. Making the store `async`
 //! would mean either blocking on a runtime from a synchronous thread — which is how a single slow
-//! Redis becomes a stalled worker pool — or moving the whole call path onto a runtime, which
-//! `internal/plugins.md` §6.2 refuses because the exchange thread exists precisely to *not* be a
-//! runtime task. So a slow backend blocks the worker that asked, and that is honest: the worker is
-//! the thing waiting for its own answer, and no other worker is affected.
+//! Redis becomes a stalled worker pool — or moving the whole call path onto a runtime, which the
+//! exchange thread's design refuses: it exists precisely to *not* be a runtime task. So a slow
+//! backend blocks the worker that asked, and that is honest: the worker is the thing waiting for
+//! its own answer, and no other worker is affected.
 //!
-//! The consequence to keep in view is the per-call deadline, still open as §10 item 9.
+//! The consequence to keep in view is the per-call deadline. A call that blocks past the request's
+//! deadline currently means the worker is killed; whether the call should instead be reported as
+//! *unknown state* with the worker kept is still an open decision, and [`crate::Error`]'s variants
+//! depend on which way it goes.
 //!
 //! # Errors are values, and "the store is full" is not an error to hide
 //!
@@ -52,7 +55,7 @@ pub use redis_store::RedisStore;
 
 /// What a key-value store can do.
 ///
-/// Deliberately small. `internal/plugins.md` §6.2 lists the PSR-16 method set as what the *client*
+/// Deliberately small. The PSR-16 method set is what the *client*
 /// exposes; three of those (`getMultiple`, `setMultiple`, `deleteMultiple`) are batches, and a
 /// batch is not three more verbs — it is the same verb with more keys, which is why there is one
 /// overridable method per direction rather than three more required ones.
@@ -79,9 +82,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 
     /// Store a value **only if the key is not already there**, answering whether it was stored.
     ///
-    /// This is the conditional write, and it is the reason `internal/plugins.md` §6.3 tells an application
-    /// that a lock cannot protect an invariant — the answer to that sentence is this method. A lock
-    /// without a fencing token cannot stop a late writer (§9.2); a compare-and-swap can, because the
+    /// This is the conditional write, and it is the answer to a question an application has to
+    /// answer for itself: a lock cannot protect an invariant, because a TTL lock has no fencing
+    /// token and cannot stop a late writer. A compare-and-swap can, because the
     /// *storage* decides, and the storage is the thing both writers agree on.
     ///
     /// **Required rather than given a default, and that is the whole point.** The obvious default —

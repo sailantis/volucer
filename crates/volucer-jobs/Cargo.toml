@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 # The same two the KV and lock crates have, and for the same reason: the refusals a caller must read are
 # the only thing a driver needs, and every driver past `memory` is behind a feature so that a single-node
-# deployment links no client at all. `internal/plugins.md` §5.
+# deployment links no client at all.
 tracing.workspace = true
 thiserror.workspace = true
 # The `script` feature is on here and off at the workspace level, and here it earns its keep differently

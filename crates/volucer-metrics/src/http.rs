@@ -13,7 +13,7 @@
 //! dashboards already written against `rr_http_request_total` and friends, and renaming them buys
 //! nothing and costs every one of those a migration. The *activation* rule differs — RoadRunner
 //! only emits HTTP metrics when an `http_metrics` middleware is listed, where volucer emits them
-//! whenever `[metrics]` is configured — and that difference is stated in `internal/plugins.md` §9.3
+//! whenever `[metrics]` is configured — and that difference is stated in the documentation
 //! rather than hidden in a name.
 //!
 //! # Labels come from closed sets, and that is the point

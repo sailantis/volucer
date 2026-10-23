@@ -1386,7 +1386,7 @@ async fn prepare(
     // backend skips it, which is the difference between "static files first" and "no
     // static layer": the first still stats on every request to discover there is no
     // file, and for an application host there never is one.
-    // The route is selected *before* the static decision, which is the change step 40 makes.
+    // The route is selected *before* the static decision.
     // It used to be selected after, so a route's `policy` could not affect the layering at all
     // and the two layers could disagree about which subtree they were serving. One selection,
     // used by both, is the same rule the `skip_stat` work established: two answers to one
@@ -1755,7 +1755,7 @@ fn to_cgi_with(
         server_name,
         server_port,
         body_len,
-        // TLS is step 23; nothing can arrive here over HTTPS yet.
+        // Nothing can arrive here over HTTPS yet.
         https: false,
     };
 
@@ -1884,7 +1884,7 @@ fn from_cgi(
 /// **A refusal to even try.** The body has to be a `Vec` rather than the borrowed slice `from_cgi`
 /// relays, because an HTTP/1.1 body with a trailer section is chunked and hyper needs it as frames;
 /// and a gRPC message is small enough that the copy is not the interesting cost. A *streamed* gRPC
-/// reply — a server-streaming method — is §10 item 4, and it is where this type would have to
+/// reply — a server-streaming method — is not supported yet, and it is where this type would have to
 /// change.
 fn grpc_answer(response: volucer_fcgi::Response) -> Result<Response<ResponseBody>> {
     let (status, headers, body) = response.parse();

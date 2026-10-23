@@ -106,7 +106,7 @@ fn params_pairs(extra: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// front-end does when the environment exceeds one record. It splits at pair boundaries, which
 /// is what `volucer-fcgi`'s `Client` does and what nginx's own tests exercise; `0` puts the
 /// whole environment in a single record. Whether every client splits at pair boundaries is not
-/// something this file asserts — see hazard 38 in `internal/plan.md`.
+/// something this file asserts.
 fn request_bytes(pairs: &[(Vec<u8>, Vec<u8>)], body: &[u8], pairs_per_record: usize) -> Vec<u8> {
     let mut out = Vec::new();
 

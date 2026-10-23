@@ -935,7 +935,7 @@ fn serve(
     // failure the shared site table exists to prevent, one layer down. A plaintext deployment
     // builds none at all, which is the whole of "TLS costs nothing when it is off".
     //
-    // Loading it here rather than inside the listener is also the ordering hazard 56 was about:
+    // Loading it here rather than inside the listener is also the ordering that matters:
     // a certificate that cannot be read must fail *before* a port is taken, not after `serve` has
     // printed that the port came up.
     let tls_state = match tls_active {
@@ -1801,7 +1801,7 @@ impl Reloader {
         //
         // This runs even when ACME manages some of the deployment's certificates, and the **merge
         // inside `refresh`** is what makes that safe. It used to be skipped, because a rebuild from
-        // the configuration alone would replace an issued certificate with a placeholder (hazard 71);
+        // the configuration alone would replace an issued certificate with a placeholder;
         // now the rebuild keeps what was issued and re-reads what is named. Skipping would have been
         // simpler and wrong in the other direction: a site's own `[sites.x.tls]` PEM *is* in the
         // configuration, and a renewal of it has to be picked up.

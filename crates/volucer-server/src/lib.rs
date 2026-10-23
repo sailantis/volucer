@@ -1,7 +1,7 @@
 //! Backend supervision and dispatch.
 //!
 //! One [`Backend`] per configured backend, one [`Dispatcher`] in front of them,
-//! so both front-ends have a single call to make. See `internal/plan.md` §3.
+//! so both front-ends have a single call to make.
 
 pub mod backend;
 pub mod build;

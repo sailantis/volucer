@@ -602,7 +602,7 @@ mod tests {
         // nginx does *not* do this: `ngx_http_fastcgi_create_request` sums every pair and emits
         // the whole environment as one record (verified in nginx 1.30.5). This shape is what the
         // front-end tolerates, not what it receives, and the split is at a *pair* boundary
-        // because a pair straddling two records is not reassembled — see hazard 38.
+        // because a pair straddling two records is not reassembled.
         let first = nvpair::encode_pairs([(&b"REQUEST_METHOD"[..], &b"GET"[..])]);
         let second = nvpair::encode_pairs([(&b"QUERY_STRING"[..], &b"x=1"[..])]);
         wire.extend(framed(RecordType::Params, 1, &first));

@@ -589,11 +589,12 @@ fn serve_connection(
         // exists at all, so this is the earliest point — but it is still before the dispatch, which
         // is the work the limit exists to protect.
         //
-        // The identity is `REMOTE_ADDR`, **not** the socket peer and not a forwarded header, and §6.8
-        // is why: nginx sets `REMOTE_ADDR = $remote_addr`, the address *it* saw the client at and
+        // The identity is `REMOTE_ADDR`, **not** the socket peer and not a forwarded header, and the
+        // reason is the asymmetry between the two: nginx sets `REMOTE_ADDR = $remote_addr`, the address
+        // *it* saw the client at and
         // already resolved through its own `real_ip` handling, while the `HTTP_*` params beside it are
         // the client's unvouched-for claims. So the param is the client, even though the socket
-        // belongs to nginx — the same asymmetry §6.8 found and left alone rather than "fixing" it.
+        // belongs to nginx — the same asymmetry this leaves alone rather than "fixing" it.
         //
         // A request with no `REMOTE_ADDR` at all (a front-end that forwards raw FastCGI without
         // setting it) resolves to `None`, and gets no bucket rather than a shared one: bucketing

@@ -17,7 +17,7 @@
 //! that read it; the third had its own copy. This module is that constant made a
 //! *value*, so a site can widen it for a non-PHP worker and all three move
 //! together. Widening only the router would turn every newly-routable extension
-//! into a source disclosure — see `internal/plan.md` step 38.
+//! into a source disclosure.
 //!
 //! Lives in `volucer-core` because `volucer-fcgi` and `volucer-watch` both
 //! depend on it, and putting it anywhere else would be a dependency cycle.
@@ -248,7 +248,7 @@ mod tests {
     fn a_path_that_is_only_an_extension_still_matches_as_it_always_did() {
         // `.php` is a legal (if odd) filename, and the predicate that existed
         // before this type did accepted it. Keeping that is not an oversight:
-        // step 38's job is to make the *list* configurable, and a predicate that
+        // making the *list* configurable is the point, and a predicate that
         // changed answer along the way would be a routing change nobody asked
         // for. The front controller's dotfile rule is what keeps such a path
         // from becoming application input.

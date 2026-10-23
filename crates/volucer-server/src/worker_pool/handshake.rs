@@ -294,7 +294,7 @@ impl WorkerListener {
 /// worker that starts but connects to the wrong address, or does not connect at all, produces
 /// no error anywhere — the accept simply never returns. That turns a misconfiguration into a
 /// server that hangs at startup instead of one that says what is wrong, which is the same
-/// failure the named-pipe transport had to solve for reads (plan hazard 43).
+/// failure the named-pipe transport had to solve for reads.
 ///
 /// The listener is made non-blocking and polled, rather than blocking in `accept` with the
 /// deadline enforced elsewhere: there is no portable `accept` timeout, and this runs once
@@ -368,8 +368,8 @@ fn accept_with_deadline(
 /// Install what answers a worker's call, if anything does.
 ///
 /// `handler` is `None` for a worker whose backend granted no `services`, and the channel then refuses
-/// every call by name. That refusal is deliberate and is the security boundary `internal/plugins.md` §4.5
-/// describes: a worker facing the public reaches no namespace at all, and the only thing saying so is
+/// every call by name. That refusal is deliberate and is the per-backend capability
+/// boundary: a worker facing the public reaches no namespace at all, and the only thing saying so is
 /// the absence of a handler rather than a list that has to be consulted correctly on every call.
 ///
 /// The `Arc` is cloned per worker and moved into the closure, so the read loop holds one reference
@@ -754,7 +754,7 @@ fn handshake_with_timeout(
 /// It must run on its own thread, and that is not incidental: reading `stderr` to
 /// end-of-file blocks until the worker exits, so doing it inline would deadlock
 /// the boot — the worker waits for `HELLO` while we wait for a line that will
-/// never come. This is the hazard in `internal/plan.md` §5, "drain `STDERR` for every
+/// never come. This is the hazard "drain `STDERR` for every
 /// backend, always", seen from the other side: draining it on the caller's thread
 /// is the same bug with a different shape.
 fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {

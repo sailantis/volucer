@@ -241,7 +241,7 @@ fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
     // one stat where it used to cost two as well.
     //
     // Measured: `GET /items` went from 2.05 `statx` per request to 1.05, which is
-    // the one this line makes. See hazard 85 in the plan.
+    // the one this line makes.
     let Some(metadata) = std::fs::metadata(&resolved).ok() else {
         // Not there. `NotAFile` rather than a 404: a path that names no file may
         // still be the application's, and this layer's job is to get out of the
@@ -1464,7 +1464,7 @@ mod tests {
         // An earlier shape asked `is_dir()` and then `is_file()`, which is two
         // `stat`s for one fact — measured at 2.05 `statx` per request against 1.05
         // after collapsing them. The answers are what this test holds; the count is
-        // not observable from here, which is why hazard 85 records the strace.
+        // not observable from here, which is why the measurement is a `strace`.
         let root = fixture(
             "plan-one-stat",
             &[("docs/index.html", "docs"), ("file.txt", "x")],

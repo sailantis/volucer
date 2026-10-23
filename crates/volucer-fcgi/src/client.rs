@@ -1,7 +1,6 @@
 //! The FastCGI client.
 //!
-//! Deliberate design points, all consequences of the hazards recorded in
-//! `internal/plan.md`:
+//! Deliberate design points, all consequences of the hazards FastCGI is famous for:
 //!
 //! - **One request in flight per connection.** `php-cgi` processes requests
 //!   sequentially, so multiplexing would add a demux table and buy nothing. A

@@ -49,7 +49,7 @@ pub struct Dispatcher {
     ///
     /// A strong handle, unlike the directory above, and the difference is a real one rather than an
     /// oversight: a driver is not the owner of anything that owns the dispatcher — no pool holds a
-    /// driver, so there is no cycle to avoid. The consumer side of step 5 will poll these, which is why
+    /// driver, so there is no cycle to avoid. The consumer side polls these, which is why
     /// they are kept rather than rebuilt.
     queues: Option<Arc<JobsPlane>>,
 }
@@ -234,7 +234,7 @@ fn build_locks(config: &Config) -> Result<Option<Arc<dyn volucer_lock::Locks>>> 
 ///
 /// The drivers are per-pipeline and the *namespace* is one, because a push names the pipeline and the
 /// namespace resolves it. So the map is built here and handed over whole — which is also what lets the
-/// consumer side of step 5's second half be added without changing this shape: the same drivers will be
+/// consumer side be added without changing this shape: the same drivers will be
 /// polled by pools, and a driver behind an `Arc<dyn Driver>` can be both.
 ///
 /// # Why a pipeline's driver is chosen per table
@@ -293,7 +293,7 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
     }
 
     if consumed.is_empty() && !jobs.pipelines.is_empty() {
-        // Not a warning: a producer-only node is a documented deployment, and `internal/plugins.md` §6.4 says
+        // Not a warning: a producer-only node is a documented deployment, and the queue design says
         // so. Logged at info because it is the answer to "why is nothing consuming", which is a question
         // an operator will otherwise ask of a queue with jobs piling up in it.
         tracing::info!(
@@ -310,7 +310,7 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
 
 /// The pipelines, and which of them this server consumes.
 ///
-/// One object rather than the two halves being passed separately, because the consumer side of step 5 needs
+/// One object rather than the two halves being passed separately, because the consumer side needs
 /// the same drivers the producer namespace holds — and threading two maps through three signatures to avoid
 /// one struct is how a seam gets missed.
 ///
@@ -598,8 +598,8 @@ impl Dispatcher {
         //
         // A registry is built **per worker backend**, from that backend's own `services` list, so a
         // worker facing the public gets one that cannot restart its siblings. That is
-        // `internal/plugins.md` §4.5, and building it once for the whole process would be the shape it
-        // refuses.
+        // the per-backend capability boundary, and building it once for the whole process would be the
+        // shape it refuses.
         // The stores are built before any backend, because a backend's registry needs them: a worker
         // granted `kv.sessions` has to find the store already there. Built once and shared, so two
         // backends granted the same storage share one map rather than getting a private copy that
@@ -699,7 +699,7 @@ impl Dispatcher {
     ///
     /// The one accessor that answers a question about the *deployment* rather than about a request, and it
     /// exists because the dispatcher itself has to answer a call: `volucer workers` and `volucer reset`
-    /// on the command line are clients of this same machinery (`internal/plugins.md` §4.6), and a CLI
+    /// on the command line are clients of this same machinery, and a CLI
     /// that re-derived "which pool is worker 3 in" would be a second implementation of the one rule
     /// `worker.reset` exists to get right.
     pub fn pools(&self) -> Option<Arc<PoolDirectory>> {
@@ -711,7 +711,7 @@ impl Dispatcher {
 
     /// The queues this deployment built, if it has a `[jobs]` table.
     ///
-    /// For the tests, and for whatever polls them next — the consumer half of step 5. `None` means no
+    /// For the tests, and for whatever polls them next — the consumer side. `None` means no
     /// `[jobs]` table, which is the same distinction `[lock]` makes: absent is not "the default driver".
     pub fn queues(&self) -> Option<Arc<JobsPlane>> {
         self.queues.as_ref().map(Arc::clone)
@@ -913,7 +913,7 @@ impl Dispatcher {
     /// `None` for every case that is not "a worker this deployment agreed may serve this service":
     /// a non-`worker` backend, a path that is not a gRPC path, and a service absent from that
     /// backend's own list. The caller turns all of them into the same `UNIMPLEMENTED`, which is what
-    /// gRPC means by "this server does not implement that method" — see `internal/plugins.md` §6.6.
+    /// gRPC means by "this server does not implement that method".
     pub fn granted_grpc_call<'a>(
         &self,
         backend: &str,
@@ -1219,7 +1219,8 @@ mod tests {
         }
     }
 
-    /// A `[kv.*]` file store is **built** from the configuration, which is the seam §8 keeps finding.
+    /// A `[kv.*]` file store is **built** from the configuration, which is the seam this pattern keeps
+    /// finding.
     ///
     /// The fourth instance of the pattern, and it is asserted the way the first three taught: through
     /// the function a deployment uses rather than through a store the test built by hand. What it
@@ -1471,7 +1472,7 @@ url = "redis://127.0.0.1:6379"
 
     /// A storage a backend was not granted is refused by name, and the refusal says what it *may* reach.
     ///
-    /// This is §4.5 as a test. The distinction worth checking is between a storage the deployment has and
+    /// This is the per-backend capability boundary as a test. The distinction worth checking is between a storage the deployment has and
     /// this backend lacks — a `services` list to edit — and a storage that does not exist at all, because
     /// an operator reading one message and acting on it as though it were the other wastes their time.
     #[test]

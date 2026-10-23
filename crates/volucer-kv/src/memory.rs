@@ -7,7 +7,7 @@
 //! static is a cache with a hit rate of `1 / workers` and no way to invalidate. This makes one
 //! process's memory addressable from all of them, over the channel that is already open.
 //!
-//! That is also what `internal/plugins.md` §6.2 means by "useful on its own for single-node caching":
+//! That is also what makes it useful on its own for single-node caching:
 //! it needs no Redis, no new listener and no new dependency.
 //!
 //! # Sharded, because the callers are concurrent
@@ -55,7 +55,7 @@
 //!
 //! There is deliberately **no background thread**. A sweeper thread needs a shutdown handle, a
 //! wake-up strategy and a place in the lifecycle, all to do work that the failing insert can do at
-//! the moment it matters. §5's service bag would own it if there were one.
+//! the moment it matters. The service registry would own it if there were one.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

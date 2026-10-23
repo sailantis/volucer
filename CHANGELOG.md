@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Entries name the failure a change removes, not only the feature it adds, because the failures
 are what an operator has to recognise. Where a number decided a change, the number is here —
-the reasoning behind it lives in the source comments and in [`internal/plan.md`](internal/plan.md).
+the reasoning behind it lives in the source comments and in the documentation under [`docs/`](docs/README.md).
 
 ## [Unreleased]
 
@@ -51,7 +51,7 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
   forge it — when the GitHub CLI is installed, authenticated, and the archive came from the GitHub
   release origin, and otherwise **prints plainly that the archive was checked only against the
   checksum beside it**. `require` refuses to install when the attestation cannot be checked, for a
-  deployment that must not take the weaker guarantee; `off` does not mention it. A *failed*
+  deployment that must not take the weaker guarantee; `off` does not mention it. A _failed_
   verification is fatal in every mode, and `off` is the deliberate way past it. The mode is
   validated before the download, because an installer that fetches five megabytes and then
   reports that its own argument was misspelled has spent the operator's time to learn something
@@ -61,7 +61,7 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
 
 - **`default_backend` and `routes` moved into `[server]`.** They were the only two bare keys at
   the top of the file, and that is where the confusion came from: every other key is a table, so
-  a reader met `default_backend = "app"` alone above `[server]` and had to be told *why* it
+  a reader met `default_backend = "app"` alone above `[server]` and had to be told _why_ it
   could not go below it (TOML reads everything after a `[table]` header as belonging to that
   table). Both are site settings, and `[server]` **is** the unnamed site — the docs have said so
   since `sites` existed — so they belong beside `document_root` and `front_controller`, which is
@@ -71,7 +71,7 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
   key did not disappear, it moved one table down, and an operator who pastes their existing file
   into a new binary deserves that sentence. The shim is removed in the release after this one.
 - **`config.describe` now redacts two things it previously let through.** The rule was a
-  sensitive *key name* only, so a credential that arrived inside a **value** passed straight to
+  sensitive _key name_ only, so a credential that arrived inside a **value** passed straight to
   a worker. Two structural rules are added: the values of any `env` or `headers` map
   are elided **with their keys kept** (`[telemetry.headers]`'s own documentation claimed this
   already worked, and it did not — the header name `x-honeycomb-team` contains no word the name
@@ -88,10 +88,7 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
   ground truth. Port allocation is still serial, and has to be: `port_is_free` is a
   probe-then-bind, so two threads probing at once would hand the same port to two children.
   Only the spawn and the wait run in parallel.
-- **`docs/` is a guide a reader can follow**, page by page. The design journals that had been
-  published as documentation moved to [`internal/`](internal/README.md), where the source
-  comments that cite them by hazard id still find them. A stale note in a published page is a
-  public claim, and there were a lot of them.
+- **`docs/` is a guide a reader can follow**, page by page.
 
 ### Fixed
 
@@ -125,7 +122,7 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
 - **A `spawn_cgi` slot could adopt a stranger's listener and answer 502.** The port a slot was
   about to use was freed by a `port_is_free` probe and bound by `php-cgi` a moment later, so
   between the two another process could take it. The startup probe connected successfully
-  against *somebody else's* listener, recorded the slot as healthy, and the first real request
+  against _somebody else's_ listener, recorded the slot as healthy, and the first real request
   came back a 502 behind an otherwise green startup banner. A connect is now followed by a
   bounded settle and then a check that **our own child is still alive** — which is the only
   evidence that separates "our backend is up" from "someone is on our port". A child that lost

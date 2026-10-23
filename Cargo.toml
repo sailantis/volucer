@@ -54,7 +54,8 @@ volucer-jobs = { version = "0.2.0", path = "crates/volucer-jobs" }
 # also why it adds **no new package** to this workspace's lockfile.
 volucer-otlp = { version = "0.2.0", path = "crates/volucer-otlp" }
 # The Redis client, **optional** and behind a feature. A deployment using the in-memory store must not
-# link a Redis to get it, which is the rule `internal/plugins.md` §5 states for every driver. Default
+# link a Redis to get it, which is the rule for every driver: features are grouped per driver, so a
+# build without one carries no code for it. Default
 # features are off — they pull in `num-bigint` for big-number support a KV store does not use — and
 # `connection-manager` is deliberately **not** enabled: it implies `aio` and therefore a runtime, and
 # these stores are synchronous on purpose. `sha1_smol` arrives with `redis`'s `script` feature, which

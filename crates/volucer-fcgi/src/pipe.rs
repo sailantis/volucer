@@ -16,7 +16,7 @@
 //! **Every operation is overlapped.** A blocking `ReadFile` on a pipe has no
 //! deadline, and this project has already paid for that once: a request path with
 //! no read timeout sat for **17 minutes** in a test that should have failed
-//! instead (hazard 43). So the handle is opened `FILE_FLAG_OVERLAPPED` and each
+//! instead. So the handle is opened `FILE_FLAG_OVERLAPPED` and each
 //! read and write is issued with an `OVERLAPPED` carrying an event, then bounded
 //! by `WaitForSingleObject`. A pipe peer that stops answering becomes a timeout
 //! rather than a hang.

@@ -2,8 +2,9 @@
 //!
 //! # Why this exists at all
 //!
-//! Everything else in this server is something nginx could do instead, and §9 of `internal/plugins.md`
-//! says so per row. A rate limit is the exception: nginx's `limit_req` is a fixed-window counter
+//! Everything else in this server is something nginx could do instead, and the
+//! divergences from RoadRunner are stated one by one elsewhere. A rate limit is the exception:
+//! nginx's `limit_req` is a fixed-window counter
 //! that cannot be keyed on a header, cannot be keyed on a value another module resolved, and
 //! cannot be changed without a reload. Behind a reverse proxy, this is the only lever an
 //! unauthenticated endpoint has.

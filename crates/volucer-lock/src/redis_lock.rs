@@ -20,7 +20,7 @@
 //!
 //! # An unknown state is produced here, and it took care to make it *possible*
 //!
-//! This is the driver `internal/plugins.md` §6.3 was written for: a command that fails or times out during
+//! This is the driver the unknown-state case was written for: a command that fails or times out during
 //! an acquisition may or may not have run, and the caller has to be told that rather than told "not
 //! held". Three things produce it, all in [`RedisLocks::classify`]:
 //!
@@ -226,7 +226,7 @@ impl RedisLocks {
     /// undetermined:
     ///
     /// - `Io` — a dropped or timed-out connection — means the bytes may have reached the server and the
-    ///   command may be running. That is the case §6.3 documents. **Only during an acquisition**: a read
+    ///   command may be running. That is the case the unknown state documents. **Only during an acquisition**: a read
     ///   that failed did nothing, and a release that failed before reaching the server did nothing
     ///   either, so a caller may simply retry those.
     /// - `Server(_)` is Redis *answering*: a `WRONGTYPE`, an `OOM` under `maxmemory`. However alarming,

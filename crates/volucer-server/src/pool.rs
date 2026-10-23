@@ -1,16 +1,15 @@
 //! A pool of `php-cgi` slots, each a listening socket with a process tree behind it.
 //!
 //! This is the `spawn_cgi` backend, and on Windows it is the only way to get
-//! per-request SAPI reset at all. The shape is forced by the platform
-//! (`internal/plan.md` §9):
+//! per-request SAPI reset at all. The shape is forced by the platform:
 //!
 //! - **A slot is an address with a capacity**, not a process. `children = 0` — the
-//!   default — is one process, which is what this pool was until hazard 86. `children = n`
+//!   default — is one process per slot. `children = n`
 //!   is a preforked master plus `n` children, all sharing the one listening socket and the
 //!   one OPcache segment; each child accepts its own connections.
 //! - **`PHP_FCGI_CHILDREN` works on both platforms**, by different mechanisms: `fork()` on
 //!   Unix (`cgi_main.c:1995`) and `CreateProcess` on Windows (`cgi_main.c:2083`). An earlier
-//!   version of this comment — and of `internal/plan.md` hazard 43 — said the Linux path ignored
+//!   version of this comment said the Linux path ignored
 //!   it, which was wrong; what is true is that a lone `php-cgi -b` with no children serves
 //!   its connections **one at a time**.
 //! - Several processes cannot share one port via `SO_REUSEADDR` on Windows, so each *slot*
@@ -917,7 +916,7 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
 /// Exists so the guard can be **falsified** rather than merely exercised. A test that raced a real
 /// child against a real clock would pass whether or not the guard ran — the child would usually
 /// still be alive 10 ms after a successful connect — which is the "a test that cannot fail on the
-/// machine it runs on is not evidence" defect `internal/plan.md` keeps recording. Taking the
+/// machine it runs on is not evidence" defect this file keeps recording. Taking the
 /// settle as a closure lets a test make the child exit *inside* the window, deterministically.
 fn wait_until_listening_with(
     slot: &mut Slot,

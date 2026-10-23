@@ -2,8 +2,8 @@
 //!
 //! # Why JSON, and why this shape
 //!
-//! `internal/plugins.md` §4.4 says params and results are JSON "and the codec stays behind its boundary;
-//! msgpack remains available for the same reason it does in the worker protocol". So this is the codec
+//! Params and results are JSON, and the codec stays behind its boundary — msgpack remains available
+//! for the same reason it does in the worker protocol. So this is the codec
 //! for one half of one message pair, and it is deliberately the smallest thing that works:
 //!
 //! ```json

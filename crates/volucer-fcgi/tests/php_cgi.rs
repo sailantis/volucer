@@ -520,8 +520,8 @@ fn serves_a_script_over_a_named_pipe() {
 ///
 /// This is the property the whole overlapped-I/O arrangement exists for, and the
 /// one this project has already paid for once: a request path with no read
-/// deadline sat for **17 minutes** in a test that should have failed instead
-/// (hazard 43). A blocking `ReadFile` on a pipe has no deadline of its own, so
+/// deadline sat for **17 minutes** in a test that should have failed instead.
+/// A blocking `ReadFile` on a pipe has no deadline of its own, so
 /// without the check below a backend that accepts and then goes quiet would hold
 /// a request thread indefinitely.
 ///

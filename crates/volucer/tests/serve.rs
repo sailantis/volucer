@@ -1888,11 +1888,12 @@ fn read_one_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     raw
 }
 
-/// **The assertion that step 68 was for.** A request through `serve` reaches a real HTTP origin,
+/// **The assertion that a whole feature was for.** A request through `serve` reaches a real HTTP
+/// origin,
 /// and the origin's answer reaches the client.
 ///
 /// Everything before this test proved a *component*: the crate's client, the config's parser, the
-/// enum's arm. None of them could pass a request through the server, and the plan's own hazard 68 is
+/// enum's arm. None of them could pass a request through the server, and that is
 /// the reason this is written as a request rather than as a unit assertion — five ACME steps shipped
 /// green while `serve` never constructed an `Engine` at all, so nothing issued anything. A build
 /// where the client exists and the front-end never calls it looks exactly like a working one.
@@ -2111,7 +2112,8 @@ origin = {origin}
 ///    address — which is the security property, since a client can always send a header.
 ///
 /// The negative case is what makes the positive one mean something: a server that trusted every
-/// header would pass step 1 and has a spoofing hole, and one that trusted none would pass step 2 and
+/// header would pass the first case and has a spoofing hole, and one that trusted none would pass
+/// the second and
 /// still be broken behind a proxy.
 #[test]
 fn a_proxy_trust_list_decides_whether_a_forwarded_address_is_believed() {
@@ -2476,9 +2478,9 @@ fn sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing() {
     //
     // **The malformed file names the *other* root on purpose.** A file that named the root already
     // serving would make this assertion pass against code that applied it anyway, which is the
-    // shape of hazard 57: where the claim is "nothing was applied", the input has to contain
-    // something that would have been applied. A duplicate key fails at parse, and it still carries
-    // a root that a partial reader would have taken.
+    // shape of a vacuous assertion: where the claim is "nothing was applied", the input has to
+    // contain something that would have been applied. A duplicate key fails at parse, and it still
+    // carries a root that a partial reader would have taken.
     let duplicate_key = format!(
         "{}document_root = {}\n",
         config_for(&second),
@@ -2835,8 +2837,9 @@ fn a_reload_keeps_the_certificate_that_was_issued() {
 /// A reload still re-reads a **named** certificate, even with a site's own ACME table in play.
 ///
 /// The complement of `a_reload_keeps_the_certificate_that_was_issued`, and it exists because the first
-/// fix for hazard 71 was *too* blunt: it skipped the certificate rebuild whenever any ACME table was
-/// configured, which kept the issued certificate but stranded every named one. A site's `[sites.x.tls]`
+/// fix for the lost-certificate was *too* blunt: it skipped the certificate rebuild whenever any ACME
+/// table was configured, which kept the issued certificate but stranded every named one. A site's
+/// `[sites.x.tls]`
 /// PEM is in the configuration and an operator can renew it by hand, so a reload has to re-read it —
 /// and the two populations have to be merged rather than chosen between.
 ///
@@ -2971,7 +2974,7 @@ fn a_reload_picks_up_a_renewed_named_certificate_while_issuance_stays() {
 ///
 /// The end-to-end assertion for the per-site wiring, and the same reasoning as the cached-certificate
 /// test: without starting the binary nothing can see that the site's engine was built at all — which
-/// is hazard 68's lesson, where five steps were committed and green while `[server.acme]` issued
+/// is the lesson of a feature whose steps were committed and green while `[server.acme]` issued
 /// something nothing served.
 ///
 /// What this pins is the **placeholder's names**, and it is the interesting half: a site whose
@@ -3438,7 +3441,7 @@ fn an_acme_configured_server_serves_its_cached_certificate() {
 /// **The assertion that the access log and the request id actually happen.**
 ///
 /// Written as a request through `serve` rather than as a unit test of the formatter, for the reason
-/// hazard 68 states: the formatter, the config and the sink can each be perfect while the front-end
+/// this states: the formatter, the config and the sink can each be perfect while the front-end
 /// never calls any of them, and the result looks exactly like a working deployment.
 ///
 /// Three things are asserted from one server, because they are one feature:
@@ -3709,7 +3712,8 @@ static_files = false
 /// **This is the test the index arithmetic needed.** `workers.list` reported each slot's *own*
 /// index, while `worker.reset` counted slots across every pool — so with one backend the two agreed
 /// and with two they did not, which is the arithmetic a single-pool test cannot see. Two is not an
-/// exotic deployment: it is a web backend and a jobs backend, which is what §6.4 recommends.
+/// exotic deployment: it is a web backend and a jobs backend, which is what the queue
+/// design recommends.
 ///
 /// It goes through the shipped binary, the `[status]` listener and the `POST` route, because the
 /// number in the answer is what an operator types next: a list that says worker 1 twice is an

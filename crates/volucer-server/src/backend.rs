@@ -43,7 +43,7 @@ const MAX_IDLE_CONNECTIONS: usize = 1;
 /// and the codec has no request-id demultiplexer, so multiplexing is not an
 /// option. A single connection therefore caps the whole backend at one request
 /// at a time no matter how large its `pm.max_children` is, which is what
-/// `internal/plan.md` hazard 22 records. This type is the fix: as many connections as
+/// this type is the fix for: as many connections as
 /// there are requests in flight, each reused when it comes back.
 ///
 /// Connections are not limited *by volucer* unless [`ExternalConfig::max_connections`]
@@ -561,7 +561,7 @@ impl Backend {
     ///
     /// A connection is taken from the pool for the duration of one request, so
     /// the backend serves as many requests at once as it has workers rather than
-    /// as many as it has *sockets* — see `internal/plan.md` hazard 22.
+    /// as many as it has *sockets*.
     ///
     /// The retry is not belt-and-braces: `FCGI_KEEP_CONN` is only a *request*,
     /// and `php-cgi` in particular closes the connection after each response

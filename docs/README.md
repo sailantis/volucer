@@ -5,8 +5,8 @@ applications, and no embedded PHP runtime — `php`, `php-cgi` and `php-fpm` are
 ordinary external processes.
 
 This guide is for developers who already have a PHP application and want to run it on
-volucer. If you are looking for the reasoning behind the project, that lives in the
-[design journals](../internal/README.md) rather than here.
+volucer. If you are looking for the reasoning behind the project, that lives in the source
+comments and in the pages below.
 
 ## Start here
 

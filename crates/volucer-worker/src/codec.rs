@@ -1678,7 +1678,7 @@ mod tests {
     /// With no handler installed, a call is refused with an answer rather than ignored.
     ///
     /// Silence is the failure to avoid: a dropped `CALL` leaves the server waiting until its own
-    /// deadline, and — as `internal/plugins.md` §4.2 records — a deadline in this pool is a kill.
+    /// deadline, and a deadline in this pool is a kill.
     #[test]
     fn a_call_with_no_handler_installed_is_refused_not_ignored() {
         let mut script = WorkerScript::default();

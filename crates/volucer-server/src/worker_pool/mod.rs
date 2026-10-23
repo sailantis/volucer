@@ -521,8 +521,8 @@ impl WorkerPool {
     /// channel, including those started later to replace a recycled one. Two constructors rather than
     /// one taking an `Option`, because the distinction they draw is not "configured or not" but
     /// **capability or no capability**, and a caller that has to write `None` at the call site has to
-    /// think about which one it means. `internal/plugins.md` §4.5 is the argument for keeping that decision
-    /// visible.
+    /// think about which one it means. The per-backend capability boundary is the argument for keeping
+    /// that decision visible.
     pub fn start_with(
         name: &str,
         config: &WorkerConfig,
@@ -1385,10 +1385,10 @@ impl WorkerPool {
     /// process and waits for its handshake, bounded by `HANDSHAKE_TIMEOUT` and in practice the
     /// application's boot time. So a worker that resets a sibling stalls its *own* request for that long,
     /// and if the stall outlasts the request's deadline the pool kills it — the concrete instance of the
-    /// hazard in `internal/plugins.md` §4.2.
+    /// call-path hazard this module cannot fix.
     ///
     /// Not fixed here, and deliberately not papered over with a shorter timeout: what a call's deadline
-    /// should be is open decision §10 item 9, and picking one here would decide the policy by accident. What
+    /// should be is still an open decision, and picking one here would decide the policy by accident. What
     /// *is* settled is that it cannot deadlock — `take_specific` only returns a slot that is in the free
     /// list, so the only lock taken below is one that no request holds.
     pub fn restart(&self, index: usize) -> std::result::Result<(), crate::calls::ResetRefusal> {

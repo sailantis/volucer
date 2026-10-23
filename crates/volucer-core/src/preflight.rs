@@ -124,7 +124,7 @@ pub fn inspect_with(
     //
     // Measured on the competition host, same binary, `GET /items` at c=32: 2.05
     // `statx` per request with the layer on against 0.04 with it off, 33,043 rps
-    // against 42,142. See hazard 85.
+    // against 42,142.
     //
     // The layer is **turned off** for those sites rather than merely reported, so this
     // warning states a decision instead of proposing one. `Sites::from_config_with` makes it,

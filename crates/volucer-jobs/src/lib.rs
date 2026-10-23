@@ -71,7 +71,7 @@ pub struct Job {
     /// The application's task name, e.g. `App\Jobs\SendEmail`.
     ///
     /// Opaque to the server, and named `task` rather than `name` because `name` is already the call
-    /// method's own field — see `internal/plugins.md` §4.4. A worker that switches on it is doing what
+    /// method's own field. A worker that switches on it is doing what
     /// RoadRunner's `$task->getName()` does.
     pub task: String,
     /// The application's payload. Opaque, exactly as a KV value is.

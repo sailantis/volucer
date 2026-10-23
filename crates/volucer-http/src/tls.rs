@@ -492,7 +492,8 @@ impl SniResolver {
     pub fn refresh(&self, certificates: &CertificateSet) -> Result<Arc<Certs>, TlsError> {
         // The table being served is passed in so an **issued** certificate survives: it is not in
         // `certificates`, which is only what the configuration states. Without this a reload would
-        // replace every ACME certificate with a placeholder, which is hazard 71's failure arriving by
+        // replace every ACME certificate with a placeholder, which is the issued-certificate-lost
+        // failure arriving by
         // a different route. See [`load_keeping`] for why the merge is the right answer rather than
         // skipping the rebuild, which would strand a renewed `[sites.x.tls]` PEM.
         let previous = self.state.load();

@@ -5,8 +5,7 @@
 //! [`record::read_record`] reads what [`record::write_records`] wrote.
 //!
 //! Nothing here allocates per record beyond the payload itself, and no record is
-//! ever buffered whole: see `internal/plan.md` for why the client relays `STDOUT`
-//! verbatim instead of parsing it.
+//! ever buffered whole: the client relays `STDOUT` verbatim instead of parsing it.
 
 pub mod cgi;
 pub mod client;

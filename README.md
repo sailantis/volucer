@@ -97,9 +97,9 @@ Framework bridges build on those — see [SDKs and Frameworks](docs/10-SDKS-AND-
 
 ## Contributing
 
-The design journals in [`internal/`](internal/README.md) record **why** each decision was made,
-including the ones that were reversed. They are working notes rather than documentation, kept
-because the source comments cite them by section number.
+The design reasoning lives in the source comments and in the documentation under
+[`docs/`](docs/README.md). The comments record **why** each decision was made, including the ones
+that were reversed.
 
 ```sh
 cargo test            # unit and integration tests, including live php-cgi

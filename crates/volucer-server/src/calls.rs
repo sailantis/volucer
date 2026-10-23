@@ -16,7 +16,7 @@
 //!
 //! `workers.list`, `worker.reset` and `config.describe` read machinery that already exists, so a control
 //! plane is available from the first commit that installs a handler rather than after KV is written.
-//! That was the argument for making the call path the foundation of `internal/plugins.md` §4, and this is
+//! That was the argument for making the call path the foundation of the control plane, and this is
 //! where it pays.
 //!
 //! # Capability is per backend
@@ -24,7 +24,7 @@
 //! A registry is built **for one backend's workers**, and the caller decides which namespaces go in it.
 //! A worker serving the public gets a registry with no `workers` namespace, so it cannot restart its
 //! siblings; an operator's worker gets one that can. A single process-wide registry would give every
-//! worker every capability, which is the shape §4.5 refuses.
+//! worker every capability, which is the shape this module refuses.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -141,7 +141,7 @@ impl MethodRegistry {
 /// read the deployment's credentials can leak them, and the leak looks like nothing at all in a log.
 ///
 /// So the redaction is applied *here*, on the way out, rather than being each namespace's
-/// responsibility. `internal/plugins.md` §9.5 is the divergence: RoadRunner's `rpc.Config` returns the
+/// responsibility. This is a deliberate divergence: RoadRunner's `rpc.Config` returns the
 /// parsed document, and this deliberately does not.
 pub struct ConfigNamespace {
     /// What to describe, already assembled. The caller does the assembly so that what is describable is
@@ -1548,7 +1548,7 @@ fn is_sensitive(key: &str) -> bool {
 /// The registry routes on the text before the **first** dot, so `kv.sessions.get` is the `kv` namespace
 /// with the verb `sessions.get`. There is therefore one `kv` namespace per registry, and which storages
 /// are in it is decided by the `services` list of the backend whose workers it was built for. That is
-/// exactly §4.5's capability boundary: a worker cannot reach a storage it was not granted, even though
+/// exactly the capability boundary: a worker cannot reach a storage it was not granted, even though
 /// every storage in the process shares one namespace prefix, and the refusal names both what it asked
 /// for and what it may have.
 ///
@@ -1822,7 +1822,7 @@ impl KvNamespace {
     ///
     /// **The one method in this namespace that is not a cache operation.** It reaches the store's
     /// `set_if_absent`, which is atomic per driver (`create_new`, a shard lock, `SET NX`), and it is
-    /// the answer `internal/plugins.md` §6.3 gives to an application that needs to protect an invariant:
+    /// the answer to an application that needs to protect an invariant:
     /// a lock has no fencing token and cannot stop a late writer, and a conditional write can because
     /// the *storage* decides.
     ///
@@ -2381,7 +2381,7 @@ const METHODS: &str =
 ///
 /// `jobs.push`, `jobs.push_batch`, `jobs.size` and `jobs.pipelines`. A worker cannot *reserve* a job
 /// through the call plane, and the reason is the design rather than an omission: a reservation is what a
-/// consumer's own channel is for (`internal/plugins.md` §6.4), because a reserved job's lease starts ticking
+/// consumer's own channel is for, because a reserved job's lease starts ticking
 /// the moment it is handed out — and a job handed into a *request* would be held by a worker that is
 /// already busy with something else, with its lease running down while it finishes.
 ///
@@ -2459,7 +2459,7 @@ impl JobsNamespace {
 
         // **Base64, like a KV value and like the lock's resource.** A job payload is the application's
         // own bytes — a serialized object, a compressed blob, an encrypted message — and a JSON string
-        // cannot carry a byte above `0x7f`. This is the same decision as §6.2's, and for the same reason.
+        // cannot carry a byte above `0x7f`. This is the same decision as the KV value's, and for the same reason.
         let payload = match params.base64("payload") {
             Ok(payload) => payload.unwrap_or_default(),
             Err(err) => return Err(Return::refused(format!("{method} was called with {err}"))),
@@ -2677,7 +2677,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 ///
 /// # Why it is a *separate* registry entry and not part of `config`
 ///
-/// Because capability is per backend (`internal/plugins.md` §4.5). A worker serving the public gets a registry
+/// Because capability is per backend. A worker serving the public gets a registry
 /// with no `workers` namespace, so it cannot restart its siblings; an operator's worker gets one that can.
 /// Splitting the namespaces is what makes that a configuration decision rather than a code change.
 pub struct WorkersNamespace {

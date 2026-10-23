@@ -1296,7 +1296,7 @@ fn a_slot_comes_back_after_a_failed_request() {
 
 /// A metric a worker emitted reaches a registry, through a real scrape.
 ///
-/// **This is the end-to-end proof of step 1, and it is the one thing that could not be tested in
+/// **This is the end-to-end proof of the metrics feature, and it is the one thing that could not be tested in
 /// pieces.** The registry is covered on its own, and so is the encoder; what is only observable here
 /// is that a `METRIC` frame from a live PHP process — through the SDK's `emitMetric`, over the real
 /// transport, decoded by the real codec — reaches the registry the metrics endpoint renders. Every
@@ -1314,7 +1314,7 @@ fn a_workers_own_metric_reaches_the_registry() {
     let registry = volucer_metrics::Registry::new();
     // Declared, because the registry refuses a name nobody described — and declaring it here rather
     // than in the pool is the point: a worker publishing a metric is publishing a name the *operator*
-    // has to have decided to accept. `internal/plugins.md` §6.1 has the `[metrics] collect` table that will
+    // has to have decided to accept. The `[metrics] collect` table is what will
     // make this a configuration entry rather than a call a test makes by hand.
     registry.describe_histogram(
         "example_request_total",
@@ -1370,7 +1370,7 @@ fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
 
 /// A metric a deployment declares in `[metrics.collect]` is the one an emitted sample lands in.
 ///
-/// **This is the gap the row in `internal/plugins.md` §1.4 called done.** The two tests above declare
+/// **This is the gap the feature was believed to have closed.** The two tests above declare
 /// `example_request_total` by hand, which is exactly what an operator cannot do — so they proved the wire
 /// worked while the feature did not. A registry refuses a name nobody described, and the only names
 /// the process described were `rr_http_*`, so every `emitMetric` in a real deployment was decoded,
@@ -1444,7 +1444,7 @@ help = "Requests the example worker counted"
 /// code that assembles them in production unexercised. The consequence is visible in the assertions — the
 /// worker's own `backend` name in `workers.list` comes from the directory the dispatcher filled in.
 ///
-/// The path exercised is the whole of `internal/plugins.md` §4 end to end: application code inside a request
+/// The path exercised is the whole call path end to end: application code inside a request
 /// handler writes a frame the server did not ask for, the server's exchange thread — mid-request, holding
 /// the pipes — recognises it as a call rather than a protocol error, dispatches it into the registry, and
 /// the worker reads the answer out of a stream that still owes it a response.
@@ -1588,7 +1588,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
 /// The first test in the tree where the *whole* path is real: a PHP application calls `Kv::set` inside a
 /// request handler, the call crosses the worker's channel to the exchange thread, the registry routes it
 /// into the `kv` namespace, a real `MemoryStore` holds the bytes, and the `get` that follows comes back
-/// with them. Every layer of §4 and §6.2 is in this one run, and no test per layer can see a missing
+/// with them. Every layer of the call path and of the storage is in this one run, and no test per layer can see a missing
 /// `build_stores` — which is the same class of seam the call-plane test above found for the call path
 /// itself.
 ///
@@ -1730,7 +1730,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
 
 /// A call naming a storage the backend was not granted is refused, by name, over a real channel.
 ///
-/// §4.5 as one request: the deployment has two storages, the backend was granted one, and the other is
+/// The per-backend capability boundary as one request: the deployment has two storages, the backend was granted one, and the other is
 /// unreachable — with a message naming what it *may* reach, so the fix is a configuration line rather
 /// than an hour with a debugger.
 #[test]
@@ -1988,7 +1988,7 @@ $worker->run(static function (Request $request, Worker $worker) use (&$held): Re
 ///
 /// # Why this test is the one that matters for the consumer half
 ///
-/// `internal/plugins.md` §8 records the pattern four times: `set_call_handler`, `build_stores`, `build_locks`,
+/// The pattern is recorded four times: `set_call_handler`, `build_stores`, `build_locks`,
 /// `build_queues` — **the wiring between two tested things is where the untested bug lives**, and an
 /// end-to-end test through the entry point a *deployment* uses is not optional for a service added to the
 /// registry. This is the fifth instance and it is a slightly different shape, which is why it is worth

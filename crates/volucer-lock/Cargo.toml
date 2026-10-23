@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 # The same two the KV crate has, and for the same reason: the refusals a caller must read are the only
 # thing this needs, and a driver past `memory` is behind a feature so that a single-node deployment
-# links no client at all. `internal/plugins.md` §5.
+# links no client at all.
 tracing.workspace = true
 thiserror.workspace = true
 # For the fresh id an acquisition generates when the caller names none. The same source the request id

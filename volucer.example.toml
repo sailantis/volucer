@@ -455,7 +455,7 @@ working_dir = "."
                           # reads a Windows pipe ~100x slower than a socket, and that
                           # was 21x on the whole route. Set it only to override - and
                           # note a worker must call `Volucer\Worker::connect()`, not
-                          # `create()`, to read a socket. See plan hazard 46.
+                          # `create()`, to read a socket.
 #
 # socket = "unix:/run/volucer/worker"
                           # WHERE the socket transport listens. Only meaningful with
