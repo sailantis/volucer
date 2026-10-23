@@ -1,30 +1,36 @@
 # Getting Started
 
-**Install volucer, serve your PHP application, and move off `php-fpm`.**
+**Install volucer, serve an application, and move off `php-fpm`.**
 
 ## What volucer is
 
-Volucer is a single binary that runs PHP applications. It never embeds PHP — `php`,
+Volucer is a single binary that runs applications. It never embeds a runtime — `php`,
 `php-cgi` and `php-fpm` are started as ordinary external processes, the same way any
-other server would start them.
+other server would start them, and it runs any FastCGI server and speaks its own worker
+protocol besides.
 
 It offers two ways to run your application, and you pick per route:
 
 | | What happens per request | Use it when |
 |---|---|---|
 | **Worker mode** | The application boots once and stays resident. It clears its own request scope between requests. | You can restructure the app to reset its own state, and the boot cost matters. |
-| **FastCGI mode** | Everything is reset, exactly as `php-fpm` does it. | You are migrating an existing app and cannot change how it handles state. |
+| **FastCGI mode** | The backend resets everything, exactly as `php-fpm` does it. | You are migrating an existing app and cannot change how it handles state. |
 
 Both are served by the same listener, so a single process can run a `/api` route in worker
 mode and a `/admin` route in FastCGI mode.
+
+**FastCGI is a protocol, not a PHP feature.** A FastCGI-speaking WSGI, Rack or Go server
+is served exactly as `php-fpm` is: `external` attaches to a pool somebody else runs, and
+`spawn_cgi` starts and supervises the processes itself — with `php-cgi` as one driver and
+any other FastCGI server as another.
 
 It runs on Linux, macOS and Windows. On Windows it is the only way to get `php-fpm`-like
 behaviour, because Windows has no `php-fpm` at all.
 
 ## Requirements
 
-- **PHP 8.2 or newer.** This is the floor for the worker SDKs.
-- A PHP application. Any framework works.
+- **PHP 8.2 or newer**, if your application is PHP. This is the floor for the PHP SDK.
+- An application. Any framework works, in any language the backend supports.
 - No Rust toolchain, no Composer package, no build step.
 
 ## Install
@@ -186,14 +192,21 @@ Three things are in there:
 
 - **`[server]`** — the listeners, where your application lives, and which backend answers a
   request that matches no route.
-- **`[backends.app]`** — how PHP gets run. This one attaches to a `php-fpm` that is
+- **`[backends.app]`** — how the application gets run. This one attaches to a `php-fpm` that is
   already running, so the behaviour is exactly what you have today.
 - **`default_backend`** — the backend used when a request matches no route. It is one of
   `[server]`'s keys rather than a top-level one, because `[server]` **is** the unnamed site:
   a `[sites.<name>]` table overrides it for one host, exactly as it overrides `document_root`.
 
 That is a complete FastCGI deployment. It behaves like `nginx` in front of `php-fpm`,
-except there is no `nginx` to configure.
+except there is no `nginx` to configure. Any FastCGI server is the same backend — a `socket`
+is a socket, and the protocol is FastCGI:
+
+```toml
+[backends.app]
+kind = "external"
+socket = "unix:/run/app/py.sock"
+```
 
 To use volucer's own worker mode instead, replace the backend:
 

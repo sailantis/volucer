@@ -8,10 +8,10 @@ A backend is one of five shapes. You pick one with `kind` in `[backends.<name>]`
 
 | `kind` | What it is | State between requests | Platforms |
 |---|---|---|---|
-| `worker` | A persistent PHP process volucer starts and supervises | The application keeps it, and clears its own request scope | all |
+| `worker` | A persistent process volucer starts and supervises, speaking volucer's protocol | The application keeps it, and clears its own request scope | all |
 | `attach` | The same, but the processes were started by somebody else | The same | Unix, or a named pipe on Windows |
-| `external` | An already-running `php-fpm` | Reset by PHP's own SAPI | Linux, macOS |
-| `spawn_cgi` | `php-cgi` processes volucer starts | Reset by PHP's own SAPI | all — **required on Windows** |
+| `external` | An already-running FastCGI server (`php-fpm`, or anything else) | Reset by the backend, per request | Linux, macOS |
+| `spawn_cgi` | FastCGI processes volucer starts — `php-cgi`, or any command | Reset by the backend, per request | all — **required on Windows** |
 | `upstream` | An HTTP origin: Node, Go, Python, Ruby | The origin's own business | all |
 
 ## Choosing one
@@ -25,8 +25,13 @@ performance difference comes from — a framework boot per request is a large pa
 If no, use `external` (Linux, macOS) or `spawn_cgi` (everywhere). The behaviour is exactly
 what `php-fpm` gives you, so nothing about your application has to change.
 
-If your application is not PHP at all, use `upstream`. It relays HTTP to a runtime that
-already owns its own HTTP loop.
+**FastCGI is a protocol, not a PHP feature.** Both of those backends speak FastCGI, so a
+FastCGI-speaking WSGI, Rack or Go server is served by them exactly as `php-fpm` is. The
+reset is the backend's own: PHP's SAPI for `php-cgi` and `php-fpm`, the CGI framework's
+for a `spawn_cgi` `command`.
+
+If your application speaks HTTP rather than FastCGI, use `upstream`. It relays HTTP to a
+runtime that already owns its own HTTP loop.
 
 You can mix them. A route picks a backend, so one process can serve a `/api` route from a
 resident worker and a `/admin` route from `php-fpm`:
@@ -50,7 +55,7 @@ backend = "fpm"
 
 ## `worker`
 
-A persistent PHP process that boots your application once and serves many requests.
+A persistent process that boots your application once and serves many requests.
 
 ```toml
 [backends.app]
@@ -137,7 +142,7 @@ measure with, not a promised speed-up.
 
 ## `attach`
 
-The same protocol as `worker`, but the PHP processes were started by somebody else.
+The same protocol as `worker`, but the processes were started by somebody else.
 
 ```toml
 [backends.app]
@@ -182,7 +187,7 @@ as `worker`.
 
 ## `external`
 
-An already-running `php-fpm`.
+An already-running FastCGI server.
 
 ```toml
 [backends.fpm]
@@ -193,10 +198,15 @@ socket = "unix:/run/php/php8.3-fpm.sock"
 This is the migration path. Point volucer at the `php-fpm` you already run and the
 behaviour is exactly what you have today: PHP's SAPI resets everything per request.
 
+**Nothing about this backend is PHP.** It is a socket and the FastCGI protocol, so a
+`gunicorn` with a FastCGI adapter, a `uwsgi` speaking the same protocol, or a Rack server
+behind `flup` is the same shape — the pool is somebody else's, volucer only speaks to it.
+The keys are `socket` and `max_connections` and there is nothing else to set.
+
 **Volucer does not manage the pool.** There is no `workers` key, and that is the point —
 the pool is somebody else's. Its size lives in `pm.max_children` or
 `PHP_FCGI_CHILDREN`, in configuration volucer has no access to. One FastCGI connection
-carries one request, so the real concurrency limit is `php-fpm`'s.
+carries one request, so the real concurrency limit is the far side's.
 
 `max_connections` bounds how many connections *volucer* keeps open to the pool. Leave it
 out and volucer opens what it needs.
@@ -206,7 +216,10 @@ out and volucer opens what it needs.
 
 ## `spawn_cgi`
 
-`php-cgi` processes that volucer starts and supervises.
+FastCGI processes that volucer starts and supervises.
+
+**Two ways to name the process, and exactly one of them.** `binary` is `php-cgi` — the
+familiar configuration, unchanged. `command` is any program that serves FastCGI.
 
 ```toml
 [backends.cgi]
@@ -226,6 +239,65 @@ died, and recycles on `max_requests`.
 On Unix the processes are placed in their own process group; on Windows they are adopted
 into a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running
 if volucer dies.
+
+### Any FastCGI server
+
+```toml
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn myapp.wsgi --bind {address}"
+workers = 4
+capacity = 4          # the app server's own worker count
+working_dir = "/srv/app"
+env = { APP_ENV = "production" }
+```
+
+**`{address}` is where that slot must bind.** The pool owns the addresses — one per slot,
+so a process can be recycled, counted and killed on its own — which means the program cannot
+choose one and has to be told. The placeholder is replaced in every argument with that
+slot's address (`127.0.0.1:19001`, or `unix:/run/app/py.0.sock`), and the same string is
+exported as **`VOLUCER_FCGI_ADDRESS`** for a program that reads it from the environment
+instead of taking it as an argument. A command that uses neither is refused at startup,
+because it would bind something of its own and every request would be a 502 after the
+startup timeout.
+
+What the pool guarantees for a `command` slot is the same as for `php-cgi`: it is started,
+waited for, health-checked by connecting, restarted if it exits, recycled on `max_requests`,
+and killed as a process group. Its stdout and stderr are drained into the log rather than
+discarded, which is where the traceback that explains a 502 actually is.
+
+**`capacity` instead of `children`.** `children` is `php-cgi`'s `PHP_FCGI_CHILDREN` — a
+prefork count volucer dictates. An application server that forks its own children has
+already decided how many it runs, so `capacity` is how the pool learns that number: it is
+how many connections are held open to one slot, and setting it below what the server can
+answer only costs throughput. One of the two keys, never both.
+
+The `binary`/`command` distinction matters in three places beyond the argv, and all three
+are properties of `php-cgi` rather than of the pool:
+
+| | `binary` | `command` |
+| --- | --- | --- |
+| how the address is given | `-b <address>` | `{address}` and `VOLUCER_FCGI_ADDRESS` |
+| concurrency inside a slot | `children` → `PHP_FCGI_CHILDREN` | `capacity` |
+| a unix socket on Windows | a named pipe | TCP only |
+
+A `command` that exits is reported once, not retried on the next port: the retry exists
+because `php-cgi` exits when it loses a bind race, and nothing known is true of another
+program that died.
+
+**Two settings are PHP-shaped by default, and a non-PHP deployment sets them explicitly.**
+`front_controller` defaults to `index.php` and `script_extensions` to `php`, `php3`,
+`phtml` — both server-level, and both meaningful only as a starting point:
+
+```toml
+[server]
+front_controller = "app.py"        # your entry point, or "" for only real files
+script_extensions = ["py"]
+```
+
+Without the first, `check` warns that `index.php` is missing — which it is, and which is
+the warning telling you to set it. Without the second, a `/app.py` route resolves as
+`PATH_INFO` for the front controller instead of as a script.
 
 ### Prefork
 

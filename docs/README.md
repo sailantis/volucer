@@ -2,8 +2,9 @@
 
 Volucer is a cross-platform application server for PHP, Python and Ruby. It does not embed a
 runtime: for PHP it starts `php` or `php-cgi` as external processes, or connects to an
-existing `php-fpm` process, and for Python and Ruby it speaks the worker protocol over the
-child's standard streams.
+existing `php-fpm` process; for Python and Ruby it speaks the worker protocol over the
+child's standard streams; and it runs **any FastCGI server** — `php-fpm`, `gunicorn`, `flup`,
+a Rack adapter — because FastCGI is a protocol rather than a PHP feature.
 
 This guide explains how to configure, run, and maintain Volucer.
 
@@ -14,8 +15,8 @@ This guide explains how to configure, run, and maintain Volucer.
 
 ## Running your application
 
-- **[Backends](02-BACKENDS.md)** — The five ways Volucer can run PHP: a persistent
-  worker, an attached worker pool, an existing `php-fpm`, a spawned `php-cgi` pool, or
+- **[Backends](02-BACKENDS.md)** — The five ways Volucer can run an application: a persistent
+  worker, an attached worker pool, an existing FastCGI server, a spawned FastCGI pool, or
   an HTTP origin. Which one to pick, and why the choice matters.
 - **[Routing and Sites](03-ROUTING-AND-SITES.md)** — Send different paths to different
   backends, and serve several applications from one process.

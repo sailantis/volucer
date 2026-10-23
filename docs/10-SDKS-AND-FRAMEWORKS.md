@@ -74,9 +74,10 @@ are no optional dependencies — a worker SDK loads before an application's own 
 known to work, so a dependency here is a failure mode unrelated to the protocol.
 
 For Django or Flask applications, the `upstream` backend can supervise gunicorn over HTTP
-without an SDK. Use the worker SDK when you need its worker-channel features, such as:
-the `kv`, `lock`, `jobs` and `metrics` services, recycling on RSS, and no HTTP framing on
-the hot path.
+without an SDK, and the `spawn_cgi` backend can run any FastCGI server — gunicorn's `flup`
+worker, a `flup-fcgi` process — without one either. Use the worker SDK when you need its
+worker-channel features, such as: the `kv`, `lock`, `jobs` and `metrics` services, recycling
+on RSS, and no HTTP framing on the hot path.
 
 ### Ruby
 
@@ -95,7 +96,8 @@ Ruby 3.1 or newer. No runtime dependencies beyond the standard library, delibera
 worker SDK is loaded before an application's own gems are known to work.
 
 For Rails or Sinatra applications, the `upstream` backend can supervise Puma over HTTP
-without the worker SDK.
+without the worker SDK, and the `spawn_cgi` backend can run a FastCGI Rack server without
+one either.
 
 ## The framework bridges
 
@@ -253,4 +255,5 @@ The Composer installer remains available as an alternative.
 | Django, Flask or Rails on the worker channel | The Python or Ruby SDK |
 | An existing PHP framework, on the worker channel | The framework bridge |
 | An existing app, changed as little as possible | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md) |
+| Any FastCGI server, started and supervised | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server) |
 | Node, Go or any other HTTP origin | The `upstream` backend |

@@ -8,7 +8,7 @@ Run PHP, Python and Ruby applications with one binary, using worker or FastCGI b
 
 ---
 
-**Volucer** runs applications without embedding a runtime. For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`. For Python and Ruby it speaks the worker protocol, which is a JSON frame format rather than a PHP interface. Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
+**Volucer** runs applications without embedding a runtime. It starts the application, supervises it, and serves it over HTTP or FastCGI. For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`. For Python and Ruby it speaks the worker protocol, which is a JSON frame format rather than a PHP interface, and it can also run any FastCGI server — `gunicorn`, `flup`, a Rack adapter. Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
 
 It runs on Linux, macOS, and Windows. Windows does not provide `php-fpm`; Volucer can supervise `php-cgi` there.
 
@@ -19,11 +19,23 @@ It runs on Linux, macOS, and Windows. Windows does not provide `php-fpm`; Voluce
 |                  | Boots the application | State between requests     | Good for                                 |
 | ---------------- | --------------------- | -------------------------- | ---------------------------------------- |
 | **Worker mode**  | Once, at startup      | Managed by the application | PHP, Python or Ruby applications         |
-| **FastCGI mode** | On every request      | Reset by PHP               | Existing PHP applications, unchanged     |
+| **FastCGI mode** | On every request      | Reset by the backend       | Any FastCGI application, PHP included    |
 
 Both modes use the same dispatcher. Routes can use different backends, configured in `volucer.toml`.
 
-**Worker mode is the language-agnostic one.** It starts a process, performs a protocol handshake, and keeps it resident — the command is yours to choose, so it can be `php worker.php`, `python worker.py` or `bundle exec worker.rb`. FastCGI mode is the PHP path: both of its backends speak to a PHP SAPI, an existing `php-fpm` or a `php-cgi` pool. For Python and Ruby, worker mode is also the better of the two, because it boots the application once instead of per request.
+**Worker mode is the language-agnostic one.** It starts a process, performs a protocol handshake, and keeps it resident — the command is yours to choose, so it can be `php worker.php`, `python worker.py` or `bundle exec worker.rb`.
+
+**FastCGI mode is per-request, and it is not a PHP feature.** FastCGI is a protocol, so a FastCGI-speaking WSGI, Rack or Go server is served exactly as `php-fpm` is. The backend either attaches to a pool somebody else runs (`external`), or Volucer starts and supervises the processes itself (`spawn_cgi`) — with `php-cgi` as one driver and any other FastCGI server as another:
+
+```toml
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn myapp.wsgi --bind {address}"
+workers = 4
+capacity = 4
+```
+
+For Python and Ruby, worker mode is usually the better of the two, because it boots the application once instead of per request.
 
 Worker mode avoids repeated application boot. An attached worker and a preforked `php-cgi` pool can also share memory pages: benchmarks measured 4.5x lower PSS than one process per slot at 16 PHP processes and 9.5x lower at 64. See the [benchmarks](docs/12-BENCHMARKS.md) for the method and results.
 
@@ -155,9 +167,10 @@ are binding streams yourself — including when the connection was opened by som
 is what the `attach` backend needs.
 
 **For a Django, Flask or Rails application, the `upstream` backend is the shorter path.** It
-supervises gunicorn or Puma over HTTP and needs no SDK at all. Use the SDK when the worker
-channel itself is what you want: the `kv`, `lock`, `jobs` and `metrics` services, recycling on
-RSS, and no HTTP framing on the hot path.
+supervises gunicorn or Puma over HTTP and needs no SDK at all. The `spawn_cgi` backend is the
+other one: it runs any FastCGI server, so a `flup` or a Rack adapter works with no SDK either.
+Use the SDK when the worker channel itself is what you want: the `kv`, `lock`, `jobs` and
+`metrics` services, recycling on RSS, and no HTTP framing on the hot path.
 
 Framework bridges build on the PHP SDK — see [SDKs and Frameworks](docs/10-SDKS-AND-FRAMEWORKS.md).
 
