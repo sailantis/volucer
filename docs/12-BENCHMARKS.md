@@ -13,8 +13,9 @@ and the controls live in that repository.
 **One host, one harness, one interpreter, one pass.** Every figure below was measured on
 the same machine, through the same script, against the same PHP build, in one
 interleaved pass — so a ratio between two arms is a ratio between two measurements made
-the same way. The host, the kernel, the PHP version and the method are printed on every
-chart.
+the same way. **Each chart names the host and the method it was measured on, and the
+build of every program it measured**, so the image is readable on its own and a figure
+is never a fact about a version no one can identify.
 
 ## `GET /items` — the ORM page
 
@@ -24,9 +25,9 @@ The `spawn_cgi` arm with `children` puts several processes behind one listening 
 
 Each chart is a bar per server, and the bar is the **request rate** — the number the page is about. The bars start at zero, so their lengths can be compared directly.
 
-**The label behind each bar is how many times slower that server is than the fastest server in the same chart.** The fastest server is the dashed vertical line, and it carries no label of its own; every other bar states its factor — `x2.5` for a server that did 40% of the leader's requests per second. The baseline is the fastest server *in that chart*, not a fixed server: a cold deployment overtakes a warm one once the host saturates, so the fastest server is not the same one at every load — and naming it per chart is more honest than a fixed reference that would read as a claim about the same winner every time.
+**The label behind each bar is how many times slower that server is than the fastest server in the same chart.** The fastest server is the dashed vertical line, and it carries no label of its own; every other bar states its factor — `x2.5` for a server that did 40% of the leader's requests per second. The baseline is the fastest server *in that chart*, not a fixed server: a cold deployment can overtake a warm one as the host saturates, so the fastest server is not necessarily the same one at every load — and naming it per chart is more honest than a fixed reference that would read as a claim about the same winner every time.
 
-**The range on each bar is the spread of the comparison, not of the server.** Both servers were measured once per round, interleaved, so each round holds a ratio of the two. The range is the smallest and largest of those round-paired ratios, scaled back into requests per second. Pairing by round is what makes that range honest: a host that drifts over the run moves both servers in the same round, so the ratio within a round is steadier than either server's own spread — measurably so, on this run, in most of the pairs on this page. A range drawn from one server's minimum and maximum would instead charge the whole of the host's drift to that one server, and would be wide for the wrong reason.
+**The range on each bar is the spread of the comparison, not of the server.** Both servers were measured once per round, interleaved, so each round holds a ratio of the two. The range is the smallest and largest of those round-paired ratios, scaled back into requests per second. Pairing by round is what makes that range honest: a host that drifts over the run moves both servers in the same round, so the ratio within a round is steadier than either server's own spread. A range drawn from one server's minimum and maximum would instead charge the whole of the host's drift to that one server, and would be wide for the wrong reason.
 
 A range that reaches across the 1.0 line means the two servers could not be told apart in this run. The table marks those rows **tie**: a difference inside the measurement's own spread is not a difference, and the factor there is the best estimate rather than a claim that one server is faster.
 
@@ -37,7 +38,7 @@ A range that reaches across the 1.0 line means the two servers could not be told
 ![OPcache on at c=32](images/benchmarks/benchmarks/benchmarks-items-on-c32.svg)
 ![OPcache on at c=64](images/benchmarks/benchmarks/benchmarks-items-on-c64.svg)
 
-The **factor** column is measured against **volucer — attach (warm, unix relay)** — the fastest server in this table. It states how many times slower each server is, so `x1.0` is the fastest and `x2.5` is a quarter of its rate. The column carries the range of the round-paired ratios beside it, and a row marked **tie** is one whose range reaches across 1.0 — the two servers could not be told apart in this run.
+The **factor** column is measured against **the fastest server in the table**, which is the row marked `x1.0`. It states how many times slower each server is, so `x1.0` is the fastest and `x2.5` is a quarter of its rate. The column carries the range of the round-paired ratios beside it, and a row marked **tie** is one whose range reaches across 1.0 — the two servers could not be told apart in this run.
 
 | server | model | PHP procs | rps | p50 | p99 | factor (range) |
 |---|---|---:|---:|---:|---:|---:|
@@ -56,12 +57,18 @@ The **factor** column is measured against **volucer — attach (warm, unix relay
 | volucer | spawn_cgi (cold, unix, children) | 16 | **8,557** | 6.81 ms | 16.61 ms | x3.0 (3.02–3.05) |
 | nginx + php-fpm | cold, unix socket | 16 | **8,282** | 7.03 ms | 9.52 ms | x3.1 (3.03–3.15) |
 
-**The two cold deployments, head to head.** `spawn_cgi` with `children` and `nginx + php-fpm` are the same idea reached two ways — a forked pool of `php-cgi` children behind one socket, or a pool of `php-fpm` children behind another — and at the same number of serving processes they are level:
+**The two cold deployments, head to head.** `spawn_cgi` with `children` and `nginx + php-fpm` are the same idea reached two ways — a forked pool of `php-cgi` children behind one socket, or a pool of `php-fpm` children behind another. The table below holds the pair at each process count the run covered, so the two are compared with the amount of server held equal:
 
-- **16 processes** — `spawn_cgi` **8,557** rps against php-fpm's **8,282**, a factor of x1.03
-- **32 processes** — `spawn_cgi` **9,113** rps against php-fpm's **9,270**, a factor of x0.98
+| PHP procs | server | model | rps | spawn_cgi ÷ php-fpm |
+|---:|---|---|---:|---:|
+| 16 | volucer | spawn_cgi (cold, unix, children) | **8,557** | x1.03 |
+| 16 | nginx + php-fpm | cold, unix socket | **8,282** | — |
+| 32 | volucer | spawn_cgi (cold, unix, children) | **9,113** | x0.98 |
+| 32 | nginx + php-fpm | cold, unix socket | **9,270** | — |
 
-**What the extra processes buy.** The table below is the same arm at 16 processes and at 32 processes, paired by the round each was measured in. It is the clearest statement of what this host does when it is given more of the server:
+The factor is `spawn_cgi`'s rate divided by php-fpm's at the same process count, so `x1.0` is level and a factor above 1.0 means the forked pool served more requests with the same number of PHP processes.
+
+**What the extra processes buy.** The table below is each arm at the smallest and the largest serving-process count this comparison publishes, paired by the round each was measured in, with the ratio of the two and its range. A ratio above 1.0 means the arm served more requests with the larger process count; a ratio below 1.0 means it served fewer; and a range that reaches across 1.0 means the two tiers could not be told apart in this run:
 
 | server | model | 16 procs | 32 procs | 32/16 (range) |
 |---|---|---:|---:|---:|
@@ -73,9 +80,7 @@ The **factor** column is measured against **volucer — attach (warm, unix relay
 | volucer | spawn_cgi (cold, unix, children) | 8,557 | 9,113 | x1.07 (1.07–1.08) |
 | nginx + php-fpm | cold, unix socket | 8,282 | 9,270 | x1.12 (1.10–1.12) |
 
-**3 of the arms got faster** with the extra processes: RoadRunner (worker (warm, pipe)), volucer (spawn_cgi (cold, unix, children)), nginx + php-fpm (cold, unix socket). **3 got slower**: volucer (worker (warm, pipe)), volucer (worker (warm, unix socket)), FrankenPHP (worker (warm, embedded)). **1 could not be told apart** from their own spread: volucer (attach (warm, unix relay)). The deployments that gained fastest are the ones that pay a framework boot per request: a process that has not yet warmed has not yet paid, so each one can add throughput the others cannot. The warm deployments keep the application resident, so their processes are interchangeable.
-
-**The 64-process tier is measured and is not in the table above.** The run covered it — the rows are in the repository — and it is left out because it is the tier where the cold path stops gaining for volucer: `spawn_cgi` with `children` is *slower* there than at 32 processes. What the tier does show is that `nginx + php-fpm` keeps improving, and a fact about another server's ceiling is not a reason for a reader to run more volucer processes. It is in the memory section below, where it is a fact about what a deployment costs rather than a claim about who wins.
+**The 64-process tier is measured and is not in the throughput table above.** The rows are in the repository, and the memory section below publishes every tier the run covered — memory is a cost of a deployment rather than a claim about who is faster, so it has no reason to stop where the throughput comparison does.
 
 ## What it costs in memory
 
@@ -112,9 +117,9 @@ The `children` key exists to answer one question: for the same number of PHP pro
 | 64 separate slots | 64 | **1102.9** | 1101.0 | 1103.4 | — |
 | 1 slot × 64 children | 64 | **116.5** | 115.3 | 116.7 | 9.5× less |
 
-For the same number of serving processes, the forked pool holds **4.5× to 9.5× less** resident memory than one process per slot — because the children inherit the master's pages instead of each mapping its own.
+The **vs one per slot** column is the row's own median divided by the one-process-per-slot row at the same process count, so it states how much less memory the forked pool holds for the same amount of server. Read it across a row of the table, not between two rows: the comparison holds the process count equal, and comparing two different counts would compare two different amounts of server.
 
-The advantage grows with the process count, because the pages the children share are the ones that would otherwise be copied into every process. That is the argument for the `children` key, and it is why the `spawn_cgi` arm with `children` is the one that appears in the throughput comparison above, while the one-process-per-slot shape is not: for the same number of PHP processes it costs several times the memory for the same throughput.
+The reason the two arrangements differ is that the children inherit the master's pages instead of each mapping its own copy, so a page the pool shares is paid for once rather than once per process. That is the argument for the `children` key, and it is why the `spawn_cgi` arm with `children` is the shape that appears in the throughput comparison above: it is the same cold path as one process per slot, at a fraction of the memory.
 
 ## What was measured
 
@@ -132,4 +137,4 @@ The advantage grows with the process count, because the pages the children share
 | nginx | nginx/1.24.0 (Ubuntu) |
 | Bench app commit | a4d44df |
 
-The **host** is the machine all of them ran on, and the **method** is the harness that drove them — both are printed on every chart above. One host, one harness, one interpreter, one pass: that is what makes a ratio between two arms a ratio between two measurements made the same way.
+The **host** is the machine all of them ran on, the **method** is the harness that drove them, and the **builds** are the versions of the programs compared — all three are printed on every chart above, so a reader who has only the image still knows what it measured. One host, one harness, one interpreter, one pass: that is what makes a ratio between two arms a ratio between two measurements made the same way.
