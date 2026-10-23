@@ -159,8 +159,9 @@ pub struct TelemetryConfig {
     /// Headers sent with every export, e.g. an API key for a hosted collector.
     ///
     /// A table, because a collector's authentication is a header and different vendors spell it
-    /// differently. **May carry a credential, which is why `config.describe` redacts it** — the same
-    /// rule the Redis URLs follow, and for the same reason.
+    /// differently. **Every value here is a credential to `config.describe`**, which elides the whole
+    /// map's values by name and keeps the header names — the same rule `[server.env]` follows, and the
+    /// one that makes `${...}` in this table safe.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
 
@@ -284,8 +285,10 @@ pub enum KvStorageConfig {
 pub struct RedisKvConfig {
     /// The server, as a URL: `redis://127.0.0.1:6379`, optionally with a username, password and database.
     ///
-    /// **May carry a credential, which is why `config.describe` redacts it** — see the redaction's own
-    /// documentation for the rule. A URL rather than separate `host`/`port`/`password` keys because that is
+    /// **May carry a credential, and `config.describe` removes the userinfo from it** — the host and the
+    /// database survive, because the address is the part an operator is checking. See the redaction's own
+    /// documentation in `volucer-server`'s `calls` module for the three rules. A URL rather than separate
+    /// `host`/`port`/`password` keys because that is
     /// what every other Redis client takes and what an operator has in their environment already.
     ///
     /// A `unix:` URL — `redis:///path/to/socket` or `unix:/run/redis.sock` — is not accepted here even where
@@ -340,6 +343,18 @@ pub struct FileKvConfig {
     #[serde(default = "default_kv_max_bytes")]
     pub max_bytes: usize,
 }
+
+/// The environment variable carrying the volucer version, set for **every** process this server
+/// starts.
+///
+/// The same fact `volucer version` prints and the same one `HelloAck` carries, made available to a
+/// process that has no channel to ask on: a `php-cgi` per-request process, a supervised origin, a
+/// job consumer. The SDK does not read it — a worker's channel already reports its version — so
+/// this is for the application and for a bug report that has to say which server it ran on.
+///
+/// **Set after the configured `env`, so it always wins**, exactly as `VOLUCER_WORKER_SOCKET` does:
+/// a value an operator could shadow would be a variable that sometimes names the wrong server.
+pub const VERSION_ENV: &str = "VOLUCER_VERSION";
 
 fn default_kv_max_bytes() -> usize {
     // Written out rather than referring to `volucer-kv`'s constant, because this crate is the leaf
@@ -1821,6 +1836,23 @@ pub struct ServerConfig {
     #[serde(default)]
     pub serve_only: ServeOnly,
 
+    /// Environment variables every process this deployment starts inherits.
+    ///
+    /// **A baseline, not a replacement.** A backend's own `env` is merged *over* this one, so the
+    /// common case — one `APP_ENV` and one `DATABASE_URL` shared by a worker pool, a job consumer
+    /// and a supervised origin — is written once instead of three times, and the exception is still
+    /// expressible per backend. The order is `inherited → this table → the backend's own env`, which
+    /// is the resolution every other volucer key already follows: the more specific statement wins.
+    ///
+    /// **Names are passed exactly as written**, unlike RoadRunner's `server.env`, which uppercases
+    /// them. A server that silently changed a variable's name would leave an application reading
+    /// `app_env` from a file that says `APP_ENV`, and the per-backend `env` here has never done it.
+    ///
+    /// **It does not reach `attach`**: volucer starts those processes not at all, and a key that
+    /// described a process nobody starts is the shape [`UpstreamConfig::command`] already refuses.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
     /// TLS settings. **Presence of this table is what turns TLS on.**
     ///
     /// No separate `enabled` boolean, deliberately: a flag and a certificate are two
@@ -2054,6 +2086,20 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub const KNOWN_ALPN: [&str; 2] = ["h2", "http/1.1"];
 
 impl ServerConfig {
+    /// The environment one started process receives: this server's baseline, overlaid by the
+    /// process's own table.
+    ///
+    /// One function rather than a merge at each spawn site, because there are four of them —
+    /// a worker pool, a consumer pool, `php-cgi` and a supervised origin — and a merge written
+    /// four times is a merge that will be right in three of them. The precedence is the one
+    /// [`ServerConfig::env`] documents: the process's own value wins.
+    #[must_use]
+    pub fn env_for(&self, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut merged = self.env.clone();
+        merged.extend(own.clone());
+        merged
+    }
+
     /// The effective front controller, or `None` for "serve only real files".
     ///
     /// The command line wins over this file, because a flag is the more specific
@@ -2825,6 +2871,27 @@ impl RequestScope {
 }
 
 impl BackendConfig {
+    /// This backend's configuration with the server's shared `env` baseline merged underneath it.
+    ///
+    /// The merge has to happen before a pool is built, because a `Spec` captures its environment at
+    /// construction and a *replacement* worker must be started on the same terms as the one it
+    /// replaces — see [`crate::config::WorkerConfig::env`]. Returning an owned copy keeps the
+    /// original configuration describable as written, which is what `config.describe` reports.
+    ///
+    /// `attach` and `external` have nothing to merge: volucer starts neither process, and an `env`
+    /// key on them would describe a process nobody here spawns.
+    #[must_use]
+    pub fn with_server_env(&self, server: &ServerConfig) -> Self {
+        let mut merged = self.clone();
+        match &mut merged {
+            BackendConfig::Worker(worker) => worker.env = server.env_for(&worker.env),
+            BackendConfig::SpawnCgi(cgi) => cgi.env = server.env_for(&cgi.env),
+            BackendConfig::Upstream(upstream) => upstream.env = server.env_for(&upstream.env),
+            BackendConfig::Attach(_) | BackendConfig::External(_) => {}
+        }
+        merged
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             BackendConfig::Worker(_) => "worker",
@@ -4047,6 +4114,20 @@ pub struct SpawnCgiConfig {
     /// `pm.max_requests`. **`0` means never recycle**, as it does there.
     #[serde(default)]
     pub max_requests: Option<u64>,
+
+    /// Extra environment variables for every `php-cgi` process this backend starts.
+    ///
+    /// The same key a `worker` and an `upstream` have, and it was missing from this kind for a
+    /// reason that no longer holds: every other thing `spawn_cgi` starts a process for is
+    /// declared here, so a deployment whose whole PHP configuration is `php-cgi` had no way to
+    /// set `APP_ENV` at all — the CGI environment volucer builds is the *request's*, and it
+    /// carries no application configuration.
+    ///
+    /// Merged over [`ServerConfig::env`], so a value shared by several backends is written once.
+    /// Written *after* `PHP_FCGI_CHILDREN` and `PHP_FCGI_MAX_REQUESTS` at spawn, so a table here
+    /// cannot move either of the two numbers the pool enforces.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 fn default_bind_host() -> String {
@@ -4087,18 +4168,29 @@ impl SpawnCgiConfig {
 }
 
 impl Config {
-    /// Parse configuration from TOML text.
+    /// Parse configuration from TOML text, without expanding `${...}`.
+    ///
+    /// **Deliberately environment-free**, and that is what makes it usable from a test: the
+    /// process environment is global, so a parser that read it would make every configuration
+    /// fixture depend on the machine it runs on. [`Config::load`] is the entry point that expands
+    /// first — one place, so `serve`, `check` and a `SIGHUP` reload cannot disagree about what the
+    /// file says.
     pub fn from_toml(text: &str) -> Result<Self> {
         Ok(toml::from_str(text)?)
     }
 
-    /// Read and parse a configuration file.
+    /// Read, expand and parse a configuration file.
+    ///
+    /// Expansion happens on the file's **text**, before parsing, so `${...}` works in a number,
+    /// port or listener position as well as in a string — see [`crate::env`] for why that is the
+    /// only form that can. A reference to an unset variable with no `${NAME:-default}` is an error
+    /// rather than an empty string.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml(&text)
+        Self::from_toml(&crate::env::expand(&text).map_err(Error::Config)?)
     }
 
     /// Reject configurations that cannot work, with actionable messages.
@@ -4128,6 +4220,11 @@ impl Config {
         // a range that fails to parse must stop the server rather than quietly not be trusted or,
         // worse, be trusted in a wider form than written.
         self.server.client_ip().map_err(Error::Config)?;
+
+        // The server's shared env baseline is checked here rather than when a process is spawned:
+        // `Command::env` accepts anything and only fails at spawn, with an `InvalidInput` error that
+        // names no key — a startup failure an operator cannot trace back to a line in their file.
+        crate::env::check_env_table("server.env", &self.server.env).map_err(Error::Config)?;
 
         // The metrics and status listeners are validated here even though they are not `server.*`,
         // because a *typo* in an address is a configuration mistake and belongs in the same message
@@ -4448,6 +4545,8 @@ impl Config {
                             "jobs.pool.command must not be empty".to_string(),
                         ));
                     }
+                    crate::env::check_env_table("jobs.pool.env", &pool.env)
+                        .map_err(Error::Config)?;
                     if pool.job_lease_seconds == 0 {
                         // Zero would expire every reservation the instant it was handed out, which means
                         // every job is handed to every consumer at once. An operator who wrote it meant
@@ -5098,6 +5197,8 @@ impl Config {
                 if w.command.trim().is_empty() {
                     return bad("worker command must not be empty".to_string());
                 }
+                crate::env::check_env_table(&format!("backends.{name}.env"), &w.env)
+                    .map_err(Error::Config)?;
                 // Checked by name against the allow-list, so a typo is refused here rather than
                 // becoming a worker that boots, serves traffic, and is silently unable to call
                 // anything. A duplicate is refused for the same reason a duplicate key would be:
@@ -5202,6 +5303,8 @@ impl Config {
                 a.validate(name).map_err(Error::Config)?;
             }
             BackendConfig::SpawnCgi(c) => {
+                crate::env::check_env_table(&format!("backends.{name}.env"), &c.env)
+                    .map_err(Error::Config)?;
                 if let Some(socket) = &c.socket {
                     validate_cgi_socket(socket)
                         .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
@@ -5230,6 +5333,8 @@ impl Config {
                 }
             }
             BackendConfig::Upstream(u) => {
+                crate::env::check_env_table(&format!("backends.{name}.env"), &u.env)
+                    .map_err(Error::Config)?;
                 // Parsing is also the validation of the `[backends.<n>.tls]` table: the origin and
                 // the table are only meaningful together, so `OriginSpec::parse` takes the table and
                 // refuses one that has no handshake to describe.
@@ -6946,6 +7051,7 @@ socket = "unix:/run/volucer/consumer"
                 socket: None,
                 children,
                 max_requests: None,
+                env: Default::default(),
             }
         }
 
@@ -8976,6 +9082,66 @@ driver = "memory"
     /// property a reader depends on — that the file is a valid configuration — plus that the two
     /// new tables are in it at all, since a deleted block is the failure mode a parse check alone
     /// would not notice.
+    /// `Config::load` expands `${...}` from the process environment, and `from_toml` does not.
+    ///
+    /// The split is the property, not an implementation detail: `from_toml` has ~230 callers in this
+    /// crate's own tests, and a parser that read the process environment would make every one of them
+    /// depend on the machine it ran on. So this test writes the environment — and holds a lock while
+    /// it does, because the environment is process-global.
+    #[test]
+    fn load_expands_the_environment_and_from_toml_does_not() {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _serial = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let path =
+            std::env::temp_dir().join(format!("volucer-expansion-{}.toml", std::process::id()));
+        // A number, a listener and a string: the three positions the expansion has to reach, and
+        // the two a post-parse approach could not.
+        std::fs::write(
+            &path,
+            "default_backend = \"app\"\n\
+             [server]\nhttp = \"127.0.0.1:${VOLUCER_TEST_PORT}\"\n\
+             [backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"\n\
+             workers = ${VOLUCER_TEST_WORKERS}\n\
+             [server.access_log]\npath = \"${VOLUCER_TEST_LOG:-logs/access.log}\"\n",
+        )
+        .expect("write the fixture");
+
+        std::env::set_var("VOLUCER_TEST_PORT", "12345");
+        std::env::set_var("VOLUCER_TEST_WORKERS", "3");
+        let loaded = Config::load(&path);
+        let unexpanded = Config::from_toml(&std::fs::read_to_string(&path).expect("read"));
+        std::env::remove_var("VOLUCER_TEST_PORT");
+        std::env::remove_var("VOLUCER_TEST_WORKERS");
+        let _ = std::fs::remove_file(&path);
+
+        let config = loaded.expect("the file loads with its variables set");
+        assert_eq!(config.server.http.as_deref(), Some("127.0.0.1:12345"));
+        let BackendConfig::Worker(worker) = &config.backends["app"] else {
+            panic!("the fixture's `app` is a worker")
+        };
+        assert_eq!(worker.workers, 3, "a number position expands too");
+        assert_eq!(
+            config
+                .server
+                .access_log
+                .as_ref()
+                .map(|log| log.path.clone()),
+            Some(PathBuf::from("logs/access.log")),
+            "an unset variable falls back to its default"
+        );
+
+        // And without the expansion the same bytes are not a configuration at all, which is why
+        // `from_toml` cannot be the entry point a deployment uses.
+        assert!(
+            unexpanded.is_err(),
+            "the raw file should not parse, or the split is untested"
+        );
+    }
+
     #[test]
     fn the_example_configuration_parses_and_validates() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8993,10 +9159,25 @@ driver = "memory"
 
         // The example documents these two as commented-out defaults, so the check is that the
         // documentation of them survives an edit rather than that they are enabled in it.
-        for table in ["# [metrics]", "# [status]", "# [telemetry]"] {
+        for table in [
+            "# [metrics]",
+            "# [status]",
+            "# [telemetry]",
+            "# [server.env]",
+        ] {
             assert!(
                 text.contains(table),
                 "{} no longer documents {table}",
+                path.display()
+            );
+        }
+        // And the expansion, because a `${...}` in the example is the only place an operator sees
+        // the syntax before writing one. It is documented as prose, so the assertion is on the form
+        // rather than on a line that a later edit could reflow.
+        for form in ["${NAME}", "${NAME:-default}", "$$"] {
+            assert!(
+                text.contains(form),
+                "{} no longer documents the {form} expansion",
                 path.display()
             );
         }
@@ -9555,6 +9736,101 @@ front_controller = "index.php"
         );
         // An empty flag is not "unset": it is the operator asking for files only.
         assert_eq!(config.server.resolve_front_controller(Some("   ")), None);
+    }
+
+    /// `[server.env]` is a baseline, and a backend's own value wins over it.
+    ///
+    /// The precedence is the whole content of the feature: written the other way round, a deployment
+    /// that moved one backend onto a different database could not express it, which is the case
+    /// [`JobsPoolConfig::env`] documents as ordinary rather than exotic.
+    #[test]
+    fn a_backends_own_env_wins_over_the_servers_baseline() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[server.env]
+APP_ENV = "production"
+DATABASE_URL = "postgres://shared/db"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[backends.app.env]
+DATABASE_URL = "postgres://its-own/db"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+
+        let BackendConfig::Worker(worker) = &config.backends["app"].with_server_env(&config.server)
+        else {
+            panic!("the fixture's `app` is a worker")
+        };
+        assert_eq!(
+            worker.env.get("APP_ENV").map(String::as_str),
+            Some("production"),
+            "the baseline reaches a backend that does not name the key"
+        );
+        assert_eq!(
+            worker.env.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://its-own/db"),
+            "and the backend's own value wins"
+        );
+
+        // `spawn_cgi` has the key too, and it is the kind that had no way to configure its
+        // application at all before it.
+        let BackendConfig::SpawnCgi(cgi) = &config.backends["cgi"].with_server_env(&config.server)
+        else {
+            panic!("the fixture's `cgi` is a spawn_cgi backend")
+        };
+        assert_eq!(
+            cgi.env.get("APP_ENV").map(String::as_str),
+            Some("production")
+        );
+
+        // The configuration itself is untouched: `config.describe` reports what the file says.
+        let BackendConfig::Worker(as_written) = &config.backends["app"] else {
+            unreachable!()
+        };
+        assert!(
+            !as_written.env.contains_key("APP_ENV"),
+            "the merge is a copy, not a rewrite of the parsed configuration"
+        );
+    }
+
+    /// An `env` key a process cannot be started with is a configuration error, not a spawn failure.
+    ///
+    /// `Command::env` accepts anything and fails at spawn with an `InvalidInput` that names no key,
+    /// which is a startup failure an operator cannot trace to a line in their file.
+    #[test]
+    fn an_unusable_env_entry_is_refused_by_name() {
+        let base = "default_backend = \"app\"\n\
+                    [server]\nhttp = \"127.0.0.1:8080\"\n\
+                    [backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"\n";
+        // Each case names the table *and* declares whatever makes that table reachable, because a
+        // table that never loads is a fixture that says nothing.
+        for (table, extra) in [
+            ("server.env", "[server.env]\n\"A=B\" = \"x\"\n".to_string()),
+            (
+                "backends.app.env",
+                "[backends.app.env]\n\"A=B\" = \"x\"\n".to_string(),
+            ),
+            (
+                "jobs.pool.env",
+                "[jobs]\nconsume = [\"emails\"]\n\
+                 [jobs.pipelines.emails]\ndriver = \"memory\"\n\
+                 [jobs.pool]\ncommand = \"php consumer.php\"\n\
+                 [jobs.pool.env]\n\"A=B\" = \"x\"\n"
+                    .to_string(),
+            ),
+        ] {
+            let config = Config::from_toml(&format!("{base}{extra}"))
+                .expect("the file parses; the entry is the mistake");
+            let err = config.validate().expect_err(table);
+            assert!(err.to_string().contains(table), "{table}: {err}");
+        }
     }
 
     #[test]

@@ -41,6 +41,7 @@ behaviour:
 |---|---|
 | `http`, `https`, `fastcgi` | A bound socket cannot move |
 | Backends, their commands and worker counts | Those are running processes with live pipes |
+| `[server.env]` and a backend's `env` | They are the environment of processes already running; a replacement worker would get the new value and its siblings would not |
 | `[server.tls]` `min_version` and `alpn` | They are baked into the `rustls` server config the acceptor holds |
 | `[server.proxy]` | Whose forwarded headers are believed is a statement about this deployment's topology |
 | `[server.rate_limit]` | The token buckets are live state, so swapping the policy would reset every caller's allowance |
@@ -171,6 +172,38 @@ The ACME cache lives under the state directory, so `[server.acme] cache` and the
 [server.acme]
 cache = "/var/lib/volucer/acme-cache"
 ```
+
+### Secrets and environment
+
+**volucer loads no `.env` file of its own**, and that is deliberate: `EnvironmentFile=` here,
+`docker run --env-file` and Compose's `env_file:` already do it, and a second loader would be a
+second precedence rule and a second path-resolution rule for one job. What volucer does is read
+the environment it is given, in the file, through `${...}`:
+
+```ini
+# the unit
+Environment=APP_ENV=production
+EnvironmentFile=/etc/volucer/secrets.env
+```
+
+```toml
+# the configuration
+[server]
+http = "127.0.0.1:${PORT:-8080}"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+workers = ${WORKERS:-0}
+```
+
+The unit's environment takes precedence over `EnvironmentFile=`, and both are visible to the
+expansion. Values are then handed to the application through `[server.env]` (shared) or a
+backend's own `env` (one table), and `config.describe` reports the names with the values
+elided — so a credential supplied this way never travels to a worker.
+
+`volucer check` performs the same expansion, so a missing variable is reported by `check` before
+`serve` is ever restarted onto it.
 
 ## Docker
 

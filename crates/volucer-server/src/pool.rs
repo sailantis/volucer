@@ -27,6 +27,7 @@
 //! only for bookkeeping — which is what lets `children` requests be in flight against one
 //! address at once.
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -301,6 +302,11 @@ pub struct CgiPool {
     /// child".
     children: u32,
     max_requests: Option<u64>,
+    /// The environment every slot is started with, already merged over `[server.env]`.
+    ///
+    /// Captured at construction for the same reason `children` is: a replacement slot must be
+    /// started on the terms the pool was configured with, not on whatever the file says now.
+    env: BTreeMap<String, String>,
     /// Held for the life of the pool; dropping it reaps every slot.
     _guard: LifecycleGuard,
 }
@@ -388,6 +394,7 @@ impl CgiPool {
             socket_paths: Vec::new(),
             children: config.fcgi_children(),
             max_requests: config.max_requests,
+            env: config.env.clone(),
             _guard: guard,
         };
 
@@ -602,6 +609,14 @@ impl CgiPool {
             // `children <= 1` to `0`, so `children = 1` means what it looks like.
             .env("PHP_FCGI_CHILDREN", self.children.to_string())
             .env("PHP_FCGI_MAX_REQUESTS", "0")
+            // The deployment's own variables last, so a table cannot move either number above —
+            // the same ordering `VOLUCER_WORKER_SOCKET` uses for a worker's address. These are the
+            // only way an application running under `php-cgi` is configured at all: the CGI
+            // environment volucer builds per request carries request data and nothing else.
+            .envs(&self.env)
+            // And the version after them, so it cannot be shadowed.
+            .env(volucer_core::config::VERSION_ENV, crate::build::VERSION);
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1192,6 +1207,7 @@ mod tests {
             socket: None,
             children: 0,
             max_requests: None,
+            env: Default::default(),
         };
         let err = CgiPool::start("test", &config).unwrap_err();
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");

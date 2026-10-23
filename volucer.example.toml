@@ -2,6 +2,19 @@
 #
 # Validate it with:  volucer check --config volucer.example.toml
 # Extra PHP search directories can be added with `--php-dir`.
+#
+# ${NAME} and ${NAME:-default} anywhere in this file are expanded from the
+# server's environment BEFORE it is parsed, so they work in a number, a port or a
+# listener address as well as in a string:
+#
+#   http    = "127.0.0.1:${PORT:-8080}"
+#   workers = ${WORKERS:-0}
+#
+# Only the braced form is expanded -- a bare $NAME is left exactly as written, so
+# a password or a DSN containing `$` cannot be mangled. `$$` is one literal `$`.
+# An unset variable without a `:-default` stops the server and names the line,
+# because an empty listener address is a server that binds nothing for a reason
+# nothing logs. See docs/01-CONFIGURATION.md.
 
 # The backend used when a request matches no route.
 default_backend = "app"
@@ -48,6 +61,36 @@ fastcgi = "127.0.0.1:9080"
 # request with a body, which is never what was meant.
 # max_body_bytes = 33554432     # 32 MiB
 
+# ---------------------------------------------------------------------------
+# The environment every process this deployment starts inherits: a worker pool,
+# a job consumer, a php-cgi slot and a supervised upstream origin. Written once
+# here, and overlaid by any backend's own `env` -- so the shared value is not
+# repeated per table and an exception is still expressible on the one table that
+# needs it.
+#
+# `attach` does not receive it: volucer starts those processes not at all.
+#
+# Names are passed exactly as written. RoadRunner uppercases `server.env` keys;
+# a server that silently renamed one would leave an application reading
+# `app_env` from a file that says `APP_ENV`.
+#
+# Every value in this table is a secret as far as `config.describe` is
+# concerned: the call reports the names and elides the values, which is what
+# makes `${DATABASE_PASSWORD}` in this file safe to send to a worker.
+#
+# [server.env]
+# APP_ENV = "production"
+# DATABASE_URL = "postgres://app@db/app"
+
+# The version of the volucer that started a process. Set for every process,
+# *after* the tables above, so it cannot be shadowed -- a variable an operator
+# could overwrite would sometimes name the wrong server. A php-cgi per-request
+# process and a supervised origin have no channel to ask, which is why it exists;
+# nothing in the SDK reads it.
+#
+# It is set by the server, so there is nothing to write for it here.
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # TLS. The presence of `[server.tls]` is what turns it on -- there is no
 # `enabled` flag, because a flag and a certificate are two statements about one
@@ -606,6 +649,16 @@ base_port = 19001
 # processes. `children = 1` is therefore mapped to 0, because one child on top of one
 # master is two processes for a slot that still serves one request at a time. Size
 # `children` to the cores and `workers` to the memory you have.
+
+# Environment variables for every slot, merged over `[server.env]`. Written after
+# PHP_FCGI_CHILDREN and PHP_FCGI_MAX_REQUESTS, so a table here cannot move either
+# number the pool enforces.
+#
+# This is the only way an application under php-cgi is configured: the CGI
+# environment volucer builds per request carries request data and nothing else.
+# Without this key a deployment whose whole PHP configuration is `spawn_cgi` had
+# no way to set APP_ENV at all.
+# env = { APP_ENV = "production" }
 
 # ---------------------------------------------------------------------------
 # Metrics, in the Prometheus text format. The presence of this table is what

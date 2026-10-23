@@ -16,6 +16,44 @@ key that parses and is ignored looks supported and cannot work.
 
 The one exception is a `deny_unknown_fields`-free path in a few places noted below.
 
+## Environment variables in the file
+
+`${NAME}` and `${NAME:-default}` are expanded from the server's own environment **before the
+file is parsed**, so they work in a string, a number, a port or a listener address:
+
+```toml
+[server]
+http = "127.0.0.1:${PORT:-8080}"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+workers = ${WORKERS:-0}
+```
+
+| Form | Meaning |
+|---|---|
+| `${NAME}` | The variable's value. **Unset is an error**, naming the variable and the line. |
+| `${NAME:-default}` | The value, or `default` when the variable is unset **or empty** — bash's `:-`. |
+| `$$` | One literal `$`, so `$${NAME}` is the text `${NAME}`. |
+
+**Only the braced form is expanded.** A bare `$NAME` is left alone, unlike RoadRunner: a
+password, a DSN or an access-log value may legitimately contain `$`, and a rule that expanded
+it would make the file mean something its author did not write.
+
+Three consequences worth knowing before writing one:
+
+- **A `${...}` in a comment is expanded too.** The substitution is textual and does not know a
+  comment from a value. This is the price of one rule rather than two.
+- **An unset variable without a default stops the server** rather than becoming an empty
+  string. An empty listener address is a server that binds nothing for a reason nothing logs.
+- **A value may not contain a line break or a NUL byte.** Because the substitution produces
+  TOML text, a newline inside a value could introduce a table header the file does not contain.
+  The expansion refuses it, naming the variable.
+
+`volucer check` reads the file through the same path, so it reports the deployment `serve`
+would actually start — including the expansion's own failures.
+
 ## Top level
 
 | Key | Type | Default | What it does |
@@ -69,6 +107,7 @@ certificate, or you have ACME configured to get one.
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
+| `env` | table | empty | Environment variables every started process inherits. |
 | `tls` | table | absent | TLS configuration. Presence enables it. |
 | `acme` | table | absent | Automatic certificates. Presence enables it. |
 | `redirect_to_https` | bool | `false` | Answer cleartext requests with a 301 to the `https://` equivalent. |
@@ -99,6 +138,45 @@ body, which is never what was meant.
 | `all` | Static files first, then the backend. The default. |
 | `backend` | The backend only. A path naming a file is dispatched like any other. |
 | `static` | Files only. A path naming no file is a 404, and no backend is consulted. |
+
+### `[server.env]`
+
+Environment variables that **every process this deployment starts** inherits: a worker pool, a
+job consumer, a `php-cgi` slot, and a supervised `upstream` origin.
+
+```toml
+[server.env]
+APP_ENV = "production"
+DATABASE_URL = "postgres://app@db/app"
+```
+
+The order is `inherited environment → [server.env] → the backend's own env`. A backend's `env`
+wins, so the common case is written once and the exception — one consumer pointed at a different
+database — is still expressible on that table.
+
+`attach` does not receive it: volucer starts those processes not at all.
+
+Names are passed **exactly as written**, with no case folding (RoadRunner uppercases `server.env`
+keys; a server that silently renamed a variable would leave an application reading `app_env` from
+a file that says `APP_ENV`). A name containing `=` or a NUL byte is refused at startup, because
+`Command::env` would otherwise fail at spawn with an error naming no key.
+
+**Every value here is a secret as far as `config.describe` is concerned**: the call reports the
+variable names and elides the values, so `${DATABASE_PASSWORD}` supplied from the environment
+cannot reach a worker.
+
+### The server's own variables
+
+Two variables are set **after** the configured `env`, so a table cannot shadow either:
+
+| Variable | Value |
+|---|---|
+| `VOLUCER_VERSION` | The version of the volucer that started the process. |
+| `VOLUCER_WORKER_SOCKET` | Where a `socket`-transport worker connects back — see [Worker Applications](07-WORKER-APPLICATIONS.md). |
+
+`VOLUCER_VERSION` exists because a `php-cgi` per-request process or a supervised origin has no
+channel to ask the server what it is. Nothing in the SDK reads it; a worker's handshake already
+reports its own version.
 
 ### `front_controller`
 
@@ -280,7 +358,7 @@ command = "php worker.php"
 | `memory_limit_mb` | integer | absent | Recycle a worker whose peak RSS exceeds this. |
 | `max_requests` | integer | absent | Recycle a worker after this many requests. |
 | `working_dir` | path | absent | The working directory for the worker. |
-| `env` | table | empty | Extra environment variables for the worker. |
+| `env` | table | empty | Extra environment variables for the worker, merged over `[server.env]`. |
 | `services` | array of strings | empty | The services this backend's workers may call. |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
@@ -341,6 +419,7 @@ access to.
 | `base_port` | integer | `19001` | The first port, when not using a socket. |
 | `socket` | string | absent | A socket prefix instead of TCP ports. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
+| `env` | table | empty | Extra environment variables for every slot. |
 
 `children > 0` turns on prefork, and it is worth about 4.5× the memory for the same
 concurrency: forked children inherit both the listening socket and the OPcache segment, so
@@ -362,7 +441,7 @@ An HTTP origin that owns its own HTTP loop — Node, ASGI, Go, Python, Ruby.
 | `origin` | string | **required** | The origin's address. |
 | `command` | string | absent | A command to start the origin with. |
 | `working_dir` | path | absent | The origin's working directory. |
-| `env` | table | empty | Extra environment variables for the origin. |
+| `env` | table | empty | Extra environment variables for the origin, merged over `[server.env]`. |
 | `protocol` | string | absent | `"h2c"` for HTTP/2 over cleartext, with prior knowledge. |
 | `tls` | table | absent | How to reach an HTTPS origin. |
 | `restart` | string | `"on_failure"` | `"never"`, `"on_failure"` or `"always"`. |
@@ -492,7 +571,7 @@ and failing later.
 | `transport` | string | platform default | `"pipe"` or `"socket"`. |
 | `socket` | string | absent | Where the socket transport listens. |
 | `working_dir` | path | absent | The working directory. |
-| `env` | table | empty | Extra environment variables. |
+| `env` | table | empty | Extra environment variables, merged over `[server.env]`. |
 
 ## A complete example
 

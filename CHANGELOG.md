@@ -17,9 +17,46 @@ the reasoning behind it lives in the source comments and in [`internal/plan.md`]
   and the release notes for 0.1.0 and 0.2.0 were written after the fact. This file is that
   description, kept as the releases happen — and it is why `docs/11-OPERATIONS.md` now sends an
   operator here before an upgrade instead of to "the release notes".
+- **`${NAME}` and `${NAME:-default}` in the configuration file.** Expanded from the server's
+  environment before the file is parsed, so a key that is not a string works too:
+  `workers = ${WORKERS:-0}`, `http = "127.0.0.1:${PORT:-8080}"`. Only the braced form is
+  expanded — a bare `$NAME` is left as written, unlike RoadRunner — because a password or a
+  DSN may contain `$` and a rule that expanded it would make the file mean something its
+  author did not write. `$$` is one literal `$`. **An unset variable with no default stops
+  the server**, naming the variable and the line: an empty listener address is a server that
+  binds nothing, for a reason nothing logs. A value containing a line break or a NUL byte is
+  refused, because the substitution produces TOML text and a newline inside a value could
+  introduce a table header the file does not contain. Expansion lives in `Config::load`, not
+  in `from_toml`, so the ~230 test fixtures that parse text do not depend on the machine.
+- **`[server.env]`: an environment baseline every started process inherits.** A worker pool,
+  a job consumer, a `php-cgi` slot and a supervised origin; a backend's own `env` is merged
+  over it, so the shared value is written once and the exception stays on the table that
+  needs it. Names are passed **exactly as written** — RoadRunner uppercases `server.env`
+  keys, and a server that silently renamed one would leave an application reading `app_env`
+  from a file that says `APP_ENV`. `attach` does not receive it, because volucer starts those
+  processes not at all. An unusable name (`=`, NUL) is refused at startup rather than failing
+  at spawn with an `InvalidInput` that names no key.
+- **`spawn_cgi` takes an `env` table.** It was the only kind that starts a process and had no
+  way to configure it: the CGI environment volucer builds per request carries request data and
+  nothing else, so a deployment whose PHP configuration was entirely `spawn_cgi` could not set
+  `APP_ENV` at all. Written after `PHP_FCGI_CHILDREN`/`PHP_FCGI_MAX_REQUESTS`, so the table
+  cannot move either number the pool enforces.
+- **`VOLUCER_VERSION` is set for every process volucer starts**, after the configured `env`, so
+  it cannot be shadowed. A `php-cgi` per-request process and a supervised origin have no channel
+  to ask the server what it is, which is why the variable exists; nothing in the SDK reads it.
 
 ### Changed
 
+- **`config.describe` now redacts two things it previously let through.** The rule was a
+  sensitive *key name* only, so a credential that arrived inside a **value** passed straight to
+  a worker. Two structural rules are added: the values of any `env` or `headers` map
+  are elided **with their keys kept** (`[telemetry.headers]`'s own documentation claimed this
+  already worked, and it did not — the header name `x-honeycomb-team` contains no word the name
+  rule matches), and a URL's userinfo is replaced with `******` so
+  `redis://user:pw@host/db` is described as `redis://******@host/db` (`RedisKvConfig::url`'s
+  documentation made the same claim, and the fixture that was supposed to pin it asserted the
+  sensitive-named keys only). Both are what make a `${DATABASE_PASSWORD}` or a
+  `${TELEMETRY_KEY}` safe to put in the file, which is the pairing this release intends.
 - **`spawn_cgi` starts its slots concurrently.** Each slot owns its own address and its own
   process tree, and nothing in the start-up loop reads another slot's state, so starting them
   one at a time was a serialisation with no purpose — every per-slot wait, multiplied by the

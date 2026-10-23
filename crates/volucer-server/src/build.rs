@@ -11,6 +11,14 @@
 /// crate to report it.
 pub use volucer_worker::PROTOCOL_VERSION as WORKER_PROTOCOL_VERSION;
 
+/// The volucer version this build is, as the string every spawned process is told.
+///
+/// The same value `volucer version` prints, and it lives here for the same reason the two above do:
+/// a build cannot report a version it does not have. It is handed to a process through
+/// [`volucer_core::config::VERSION_ENV`], because a `php-cgi` per-request process and a supervised
+/// origin have no channel to ask on.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The lowest PHP version the worker SDK supports.
 ///
 /// 8.2, and the reason is a function rather than syntax: the SDK calls

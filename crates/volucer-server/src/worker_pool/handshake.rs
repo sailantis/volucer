@@ -617,6 +617,10 @@ fn boot_spawned(
     for (key, value) in env {
         command.env(key, value);
     }
+    // Set after the configured `env`, so it cannot be shadowed — the same ordering the socket
+    // address below uses, and for the same reason: a value an operator could overwrite would be a
+    // variable that sometimes reports the wrong server.
+    command.env(volucer_core::config::VERSION_ENV, crate::build::VERSION);
     if let Some(address) = &socket_address {
         // Set *after* the configured `env`, so the address always wins. A configuration
         // that carries its own `env` map would otherwise be able to point the worker at a

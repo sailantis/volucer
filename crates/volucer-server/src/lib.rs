@@ -18,7 +18,7 @@ pub mod upstream_pool;
 pub mod worker_pool;
 
 pub use backend::{Backend, Contention};
-pub use build::{MINIMUM_PHP_VERSION, WORKER_PROTOCOL_VERSION};
+pub use build::{MINIMUM_PHP_VERSION, VERSION, WORKER_PROTOCOL_VERSION};
 pub use calls::{
     ConfigNamespace, KvNamespace, MethodRegistry, Namespace, PoolLookup, ResetRefusal,
     WorkerStatus, WorkersNamespace,

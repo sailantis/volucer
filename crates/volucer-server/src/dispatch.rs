@@ -616,6 +616,12 @@ impl Dispatcher {
         let mut backends = BTreeMap::new();
         let mut registries: BTreeMap<String, Arc<MethodRegistry>> = BTreeMap::new();
         for (name, backend_config) in &config.backends {
+            // The server's shared `env` baseline is merged in *here*, before a pool is built: a
+            // `Spec` captures its environment at construction, and a replacement worker is started
+            // from that captured copy — so a merge applied anywhere later would be a baseline that
+            // held for the first worker and not for the one that replaced it.
+            let backend_config = backend_config.with_server_env(&config.server);
+            let backend_config = &backend_config;
             let registry = match backend_config {
                 BackendConfig::Worker(worker) => {
                     let registry = Arc::new(worker_registry(

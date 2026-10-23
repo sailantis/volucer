@@ -174,11 +174,32 @@ const ELIDED_KEY_PARTS: [&str; 7] = [
     "ca",
 ];
 
+/// Keys whose **whole value is a map of secrets**, so every value in it is elided whatever it is named.
+///
+/// # Why a name rule is not enough for these
+///
+/// `[server.env]`, a backend's `env` and `[telemetry.headers]` are all operator-chosen names, and a name
+/// is the one thing this cannot judge: `x-honeycomb-team`, `DATABASE_URL` and `HONEYCOMB_KEY` are three
+/// spellings of the same secret and only the third contains a word from
+/// [`ELIDED_KEY_PARTS`]. The key itself is kept, because *which* variables and headers exist is a fact
+/// about the deployment that an operator wants and a credential does not disclose.
+///
+/// This is not belt-and-braces over the name rule: it is the rule for a container, and the two together
+/// are why a `${DATABASE_PASSWORD}` put in the file by the expansion cannot reach a worker.
+const ELIDED_MAPS: [&str; 2] = ["env", "headers"];
+
 /// What replaces an elided value.
 ///
 /// A word rather than an empty string, so that a reader of the answer can tell "there is a value here
 /// and you may not see it" from "this field is unset" — two very different operational situations.
 const ELIDED: &str = "<elided>";
+
+/// What replaces the userinfo of a URL that carries one.
+///
+/// A URL is one value with a credential inside it, so it cannot be elided whole — the scheme and the
+/// host are the useful half, and a driver's address is what an operator is checking. This is the
+/// spelling every client prints, so a reader recognises it as redaction rather than as an odd port.
+const ELIDED_USERINFO: &str = "******";
 
 #[cfg(test)]
 mod tests {
@@ -1251,6 +1272,10 @@ mod tests {
             "abc123",
             "certs/a.key",
             "s1",
+            // The fixture's `url` carries userinfo, and this assertion is what keeps it out. It was
+            // missing while `RedisKvConfig::url`'s documentation claimed the redaction covered it —
+            // so the claim was true of the key-name rule and false of the value.
+            "user:pw@",
             "Bearer x",
         ] {
             assert!(
@@ -1304,6 +1329,94 @@ mod tests {
             assert!(!is_sensitive(key), "{key} is not a credential");
         }
     }
+
+    /// A map of operator-named pairs is elided **by value, keeping its keys**.
+    ///
+    /// The name rule cannot judge these: `DATABASE_URL` and `x-honeycomb-team` are secrets whose names
+    /// contain no word from [`ELIDED_KEY_PARTS`], and `[telemetry.headers]` is documented as carrying a
+    /// collector key. This is what makes `${...}` in the file safe — a secret supplied through the
+    /// environment lands in exactly one of these tables.
+    #[test]
+    fn every_value_of_an_env_or_headers_map_is_elided_and_its_keys_survive() {
+        let description = serde_json::json!({
+            "server": { "env": { "APP_ENV": "production", "DATABASE_URL": "postgres://u:p@db/app" } },
+            "backends": {
+                "app": { "env": { "SENTRY_DSN": "https://abc@sentry/1" } }
+            },
+            "telemetry": { "headers": { "x-honeycomb-team": "team-secret" } }
+        });
+
+        let namespace = ConfigNamespace::new(&description);
+        let answer = namespace.serve(&call("config.describe"));
+        let text = serde_json::to_string(&answer.result).expect("serializable");
+
+        for secret in [
+            "production",
+            "postgres://u:p@db/app",
+            "https://abc@sentry/1",
+            "team-secret",
+        ] {
+            assert!(
+                !text.contains(secret),
+                "{secret:?} must not appear:\n{text}"
+            );
+        }
+        // The names are what makes the answer worth having, so they are what survives.
+        for key in ["APP_ENV", "DATABASE_URL", "SENTRY_DSN", "x-honeycomb-team"] {
+            assert!(
+                text.contains(key),
+                "{key} should survive as a name:\n{text}"
+            );
+        }
+    }
+
+    /// A URL keeps its scheme, host and path and loses its userinfo.
+    ///
+    /// The narrowest rule of the three, and the one that has to be: a driver's address is the half an
+    /// operator is checking, so eliding the whole value would make `check` useless. `rfind` picks the
+    /// **host** boundary, so a password containing `@` cannot leave a fragment behind.
+    #[test]
+    fn a_url_loses_only_its_userinfo() {
+        for (url, expected) in [
+            ("redis://127.0.0.1:6379", None),
+            (
+                "redis://:pw@redis:6379/0",
+                Some("redis://******@redis:6379/0"),
+            ),
+            (
+                "redis://user:p@ss@redis:6379/0",
+                Some("redis://******@redis:6379/0"),
+            ),
+            (
+                "postgres://u:p@db.example.com:5432/app?sslmode=require",
+                Some("postgres://******@db.example.com:5432/app?sslmode=require"),
+            ),
+            // Not URLs with userinfo, and each must be left exactly as written. The `@` in the path is
+            // the case that makes the rule look only at the authority.
+            ("http://example.com/users/@me", None),
+            ("/run/redis.sock", None),
+            ("a plain string", None),
+        ] {
+            assert_eq!(
+                expected.map(str::to_string),
+                redact_url_userinfo(url),
+                "{url}"
+            );
+        }
+    }
+
+    /// And the rule reaches a value that arrived under a benign key, which is how a driver's `url` is
+    /// described.
+    #[test]
+    fn a_url_under_a_key_that_is_not_sensitive_is_still_redacted() {
+        let namespace = ConfigNamespace::new(&serde_json::json!({
+            "kv": { "cache": { "url": "redis://:hunter2@redis:6379" } }
+        }));
+        let text = serde_json::to_string(&namespace.serve(&call("config.describe")).result)
+            .expect("serializable");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("redis:6379"), "the host survives: {text}");
+    }
 }
 
 impl ConfigNamespace {
@@ -1337,24 +1450,84 @@ impl Namespace for ConfigNamespace {
 /// Recursive, because a driver's configuration is nested: a queue's credentials live under
 /// `pipelines.<name>.config`, and a redaction that only looked at the top level would miss every one of
 /// them while looking correct on a flat test fixture.
+///
+/// # Three rules, because a credential can arrive three ways
+///
+/// 1. **A sensitive key name** — `password`, `secret`, `key` and the rest of
+///    [`ELIDED_KEY_PARTS`]. The original rule, and still the only one that works for a driver's own
+///    fields.
+/// 2. **A map whose values are all operator-named pairs** — [`ELIDED_MAPS`]. An `env` table's names are
+///    chosen by the deployment, so `DATABASE_URL` and `x-honeycomb-team` are secrets the name rule
+///    cannot see. The **keys survive**, because which variables and headers exist is what makes the
+///    answer useful.
+/// 3. **A URL carrying userinfo** — `scheme://user:pass@host`. A URL is one value, so it cannot be
+///    elided whole without losing the host, which is the part an operator is checking. This is the rule
+///    that makes `${DATABASE_URL}` in a driver's `url` safe, and that is the shape the expansion
+///    produces.
 fn redact(value: &mut serde_json::Value) {
+    redact_entries(value, false);
+}
+
+/// [`redact`], with `all_values` set when the containing node is a map of secrets.
+fn redact_entries(value: &mut serde_json::Value, all_values: bool) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, entry) in map.iter_mut() {
-                if is_sensitive(key) {
+                // A container is decided by its own key, and then *its* entries by the rule that
+                // container implies — so `[telemetry.headers]` elides each header's value rather than
+                // the whole table, which keeps the table's shape visible.
+                if all_values || is_sensitive(key) {
                     *entry = serde_json::Value::String(ELIDED.to_string());
                 } else {
-                    redact(entry);
+                    redact_entries(entry, is_secret_map(key));
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                redact(item);
+                redact_entries(item, all_values);
+            }
+        }
+        // A URL inside a map of secrets is already gone; one anywhere else keeps its host. The order
+        // matters: `all_values` has already replaced it with `ELIDED` by the time this runs on a child.
+        serde_json::Value::String(text) => {
+            if let Some(redacted) = redact_url_userinfo(text) {
+                *text = redacted;
             }
         }
         _ => {}
     }
+}
+
+/// Whether a key names a map whose every value is a secret.
+fn is_secret_map(key: &str) -> bool {
+    ELIDED_MAPS.contains(&key.to_ascii_lowercase().as_str())
+}
+
+/// `scheme://user:pass@host/path` → `scheme://******@host/path`, or `None` when there is no userinfo.
+///
+/// Deliberately narrow: it looks for `://`, then an `@` **before the next `/`**, and only redacts the
+/// part up to the last `@` in that span — so a `@` in a path or a query string, which is legal and
+/// common (`/users/@me`), is left alone. A parse failure, a missing `://`, or an `@` after the path
+/// begins all mean "not a URL with userinfo" and the value is returned unchanged.
+///
+/// A `redis://:password@host` has no user, and the empty-name case is redacted too: the password is the
+/// credential whether or not anybody wrote a name in front of it.
+fn redact_url_userinfo(value: &str) -> Option<String> {
+    let scheme_end = value.find("://")? + 3;
+    let authority_end = value[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(value.len(), |offset| scheme_end + offset);
+    let authority = &value[scheme_end..authority_end];
+    let at = authority.rfind('@')?;
+    // Rebuilt rather than `replace`d, because the userinfo may itself contain an `@` (a password may)
+    // and `rfind` is what picks the *host* boundary rather than the first one.
+    Some(format!(
+        "{}{ELIDED_USERINFO}@{}{}",
+        &value[..scheme_end],
+        &authority[at + 1..],
+        &value[authority_end..]
+    ))
 }
 
 /// Whether a key name is one whose value must not be described.

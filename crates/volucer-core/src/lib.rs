@@ -2,6 +2,7 @@
 
 pub mod clientip;
 pub mod config;
+pub mod env;
 pub mod error;
 pub mod hostmap;
 pub mod php;

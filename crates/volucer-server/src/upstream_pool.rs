@@ -158,6 +158,8 @@ impl Shared {
         for (key, value) in &self.spec.env {
             command.env(key, value);
         }
+        // Last, so a configured `env` cannot shadow it — see `VERSION_ENV`.
+        command.env(volucer_core::config::VERSION_ENV, crate::build::VERSION);
         // Both pipes drained rather than nulled, the same courtesy the worker pool extends to PHP
         // and for the same reason: an application's own diagnostics are the only thing that
         // explains a 502 it caused, and a process whose pipe fills up blocks for ever on its next

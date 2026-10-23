@@ -23,6 +23,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
         socket: None,
         max_requests: None,
         children: 0,
+        env: Default::default(),
     }
 }
 
@@ -64,6 +65,78 @@ fn fixture(name: &str) -> (PathBuf, String) {
     (root, "index.php".to_string())
 }
 
+/// A `spawn_cgi` slot's `env` reaches the PHP process, and `VOLUCER_VERSION` is set even though the
+/// configured table does not name it.
+///
+/// Both halves matter and neither is a detail. `env` on this kind is the only way an application under
+/// `php-cgi` is configured at all — the CGI environment volucer builds per request carries request data
+/// and nothing else — and `VOLUCER_VERSION` is the one fact a per-request process cannot ask the server
+/// for, because it has no channel.
+#[test]
+fn a_slot_receives_the_configured_environment_and_the_server_version() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!(
+        "volucer-pool-env-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    write_script(
+        &root,
+        "index.php",
+        r#"<?php
+           header('Content-Type: text/plain');
+           echo "APP=", getenv('VOLUCER_TEST_APP'), "\n";
+           echo "OVERRIDDEN=", getenv('VOLUCER_TEST_OVERRIDDEN'), "\n";
+           echo "VERSION=", getenv('VOLUCER_VERSION'), "\n";
+        "#,
+    );
+
+    let mut config = config_for(&binary, 1, base_port);
+    config.env = [
+        ("VOLUCER_TEST_APP", "from-config"),
+        // A value the server sets itself. The pool writes it *after* the configured table, so this
+        // entry must not win — that ordering is what makes the version trustworthy.
+        ("VOLUCER_VERSION", "spoofed"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect();
+    // And the child must not inherit the variable from *this* process either, which is the failure a
+    // `Command::env` without an explicit overwrite would hide on a developer's machine only.
+    config
+        .env
+        .insert("VOLUCER_TEST_OVERRIDDEN".to_string(), "own".to_string());
+
+    let mut pool = CgiPool::start("env-test", &config).expect("a pool starts");
+    let response = pool
+        .request(&request_for(&root, "index.php", ""))
+        .expect("the slot answered");
+    response.check_protocol().expect("completed");
+    let stdout = String::from_utf8_lossy(&response.stdout).to_string();
+
+    assert!(stdout.contains("APP=from-config"), "{stdout}");
+    assert!(stdout.contains("OVERRIDDEN=own"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("VERSION={}", volucer_server::VERSION)),
+        "the server's own version, not the configured value:\n{stdout}"
+    );
+    assert!(!stdout.contains("spoofed"), "{stdout}");
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A pool bound to unix sockets must serve exactly what the TCP pool serves.
 ///
 /// This is the test that makes `socket = "unix:..."` a supported configuration
@@ -89,6 +162,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
         socket: Some(format!("unix:{prefix}")),
         max_requests: None,
         children: 0,
+        env: Default::default(),
     };
 
     let mut pool = CgiPool::start("unix-test", &config).expect("a unix-socket pool starts");
@@ -159,6 +233,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
         socket: Some(prefix.clone()),
         max_requests: None,
         children: 0,
+        env: Default::default(),
     };
 
     let mut pool = CgiPool::start("pipe-test", &config).expect("a pipe pool starts");
@@ -210,6 +285,7 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
         socket: Some(format!("unix:{prefix}")),
         max_requests: None,
         children: 0,
+        env: Default::default(),
     };
 
     let mut pool = CgiPool::start("unix-restart", &config).expect("pool starts");

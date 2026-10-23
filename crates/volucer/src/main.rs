@@ -1647,9 +1647,16 @@ fn start_consumers(
     // `consume` is non-empty — so by here a pool config means there is something to consume. The empty
     // check is what turns that into a statement rather than an assumption: without it, a configuration
     // that named a pool and consumed nothing would boot a set of consumer processes that poll nothing.
+    //
+    // The consumer's `env` is merged over `[server.env]` here, for the same reason the dispatcher
+    // merges a backend's: `[jobs.pool]` is not a backend, so it does not pass through
+    // `BackendConfig::with_server_env`, and a baseline that reached a web worker but not a consumer
+    // would be a deployment whose queue talked to the wrong database.
+    let mut pool_config = pool_config.clone();
+    pool_config.env = config.server.env_for(&pool_config.env);
     let consumers = Consumers::new(
         &plane,
-        WorkerPool::start_consumers("jobs", pool_config)?,
+        WorkerPool::start_consumers("jobs", &pool_config)?,
         Duration::from_secs(pool_config.job_lease_seconds),
         pool_config.prefetch,
     );
@@ -1825,6 +1832,7 @@ pub fn restart_only() -> Vec<&'static str> {
     vec![
         "a reload does not change: listener addresses (the sockets are already bound)",
         "a reload does not change: backends, their commands and worker counts (the processes are running)",
+        "a reload does not change: [server.env] and a backend's env (the processes are already running with the old values, so a reload would leave a replacement worker on the new ones and its siblings on the old)",
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
         "a reload does not change: [server.rate_limit] (the buckets are live state, so replacing the policy would reset every caller's allowance)",
@@ -2392,6 +2400,19 @@ fn check(
         // went away with the same commit that added the request path below it. Both existed so that
         // `check` could not answer "configuration OK" for a kind `serve` refused, and both were
         // removed together for the same reason.
+        //
+        // What *is* printed is the merged environment's variable **names**, because they are the
+        // half an operator can act on and the values are the half that must not reach a terminal
+        // they later paste into a ticket. Printing nothing would hide the case this feature exists
+        // for: a key set once in `[server.env]` and inherited by four processes, where "did it
+        // reach this backend" is a question the file alone cannot answer.
+        let names = backend_env_names(&config.server, backend);
+        if !names.is_empty() {
+            println!(
+                "      env:               {} (values not printed)",
+                names.join(", ")
+            );
+        }
     }
 
     // The KV storages, with a file store's *resolved* directory. The resolved value is the one that
@@ -2731,6 +2752,30 @@ fn check(
 /// after a child has been forked to serve the connection (1.5 s after start on the bench host),
 /// so on the accept path this would trade a reliable queue for an unreliable gauge. The two
 /// numbers are reported, never acted on.
+/// The variable names a backend's processes receive: `[server.env]` merged with its own `env`.
+///
+/// Names only, deliberately. The values are the half that must not be printed — an operator pastes
+/// `check` output into a ticket — and the names are the half that answers the question the file
+/// cannot: *which* processes inherited the baseline. Sorted, because a `BTreeMap` already is and
+/// because a stable order is what makes two runs diffable.
+fn backend_env_names(
+    server: &volucer_core::config::ServerConfig,
+    backend: &volucer_core::config::BackendConfig,
+) -> Vec<String> {
+    let own = match backend {
+        volucer_core::config::BackendConfig::Worker(worker) => &worker.env,
+        volucer_core::config::BackendConfig::SpawnCgi(cgi) => &cgi.env,
+        volucer_core::config::BackendConfig::Upstream(upstream) => &upstream.env,
+        // Neither starts a process here, so neither receives the baseline — see
+        // `ServerConfig::env`.
+        volucer_core::config::BackendConfig::Attach(_)
+        | volucer_core::config::BackendConfig::External(_) => return Vec::new(),
+    };
+    // Owned rather than borrowed: the merge produces a new map, so a `&str` into it could not
+    // outlive this call.
+    server.env_for(own).into_keys().collect()
+}
+
 fn print_advertised_capacity(external: &volucer_core::config::ExternalConfig) {
     use std::time::Duration;
 
@@ -2982,6 +3027,7 @@ document_root = "/from/file"
         for required in [
             "listener addresses",
             "backends",
+            "server.env",
             "min_version",
             "server.proxy",
             "server.rate_limit",
