@@ -417,10 +417,10 @@ fastcgi = "127.0.0.1:9080"
 #   header named next to a key that does not read one is a line that believes it
 #   limits that header.
 # ---------------------------------------------------------------------------
-# Persistent worker pool: the PHP process boots the application once and stays
+# Persistent worker pool: the process boots the application once and stays
 # resident. volucer talks to it over the child's stdin/stdout pipes using its
-# own framed protocol. State is NOT reset by PHP per request, so the
-# application must clear its own request scope.
+# own framed protocol. State is NOT reset per request, so the application must
+# clear its own request scope.
 # ---------------------------------------------------------------------------
 [backends.app]
 kind = "worker"
@@ -665,6 +665,39 @@ base_port = 19001
 # Without this key a deployment whose whole PHP configuration is `spawn_cgi` had
 # no way to set APP_ENV at all.
 # env = { APP_ENV = "production" }
+
+# ---------------------------------------------------------------------------
+# The same backend with any other FastCGI server. `command` and `binary` are
+# mutually exclusive: `binary` is php-cgi's own argv (-b) plus its prefork
+# environment, `command` is a program that binds the address it is given.
+#
+# `{address}` is replaced per slot -- 127.0.0.1:19001, or unix:/run/app/py.0.sock
+# when `socket` is set -- in every argument, and the same string is exported as
+# VOLUCER_FCGI_ADDRESS for a program that reads it from the environment. A
+# command using neither is refused at startup: it would bind somewhere the pool
+# cannot reach, and every request would be a 502 after the startup timeout.
+#
+# `capacity`, not `children`, is how many requests one slot answers at once: an
+# application server that forks its own children has already decided that number,
+# and the pool only needs to know it so it does not hold more connections open
+# than there are children to accept them. Setting both keys is refused.
+#
+# `working_dir` matters here in a way it does not for php-cgi: a Python
+# application finds its modules relative to the working directory, and a Ruby one
+# finds config.ru there.
+# ---------------------------------------------------------------------------
+# [backends.py]
+# kind = "spawn_cgi"
+# command = "gunicorn myapp.wsgi --bind {address}"
+# workers = 4
+# capacity = 4
+# working_dir = "/srv/app"
+# env = { APP_ENV = "production" }
+#
+# A unix socket is handed over in `unix:` form, which is what the rest of the
+# world spells a socket -- and what `php-cgi -b` does NOT accept, which is why
+# the two drivers spell this one argument differently.
+# socket = "unix:/run/volucer/py"
 
 # ---------------------------------------------------------------------------
 # Metrics, in the Prometheus text format. The presence of this table is what
