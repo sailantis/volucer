@@ -142,7 +142,10 @@ impl Response {
 
 /// Split a FastCGI `STDOUT` payload into its status and headers.
 ///
-/// A response without a `Status:` header is `200` per the specification.
+/// A response that states no `Status:` is `200` per the specification — **unless it carries a
+/// `Location`**, which makes it a `302`: RFC 3875 §6.2.3 leaves the status to the server when
+/// the application states none, and a bare `Location` is the spec's way of asking for a
+/// redirect. nginx, Caddy and Apache all resolve it the same way. See [`parse_response`].
 ///
 /// The whole-payload `String::from_utf8_lossy` this used to start with was the
 /// most expensive thing on the HTTP hot path after the checksum: it validates
@@ -193,6 +196,10 @@ pub fn parse_response<'a>(stdout: &'a [u8]) -> (u16, ParsedHeaders<'a>, &'a [u8]
     };
 
     let mut status = 200u16;
+    // Whether the header block stated a status at all. It decides the `Location` rule below,
+    // and it cannot be inferred from `status` afterwards because a backend may legitimately
+    // send `Status: 200` explicitly.
+    let mut stated = false;
     // Sixteen bytes per header is a typical line. Reserving saves the first few
     // doublings on a response carrying the usual dozen headers.
     let mut headers: ParsedHeaders<'a> = Vec::with_capacity(head.len() / 16);
@@ -211,6 +218,7 @@ pub fn parse_response<'a>(stdout: &'a [u8]) -> (u16, ParsedHeaders<'a>, &'a [u8]
         if let Some((name, value)) = header_parts(line) {
             if name.eq_ignore_ascii_case(b"status") {
                 status = parse_status_code(value).unwrap_or(200);
+                stated = true;
             } else {
                 push_ascii(&mut headers, name, value);
             }
@@ -219,6 +227,27 @@ pub fn parse_response<'a>(stdout: &'a [u8]) -> (u16, ParsedHeaders<'a>, &'a [u8]
     }
     for line in lines {
         push_header(&mut headers, line.strip_suffix(b"\r").unwrap_or(line));
+    }
+
+    // **A `Location` with no `Status:` is a `302`, not a `200`.** CGI/1.1 and nginx agree on
+    // this, and it is the one part of the spec this parser used to get wrong: RFC 3875 §6.2.3
+    // makes the *server* choose the status from the response fields, and §6.2.4 gives
+    // client-redirect-with-document its own status precisely because a bare `Location` means
+    // "send the client somewhere else". PHP frameworks always emit `Status`, so a PHP-only
+    // deployment never saw the difference — a Rack or WSGI application that sets `Location` and
+    // lets the server pick (Rack's `[302, {"Location" => ...}, []]` is usually explicit, but
+    // Sinatra and several WSGI middlewares are not) would have been answered `200` with a
+    // `Location` header, which no client follows.
+    //
+    // Only when the backend stated nothing: an explicit `Status: 200` beside a `Location` is
+    // the application saying it meant a body with a location in it, and overriding that would
+    // be this parser inventing a decision the application made.
+    if !stated
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("location"))
+    {
+        status = 302;
     }
 
     (status, headers, body)
@@ -786,6 +815,40 @@ mod tests {
         let (status, headers) = parse_response_headers(b"Content-Type: text/plain\r\n\r\nhi");
         assert_eq!(status, 200);
         assert_eq!(headers.len(), 1);
+    }
+
+    /// A bare `Location` is a redirect, which is RFC 3875 §6.2.3's rule and nginx's.
+    ///
+    /// The case a PHP-only deployment never produced: frameworks send `Status`, so `200` was
+    /// the right answer for every backend volucer had. A WSGI or Rack application that sets
+    /// `Location` and lets the server choose would have been answered `200` here, with a
+    /// header no client follows.
+    #[test]
+    fn a_location_without_a_status_is_a_found() {
+        let (status, headers) = parse_response_headers(b"Location: /login\r\n\r\n");
+        assert_eq!(status, 302);
+        assert_eq!(headers, vec![("Location", "/login")]);
+    }
+
+    /// And an explicit status wins, because the application has then answered the question.
+    #[test]
+    fn an_explicit_status_beside_a_location_is_kept() {
+        let (status, _) =
+            parse_response_headers(b"Status: 201 Created\r\nLocation: /items/7\r\n\r\n");
+        assert_eq!(status, 201);
+    }
+
+    /// A `Location` that is not in the header block at all leaves the default alone.
+    ///
+    /// Pins the *scope* of the rule: it is the header block the parser found, not a substring
+    /// search of the payload, so an application whose body happens to contain the word
+    /// `Location:` is not turned into a redirect.
+    #[test]
+    fn a_location_in_the_body_is_not_a_header() {
+        let (status, headers) =
+            parse_response_headers(b"Content-Type: text/plain\r\n\r\nLocation: /x");
+        assert_eq!(status, 200);
+        assert!(!headers.iter().any(|(name, _)| *name == "Location"));
     }
 
     #[test]

@@ -13,6 +13,26 @@ the reasoning behind it lives in the source comments and in the documentation un
 
 ### Added
 
+- **`spawn_cgi` runs any FastCGI server, not only `php-cgi`.** A new `command` key takes a
+  program that starts one slot — `gunicorn myapp.wsgi --bind {address}`, a `flup` server, a
+  Rack adapter — and the placeholder is replaced per slot with the address that slot must
+  bind. The same string is exported as `VOLUCER_FCGI_ADDRESS` for a program that reads it from
+  the environment, so a server needing no placeholder needs no argument either. `binary` and
+  `command` are mutually exclusive and each keeps its own semantics: a `binary` deployment is
+  still `php-cgi`, with `children` as its prefork count and a named pipe on Windows; a
+  `command` deployment uses `capacity` for the same number and TCP. A command that names
+  neither the placeholder nor a reader of the variable is refused at startup, because it would
+  bind somewhere the pool cannot reach and every request would be a 502 after a ten-second
+  timeout. What the pool guarantees is unchanged and now driver-independent: started, waited
+  for, health-checked, restarted on death, recycled on `max_requests`, killed as a process
+  group. A command that exits is reported once rather than retried across ten ports — the
+  retry exists for `php-cgi` losing a bind race, and nothing known is true of another program
+  that died.
+- **`spawn_cgi` takes `working_dir`.** The key `worker`, a job consumer and `upstream` already
+  had, and its absence was the one thing that made a non-PHP command unusable: a Python
+  application finds its modules relative to the working directory and a Ruby one finds
+  `config.ru` there, so a supervisor that guessed would start the process somewhere it cannot
+  boot.
 - **`CHANGELOG.md`.** What changed between two tags could only be read out of the commit log,
   and the release notes for 0.1.0 and 0.2.0 were written after the fact. This file is that
   description, kept as the releases happen — and it is why `docs/11-OPERATIONS.md` now sends an
@@ -92,6 +112,30 @@ the reasoning behind it lives in the source comments and in the documentation un
 
 ### Fixed
 
+- **The CGI environment was wrong for every non-PHP application, in three ways that PHP could
+  not reveal.** All three are the same class of bug: the variables were built to PHP's habits
+  because PHP was the only backend, and each one is silently wrong for a WSGI or Rack
+  application. (1) **The site root carried no `PATH_INFO`.** It was omitted for `/` and for an
+  empty value alike, which is fine for PHP — it routes on `REQUEST_URI` — and wrong for a
+  runtime that dispatches on `PATH_INFO`, where an absent variable is not the same thing as
+  `"/"`: a request for `/` arrived with no path at all. It is now sent whenever it is non-empty,
+  including `"/"`. (2) **A bare `Location` was answered `200` instead of `302`.** RFC 3875
+  §6.2.3 leaves the status to the server when the application states none, and a `Location`
+  with no `Status:` is the spec's way of asking for a redirect; nginx, Caddy and Apache all
+  resolve it that way. PHP frameworks always send `Status`, so this could only ever misfire for
+  another runtime — and a `302` turned into a `200` is a header no client follows. An explicit
+  `Status` still wins. (3) **A request header named `Proxy` became `HTTP_PROXY`** — httpoxy
+  (CVE-2016-5385 and its siblings). Python, Ruby and Go HTTP clients read `HTTP_PROXY` from the
+  environment to decide where to send their *outbound* requests, so a client sending
+  `Proxy: http://attacker/` chose the proxy for the application's own upstream calls. The header
+  is now dropped rather than renamed: it has no CGI meaning, and no request may name a proxy.
+- **A `spawn_cgi` slot's stdout and stderr were discarded, and pool errors named the wrong
+  backend.** The pipes go to `Stdio::null()`, which for `php-cgi` cost a lost extension warning
+  and for any other driver cost the traceback that explains a 502 — the same reason
+  `upstream_pool` has always drained both. Separately, every transport failure was reported as
+  `backend: "spawn_cgi"` regardless of the configured name, so a deployment with two FastCGI
+  backends could not tell which one refused a request, and the message named a configuration
+  block that may not exist.
 - **A path containing `..` could reach a script outside the document root, and php-cgi ran it.**
   `route()` refused any percent-decoded path that climbed out of the root, but `route_or_dispatch()`
   — the function the server actually calls for a route that has already claimed a backend — treated

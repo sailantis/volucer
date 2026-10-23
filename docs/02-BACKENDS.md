@@ -299,6 +299,20 @@ Without the first, `check` warns that `index.php` is missing — which it is, an
 the warning telling you to set it. Without the second, a `/app.py` route resolves as
 `PATH_INFO` for the front controller instead of as a script.
 
+**Two settings are PHP-shaped by default, and a non-PHP deployment sets them explicitly.**
+`front_controller` defaults to `index.php` and `script_extensions` to `php`, `php3`,
+`phtml` — both server-level, and both meaningful only as a starting point:
+
+```toml
+[server]
+front_controller = "app.py"        # your entry point, or "" for only real files
+script_extensions = ["py"]
+```
+
+Without the first, `check` warns that `index.php` is missing — which it is, and which is
+the warning telling you to set it. Without the second, a `/app.py` route resolves as
+`PATH_INFO` for the front controller instead of as a script.
+
 ### Prefork
 
 ```toml
@@ -326,13 +340,18 @@ kills the process **group** rather than the master's pid.
 
 ### Sockets
 
-A `spawn_cgi` pool talks to its `php-cgi` processes over loopback TCP by default. `socket`
-moves it off the loopback stack, and what the setting means depends on the platform: a
-unix socket path on Linux and macOS, and a **named pipe** on Windows, because that is
-what `php-cgi -b` binds there.
+A `spawn_cgi` pool talks to its processes over loopback TCP by default. `socket` moves it
+off the loopback stack, and what the setting means depends on the platform: a unix socket
+path on Linux and macOS, and a **named pipe** on Windows, because that is what `php-cgi -b`
+binds there.
 
 Both are a *prefix* — each slot appends its index, so `\\.\pipe\volucer-cgi` gives slot 0
 the pipe `\\.\pipe\volucer-cgi.0`.
+
+A `command` slot is handed the address in `unix:` form (`unix:/run/app/py.0.sock`), both as
+the `{address}` substitution and in `VOLUCER_FCGI_ADDRESS`, because that is the spelling the
+rest of the world uses for a socket. Named pipes are refused for a `command`: the pipe is
+`php-cgi -b`'s Windows mechanism, and no other FastCGI server binds one.
 
 ## `upstream`
 

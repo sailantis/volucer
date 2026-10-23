@@ -263,17 +263,20 @@ pub struct Contention {
 /// A backend, ready to serve requests.
 #[derive(Debug)]
 pub enum Backend {
-    /// An already-running `php-fpm`, reached over its socket.
+    /// An already-running FastCGI server, reached over its socket.
     ///
-    /// volucer does not manage this pool: systemd and php-fpm do, including
-    /// `pm.max_requests` and per-pool users. We only speak FastCGI to it.
+    /// volucer does not manage this pool: systemd and the server itself do, including
+    /// `pm.max_requests` and per-pool users. We only speak FastCGI to it. Nothing about the
+    /// variant is PHP-specific — a WSGI or Rack server speaking FastCGI is the same shape, and
+    /// only the two doc comments below name `php-fpm` because it is the common case.
     External {
         name: String,
         /// Shared behind its own lock: one backend serves both front-ends, so a
         /// `&mut` here would make the whole dispatcher exclusive again.
         pool: ClientPool,
     },
-    /// A pool of `php-cgi` processes that volucer starts and supervises.
+    /// A pool of FastCGI processes that volucer starts and supervises: `php-cgi`, or any
+    /// command that serves FastCGI on the address it is given.
     SpawnCgi { name: String, pool: CgiPool },
     /// A pool of persistent PHP workers speaking volucer's own protocol.
     ///
@@ -464,12 +467,17 @@ impl Backend {
         matches!(self, Backend::External { .. } | Backend::SpawnCgi { .. })
     }
 
-    /// Whether PHP's own SAPI resets state between requests for this backend.
+    /// Whether the backend itself resets state between requests.
     ///
-    /// **Only meaningful for the three CGI-shaped kinds.** An upstream is somebody else's runtime
+    /// **Only meaningful for the CGI-shaped kinds.** An upstream is somebody else's runtime
     /// and this cannot answer for it — which is why it is not the question the front-end asks.
     /// [`BackendConfig::request_scope`] owns the three-answer version and the text `check` prints;
-    /// this is the two-answer version, kept for the callers that genuinely mean PHP.
+    /// this is the two-answer version, kept for the callers that genuinely mean "is this a
+    /// per-request process".
+    ///
+    /// Both FastCGI shapes answer `true`: `php-fpm` resets through PHP's SAPI and a `spawn_cgi`
+    /// slot through whatever the configured command is. Which mechanism it is has no bearing on
+    /// the answer.
     pub fn resets_per_request(&self) -> bool {
         matches!(self, Backend::External { .. } | Backend::SpawnCgi { .. })
     }
@@ -521,8 +529,8 @@ impl Backend {
     /// distinction is drawn by the pool itself; see [`WorkerPool::is_ready`].
     ///
     /// The three CGI-shaped kinds that are not worker pools answer `true` unconditionally, because
-    /// volucer does not own their boot: an `external` php-fpm is already running and supervised by
-    /// systemd, and a `spawn_cgi` pool's `php-cgi` processes are up before the pool is built — the
+    /// volucer does not own their boot: an `external` server is already running and supervised by
+    /// systemd, and a `spawn_cgi` pool's processes are up before the pool is built — the
     /// constructor waits for the port. A server that made a readiness probe wait for a process it did
     /// not start would be reporting on somebody else's runtime.
     pub fn is_ready(&self) -> bool {
@@ -547,7 +555,8 @@ impl Backend {
     /// Publish this backend's gauges, when it has any to publish.
     ///
     /// Only a worker pool has numbers worth graphing: an `external` pool is somebody else's to
-    /// report on, and a `spawn_cgi` pool has no per-worker telemetry because `php-cgi` has no channel
+    /// report on, and a `spawn_cgi` pool has no per-worker telemetry because a FastCGI process has
+    /// no channel
     /// to send any. A backend that published zeroes for those would make `rr_http_total_workers`
     /// claim a number nobody counted.
     pub fn publish_metrics(&self, registry: &volucer_metrics::Registry) {

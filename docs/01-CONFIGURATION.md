@@ -173,10 +173,16 @@ Two variables are set **after** the configured `env`, so a table cannot shadow e
 |---|---|
 | `VOLUCER_VERSION` | The version of the volucer that started the process. |
 | `VOLUCER_WORKER_SOCKET` | Where a `socket`-transport worker connects back — see [Worker Applications](07-WORKER-APPLICATIONS.md). |
+| `VOLUCER_FCGI_ADDRESS` | The address a `spawn_cgi` slot must bind. Only read by a `command` deployment; `php-cgi` takes it as `-b`. |
 
 `VOLUCER_VERSION` exists because a `php-cgi` per-request process or a supervised origin has no
 channel to ask the server what it is. Nothing in the SDK reads it; a worker's handshake already
 reports its own version.
+
+`VOLUCER_FCGI_ADDRESS` and the `{address}` placeholder carry the same string, so a `spawn_cgi`
+`command` may take its bind address either way — as an argument or from the environment. Both
+are written *after* the backend's `env` table, so a configured variable cannot point the program
+at an address the pool is not connecting to.
 
 ### `front_controller`
 
@@ -403,7 +409,7 @@ instead of starting processes.
 
 ### `kind = "external"`
 
-An already-running `php-fpm`.
+An already-running FastCGI server — `php-fpm`, or any other.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -414,15 +420,24 @@ An already-running `php-fpm`.
 size lives in `pm.max_children` or `PHP_FCGI_CHILDREN`, in configuration volucer has no
 access to.
 
+Nothing here is PHP-specific — it is a socket and a protocol, so a FastCGI-speaking WSGI,
+Rack or Go server is the same backend.
+
 ### `kind = "spawn_cgi"`
 
-`php-cgi` processes started by volucer. The only per-request-reset option on Windows.
+FastCGI processes started by volucer — `php-cgi`, or any program that serves FastCGI. The
+only per-request-reset option on Windows.
+
+Exactly one of `binary` and `command`:
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `binary` | path | **required** | The `php-cgi` executable. |
+| `binary` | path | — | The `php-cgi` executable. The `PHP_FCGI_*` driver. |
+| `command` | string | — | A command that starts **one slot**, with `{address}` where it must bind. |
 | `workers` | integer | `0` | How many slots. `0` means one per logical CPU. |
-| `children` | integer | `0` | `php-cgi` children behind each slot. `0` means no prefork. |
+| `children` | integer | `0` | `php-cgi` children behind each slot (`binary` only). `0` means no prefork. |
+| `capacity` | integer | `0` | Requests one slot serves at once (`command` only). `0` means one. |
+| `working_dir` | path | absent | Working directory for each started process. |
 | `bind_host` | string | `"127.0.0.1"` | Where the slots listen. Loopback only. |
 | `base_port` | integer | `19001` | The first port, when not using a socket. |
 | `socket` | string | absent | A socket prefix instead of TCP ports. |
@@ -436,9 +451,25 @@ the compiled scripts exist once. `children` counts children, **not** processes �
 count on the host. `children = 1` is therefore mapped to `0` and stays a truthful alias
 for the default.
 
+`command` is the non-PHP shape. `{address}` is replaced in every argument with the address
+that slot must bind, and the same string is exported as `VOLUCER_FCGI_ADDRESS`. A command
+using neither is refused at startup, because it would bind somewhere the pool cannot reach.
+`capacity` — not `children` — says how many requests one slot answers at once, which is the
+number your application server was told to fork; setting both keys is refused.
+
+```toml
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn myapp.wsgi --bind {address}"
+workers = 4
+capacity = 4
+working_dir = "/srv/app"
+```
+
 `socket` is a prefix too, and it means a unix socket on Linux and macOS and a **named
 pipe** on Windows, because that is what `php-cgi -b` binds there. `\\.\pipe\volucer-cgi`
-gives slot 0 the pipe `\\.\pipe\volucer-cgi.0`.
+gives slot 0 the pipe `\\.\pipe\volucer-cgi.0`. A `command` slot gets a `unix:` address and
+may not use a pipe.
 
 ### `kind = "upstream"`
 

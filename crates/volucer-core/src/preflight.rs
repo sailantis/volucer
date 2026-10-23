@@ -401,12 +401,62 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                 }
             }
             BackendConfig::SpawnCgi(cgi) => {
-                if !cgi.binary.is_file() {
-                    warnings.push(Warning::with_hint(
-                        format!("backends.{name}: {} does not exist", cgi.binary.display()),
-                        "point `binary` at the php-cgi executable for this host — \
-                         `volucer check` lists every PHP binary it found above",
-                    ));
+                // One program per driver, checked by the same rule: a mistyped path is the
+                // mistake a configuration file is most likely to make, and it is a warning here
+                // rather than an error for the reason the document root is — an image that
+                // installs the runtime in a later layer is a normal thing to check.
+                match (&cgi.binary, &cgi.command) {
+                    (Some(binary), _) if !binary.is_file() => {
+                        warnings.push(Warning::with_hint(
+                            format!("backends.{name}: {} does not exist", binary.display()),
+                            "point `binary` at the php-cgi executable for this host — \
+                             `volucer check` lists every PHP binary it found above",
+                        ));
+                    }
+                    (None, Some(command)) => {
+                        // Resolved the way the pool resolves it, so what is checked is the file
+                        // that will actually run: a bare `gunicorn` is a `PATH` lookup.
+                        let program = crate::program::split_command(command)
+                            .map(|(program, _)| program)
+                            .unwrap_or_else(|_| command.clone());
+                        let binary = crate::program::resolve_program(&program);
+                        if !binary.is_file() {
+                            warnings.push(Warning::with_hint(
+                                format!(
+                                    "backends.{name}: the slot program {} does not exist (from \
+                                     command {command:?})",
+                                    binary.display()
+                                ),
+                                "check the path or the `command` of this backend — each slot is \
+                                 started with `command`, and `{address}` is replaced with the \
+                                 address that slot must bind",
+                            ));
+                        }
+                        if let Some(dir) = &cgi.working_dir {
+                            if !dir.is_dir() {
+                                warnings.push(Warning::with_hint(
+                                    format!(
+                                        "backends.{name}: working_dir {} is not a directory",
+                                        dir.display()
+                                    ),
+                                    "a Python or Ruby application is started here, so a missing \
+                                     directory is a slot that cannot import its own code",
+                                ));
+                            }
+                        }
+                        if !command.contains(crate::config::FCGI_ADDRESS_PLACEHOLDER) {
+                            warnings.push(Warning::with_hint(
+                                format!(
+                                    "backends.{name}: the command {command:?} does not use \
+                                     {{address}}, so this slot is never told the address it must \
+                                     bind"
+                                ),
+                                "put {address} where the program expects its bind address, e.g. \
+                                 \"gunicorn app.wsgi --bind {address}\"",
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
                 if let Some(socket) = &cgi.socket {
                     warn_about_socket_prefix(warnings, &format!("backends.{name}"), socket);
@@ -417,6 +467,11 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                 // process, and whether it is there yet is not a configuration
                 // mistake. A `unix:` path can be checked cheaply, though, and a
                 // missing one is the common cause of a first-request 502.
+                //
+                // Not PHP-specific: `external` is a socket and a protocol, and the pool behind
+                // it may be `php-fpm` or any other FastCGI server. The message says "FastCGI
+                // server" for that reason — an operator reading it has to be able to match it
+                // to what they are running.
                 if let Some(path) = external.socket.strip_prefix("unix:") {
                     if !Path::new(path).exists() {
                         warnings.push(Warning::with_hint(
@@ -424,7 +479,7 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                                 "backends.{name}: nothing is listening on {} yet",
                                 external.socket
                             ),
-                            "start php-fpm before serving, or ignore this if it starts first",
+                            "start the FastCGI server before serving, or ignore this if it starts first",
                         ));
                     }
                 }

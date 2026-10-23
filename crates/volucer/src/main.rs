@@ -2369,11 +2369,28 @@ fn check(
                 );
             }
         }
-        // And a preforked `php-cgi` slot prints its width, because `workers` alone stopped being
-        // the process count when `children` existed: `workers × (children + 1)` is what the
-        // machine will run, and a reader tuning memory needs that number rather than the two
-        // factors to multiply themselves.
+        // And a `spawn_cgi` backend prints how its slots are started and how wide each is.
+        //
+        // Both lines answer questions the file alone cannot. `driver` says which of the two
+        // spawn shapes is in use, because a reader cannot tell from `binary`/`command` whether
+        // `children` or `capacity` is the one in force. The prefork line exists because
+        // `workers` alone stopped being the process count when `children` did: `workers ×
+        // (children + 1)` is what the machine will run, and a reader tuning memory needs that
+        // number rather than the two factors to multiply themselves.
         if let volucer_core::config::BackendConfig::SpawnCgi(cgi) = backend {
+            if cgi.is_php_cgi() {
+                println!("      driver:            php-cgi (binary)");
+            } else {
+                println!("      driver:            command");
+                println!(
+                    "      program:           {}",
+                    cgi.command.as_deref().unwrap_or("(none)").trim()
+                );
+                println!("      capacity:          {} per slot", cgi.slot_capacity());
+                if let Some(dir) = &cgi.working_dir {
+                    println!("      working dir:       {}", dir.display());
+                }
+            }
             if cgi.children > 0 {
                 // `workers = 0` means one per core, so the slot count has to be resolved the
                 // same way the pool resolves it; printing the configured `0` would understate

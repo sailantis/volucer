@@ -16,7 +16,10 @@ use common::{find_php_cgi, free_port_run, serial, write_script};
 
 fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
     SpawnCgiConfig {
-        binary: binary.to_path_buf(),
+        binary: Some(binary.to_path_buf()),
+        command: None,
+        capacity: 0,
+        working_dir: None,
         workers,
         bind_host: "127.0.0.1".to_string(),
         base_port,
@@ -155,7 +158,10 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
     let (root, script_name) = fixture("unix");
     let prefix = format!("/tmp/volucer-pool-unix-{}", std::process::id());
     let config = SpawnCgiConfig {
-        binary: binary.clone(),
+        binary: Some(binary.clone()),
+        command: None,
+        capacity: 0,
+        working_dir: None,
         workers: 2,
         bind_host: "127.0.0.1".to_string(),
         base_port: 19_900,
@@ -226,7 +232,10 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
     // A name unique to this process and test, so parallel binaries cannot collide.
     let prefix = format!(r"\\.\pipe\volucer-pool-{}", std::process::id());
     let config = SpawnCgiConfig {
-        binary: binary.clone(),
+        binary: Some(binary.clone()),
+        command: None,
+        capacity: 0,
+        working_dir: None,
         workers: 2,
         bind_host: "127.0.0.1".to_string(),
         base_port: 19_920,
@@ -278,7 +287,10 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
     let (root, script_name) = fixture("unix-restart");
     let prefix = format!("/tmp/volucer-pool-unix-restart-{}", std::process::id());
     let config = SpawnCgiConfig {
-        binary: binary.clone(),
+        binary: Some(binary.clone()),
+        command: None,
+        capacity: 0,
+        working_dir: None,
         workers: 1,
         bind_host: "127.0.0.1".to_string(),
         base_port: 19_950,
@@ -590,6 +602,150 @@ fn a_pool_skips_ports_that_are_already_in_use() {
 
     pool.shutdown();
     drop(blocker);
+}
+
+/// A `command` slot really serves: the placeholder becomes an address, the process binds it, and
+/// the same bytes come back as from a `binary` slot.
+///
+/// The command here is `php-cgi -b {address}` — deliberately, because it exercises every part of
+/// the command path while leaving the *server* identical to the tested one. What it proves is the
+/// machinery a non-PHP deployment depends on: `{address}` substitution, `VOLUCER_FCGI_ADDRESS`,
+/// spawning through a tokenizer rather than `Command::new(binary)`, and the readiness probe. What
+/// it does not prove is another language's dialect, which cannot be tested from here at all.
+#[test]
+fn a_command_driver_serves_through_the_address_it_was_given() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(2) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let (root, script_name) = fixture("command");
+    let config = SpawnCgiConfig {
+        binary: None,
+        command: Some(format!("{} -b {{address}}", binary.display())),
+        workers: 2,
+        bind_host: "127.0.0.1".to_string(),
+        base_port,
+        socket: None,
+        max_requests: None,
+        children: 0,
+        // One request per slot: a bare `php-cgi -b` does not prefork, so this is the honest
+        // number for what a `command` slot can answer at once.
+        capacity: 1,
+        working_dir: None,
+        env: Default::default(),
+    };
+
+    let mut pool = CgiPool::start("command-test", &config).expect("a command pool starts");
+    assert_eq!(pool.len(), 2, "one process per configured slot");
+    assert_eq!(pool.ports().len(), 2, "each slot bound its own port");
+
+    let response = pool
+        .request(&request_for(&root, &script_name, "from-a-command-slot"))
+        .expect("the slot answered");
+    response.check_protocol().expect("completed");
+    let stdout = String::from_utf8_lossy(&response.stdout);
+    assert!(
+        stdout.contains("MARK=from-a-command-slot"),
+        "the request body has to reach the application: {stdout}"
+    );
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A command that never mentions `{address}` is refused before anything is spawned.
+///
+/// The failure it prevents is the worst kind: the program ignores its address, binds something of
+/// its own, and the pool connects to nothing — so every request is a 502 after a ten-second
+/// startup timeout, with no message naming the key that was wrong.
+#[test]
+fn a_command_with_no_address_placeholder_is_a_misconfiguration() {
+    let _serial = serial();
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let config = SpawnCgiConfig {
+        binary: None,
+        // A program that exists, so the failure is unambiguously the placeholder rather than a
+        // missing file — which is what makes this a test of the rule and not of `PATH`.
+        command: Some(if cfg!(windows) {
+            "cmd /C exit".to_string()
+        } else {
+            "true".to_string()
+        }),
+        workers: 1,
+        bind_host: "127.0.0.1".to_string(),
+        base_port,
+        socket: None,
+        max_requests: None,
+        children: 0,
+        capacity: 0,
+        working_dir: None,
+        env: Default::default(),
+    };
+
+    let err = CgiPool::start("no-placeholder", &config).expect_err("must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("{address}"),
+        "the message must name the placeholder: {text}"
+    );
+}
+
+/// A `command` that exits is reported once, not retried on ten ports.
+///
+/// `php-cgi` exits when it loses a bind race, which is why that driver retries on the next port.
+/// Nothing known is true of a configured command, and retrying a program that died for the
+/// operator's own reason — a syntax error, a missing module — turns one loud failure into ten
+/// slow ones with the last one's message.
+#[test]
+fn a_command_that_exits_is_not_retried_across_ports() {
+    let _serial = serial();
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let config = SpawnCgiConfig {
+        binary: None,
+        command: Some(if cfg!(windows) {
+            // Exits immediately, and understands no `{address}` because it never looks at it.
+            "cmd /C exit 3 -b {address}".to_string()
+        } else {
+            "false -b {address}".to_string()
+        }),
+        workers: 1,
+        bind_host: "127.0.0.1".to_string(),
+        base_port,
+        socket: None,
+        max_requests: None,
+        children: 0,
+        capacity: 0,
+        working_dir: None,
+        env: Default::default(),
+    };
+
+    let started = std::time::Instant::now();
+    let err = CgiPool::start("exits", &config).expect_err("the slot cannot start");
+    assert!(
+        matches!(err, volucer_server::ServerError::StartupExited { .. }),
+        "a process that exited must be reported as such: {err:?}"
+    );
+    // The retry would take ten spawns plus the settle after each connect; this bound is what
+    // distinguishes "tried once" from "tried ten times" without measuring the port loop.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a command that exited must not be retried across ports; took {:?}",
+        started.elapsed()
+    );
 }
 
 /// Kill a process by id, without pulling in a signal crate.

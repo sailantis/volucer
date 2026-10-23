@@ -11,6 +11,11 @@
 //!   controller expects.** nginx does this with
 //!   `try_files $uri /index.php$is_args$args`; getting it wrong means either a
 //!   404 from PHP ("No input file specified") or a route that never matches.
+//! - **The environment is not PHP's alone.** The same variables carry a WSGI or Rack
+//!   application, and two of them mean something different there: `PATH_INFO` is the path the
+//!   application dispatches on, so the site root must carry `"/"` rather than nothing; and a
+//!   request header named `Proxy` must be dropped rather than becoming `HTTP_PROXY`, which
+//!   those runtimes read as "send my outbound requests here" (httpoxy).
 
 use std::path::{Path, PathBuf};
 
@@ -495,7 +500,14 @@ pub fn build_params_for(
     push_pair(&mut pairs, "SCRIPT_FILENAME", &script_filename);
     push_pair(&mut pairs, "SCRIPT_NAME", &script_name);
     push_pair(&mut pairs, "REDIRECT_STATUS", "200");
-    if !path_info.is_empty() && path_info != "/" {
+    // Sent whenever there is one, **including `"/"`**. PHP does not need it — it routes on
+    // `REQUEST_URI` and `SCRIPT_FILENAME` — but a WSGI or Rack application is handed
+    // `PATH_INFO` as the path it dispatches on, and an absent variable is not the same thing
+    // as `"/"`: a request for the site root would arrive with no path at all. nginx elides
+    // the empty case because `fastcgi_split_path_info` produces `""` for a plain script,
+    // which is the one case left out here too: a direct `/index.php` has no path *after* the
+    // script, and `""` and absent mean the same thing to every reader.
+    if !path_info.is_empty() {
         push_pair(&mut pairs, "PATH_INFO", &path_info);
     }
     if info.https {
@@ -518,6 +530,24 @@ pub fn build_params_for(
         }
         if name.eq_ignore_ascii_case("content-type") {
             push_pair(&mut pairs, "CONTENT_TYPE", value);
+            continue;
+        }
+        // **httpoxy (CVE-2016-5385 and its siblings).** A request header named `Proxy` becomes
+        // `HTTP_PROXY` under the CGI mapping, and every common HTTP client library in Python,
+        // Ruby, Go and PHP reads `HTTP_PROXY` from the environment to decide where to send its
+        // *outbound* requests. So a client that sends `Proxy: http://attacker/` makes the
+        // application's own upstream calls go through the attacker.
+        //
+        // Dropped rather than renamed because the header has no CGI meaning at all: it is not
+        // part of HTTP/1.1, and nothing a request can carry should be able to name a proxy. RFC
+        // 3875 gives the server this latitude — `HTTP_*` is defined as the *protocol* headers,
+        // and a name that no protocol uses is not one. nginx added the same exclusion.
+        //
+        // This was invisible while every backend was PHP: an application that does not make
+        // outbound HTTP requests has nothing to be redirected. It becomes reachable the moment
+        // a Python or Ruby application is served through this environment, which is the reason
+        // it is fixed here rather than left to each application.
+        if name.eq_ignore_ascii_case("proxy") {
             continue;
         }
         push_http_header(&mut pairs, name, value);
@@ -1037,6 +1067,45 @@ mod tests {
         format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"))
     }
 
+    /// httpoxy: a request header named `Proxy` must not become `HTTP_PROXY`.
+    ///
+    /// Pinned as a *request* test rather than as a note, because the failure it prevents is
+    /// silent: a Python or Ruby application that makes an outbound HTTP call reads
+    /// `HTTP_PROXY` from its environment, and nothing in the response would show that a client
+    /// had chosen the proxy.
+    #[test]
+    fn a_proxy_header_is_not_carried_into_the_environment() {
+        let root = fixture("httpoxy", &[("index.php", "<?php")]);
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        let info = RequestInfo {
+            uri: "/".to_string(),
+            headers: vec![
+                ("Proxy".to_string(), "http://attacker:8080/".to_string()),
+                ("X-Kept".to_string(), "yes".to_string()),
+            ],
+            ..RequestInfo::default()
+        };
+        let params = build_params(&info, &routing).expect("params build");
+
+        assert!(
+            !params
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case(b"HTTP_PROXY")),
+            "a request header must never reach HTTP_PROXY"
+        );
+        // And the exclusion is narrow: the neighbouring header is still mapped, so a future
+        // change that stopped translating headers altogether cannot pass this test.
+        assert!(params
+            .iter()
+            .any(|(key, value)| key.as_slice() == b"HTTP_X_KEPT" && value.as_slice() == b"yes"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_in_place_cgi_name_matches_the_formatting_it_replaced() {
         // The rewrite of the key construction is only worth having if it is the same
@@ -1084,6 +1153,35 @@ mod tests {
             .iter()
             .any(|(key, value)| key.as_slice() == b"CONTENT_TYPE"
                 && value.as_slice() == b"application/x-www-form-urlencoded"));
+    }
+
+    /// The root request must carry `PATH_INFO = "/"`, not nothing.
+    ///
+    /// The two are not interchangeable to a WSGI or Rack application, which dispatches on
+    /// `PATH_INFO` and treats an absent one as a malformed request. PHP never noticed: it routes
+    /// on `REQUEST_URI`, which this has always sent. So the case is pinned here rather than
+    /// described — omitting `"/"` was invisible for as long as every backend was PHP.
+    #[test]
+    fn the_site_root_carries_path_info_of_a_slash() {
+        let root = fixture("root-pathinfo", &[("index.php", "<?php")]);
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        let info = RequestInfo {
+            uri: "/".to_string(),
+            ..RequestInfo::default()
+        };
+        let params = build_params(&info, &routing).expect("params build");
+        assert!(
+            params
+                .iter()
+                .any(|(key, value)| key.as_slice() == b"PATH_INFO" && value.as_slice() == b"/"),
+            "the root must reach the front controller as PATH_INFO=/"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

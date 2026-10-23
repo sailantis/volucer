@@ -2872,13 +2872,19 @@ pub enum BackendConfig {
 /// Whether a backend resets state between requests in the application's own runtime.
 ///
 /// Three answers, not two, and the third is the one that would be got wrong by a boolean: an
-/// upstream is neither PHP's SAPI resetting per request nor an application-scoped PHP worker — it
+/// upstream is neither a CGI process resetting per request nor an application-scoped worker — it
 /// is somebody else's runtime, whose request scope is its own business and not something this
 /// side can describe. `check` prints exactly that rather than claiming one of the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestScope {
-    /// PHP's SAPI rebuilds it for every request (CGI, php-fpm, `php-cgi`).
-    PhpSapi,
+    /// State is reset for every request, by the backend itself.
+    ///
+    /// Both FastCGI shapes: `php-fpm` resets it through PHP's SAPI, and a `spawn_cgi` slot is
+    /// either a `php-cgi` process or whatever CGI framework the configured `command` runs. The
+    /// *mechanism* differs and volucer does not need to know which one it is — only that the
+    /// application is not expected to clear its own state, which is the fact a reader of `check`
+    /// is looking for. It was named `PhpSapi` while both backends could only run PHP.
+    PerRequest,
     /// The application lives across requests and clears its own (the worker protocol).
     ApplicationScoped,
     /// A runtime of its own, which volucer does not reach into.
@@ -2893,7 +2899,7 @@ impl RequestScope {
     /// have to be reinterpreted wherever it is printed.
     pub fn describe(self) -> &'static str {
         match self {
-            RequestScope::PhpSapi => "yes (PHP SAPI)",
+            RequestScope::PerRequest => "yes (reset by the backend, per request)",
             RequestScope::ApplicationScoped => "no (application-scoped worker)",
             RequestScope::OriginScoped => "not applicable (the origin owns its request scope)",
         }
@@ -2932,9 +2938,9 @@ impl BackendConfig {
         }
     }
 
-    /// True when the backend resets state per request in PHP's own SAPI.
+    /// True when the backend resets state per request.
     pub fn resets_per_request(&self) -> bool {
-        matches!(self.request_scope(), RequestScope::PhpSapi)
+        matches!(self.request_scope(), RequestScope::PerRequest)
     }
 
     /// Where a request's state is scoped for this backend.
@@ -2944,7 +2950,7 @@ impl BackendConfig {
             // persistent PHP process that clears its own request scope, which is the fact this
             // answers. Who called `fork()` has no bearing on it.
             BackendConfig::Worker(_) | BackendConfig::Attach(_) => RequestScope::ApplicationScoped,
-            BackendConfig::External(_) | BackendConfig::SpawnCgi(_) => RequestScope::PhpSapi,
+            BackendConfig::External(_) | BackendConfig::SpawnCgi(_) => RequestScope::PerRequest,
             BackendConfig::Upstream(_) => RequestScope::OriginScoped,
         }
     }
@@ -2977,7 +2983,10 @@ impl BackendConfig {
             BackendConfig::External(_) => {
                 "one connection per request in flight; the pool's own max_children is the limit"
             }
-            BackendConfig::SpawnCgi(_) => "one slot per listening socket, `children` requests each",
+            BackendConfig::SpawnCgi(cgi) if cgi.is_php_cgi() => {
+                "one slot per listening socket, `children` requests each"
+            }
+            BackendConfig::SpawnCgi(_) => "one slot per listening socket, `capacity` requests each",
             BackendConfig::Upstream(_) => "the origin's own loop",
         }
     }
@@ -3823,6 +3832,23 @@ pub const WORKER_SOCKET_ENV: &str = "VOLUCER_WORKER_SOCKET";
 /// container, and that variable's own value is a TCP address too.
 pub const RELAY_SOCKET_ENV: &str = "VOLUCER_RELAY_SOCKET";
 
+/// The environment variable carrying the address a `spawn_cgi` slot must bind, and the
+/// placeholder a slot's `command` may use in place of it.
+///
+/// A slot's address is decided by the pool — one per process, so that a process can be
+/// recycled, counted and reasoned about on its own — which means the program cannot choose it
+/// and has to be told. Two forms, because both exist in the wild: `command = "flup-fcgi
+/// {address}"` for a program that takes it as an argument, and this variable for one that reads
+/// its bind address from the environment.
+///
+/// The same value is in both, so a deployment may use either, or both. Both are written *after*
+/// a configured `env` table, so a table cannot point the program at an address the pool is not
+/// connecting to.
+pub const FCGI_ADDRESS_ENV: &str = "VOLUCER_FCGI_ADDRESS";
+
+/// The placeholder a `spawn_cgi` `command` uses for the address its slot must bind.
+pub const FCGI_ADDRESS_PLACEHOLDER: &str = "{address}";
+
 /// The call namespaces a worker backend may be granted, and the fixed half of the allow-list
 /// `WorkerConfig::services` is checked against.
 ///
@@ -4056,19 +4082,64 @@ impl AttachConfig {
     }
 }
 
+/// A pool of FastCGI processes volucer starts and supervises.
+///
+/// **Two drivers, one shape.** The pool's job — assign an address to each slot, spawn one
+/// process tree per address, wait until it listens, restart it when it dies, recycle it on
+/// `max_requests` — has nothing to do with PHP. What *was* PHP-shaped is the three things that
+/// differ between `php-cgi` and any other FastCGI application server, and they are the three
+/// this type now expresses as a choice:
+///
+/// | | `binary` (php-cgi) | `command` (anything else) |
+/// | --- | --- | --- |
+/// | how the address is given | `-b <address>` | `{address}` in the command, or `VOLUCER_FCGI_ADDRESS` |
+/// | concurrency inside a slot | `children` → `PHP_FCGI_CHILDREN` | `capacity` |
+/// | a unix socket on Windows | a named pipe, which is what `-b` binds there | TCP only |
+///
+/// Exactly one of [`SpawnCgiConfig::binary`] and [`SpawnCgiConfig::command`] is set. `binary`
+/// keeps every configuration written before `command` existed meaning exactly what it meant,
+/// including the prefork and pipe behaviour, because those are properties of `php-cgi` rather
+/// than of the pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnCgiConfig {
-    /// `php-cgi` binary.
-    pub binary: PathBuf,
-
-    /// Number of processes, and therefore number of ports. `0` means one per logical CPU.
+    /// The `php-cgi` binary. **Exactly one of `binary` and `command`.**
     ///
-    /// **Each of these is one process, and on Linux that is a deliberate choice rather than
-    /// the only option.** `php-cgi -b` with `PHP_FCGI_CHILDREN = n` preforking is a real
-    /// Linux feature — measured here, not assumed: `n = 4` produced exactly four children and
-    /// distributed twelve sequential requests round-robin across all four, and `SIGTERM` to
-    /// the master left none behind. The pool sets `PHP_FCGI_CHILDREN = 0` anyway (see
+    /// Kept as its own key rather than folded into `command = "php-cgi -b {address}"` because
+    /// the two are not the same thing: this one also means "export `PHP_FCGI_CHILDREN`",
+    /// "`children` is the slot's capacity", and "a Windows `socket` is a named pipe". A
+    /// deployment written before `command` existed must keep all three.
+    #[serde(default)]
+    pub binary: Option<PathBuf>,
+
+    /// A command that starts **one slot**, e.g.
+    /// `gunicorn myapp.wsgi --bind {address}` or `flup-fcgi {address}`.
+    ///
+    /// **Where the address goes.** `{address}` is replaced in every argument with the address
+    /// that slot must bind — `127.0.0.1:19001`, `unix:/run/app/py.0.sock` — and the same string
+    /// is exported as [`FCGI_ADDRESS_ENV`], so a program that reads its address from the
+    /// environment needs no placeholder at all. A placeholder is unavoidable for the majority
+    /// that take it as an argument, and an argument is the only form a shell-free tokenizer can
+    /// build safely.
+    ///
+    /// **The process must serve FastCGI on that address and nothing else.** The pool connects
+    /// to it, so an application server that ignores the address and picks its own is not
+    /// reachable — the first request is a 502 after a startup timeout, which is the failure
+    /// `check` reports as "did not start listening".
+    ///
+    /// Split by the same tokenizer a worker's `command` uses ([`crate::program::split_command`]),
+    /// which is deliberately not a shell: no variables, no globs, no operators. A deployment
+    /// that needs shell syntax writes a script and names it.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// Number of processes, and therefore number of addresses. `0` means one per logical CPU.
+    ///
+    /// **Each of these is one slot, and for the `binary` driver that is a deliberate choice
+    /// rather than the only option.** `php-cgi -b` with `PHP_FCGI_CHILDREN = n` preforking is a
+    /// real Linux feature — measured here, not assumed: `n = 4` produced exactly four children
+    /// and distributed twelve sequential requests round-robin across all four, and `SIGTERM` to
+    /// the master left none behind. The pool sets `PHP_FCGI_CHILDREN` itself (see
     /// `pool.rs`), because `workers` has to be a number the pool can enforce: a slot that
     /// hides twenty children looks idle while twenty requests run, cannot be recycled by
     /// `max_requests`, and does not stop work when it is killed.
@@ -4108,6 +4179,11 @@ pub struct SpawnCgiConfig {
     /// PHP processes per slot, sharing that slot's listening socket. `0` — the default
     /// — means one, which is what every configuration written before this key meant.
     ///
+    /// **Only meaningful with `binary`.** With `command` the number is
+    /// [`SpawnCgiConfig::capacity`], because a prefork count is `php-cgi`'s own mechanism and
+    /// exporting `PHP_FCGI_CHILDREN` to a Python process would be noise it cannot act on.
+    /// Setting both is refused rather than silently preferring one.
+    ///
     /// **This is `PHP_FCGI_CHILDREN`, and it is measured rather than asserted.** A
     /// `php-cgi -b` master forks this many children (or `CreateProcess`es them on
     /// Windows) *after* binding, and every one of them inherits the listening socket
@@ -4140,22 +4216,56 @@ pub struct SpawnCgiConfig {
     #[serde(default)]
     pub children: u32,
 
+    /// How many requests one slot may serve **at once**. Only meaningful with `command`.
+    ///
+    /// The generic form of [`SpawnCgiConfig::children`], and it exists because the pool has to
+    /// know the number for a reason that is not PHP's: [`SpawnCgiConfig::slot_capacity`] is what
+    /// admits concurrent requests to one address, and a slot with no prefork behind it can serve
+    /// exactly one. An application server that does its own forking must not be handed more
+    /// connections than it has children, or requests queue in the socket backlog where nothing
+    /// counts them — which is the same argument `ExternalConfig::max_connections` makes about
+    /// somebody else's pool.
+    ///
+    /// `0` means one, the honest answer for a program volucer did not fork. Set it to the number
+    /// of workers your server was told to start (gunicorn's `workers`, puma's `threads`).
+    ///
+    /// Refused together with `children`: one of them describes a php-cgi prefork count and the
+    /// other describes the same capacity generically, and a file stating both says two different
+    /// things about one number.
+    #[serde(default)]
+    pub capacity: u32,
+
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
     /// `pm.max_requests`. **`0` means never recycle**, as it does there.
     #[serde(default)]
     pub max_requests: Option<u64>,
 
-    /// Extra environment variables for every `php-cgi` process this backend starts.
+    /// Working directory for each started process.
+    ///
+    /// The key `worker`, a job consumer and `upstream` already have, and its absence here was
+    /// the one thing that made a non-PHP command unusable: a Python application finds its
+    /// modules relative to the working directory, a Ruby one finds `config.ru` there, and a
+    /// supervisor that guessed would start the process somewhere it cannot boot. Defaults to
+    /// the process's own directory, the same rule the other three follow.
+    ///
+    /// **Not applied to a `binary` deployment by default**, so a configuration written before
+    /// this key keeps the behaviour it had — `php-cgi` chdir's into the script's own directory
+    /// per request and a fixed working directory would change that.
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+
+    /// Extra environment variables for every process this backend starts.
     ///
     /// The same key a `worker` and an `upstream` have, and it was missing from this kind for a
     /// reason that no longer holds: every other thing `spawn_cgi` starts a process for is
-    /// declared here, so a deployment whose whole PHP configuration is `php-cgi` had no way to
+    /// declared here, so a deployment whose whole configuration is this backend had no way to
     /// set `APP_ENV` at all — the CGI environment volucer builds is the *request's*, and it
     /// carries no application configuration.
     ///
     /// Merged over [`ServerConfig::env`], so a value shared by several backends is written once.
-    /// Written *after* `PHP_FCGI_CHILDREN` and `PHP_FCGI_MAX_REQUESTS` at spawn, so a table here
-    /// cannot move either of the two numbers the pool enforces.
+    /// Written *after* `PHP_FCGI_CHILDREN`, `PHP_FCGI_MAX_REQUESTS` and
+    /// [`FCGI_ADDRESS_ENV`] at spawn, so a table here cannot move either of the numbers the pool
+    /// enforces or the address it is about to connect to.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -4171,12 +4281,37 @@ fn default_base_port() -> u16 {
 impl SpawnCgiConfig {
     /// How many requests this slot can serve at once.
     ///
-    /// `children.max(1)`, and the `max(1)` is the whole point: `children = 0` means
-    /// "do not turn prefork on", which is one process and therefore one request. Written
-    /// here rather than at the call site so the pool's capacity and the number of
-    /// processes php-cgi was told to start cannot be computed differently in two places.
+    /// `children.max(1)` for a `binary` deployment and `capacity.max(1)` for a `command` one,
+    /// and the `max(1)` is the whole point: zero means "no prefork", which is one process and
+    /// therefore one request. Written here rather than at the call site so the pool's capacity
+    /// and the number of processes the driver was told to start cannot be computed differently
+    /// in two places.
     pub fn slot_capacity(&self) -> usize {
-        self.children.max(1) as usize
+        match self.driver() {
+            SpawnDriver::PhpCgi => self.children.max(1) as usize,
+            SpawnDriver::Command => self.capacity.max(1) as usize,
+        }
+    }
+
+    /// Which of the two spawn shapes this backend is.
+    ///
+    /// Infallible because `validate` has already refused a table that names neither or both, and
+    /// a `Result` here would put an unwrap in the request path for a condition checked at
+    /// startup. A table constructed by hand in a test names one or the other; a table that names
+    /// neither is read as `Command` with no command, which `validate` refuses and which
+    /// [`SpawnCgiConfig::command_line`] reports as the misconfiguration it is.
+    pub fn driver(&self) -> SpawnDriver {
+        if self.binary.is_some() {
+            SpawnDriver::PhpCgi
+        } else {
+            SpawnDriver::Command
+        }
+    }
+
+    /// True when the `binary` driver is in use, which is the shape that exports
+    /// `PHP_FCGI_CHILDREN` and whose Windows `socket` is a named pipe.
+    pub fn is_php_cgi(&self) -> bool {
+        self.driver() == SpawnDriver::PhpCgi
     }
 
     /// The value to write to `PHP_FCGI_CHILDREN` for each slot.
@@ -4193,6 +4328,120 @@ impl SpawnCgiConfig {
             0
         } else {
             self.children
+        }
+    }
+
+    /// Refuse a table whose values cannot mean what they look like.
+    ///
+    /// Split from `Config::validate` only to keep that function readable; the messages name the
+    /// keys exactly as the file spells them.
+    pub fn validate(&self, backend: &str) -> std::result::Result<(), String> {
+        match (&self.binary, &self.command) {
+            (None, None) => {
+                return Err(format!(
+                    "backends.{backend} names neither `binary` nor `command`; set `binary` to a \
+                     php-cgi executable, or `command` to a program that serves FastCGI on \
+                     `{{address}}` (e.g. \"gunicorn app.wsgi --bind {{address}}\")"
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "backends.{backend} sets both `binary` and `command`; they are two ways to \
+                     start the same slot — `binary` is php-cgi's own argv (`-b`) plus its prefork \
+                     environment, `command` is any FastCGI server — so keep the one that \
+                     describes this deployment"
+                ))
+            }
+            (None, Some(command)) if command.trim().is_empty() => {
+                return Err(format!(
+                    "backends.{backend}.command is empty; name the program that serves this slot, \
+                     with `{{address}}` where it expects the address to bind"
+                ))
+            }
+            _ => {}
+        }
+
+        // `children` and `capacity` describe one number — how many requests one address serves
+        // at once — for the two drivers respectively. A file that sets both has said two
+        // different things about it, and silently picking one is how a pool ends up admitting
+        // more than the server behind it can answer.
+        if !self.is_php_cgi() && self.children > 0 {
+            return Err(format!(
+                "backends.{backend}.children is php-cgi's prefork count and has no meaning with \
+                 `command`; use `capacity` for the number of requests one slot may serve at once"
+            ));
+        }
+        if self.is_php_cgi() && self.capacity > 0 {
+            return Err(format!(
+                "backends.{backend}.capacity is the generic form of `children`; with `binary` the \
+                 prefork count is `children`, which is also what `PHP_FCGI_CHILDREN` receives — \
+                 set that instead"
+            ));
+        }
+
+        crate::env::check_env_table(&format!("backends.{backend}.env"), &self.env)?;
+
+        if let Some(socket) = &self.socket {
+            // A pipe is `php-cgi -b`'s Windows behaviour, not a property of the pool: a generic
+            // command is given one string and has to understand it, and no other FastCGI server
+            // binds a named pipe. Refused rather than started and left unreachable.
+            #[cfg(windows)]
+            if !self.is_php_cgi() && socket.starts_with(r"\\.\pipe\") {
+                return Err(format!(
+                    "backends.{backend}.socket is a named pipe, which only `php-cgi -b` binds; a \
+                     `command` deployment must use loopback TCP — leave `socket` unset"
+                ));
+            }
+            validate_cgi_socket(socket)
+                .map_err(|err| format!("backends.{backend}.socket: {err}"))?;
+        }
+
+        if self.bind_host != "127.0.0.1" && self.bind_host != "::1" {
+            return Err(format!(
+                "bind_host {:?} is not loopback; the FastCGI backend must never be exposed",
+                self.bind_host
+            ));
+        }
+
+        // A typo here is expensive in a way no other key is: `children = 16000`
+        // would ask php-cgi to fork sixteen thousand processes before the pool
+        // accepted its first request, and the failure would be a machine that has
+        // stopped responding rather than a message. The ceiling is well above any
+        // sane deployment — a slot is meant to be roughly core-sized — and low
+        // enough that a decimal-point mistake is a refusal.
+        const MAX_PER_SLOT: u32 = 1024;
+        if self.children > MAX_PER_SLOT || self.capacity > MAX_PER_SLOT {
+            return Err(format!(
+                "backends.{backend} asks for {} processes behind one slot, above the {MAX_PER_SLOT} \
+                 this pool will start per slot; that is almost certainly a typo — `workers` is how \
+                 many slots, `children`/`capacity` is how many serve each one",
+                self.children.max(self.capacity)
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Which of the two ways a `spawn_cgi` slot is started.
+///
+/// A value rather than a `bool` because three decisions turn on it — the argv, whether
+/// `PHP_FCGI_*` is exported, and whether a Windows `socket` is a pipe — and a boolean would have
+/// to be reinterpreted at each of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnDriver {
+    /// `php-cgi` with `-b`, `PHP_FCGI_CHILDREN` and the pipe behaviour.
+    PhpCgi,
+    /// A command with `{address}` substituted, and [`FCGI_ADDRESS_ENV`] exported.
+    Command,
+}
+
+impl SpawnDriver {
+    /// The name this is written as, for `check` and for messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpawnDriver::PhpCgi => "php-cgi",
+            SpawnDriver::Command => "command",
         }
     }
 }
@@ -5351,34 +5600,11 @@ impl Config {
                 a.validate(name).map_err(Error::Config)?;
             }
             BackendConfig::SpawnCgi(c) => {
-                crate::env::check_env_table(&format!("backends.{name}.env"), &c.env)
-                    .map_err(Error::Config)?;
-                if let Some(socket) = &c.socket {
-                    validate_cgi_socket(socket)
-                        .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
-                }
-                if c.bind_host != "127.0.0.1" && c.bind_host != "::1" {
-                    return bad(format!(
-                        "bind_host {:?} is not loopback; php-cgi should never be exposed",
-                        c.bind_host
-                    ));
-                }
-                // A typo here is expensive in a way no other key is: `children = 16000`
-                // would ask php-cgi to fork sixteen thousand processes before the pool
-                // accepted its first request, and the failure would be a machine that has
-                // stopped responding rather than a message. The ceiling is well above any
-                // sane deployment — a slot is meant to be roughly core-sized — and low
-                // enough that a decimal-point mistake is a refusal.
-                const MAX_CHILDREN_PER_SLOT: u32 = 1024;
-                if c.children > MAX_CHILDREN_PER_SLOT {
-                    return bad(format!(
-                        "children is {}, above the {MAX_CHILDREN_PER_SLOT} this pool will start \
-                         per slot; a preforked master forks that many processes on startup, so \
-                         this is almost certainly a typo — `workers` is how many slots, `children` \
-                         is how many PHP processes share each one",
-                        c.children
-                    ));
-                }
+                // One call, because the rules are about this table alone: which driver is in
+                // use, whether `children`/`capacity` describe the same number twice, and
+                // whether a `socket` is a shape the driver can bind. Kept on the type rather
+                // than here so `spawn_cgi`'s rules are not split across two files.
+                c.validate(name).map_err(Error::Config)?;
             }
             BackendConfig::Upstream(u) => {
                 crate::env::check_env_table(&format!("backends.{name}.env"), &u.env)
@@ -7081,7 +7307,6 @@ socket = "unix:/run/volucer/consumer"
 
     /// `children` decides both the pool's capacity and `PHP_FCGI_CHILDREN`, and the two must
     /// agree — which means `children = 1` must not ask php-cgi for "a master plus one child".
-    ///
     /// The failure this pins was measured, not hypothetical: with the raw value written
     /// through, `children = 1` started **two** processes and served one pid, so an operator
     /// who wrote `1` got two PHP boots for one request's worth of capacity. The mapping lives
@@ -7090,13 +7315,16 @@ socket = "unix:/run/volucer/consumer"
     fn children_decides_process_count_and_capacity_together() {
         fn config(children: u32) -> SpawnCgiConfig {
             SpawnCgiConfig {
-                binary: PathBuf::from("/usr/bin/php-cgi"),
+                binary: Some(PathBuf::from("/usr/bin/php-cgi")),
+                command: None,
                 workers: 1,
                 bind_host: "127.0.0.1".to_string(),
                 base_port: 19_001,
                 socket: None,
                 children,
+                capacity: 0,
                 max_requests: None,
+                working_dir: None,
                 env: Default::default(),
             }
         }
@@ -7148,6 +7376,147 @@ children = 100000
             err.contains("typo"),
             "the message must say what it probably is: {err}"
         );
+    }
+
+    /// The two drivers are told apart by which key is set, and neither is a default.
+    ///
+    /// A table that names neither cannot be started — there is no program to run — and a table
+    /// that names both has said two different things about how one slot is started. Both are
+    /// refused at validation, so the failure is a message naming the keys rather than a pool of
+    /// slots that spawn nothing.
+    #[test]
+    fn a_spawn_cgi_backend_must_name_exactly_one_program() {
+        fn error(text: &str) -> String {
+            Config::from_toml(text)
+                .expect("the shape parses; the refusal is validation")
+                .validate()
+                .expect_err("must be refused")
+                .to_string()
+        }
+
+        let neither = r#"
+[server]
+default_backend = "cgi"
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+"#;
+        let err = error(neither);
+        assert!(err.contains("binary") && err.contains("command"), "{err}");
+
+        let both = r#"
+[server]
+default_backend = "cgi"
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+command = "gunicorn app.wsgi --bind {address}"
+"#;
+        let err = error(both);
+        assert!(
+            err.contains("both") && err.contains("command"),
+            "a file naming both must say so: {err}"
+        );
+    }
+
+    /// A `command` deployment is accepted, and `capacity` — not `children` — is its width.
+    #[test]
+    fn a_command_driver_uses_capacity_for_its_slot_width() {
+        let text = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --bind {address}"
+workers = 2
+capacity = 4
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("validates");
+        let BackendConfig::SpawnCgi(cgi) = &config.backends["py"] else {
+            panic!("expected spawn_cgi");
+        };
+        assert_eq!(cgi.driver(), SpawnDriver::Command);
+        assert!(!cgi.is_php_cgi());
+        assert_eq!(cgi.slot_capacity(), 4);
+        // Not consulted, so a `command` deployment does not accidentally write
+        // `PHP_FCGI_CHILDREN` into a Python process.
+        assert_eq!(cgi.fcgi_children(), 0);
+    }
+
+    /// `children` and `capacity` describe one number, so a file setting both is refused.
+    ///
+    /// The failure this prevents is silent: whichever the pool preferred would be the width, and
+    /// the other key would be a setting an operator believes is in force.
+    #[test]
+    fn children_and_capacity_cannot_both_describe_one_slot() {
+        let command_with_children = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --bind {address}"
+children = 4
+"#;
+        let err = Config::from_toml(command_with_children)
+            .expect("parses")
+            .validate()
+            .expect_err("must be refused")
+            .to_string();
+        assert!(
+            err.contains("children") && err.contains("capacity"),
+            "{err}"
+        );
+
+        let binary_with_capacity = r#"
+[server]
+default_backend = "cgi"
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+capacity = 4
+"#;
+        let err = Config::from_toml(binary_with_capacity)
+            .expect("parses")
+            .validate()
+            .expect_err("must be refused")
+            .to_string();
+        assert!(
+            err.contains("capacity") && err.contains("children"),
+            "{err}"
+        );
+    }
+
+    /// A `binary` deployment written before `command` existed keeps its meaning exactly.
+    ///
+    /// The compatibility property that makes this an optional key rather than a new variant: a
+    /// file that names only `binary` must be `PhpCgi`, with `children` as its width and no
+    /// requirement for a placeholder it has never heard of.
+    #[test]
+    fn an_existing_binary_configuration_is_still_the_php_cgi_driver() {
+        let text = r#"
+[server]
+default_backend = "cgi"
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+children = 8
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("validates");
+        let BackendConfig::SpawnCgi(cgi) = &config.backends["cgi"] else {
+            panic!("expected spawn_cgi");
+        };
+        assert_eq!(cgi.driver(), SpawnDriver::PhpCgi);
+        assert!(cgi.is_php_cgi());
+        assert_eq!(cgi.slot_capacity(), 8);
+        assert_eq!(cgi.fcgi_children(), 8);
+        assert!(cgi.working_dir.is_none(), "an absent key stays absent");
     }
 
     #[test]

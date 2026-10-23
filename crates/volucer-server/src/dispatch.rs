@@ -637,8 +637,8 @@ impl Dispatcher {
                 }
                 // The other three kinds have no channel, so there is nothing to install a handler
                 // on and nothing that can call. Not an oversight: `spawn_cgi` and `external` speak
-                // FastCGI to PHP, which has no call surface at all, and an upstream is somebody
-                // else's process.
+                // FastCGI, which has no call surface at all — no frame a server could carry a
+                // method name in — and an upstream is somebody else's process.
                 _ => None,
             };
             backends.insert(
@@ -661,7 +661,7 @@ impl Dispatcher {
 
         // No backends at all is a legitimate deployment rather than a mistake: a
         // listener with nothing to dispatch to is how static files are served
-        // without PHP, and with no backends there is also no route that could
+        // without any backend at all, and with no backends there is also no route that could
         // select one, because `Config::validate` requires every route to name a
         // configured backend. It is allowed here so that `check` and `serve`
         // agree about the file — `check` reports it as a warning, because a server
@@ -971,13 +971,14 @@ impl Dispatcher {
     /// Whether every worker pool can serve a request now.
     ///
     /// **Only worker pools count, and the asymmetry is the point.** A pool that volucer started
-    /// itself is the one that spends a measurable time booting — four PHP processes, each loading
-    /// an application — so it is the one a readiness probe should wait for. An `external` php-fpm is
-    /// already running and supervised by systemd, and an `upstream` origin is somebody else's
-    /// process; waiting for either would be this server reporting on a runtime it does not own.
+    /// itself is the one that spends a measurable time booting — four worker processes, each
+    /// loading an application — so it is the one a readiness probe should wait for. An `external`
+    /// FastCGI server is already running and supervised by systemd, and an `upstream` origin is
+    /// somebody else's process; waiting for either would be this server reporting on a runtime it
+    /// does not own.
     ///
     /// A dispatcher with no worker pools at all is ready, which is the honest answer for a
-    /// static-only deployment or one behind an already-running FPM.
+    /// static-only deployment or one behind an already-running FastCGI pool.
     pub fn is_ready(&self) -> bool {
         self.backends.values().all(|backend| backend.is_ready())
     }

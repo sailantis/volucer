@@ -1,12 +1,13 @@
-//! A pool of `php-cgi` slots, each a listening socket with a process tree behind it.
+//! A pool of FastCGI slots, each an address with a process tree behind it.
 //!
-//! This is the `spawn_cgi` backend, and on Windows it is the only way to get
-//! per-request SAPI reset at all. The shape is forced by the platform:
+//! This is the `spawn_cgi` backend, and it is the only way to get a per-request reset on
+//! Windows, where `php-fpm` does not exist. The shape is forced by the platform:
 //!
-//! - **A slot is an address with a capacity**, not a process. `children = 0` — the
-//!   default — is one process per slot. `children = n`
-//!   is a preforked master plus `n` children, all sharing the one listening socket and the
-//!   one OPcache segment; each child accepts its own connections.
+//! - **A slot is an address with a capacity**, not a process. `children = 0` (or `capacity = 0`)
+//!   is one process per slot. `children = n` is a preforked master plus `n` children, all
+//!   sharing the one listening socket and the one OPcache segment; each child accepts its own
+//!   connections. `capacity = n` is the same number for a `command` slot, which does its own
+//!   forking and reports its width instead of having it dictated.
 //! - **`PHP_FCGI_CHILDREN` works on both platforms**, by different mechanisms: `fork()` on
 //!   Unix (`cgi_main.c:1995`) and `CreateProcess` on Windows (`cgi_main.c:2083`). An earlier
 //!   version of this comment said the Linux path ignored
@@ -15,16 +16,22 @@
 //! - Several processes cannot share one port via `SO_REUSEADDR` on Windows, so each *slot*
 //!   needs its own port. Within a slot, the children share the one bound socket because the
 //!   master binds once and forks afterwards.
-//! - FastCGI request ids would allow multiplexing, but `php-cgi` refuses it outright —
-//!   `FCGI_MPXS_CONNS` is `0` (`main/fastcgi.c:490`) and the accept loop is one request at a
-//!   time (`cgi_main.c:2276`). So more concurrency out of one slot means more processes,
-//!   which is exactly what `children` is, and a demux table would buy nothing.
+//! - FastCGI request ids would allow multiplexing, but neither driver does `FCGI_MPXS_CONNS` —
+//!   `php-cgi` refuses it outright (`main/fastcgi.c:490`) and an application server behind
+//!   `command` is an ordinary CGI framework, so one request per connection either way. More
+//!   concurrency out of one slot means more processes, which is what `children` and `capacity`
+//!   are, and a demux table would buy nothing.
 //!
-//! The pool owns the processes, assigns the addresses, health-checks by connecting,
-//! restarts a slot that died, and lends a connection per request. Concurrency within a slot
-//! is admitted by [`SlotPermits`] rather than by the slot's lock, so a slot's lock is held
-//! only for bookkeeping — which is what lets `children` requests be in flight against one
-//! address at once.
+//! **Two drivers, one pool.** Everything above the spawn is shared: the addresses, the
+//! readiness probe, the restart on death, `max_requests`, and the per-slot admission. What
+//! differs is the argv ([`SpawnDriver`]) and whether `PHP_FCGI_*` is exported — so the pool
+//! holds a [`SlotLaunch`] and asks it to build a command, rather than branching at every site.
+//!
+//! The pool owns the processes, assigns the addresses, health-checks by connecting, restarts a
+//! slot that died, and lends a connection per request. Concurrency within a slot is admitted by
+//! [`SlotPermits`] rather than by the slot's lock, so a slot's lock is held only for
+//! bookkeeping — which is what lets a slot's whole capacity be in flight against one address at
+//! once.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -34,7 +41,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use volucer_core::config::SpawnCgiConfig;
+use volucer_core::config::{
+    SpawnCgiConfig, SpawnDriver, FCGI_ADDRESS_ENV, FCGI_ADDRESS_PLACEHOLDER,
+};
+use volucer_core::program::{resolve_program, split_command};
 use volucer_fcgi::{Client, Endpoint, Request, Response};
 
 use crate::error::{Hint, Result, ServerError};
@@ -145,15 +155,21 @@ fn exchange(
     endpoint: &Endpoint,
     request: &Request,
     take: Option<Client>,
+    backend: &str,
 ) -> Result<(Response, Client)> {
     // Reuse the connection only when the previous request said it may be
-    // reused; `php-cgi` may close after every request, and assuming
+    // reused; a CGI backend may close after every request, and assuming
     // otherwise is how a pool ends up writing into a dead socket.
+    //
+    // **Named**, not hardcoded: this used to report every failure as
+    // `backend: "spawn_cgi"`, so a deployment with two FastCGI backends could not tell which
+    // one refused the request from the error — and the log line named a configuration block
+    // that may not even exist under that name.
     let mut client = match take {
         Some(client) if client.is_reusable() => client,
         _ => Client::connect(endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
             ServerError::Worker {
-                backend: "spawn_cgi".to_string(),
+                backend: backend.to_string(),
                 source,
             }
         })?,
@@ -163,21 +179,21 @@ fn exchange(
     loop {
         match client.request(request) {
             Ok(response) => return Ok((response, client)),
-            // One retry on a transport error: a slot may have recycled
-            // between requests without the port changing, and php-cgi closes
-            // the connection even when keep-alive was requested.
+            // One retry on a transport error: a slot may have recycled between requests
+            // without the address changing, and `php-cgi` closes the connection even when
+            // keep-alive was requested.
             Err(err) if attempt == 0 && retryable(&err) => {
                 attempt += 1;
                 client = Client::connect(endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
                     ServerError::Worker {
-                        backend: "spawn_cgi".to_string(),
+                        backend: backend.to_string(),
                         source,
                     }
                 })?;
             }
             Err(source) => {
                 return Err(ServerError::Worker {
-                    backend: "spawn_cgi".to_string(),
+                    backend: backend.to_string(),
                     source,
                 })
             }
@@ -208,6 +224,241 @@ fn retryable(err: &volucer_fcgi::FcgiError) -> bool {
     is_connection_error(err)
 }
 
+/// How one slot's process is started, resolved once at construction.
+///
+/// A value rather than a branch at every spawn site, and *resolved* rather than read from the
+/// configuration again: a replacement slot must be started on the terms the pool was configured
+/// with, not on whatever the file says now — the same rule `children` and `env` follow.
+#[derive(Debug, Clone)]
+struct SlotLaunch {
+    kind: SlotKind,
+    /// The environment every slot is started with, already merged over `[server.env]`.
+    env: BTreeMap<String, String>,
+    working_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum SlotKind {
+    /// `php-cgi -b <address>` plus the prefork variables.
+    PhpCgi {
+        binary: PathBuf,
+        /// `PHP_FCGI_CHILDREN`: `0` for one process, `n` for a preforked master.
+        children: u32,
+    },
+    /// A configured command, with `{address}` substituted per slot.
+    Command {
+        /// The program, resolved through `PATH` once so a mistyped name is a startup error
+        /// rather than a pool of 502s, and so `check` and `serve` agree about which file runs.
+        binary: PathBuf,
+        /// The remaining tokens, still carrying `{address}` where the operator put it.
+        args: Vec<String>,
+    },
+}
+
+impl SlotLaunch {
+    /// Resolve a slot's launch from the configuration, before anything is spawned.
+    ///
+    /// Every check that can be made without a process happens here, so a mistyped `binary` or
+    /// `command` is a startup failure naming the key rather than a slot that spawns and exits.
+    fn from_config(config: &SpawnCgiConfig, backend: &str) -> Result<Self> {
+        let kind = match config.driver() {
+            SpawnDriver::PhpCgi => {
+                let binary = config
+                    .binary
+                    .clone()
+                    .ok_or_else(|| ServerError::Misconfigured {
+                        backend: backend.to_string(),
+                        reason: "`binary` is required for the php-cgi driver".to_string(),
+                    })?;
+                if !binary.is_file() {
+                    return Err(ServerError::Misconfigured {
+                        backend: backend.to_string(),
+                        reason: format!("{} does not exist", binary.display()),
+                    });
+                }
+                SlotKind::PhpCgi {
+                    binary,
+                    children: config.fcgi_children(),
+                }
+            }
+            SpawnDriver::Command => {
+                let command =
+                    config
+                        .command
+                        .as_deref()
+                        .ok_or_else(|| ServerError::Misconfigured {
+                            backend: backend.to_string(),
+                            reason: "`command` is required when no `binary` is set".to_string(),
+                        })?;
+                let (program, args) =
+                    split_command(command).map_err(|reason| ServerError::Misconfigured {
+                        backend: backend.to_string(),
+                        reason,
+                    })?;
+                let binary = resolve_program(&program);
+                if !binary.is_file() {
+                    return Err(ServerError::Misconfigured {
+                        backend: backend.to_string(),
+                        reason: format!(
+                            "the slot program {} does not exist (from command {command:?})",
+                            binary.display()
+                        ),
+                    });
+                }
+                // Checked here rather than at the spawn, because the failure it prevents is
+                // worse than a wrong path: a command with no `{address}` and no reader of
+                // `VOLUCER_FCGI_ADDRESS` ignores the address it was given and binds somewhere
+                // of its own, so the pool connects to nothing and every request is a 502 after
+                // the startup timeout. There is no way to tell the two apart from here, so the
+                // placeholder requirement is stated rather than guessed: the variable is
+                // documented as the alternative for a program that reads one, and a program
+                // that reads *neither* cannot be started by a supervisor that assigns
+                // addresses.
+                if !args
+                    .iter()
+                    .any(|arg| arg.contains(FCGI_ADDRESS_PLACEHOLDER))
+                {
+                    // `{address}` may also be the program's own path, which is legal though
+                    // unusual — `resolve_program` would have failed on it, so it cannot reach
+                    // here; the check is on the args for that reason.
+                    return Err(ServerError::Misconfigured {
+                        backend: backend.to_string(),
+                        reason: format!(
+                            "the command {command:?} does not use {FCGI_ADDRESS_PLACEHOLDER}, so \
+                             this slot would never be told the address to bind; put \
+                             {FCGI_ADDRESS_PLACEHOLDER} where the program expects it (e.g. \
+                             \"gunicorn app.wsgi --bind {FCGI_ADDRESS_PLACEHOLDER}\"), or, if it \
+                             reads {FCGI_ADDRESS_ENV} from the environment, name it in the command \
+                             so the placeholder is still present"
+                        ),
+                    });
+                }
+                SlotKind::Command { binary, args }
+            }
+        };
+
+        if let Some(dir) = &config.working_dir {
+            if !dir.is_dir() {
+                return Err(ServerError::Misconfigured {
+                    backend: backend.to_string(),
+                    reason: format!("working_dir {} is not a directory", dir.display()),
+                });
+            }
+        }
+
+        Ok(SlotLaunch {
+            kind,
+            env: config.env.clone(),
+            working_dir: config.working_dir.clone(),
+        })
+    }
+
+    /// The command for one slot, with the address substituted.
+    fn command(&self, address: &str) -> Command {
+        match &self.kind {
+            SlotKind::PhpCgi { binary, children } => {
+                let mut command = Command::new(binary);
+                command
+                    .arg("-b")
+                    .arg(address)
+                    // php-cgi's own preforking, which the pool *declares* rather than
+                    // suppresses.
+                    //
+                    // A `php-cgi` started with `-b` is not necessarily one process: it is a
+                    // parent that forks (or, on Windows, `CreateProcess`es)
+                    // `PHP_FCGI_CHILDREN` children, all sharing the one bound socket, and each
+                    // child accepts its own connections. The variable is read from php-cgi's
+                    // *own* environment (`cgi_main.c:1964`), so leaving it unset inherits
+                    // whatever a deployment exported for php-fpm — measured at 20 on a 12-core
+                    // machine, which made `workers` a lie.
+                    //
+                    // So the value is always written, and it is always the pool's own
+                    // decision: `children`, or `0` to mean one process per slot.
+                    .env("PHP_FCGI_CHILDREN", children.to_string())
+                    .env("PHP_FCGI_MAX_REQUESTS", "0")
+                    .envs(&self.env);
+                command
+            }
+            SlotKind::Command { binary, args } => {
+                let mut command = Command::new(binary);
+                // `replace` rather than a shell: the tokenizer has already made each token one
+                // argument, so a path with a space in it stays one argument, and an address can
+                // never become shell syntax. A token may carry the placeholder more than once
+                // and any number of tokens may — `--bind {address} --pidfile {address}.pid` is
+                // an ordinary pairing.
+                for arg in args {
+                    command.arg(arg.replace(FCGI_ADDRESS_PLACEHOLDER, address));
+                }
+                command.envs(&self.env);
+                command
+            }
+        }
+    }
+
+    /// The binary, for error messages.
+    fn binary(&self) -> &Path {
+        match &self.kind {
+            SlotKind::PhpCgi { binary, .. } => binary,
+            SlotKind::Command { binary, .. } => binary,
+        }
+    }
+
+    /// Whether this driver's process is known to exit when it loses the bind race.
+    ///
+    /// `php-cgi` does — `exit()` after a failed `bind()`, which is the whole reason
+    /// [`CgiPool::spawn_port_slot`] retries on the next port. A configured command's behaviour
+    /// is not knowable from here, and retrying a program that died for the operator's own reason
+    /// (a syntax error, a missing module) would turn one loud failure into ten slow ones. So the
+    /// retry stays a php-cgi property, which is the one thing about the two drivers that differs
+    /// in *policy* rather than in argv.
+    fn retries_lost_bind(&self) -> bool {
+        matches!(self.kind, SlotKind::PhpCgi { .. })
+    }
+}
+
+/// Read a slot's output pipe into the log until it closes.
+///
+/// A thread per pipe rather than `Stdio::null()`, because the reason a non-PHP slot never started
+/// listening is usually one line in one of these: a Python traceback, a Ruby `LoadError`, a
+/// `php-cgi` warning about an extension. Nulling them turned every one of those into a bare
+/// startup timeout.
+///
+/// `debug` rather than `info`, and that is the same level `upstream_pool` uses for an origin's
+/// output: an application's access log belongs to the application, and a server that echoed every
+/// request line at `info` would bury its own operational messages. A crash still surfaces —
+/// through the slot's exit status in `StartupExited`, and through this line when the level is
+/// raised.
+///
+/// The thread is detached and ends when the pipe does, which happens when the child exits or is
+/// killed: nothing joins it, and nothing needs to, because it owns no state the pool reads.
+fn drain<R>(backend: String, pid: u32, source: R, stream: &'static str)
+where
+    R: std::io::Read + Send + 'static,
+{
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(source);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line);
+                    let text = text.trim_end();
+                    if !text.is_empty() {
+                        tracing::debug!(backend = %backend, pid, stream, line = %text, "slot output");
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(backend = %backend, pid, stream, %err, "slot output ended");
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// Where a slot binds: a loopback port, a unix socket path, or a Windows pipe.
 #[derive(Debug, Clone)]
 enum SlotAddress {
@@ -218,11 +469,23 @@ enum SlotAddress {
 }
 
 impl SlotAddress {
-    /// The string `php-cgi -b` is given.
-    fn bind_argument(&self, bind_host: &str) -> String {
+    /// The address string this slot's program is given.
+    ///
+    /// **One string, both drivers.** `php-cgi -b` takes a bare path for a unix socket and
+    /// `host:port` for TCP; a configured command is handed the `unix:` form, because that is
+    /// what the rest of the world spells a socket and what the same value looks like in
+    /// [`FCGI_ADDRESS_ENV`] — a program reading the variable and a program reading the argument
+    /// must not see two spellings of one address.
+    fn bind_argument(&self, bind_host: &str, driver: SpawnDriver) -> String {
         match self {
             SlotAddress::Port(port) => format!("{bind_host}:{port}"),
-            SlotAddress::Socket(path) => path.display().to_string(),
+            SlotAddress::Socket(path) => match driver {
+                // `php-cgi -b` parses its argument and only falls back to TCP when it contains
+                // a `:` or is all digits, so the bare path is the form it understands. The
+                // `unix:` prefix would be taken as a host name.
+                SpawnDriver::PhpCgi => path.display().to_string(),
+                SpawnDriver::Command => format!("unix:{}", path.display()),
+            },
             #[cfg(windows)]
             SlotAddress::Pipe(name) => name.display().to_string(),
         }
@@ -234,12 +497,12 @@ impl SlotAddress {
     /// unrepresentable as an [`Endpoint`] on Windows; config validation rejects
     /// such a configuration before a pool is built, so reaching the error here
     /// means the pool was constructed by hand.
-    fn endpoint(&self, bind_host: &str) -> Result<Endpoint> {
+    fn endpoint(&self, bind_host: &str, backend: &str) -> Result<Endpoint> {
         match self {
             SlotAddress::Port(port) => Ok(Endpoint::Tcp(format!("{bind_host}:{port}"))),
             SlotAddress::Socket(path) => Endpoint::parse(&format!("unix:{}", path.display()))
                 .map_err(|source| ServerError::Misconfigured {
-                    backend: "spawn_cgi".to_string(),
+                    backend: backend.to_string(),
                     reason: format!("{} cannot be a unix socket here: {source}", path.display()),
                 }),
             #[cfg(windows)]
@@ -282,30 +545,26 @@ pub struct CgiPool {
     slots: Vec<Mutex<Slot>>,
     /// Admission per slot, so a slot's capacity is enforced without holding its lock.
     ///
-    /// Sized to the slot count and created from `config.children`, so a slot's permit count
-    /// and the number of processes `php-cgi` was told to fork are the same number read from
-    /// the same place ([`SpawnCgiConfig::slot_capacity`]).
+    /// Sized to the slot count and created from `config.slot_capacity()`, so a slot's permit
+    /// count and the number of processes the driver was told to start are the same number read
+    /// from the same place.
     permits: Vec<SlotPermits>,
     /// Round-robin position, so work and therefore memory are spread evenly.
     cursor: AtomicUsize,
-    binary: PathBuf,
+    /// How one slot's process is started, resolved once at construction.
+    ///
+    /// Held as a value rather than re-derived from the configuration, because a replacement slot
+    /// must be started on the terms the pool was configured with — the same rule `capacity` and
+    /// `env` follow.
+    launch: SlotLaunch,
+    /// Which driver built `launch`, for the three decisions that are not about argv: whether a
+    /// Windows `socket` is a pipe, how a unix address is spelled, and whether a lost bind is
+    /// retried.
+    driver: SpawnDriver,
     bind_host: String,
     /// Socket paths this pool bound and therefore must unlink on the way out.
     socket_paths: Vec<PathBuf>,
-    /// `PHP_FCGI_CHILDREN` for every slot: `0` for one process, `n` for a preforked master.
-    ///
-    /// Stored because a *replacement* slot must fork what the slot it replaces forked, and
-    /// read from the configuration at startup rather than per spawn so a respawn cannot
-    /// disagree with the pool's own capacity. Already mapped through
-    /// [`SpawnCgiConfig::fcgi_children`], so `1` never reaches php-cgi as "a master plus one
-    /// child".
-    children: u32,
     max_requests: Option<u64>,
-    /// The environment every slot is started with, already merged over `[server.env]`.
-    ///
-    /// Captured at construction for the same reason `children` is: a replacement slot must be
-    /// started on the terms the pool was configured with, not on whatever the file says now.
-    env: BTreeMap<String, String>,
     /// Held for the life of the pool; dropping it reaps every slot.
     _guard: LifecycleGuard,
 }
@@ -367,12 +626,10 @@ impl SlotPermits {
 impl CgiPool {
     /// Start a pool from configuration.
     pub fn start(name: &str, config: &SpawnCgiConfig) -> Result<Self> {
-        if !config.binary.is_file() {
-            return Err(ServerError::Misconfigured {
-                backend: name.to_string(),
-                reason: format!("{} does not exist", config.binary.display()),
-            });
-        }
+        // Resolved before anything is spawned: a mistyped `binary`, a `command` naming a program
+        // that is not there, and a command with no `{address}` are all startup failures that name
+        // the key rather than a pool of slots that spawn and exit.
+        let launch = SlotLaunch::from_config(config, name)?;
 
         let guard = LifecycleGuard::new(&format!("volucer-{name}")).map_err(|source| {
             ServerError::Misconfigured {
@@ -388,12 +645,11 @@ impl CgiPool {
             slots: Vec::with_capacity(count as usize),
             permits: (0..count).map(|_| SlotPermits::new(capacity)).collect(),
             cursor: AtomicUsize::new(0),
-            binary: config.binary.clone(),
+            launch,
+            driver: config.driver(),
             bind_host: config.bind_host.clone(),
             socket_paths: Vec::new(),
-            children: config.fcgi_children(),
             max_requests: config.max_requests,
-            env: config.env.clone(),
             _guard: guard,
         };
 
@@ -402,8 +658,10 @@ impl CgiPool {
         tracing::info!(
             backend = %pool.name,
             slots = pool.slots.len(),
-            binary = %pool.binary.display(),
-            "php-cgi pool started"
+            driver = pool.driver.as_str(),
+            program = %pool.launch.binary().display(),
+            capacity = pool.permits.first().map_or(0, |permits| permits.capacity),
+            "FastCGI pool started"
         );
         Ok(pool)
     }
@@ -481,7 +739,12 @@ impl CgiPool {
                     // the binary, the bind host and the lifecycle guard, and mutates none of
                     // them. `CgiPool::start` has not published this pool to anyone yet.
                     scope.spawn(move || match address {
-                        SlotAddress::Port(first) => pool.spawn_port_slot(*first),
+                        // Only a driver whose process exits on a lost bind gets a retry — see
+                        // `SlotLaunch::retries_lost_bind`. A configured command that dies is
+                        // reported as itself, because the next port would not be the fix.
+                        SlotAddress::Port(first) if pool.launch.retries_lost_bind() => {
+                            pool.spawn_port_slot(*first)
+                        }
                         other => pool.spawn_slot(other),
                     })
                 })
@@ -568,7 +831,7 @@ impl CgiPool {
                         backend = %self.name,
                         port,
                         attempt = attempts,
-                        "php-cgi exited while binding; trying the next port"
+                        "the slot exited while binding; trying the next port"
                     );
                     port = port
                         .checked_add(1)
@@ -583,64 +846,64 @@ impl CgiPool {
     }
 
     fn spawn_slot(&self, address: &SlotAddress) -> Result<Slot> {
-        let mut command = Command::new(&self.binary);
+        let bind = address.bind_argument(&self.bind_host, self.driver);
+        let mut command = self.launch.command(&bind);
+        // Written after the configured `env`, so a table cannot point the program at an address
+        // the pool is not connecting to — the same ordering `VOLUCER_WORKER_SOCKET` uses for a
+        // worker's address. Exported for both drivers: `php-cgi` ignores it, and a command that
+        // reads it instead of taking `{address}` is the case this exists for.
         command
-            .arg("-b")
-            .arg(address.bind_argument(&self.bind_host))
-            // php-cgi's own preforking, which the pool now *declares* rather than suppresses.
-            //
-            // A `php-cgi` started with `-b` is not necessarily one process: it is a parent
-            // that forks (or, on Windows, `CreateProcess`es) `PHP_FCGI_CHILDREN` children,
-            // all sharing the one bound socket, and each child accepts its own connections.
-            // The variable is read from php-cgi's *own* environment (`cgi_main.c:1964`), so
-            // leaving it unset inherits whatever a deployment exported for php-fpm — measured
-            // at 20 on a 12-core machine, which made `workers` a lie.
-            //
-            // So the value is always written, and it is always the pool's own decision:
-            // `children`, or `0` to mean one process per slot. `0` rather than `1` because
-            // php-cgi spawns CHILDREN *in addition to itself* — measured against php-cgi
-            // 8.3.31, `0` gives exactly one process and `1` gives two.
-            //
-            // `fcgi_children()`, not `children`: php-cgi spawns CHILDREN *in addition to
-            // itself*, so `children = 1` would be a master plus a child — two PHP boots for a
-            // slot that can still serve one request, because one child accepts one connection.
-            // Measured: `1` gave two processes and one pid answering. The accessor maps
-            // `children <= 1` to `0`, so `children = 1` means what it looks like.
-            .env("PHP_FCGI_CHILDREN", self.children.to_string())
-            .env("PHP_FCGI_MAX_REQUESTS", "0")
-            // The deployment's own variables last, so a table cannot move either number above —
-            // the same ordering `VOLUCER_WORKER_SOCKET` uses for a worker's address. These are the
-            // only way an application running under `php-cgi` is configured at all: the CGI
-            // environment volucer builds per request carries request data and nothing else.
-            .envs(&self.env)
-            // And the version after them, so it cannot be shadowed.
+            .env(FCGI_ADDRESS_ENV, &bind)
+            // And the version last, so it cannot be shadowed.
             .env(volucer_core::config::VERSION_ENV, crate::build::VERSION);
+        if let Some(dir) = &self.launch.working_dir {
+            command.current_dir(dir);
+        }
+        // **Piped and drained, not nulled.** A `php-cgi` slot with a broken extension writes a
+        // start-up warning here and then serves; a Python or Ruby application writes the
+        // traceback that explains why it will not, and nulling it left an operator with a 502
+        // and no reason. The same courtesy `upstream_pool` extends to a supervised origin, and
+        // for the same reason: a dropped pipe is the half of the story that matters.
+        //
+        // stdin stays null: nothing volucer starts here reads it, and a program that blocks on
+        // a terminal that never arrives would hang the slot rather than fail it.
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         configure_command(&mut command);
 
-        let child = command.spawn().map_err(|source| ServerError::Spawn {
-            binary: self.binary.clone(),
+        let mut child = command.spawn().map_err(|source| ServerError::Spawn {
+            binary: self.launch.binary().to_path_buf(),
             source,
         })?;
+
+        // Drained before the readiness wait, because the reason a slot never listens is very
+        // often in one of these two pipes — and a pipe nobody reads fills up and blocks the
+        // child, which would turn "the application logged a lot while booting" into a startup
+        // timeout with no output at all.
+        if let Some(stdout) = child.stdout.take() {
+            drain(self.name.clone(), child.id(), stdout, "slot stdout");
+        }
+        if let Some(stderr) = child.stderr.take() {
+            drain(self.name.clone(), child.id(), stderr, "slot stderr");
+        }
 
         // Adopt before waiting, so a failure here cannot leave an orphan.
         self._guard
             .adopt(&child)
             .map_err(|source| ServerError::Spawn {
-                binary: self.binary.clone(),
+                binary: self.launch.binary().to_path_buf(),
                 source,
             })?;
 
         let mut slot = Slot {
             child,
-            endpoint: address.endpoint(&self.bind_host)?,
+            endpoint: address.endpoint(&self.bind_host, &self.name)?,
             served: 0,
             clients: Vec::new(),
         };
-        wait_until_listening(&mut slot, &self.binary, STARTUP_TIMEOUT)?;
+        wait_until_listening(&mut slot, self.launch.binary(), STARTUP_TIMEOUT)?;
         Ok(slot)
     }
 
@@ -694,7 +957,7 @@ impl CgiPool {
             (slot.endpoint.clone(), slot.clients.pop())
         };
 
-        let (response, client) = exchange(&endpoint, request, taken)?;
+        let (response, client) = exchange(&endpoint, request, taken, &self.name)?;
 
         let served = {
             let mut slot = self.slots[index]
@@ -752,7 +1015,7 @@ impl CgiPool {
             tracing::warn!(
                 backend = %self.name,
                 address = %slot.endpoint,
-                "a php-cgi slot died; restarting"
+                "a FastCGI slot died; restarting"
             );
             if let Err(err) = self.replace_locked(&mut slot) {
                 tracing::warn!(backend = %self.name, %err, "could not restart a slot");
@@ -1008,18 +1271,32 @@ mod tests {
     #[test]
     fn a_slot_address_knows_how_to_bind_and_how_to_connect() {
         let port = SlotAddress::Port(19_001);
-        assert_eq!(port.bind_argument("127.0.0.1"), "127.0.0.1:19001");
         assert_eq!(
-            port.endpoint("127.0.0.1")
+            port.bind_argument("127.0.0.1", SpawnDriver::PhpCgi),
+            "127.0.0.1:19001"
+        );
+        assert_eq!(
+            port.bind_argument("127.0.0.1", SpawnDriver::Command),
+            "127.0.0.1:19001",
+            "a TCP address is spelled the same way for both drivers"
+        );
+        assert_eq!(
+            port.endpoint("127.0.0.1", "test")
                 .expect("a port is always an endpoint"),
             Endpoint::Tcp("127.0.0.1:19001".to_string())
         );
 
         let socket = SlotAddress::Socket(PathBuf::from("/run/volucer/cgi.0.sock"));
         assert_eq!(
-            socket.bind_argument("127.0.0.1"),
+            socket.bind_argument("127.0.0.1", SpawnDriver::PhpCgi),
             "/run/volucer/cgi.0.sock",
             "php-cgi takes a bare path for a unix socket, not the `unix:` prefix"
+        );
+        assert_eq!(
+            socket.bind_argument("127.0.0.1", SpawnDriver::Command),
+            "unix:/run/volucer/cgi.0.sock",
+            "a configured command is handed the `unix:` form, the same spelling \
+             VOLUCER_FCGI_ADDRESS carries"
         );
     }
 
@@ -1031,7 +1308,7 @@ mod tests {
         let socket = SlotAddress::Socket(PathBuf::from("/run/volucer/cgi.0.sock"));
         assert_eq!(
             socket
-                .endpoint("127.0.0.1")
+                .endpoint("127.0.0.1", "test")
                 .expect("unix sockets exist here"),
             Endpoint::Unix("/run/volucer/cgi.0.sock".to_string())
         );
@@ -1042,7 +1319,7 @@ mod tests {
     fn a_unix_slot_address_is_refused_where_the_platform_has_none() {
         let socket = SlotAddress::Socket(PathBuf::from("/run/volucer/cgi.0.sock"));
         let err = socket
-            .endpoint("127.0.0.1")
+            .endpoint("127.0.0.1", "test")
             .expect_err("a unix socket cannot be reached here");
         assert!(err.to_string().contains("cannot be a unix socket"), "{err}");
     }
@@ -1058,14 +1335,14 @@ mod tests {
             "php-cgi takes the pipe name verbatim, not `host:port`"
         );
         assert_eq!(
-            pipe.endpoint("127.0.0.1")
+            pipe.endpoint("127.0.0.1", "test")
                 .expect("a pipe is always an endpoint"),
             Endpoint::Pipe(r"\\.\pipe\volucer-cgi.0".to_string())
         );
         // And the round trip has to come back to the same place, or a recycled slot
         // would bind a differently named pipe.
         assert!(matches!(
-            slot_address_of(&pipe.endpoint("127.0.0.1").unwrap()),
+            slot_address_of(&pipe.endpoint("127.0.0.1", "test").unwrap()),
             SlotAddress::Pipe(_)
         ));
     }
@@ -1077,7 +1354,7 @@ mod tests {
         // reconstruction drifts, a recycled slot silently moves.
         let port = SlotAddress::Port(19_444);
         let endpoint = port
-            .endpoint("127.0.0.1")
+            .endpoint("127.0.0.1", "test")
             .expect("a port is always reachable");
         match slot_address_of(&endpoint) {
             SlotAddress::Port(recovered) => assert_eq!(recovered, 19_444),
@@ -1092,7 +1369,7 @@ mod tests {
     fn a_unix_slot_address_round_trips_through_an_endpoint() {
         let socket = SlotAddress::Socket(PathBuf::from("/run/volucer/cgi.3.sock"));
         let endpoint = socket
-            .endpoint("127.0.0.1")
+            .endpoint("127.0.0.1", "test")
             .expect("unix sockets exist here");
         match slot_address_of(&endpoint) {
             SlotAddress::Socket(recovered) => {
@@ -1199,13 +1476,16 @@ mod tests {
     #[test]
     fn a_missing_binary_is_a_misconfiguration_not_a_panic() {
         let config = SpawnCgiConfig {
-            binary: PathBuf::from("definitely-not-a-php-cgi"),
+            binary: Some(PathBuf::from("definitely-not-a-php-cgi")),
+            command: None,
             workers: 1,
             bind_host: "127.0.0.1".to_string(),
             base_port: 19_700,
             socket: None,
             children: 0,
+            capacity: 0,
             max_requests: None,
+            working_dir: None,
             env: Default::default(),
         };
         let err = CgiPool::start("test", &config).unwrap_err();
