@@ -1,12 +1,11 @@
 # Volucer Documentation
 
-Volucer is a cross-platform PHP application server. One binary, two ways to run PHP
-applications, and no embedded PHP runtime — `php`, `php-cgi` and `php-fpm` are started as
-ordinary external processes.
+Volucer is a cross-platform application server for PHP, Python and Ruby. It does not embed a
+runtime: for PHP it starts `php` or `php-cgi` as external processes, or connects to an
+existing `php-fpm` process, and for Python and Ruby it speaks the worker protocol over the
+child's standard streams.
 
-This guide is for developers who already have a PHP application and want to run it on
-volucer. If you are looking for the reasoning behind the project, that lives in the source
-comments and in the pages below.
+This guide explains how to configure, run, and maintain Volucer.
 
 ## Start here
 
@@ -15,7 +14,7 @@ comments and in the pages below.
 
 ## Running your application
 
-- **[Backends](02-BACKENDS.md)** — The five ways volucer can run PHP: a persistent
+- **[Backends](02-BACKENDS.md)** — The five ways Volucer can run PHP: a persistent
   worker, an attached worker pool, an existing `php-fpm`, a spawned `php-cgi` pool, or
   an HTTP origin. Which one to pick, and why the choice matters.
 - **[Routing and Sites](03-ROUTING-AND-SITES.md)** — Send different paths to different
@@ -27,7 +26,7 @@ comments and in the pages below.
 
 ## Configuration
 
-- **[Configuration](01-CONFIGURATION.md)** — Every key the configuration file accepts,
+- **[Configuration](01-CONFIGURATION.md)** — Configuration keys and their defaults.
   with its default. This is the reference; the other pages explain what the keys do.
 
 ## Writing a worker application
@@ -36,7 +35,7 @@ comments and in the pages below.
   application resident, handle requests, and clear your own request scope.
 - **[Services](08-SERVICES.md)** — Key-value storage, locks, queues and gRPC, from
   inside a running request.
-- **[Worker Protocol](09-WORKER-PROTOCOL.md)** — The wire protocol, for anyone
+- **[Worker Protocol](09-WORKER-PROTOCOL.md)** — A summary of the wire protocol.
   implementing a worker in another language.
 
 ## Operating volucer
@@ -47,12 +46,11 @@ comments and in the pages below.
   systemd and the release process.
 - **[SDKs and Frameworks](10-SDKS-AND-FRAMEWORKS.md)** — The PHP, Python and Ruby SDKs,
   and the framework integrations built on them.
-- **[Benchmarks](12-BENCHMARKS.md)** — Measured performance against RoadRunner,
-  FrankenPHP and `nginx` + `php-fpm`, at 16 and 32 PHP processes, and what each
-  of them costs in memory.
+- **[Benchmarks](12-BENCHMARKS.md)** — Performance and memory measurements against
+  RoadRunner, FrankenPHP, and `nginx` + `php-fpm`, including the test method and results.
 ## Reference
 
 - **[The worker protocol](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md)**
-  — The normative specification, pinned byte-for-byte by every SDK.
+  — The normative protocol specification.
 - **[volucer.example.toml](https://github.com/sailantis/volucer/blob/main/volucer.example.toml)**
   — An annotated configuration file covering every section.
