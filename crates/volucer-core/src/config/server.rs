@@ -1,0 +1,533 @@
+//! `[server]`: the listeners, and the request-facing tables beneath them.
+
+use super::*;
+
+/// Server-wide settings: the listeners, plus how a request path becomes a script.
+///
+/// Both listeners are optional, but at least one must be configured.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// HTTP listener, e.g. `127.0.0.1:8080`.
+    ///
+    /// With no `[server.tls]` this listener is plaintext. With `[server.tls]` present and
+    /// no `https`, TLS wraps *this* listener, and `[server.tls].plain` decides whether it
+    /// also answers cleartext on the same port.
+    #[serde(default)]
+    pub http: Option<String>,
+
+    /// HTTPS listener, e.g. `0.0.0.0:443`.
+    ///
+    /// A second, independently bound listener that speaks TLS only. Setting it frees
+    /// `http` to stay plaintext, which is what an `:80` and `:443` deployment needs — and
+    /// what ACME's HTTP-01 challenge and an `:80` → `:443` redirect need, because those
+    /// are the only parts of TLS that genuinely require a particular port.
+    ///
+    /// Requires `[server.tls]`: a TLS listener with no certificate is an error, not a
+    /// listener that fails every handshake. Setting it together with `[server.tls].plain`
+    /// is also an error — the port is already dedicated, so the same-port sniff would have
+    /// nothing to decide.
+    #[serde(default)]
+    pub https: Option<String>,
+
+    /// FastCGI listener, e.g. `127.0.0.1:9000` or `unix:/run/volucer.sock`.
+    #[serde(default)]
+    pub fastcgi: Option<String>,
+
+    /// How responses this server produces are compressed.
+    ///
+    /// Off by default, which is a deliberate inversion of nginx's: compressing a backend's output
+    /// costs CPU on the request path of a server designed around one request at a time per worker
+    /// slot, so a deployment opts in knowing that rather than discovering it. Precompressed
+    /// static variants are a different mechanism and unaffected by this key.
+    #[serde(default)]
+    pub compression: Option<CompressionSetting>,
+
+    /// The largest request body either front-end will accept, in bytes.
+    ///
+    /// Defaults to 32 MiB, which is what was hard-coded here before this key existed, so a
+    /// deployment that says nothing keeps its behaviour. The **unit is in the name**, following
+    /// [`max_multirange_bytes`](StaticConfig::max_multirange_bytes) and `memory_limit_mb`: RoadRunner
+    /// spells this `http.max_request_size` and counts **megabytes**, and a key with the same name and
+    /// a different unit is the one kind of compatibility that costs more than it buys.
+    ///
+    /// It bounds the **body**, not the headers: a header block is already bounded by the protocol
+    /// layer, and the body is the part a client chooses freely. Both front-ends apply it, because
+    /// both buffer the body before a backend sees it — the CGI environment has to carry
+    /// `CONTENT_LENGTH` before `php-cgi` reads a byte, so there is no stream to pass through. That is
+    /// also why it is a *refusal* rather than a back-pressure valve.
+    ///
+    /// **It deliberately does not bound an `upstream` backend**, whose request body streams to the
+    /// origin unread. That is a documented decision rather than an omission — a reverse proxy
+    /// silently imposing a limit its own client never set is a bug report waiting — and the limit to
+    /// configure for one is the origin's. See the README, *Backends*.
+    ///
+    /// Zero is refused rather than read as "unlimited": a zero here refuses every request with a
+    /// body, which is never what was meant, and the same rule already governs
+    /// `static_files.max_multirange_bytes`.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
+
+    /// Directory that PHP scripts and static files are resolved against.
+    ///
+    /// A relative path is relative to the process's working directory, not to
+    /// this file — the same rule [`WorkerConfig::working_dir`] follows. Prefer
+    /// an absolute path: a deployment that sets its working directory elsewhere
+    /// would otherwise resolve somewhere else silently. `volucer check` prints
+    /// the path it actually resolved.
+    ///
+    /// Unset means the `serve` command line decides, and failing that `.`.
+    #[serde(default)]
+    pub document_root: Option<PathBuf>,
+
+    /// Front controller, relative to the document root, e.g. `index.php`.
+    ///
+    /// This is what makes a front controller work: a path naming no file under
+    /// the document root is given to this script with `PATH_INFO` set, instead
+    /// of answering 404.
+    ///
+    /// Set it to the empty string to serve only real `.php` files, matching
+    /// nginx's `location ~ \.php$`. Unset means the `serve` command line
+    /// decides, and failing that `index.php`.
+    #[serde(default)]
+    pub front_controller: Option<String>,
+
+    /// Which extensions name a script a backend is asked to execute.
+    ///
+    /// Defaults to `["php", "php3", "phtml"]`, which is what the server has
+    /// always accepted. Widening it is what makes a non-PHP worker reachable at
+    /// all: `path_suffix` can *route* `/app.py`, but this list is what decides
+    /// that `/app.py` resolves as a script rather than arriving at the front
+    /// controller as `PATH_INFO`.
+    ///
+    /// **It is deliberately one list rather than two.** The same answer is used
+    /// by the router (what to hand a backend), by the static layer (what must
+    /// never be served from disk, because that discloses source) and by
+    /// `skip_stat` (whether a route has already proved its path names a script).
+    /// Widening the router alone would turn every newly-routable extension into
+    /// a source disclosure, so the three move together by construction.
+    ///
+    /// A leading dot is accepted (`".php"` and `"php"` are the same entry) and
+    /// the comparison is case-insensitive, matching PHP's own behaviour. An
+    /// empty list is refused: it would silently send every script path to the
+    /// front controller as `PATH_INFO`. See [`crate::script`].
+    #[serde(default)]
+    pub script_extensions: Option<Vec<String>>,
+
+    /// Serving files from the document root, without a backend.
+    ///
+    /// A table tunes the layer; `false` turns it off and `true` turns it on with the
+    /// defaults. Off by default, so an existing deployment is not changed by
+    /// upgrading.
+    #[serde(default)]
+    pub static_files: StaticsSetting,
+
+    /// What this deployment serves; see [`ServeOnly`]. Defaults to everything.
+    #[serde(default)]
+    pub serve_only: ServeOnly,
+
+    /// The backend a request that matches no route is answered by.
+    ///
+    /// It lives here rather than at the top level because `[server]` **is** the unnamed site — see
+    /// [`Config::sites`] — and this is a site setting, exactly like `document_root` and
+    /// `front_controller`. `[sites.<name>]` overrides it for one host, and the inheritance runs in
+    /// the same direction as every other per-site key: the more specific table wins.
+    ///
+    /// Required once `[backends]` is non-empty, and refused when it names no configured backend:
+    /// backends nothing can select are a typo, and a name that matches nothing is a configuration
+    /// that parses and then fails every request.
+    #[serde(default)]
+    pub default_backend: Option<String>,
+
+    /// The route table, in the order written. See [`RouteConfig`] for the precedence rule.
+    ///
+    /// Here for the reason [`ServerConfig::default_backend`] is: routing is what the unnamed site
+    /// does, not what the process does. A site's own `routes` **replaces** this list rather than
+    /// merging with it, so a host that states one route does not inherit the other twenty.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
+
+    /// Environment variables every process this deployment starts inherits.
+    ///
+    /// **A baseline, not a replacement.** A backend's own `env` is merged *over* this one, so the
+    /// common case — one `APP_ENV` and one `DATABASE_URL` shared by a worker pool, a job consumer
+    /// and a supervised origin — is written once instead of three times, and the exception is still
+    /// expressible per backend. The order is `inherited → this table → the backend's own env`, which
+    /// is the resolution every other volucer key already follows: the more specific statement wins.
+    ///
+    /// **Names are passed exactly as written**, unlike RoadRunner's `server.env`, which uppercases
+    /// them. A server that silently changed a variable's name would leave an application reading
+    /// `app_env` from a file that says `APP_ENV`, and the per-backend `env` here has never done it.
+    ///
+    /// **It does not reach `attach`**: volucer starts those processes not at all, and a key that
+    /// described a process nobody starts is the shape [`UpstreamConfig::command`] already refuses.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// TLS settings. **Presence of this table is what turns TLS on.**
+    ///
+    /// No separate `enabled` boolean, deliberately: a flag and a certificate are two
+    /// statements about one thing, and they can disagree. A table without both a
+    /// certificate and a key is rejected instead.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
+    /// Certificate issuance. **Presence of this table is what turns ACME on.**
+    ///
+    /// Opt-in *in addition* to `[server.tls]`, which stays required: a deployment with no ACME
+    /// behaves exactly as it did before this key existed. See [`AcmeConfig`] for why a fallback
+    /// certificate is not optional.
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+
+    /// Answer cleartext requests on `http` with a `301` to the `https://` equivalent.
+    ///
+    /// Off by default: it changes what an existing cleartext deployment does, and a
+    /// redirect is a deployment's decision rather than a server's. Only meaningful when
+    /// there is a plaintext listener to redirect *from* — with TLS on `http` and
+    /// `plain = false`, that listener only ever answers TLS, so setting this is an error
+    /// rather than a silently inert key.
+    #[serde(default)]
+    pub redirect_to_https: bool,
+
+    /// The access log. **Absent is what turns it off**, which is the default.
+    ///
+    /// Off by default on the same rule `static_files` follows: an existing deployment must not
+    /// be changed by upgrading. A table rather than a boolean because a path is required for it
+    /// to mean anything, and a bare `true` with no destination is the kind of two-statements-one-
+    /// thing the `[server.tls]` doc already refuses.
+    ///
+    /// This is deliberately **not** the diagnostic log. See `volucer-observe`'s `access_log`
+    /// module: an access log that shared a verbosity filter with diagnostics would be one
+    /// setting away from silence, and both directions are wrong — debugging a worker loud
+    /// floods it, and quieting the diagnostics erases the record of who requested what.
+    #[serde(default)]
+    pub access_log: Option<AccessLogConfig>,
+
+    /// Where the client's address comes from when a reverse proxy is in front.
+    ///
+    /// **Absent is the default and means the peer address**, which is what every existing
+    /// deployment already gets. The table exists because turning it on is a *trust* statement —
+    /// `X-Forwarded-For` is a request header, so believing it from an arbitrary client is worse
+    /// than ignoring it — and a trust statement should have to be written down and named.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
+
+    /// Refuse callers over a configured rate. **Absent is what turns it off**, and that is the
+    /// default.
+    ///
+    /// The same convention as [`Config::metrics`] and [`ServerConfig::tls`]: the presence of the
+    /// table is the enable switch, because an `enabled` flag beside a `rate` is two statements
+    /// about one thing and they can disagree.
+    ///
+    /// It is keyed on the identity `[server.proxy]` resolves, which is the whole reason that table
+    /// was built first: behind nginx a limit keyed on the peer throttles the proxy and cannot tell
+    /// two clients apart at all. See [`Self::rate_limiter`].
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+/// One rate-limit policy, applied by every front-end.
+///
+/// The names are RoadRunner's (`http.rate_limiter`) with the same three key modes, because an
+/// operator who has written an `rr.yaml` block already knows what they mean. Two things depart from
+/// it deliberately, and both are in [`ServerConfig::rate_limiter`]'s documentation: `burst` defaults
+/// to `rate` rather than to `1`, and a full table answers a 429 rather than a 503.
+///
+/// # One policy per process, which is a limitation rather than a design
+///
+/// Route-level and per-site limits are the obvious next question, and the answer is no for a
+/// reason worth recording: a bucket's identity is (who, *which limit*), so two policies over one
+/// client are two buckets, and a route table would need the policy's name in the key. RoadRunner
+/// has the same restriction and states it. A deployment that needs several limits puts a second
+/// proxy in front, or waits for this to grow a route table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Who a bucket belongs to: `"ip"` (the default), `"header"`, or `"global"`.
+    #[serde(default)]
+    pub key: KeyMode,
+
+    /// The header whose value names the caller, when `key = "header"`.
+    ///
+    /// Required in that mode and refused in the other two: a header named beside a key that does
+    /// not read one is a line that believes it limits that header, and RoadRunner's own schema
+    /// makes the same call.
+    ///
+    /// **Not an authenticated identity.** A client chooses the value, so a client that varies it
+    /// gets one bucket per request until the table fills. Its use is a value the *proxy* sets — a
+    /// tenant it routed, a key it vouched for.
+    #[serde(default)]
+    pub header: Option<String>,
+
+    /// Requests allowed per `interval`. Required, because a rate limit with no rate is a table
+    /// that appears to protect something and does not.
+    pub rate: u32,
+
+    /// How long `rate` requests take to accrue, in milliseconds.
+    ///
+    /// Named `interval_ms` rather than RoadRunner's `interval` (a Go duration string), following
+    /// `[telemetry].interval_ms` and `[backends.pool].ready_timeout_ms`: a number with its unit in
+    /// the key cannot be misread, and a duration syntax is a parser this file does not have.
+    #[serde(default = "default_rate_interval_ms")]
+    pub interval_ms: u64,
+
+    /// How many requests may be spent at once, and how many a bucket holds.
+    ///
+    /// **Defaults to `rate`, not to 1.** RoadRunner defaults it to one, which turns
+    /// `rate = 60, interval_ms = 60000` into "one request, then one per second" — a limit nobody
+    /// writing that line meant. Defaulting to `rate` is the ordinary reading of "60 requests a
+    /// minute": the allowance may be spent at once and it returns over the minute.
+    #[serde(default)]
+    pub burst: Option<u32>,
+
+    /// How many identities one process tracks before it stops admitting new ones.
+    ///
+    /// Defaults to [`DEFAULT_MAX_ENTRIES`]. A full table that is only full of *depleted* buckets
+    /// refuses the newcomer with a 429 rather than evicting somebody's allowance; see
+    /// [`volucer_core::ratelimit`](crate::ratelimit) for why that is the lossless direction.
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+}
+
+fn default_rate_interval_ms() -> u64 {
+    1000
+}
+
+/// Which peers may assert a client address, and through which headers.
+///
+/// The defect this answers is invisible: behind nginx every request arrives from nginx, so the
+/// access log records the proxy and anything keyed on the address — a rate limiter, an IP
+/// allow-list — keys on the proxy rather than the client. Both look like correct behaviour until
+/// two clients have to be told apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Networks whose forwarded headers are believed, e.g. `["127.0.0.1", "10.0.0.0/8"]`.
+    ///
+    /// **An empty list means the feature is off, and an absent `[server.proxy]` is the same thing.**
+    /// A bare address is a network of one, which is how a single local proxy is named. Every entry
+    /// is parsed at load time: a range that does not parse is a startup failure rather than a
+    /// silently dropped entry, because a trust list is one of the few settings where a typo is a
+    /// security decision and a shortened list is not visible afterwards.
+    ///
+    /// The names are RoadRunner's, and deliberately so: `http.trusted_subnets` is what an operator
+    /// migrating from RoadRunner — or an nginx config they are copying from — already has in mind.
+    #[serde(default)]
+    pub trusted_subnets: Vec<String>,
+
+    /// The headers to consult, in order, when the peer is trusted.
+    ///
+    /// **The order is the security-relevant part**, not a preference: the first header that yields
+    /// a parsable address wins. Defaults to `Forwarded`, then the `X-Forwarded-For` family, which is
+    /// RoadRunner's order. `X-Forwarded-For` is appended to by every hop, so behind a CDN its first
+    /// element is the *client's own claim* rather than the client's address — a deployment that
+    /// knows its topology should name this list rather than rely on the default.
+    ///
+    /// A name that is blank or repeated is dropped rather than refused, and any name other than the
+    /// two structured headers is read as a single address, which is what makes a CDN's own header
+    /// usable without a code change.
+    #[serde(default)]
+    pub trusted_headers: Vec<String>,
+}
+
+/// The access log's destination and shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLogConfig {
+    /// Where records are appended. Created if it does not exist.
+    ///
+    /// A relative path resolves against **the directory holding the config file**, the same rule
+    /// `[server.tls]`'s `certificate` follows and for the same reason: a log beside `volucer.toml`
+    /// is the case an operator means, and resolving it against wherever the process happened to
+    /// start is a footgun. `volucer check` prints the path it resolved.
+    pub path: PathBuf,
+
+    /// `"combined"` (nginx's shape plus two timings, the default) or `"json"`.
+    ///
+    /// Parsed strictly rather than defaulted on a typo: quietly choosing a format the operator did
+    /// not ask for produces a log their queries do not match, which is worse than refusing to
+    /// start.
+    #[serde(default)]
+    pub format: AccessLogFormat,
+
+    /// The header an inbound request id is adopted from, and echoed back on.
+    ///
+    /// Defaults to `X-Request-Id`, and **adopting is the default** because "one id across the
+    /// tiers" is the feature: a request id that changes at every hop cannot correlate a client's
+    /// log with ours. Set it to the empty string to always mint a fresh one, which is what nginx
+    /// does — `$request_id` is always its own. The value is validated as an identifier, and a
+    /// client's malformed one is replaced rather than refused; see `volucer-observe`.
+    #[serde(default = "default_request_id_header")]
+    pub request_id_header: String,
+}
+
+/// The header a request id is adopted from, unless a deployment says otherwise.
+fn default_request_id_header() -> String {
+    "X-Request-Id".to_string()
+}
+
+/// How an access-log record is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AccessLogFormat {
+    /// nginx's `combined` shape, with the request and origin timings appended.
+    #[default]
+    #[serde(rename = "combined")]
+    Combined,
+    /// One JSON object per line.
+    #[serde(rename = "json")]
+    Json,
+}
+
+/// The front controller used when neither the config nor the command line says.
+pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
+
+/// The largest request body a backend will be handed, when configuration says nothing.
+///
+/// The value `HttpLimits::default()` used before [`ServerConfig::max_body_bytes`] existed, kept
+/// deliberately: an unconfigured deployment must not change behaviour because the key was added.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// ALPN protocol names this server understands.
+///
+/// Checked by name rather than passed through, because an unknown identifier is accepted by
+/// rustls and then never selected by anyone: the listener would look configured and answer
+/// only whatever a client happened to offer. `h2` and `http/1.1` are the two it can actually
+/// serve.
+pub const KNOWN_ALPN: [&str; 2] = ["h2", "http/1.1"];
+
+impl ServerConfig {
+    /// The environment one started process receives: this server's baseline, overlaid by the
+    /// process's own table.
+    ///
+    /// One function rather than a merge at each spawn site, because there are four of them —
+    /// a worker pool, a consumer pool, `php-cgi` and a supervised origin — and a merge written
+    /// four times is a merge that will be right in three of them. The precedence is the one
+    /// [`ServerConfig::env`] documents: the process's own value wins.
+    #[must_use]
+    pub fn env_for(&self, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut merged = self.env.clone();
+        merged.extend(own.clone());
+        merged
+    }
+
+    /// The effective front controller, or `None` for "serve only real files".
+    ///
+    /// The command line wins over this file, because a flag is the more specific
+    /// statement, and an empty value on either side means "no front controller".
+    pub fn resolve_front_controller(&self, from_command_line: Option<&str>) -> Option<String> {
+        let value = from_command_line
+            .or(self.front_controller.as_deref())
+            .unwrap_or(DEFAULT_FRONT_CONTROLLER);
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+
+    /// The static layer's settings, with any bare boolean resolved.
+    ///
+    /// The layer is **on** unless a deployment says otherwise, so an absent key resolves to
+    /// `enabled = true`. Only a path that names a real, non-script file changes behaviour:
+    /// a front-controller application answers every unmatched path exactly as it did when the
+    /// default was off.
+    pub fn statics(&self) -> StaticConfig {
+        self.static_files.applied_to(&StaticConfig {
+            enabled: true,
+            ..StaticConfig::default()
+        })
+    }
+
+    /// The script extensions in effect, with the default resolved.
+    ///
+    /// Unset means [`crate::script::DEFAULT_SCRIPT_EXTENSIONS`], which is what every release
+    /// before this key accepted. [`Config::validate`] refuses a list this cannot parse — an empty
+    /// one, or an entry naming a path — so falling back to the default here is only the shape a
+    /// caller sees if it skipped validation, never a configuration being silently reinterpreted.
+    /// The server's compression settings, defaulted when absent.
+    ///
+    /// A key that is unset means "off", not "on with defaults": the difference is the whole
+    /// decision, so it is made here once rather than at each reader.
+    pub fn compression(&self) -> CompressionSetting {
+        self.compression.clone().unwrap_or_default()
+    }
+
+    pub fn script_extensions(&self) -> crate::script::ScriptExtensions {
+        self.script_extensions
+            .as_deref()
+            .and_then(|list| {
+                crate::script::ScriptExtensions::from_config(list, "server.script_extensions").ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The largest body either front-end will accept, with the default resolved.
+    ///
+    /// Reads through to the one constant rather than repeating it, so the HTTP and FastCGI
+    /// front-ends cannot disagree about the answer — the defect this key was added to fix was
+    /// that only one of them had an answer at all.
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES)
+    }
+
+    /// Whether a plaintext listener exists to redirect *from*.
+    ///
+    /// Two shapes have one: `http` + `https`, and TLS on `http` with `plain = true`. With
+    /// TLS on `http` alone, that socket never answers cleartext, so `redirect_to_https` has
+    /// nothing to act on.
+    pub fn has_plaintext_listener(&self) -> bool {
+        let Some(tls) = &self.tls else {
+            return false;
+        };
+        if self.https.is_some() {
+            return self.http.is_some();
+        }
+        tls.plain
+    }
+
+    /// The client-address policy this deployment asks for, or the reason it is not usable.
+    ///
+    /// Returns a policy that is **off** when there is no `[server.proxy]` table or no
+    /// `trusted_subnets`, which is the same answer either way: no header is consulted and every
+    /// request resolves to its own peer.
+    ///
+    /// An error means a range did not parse, and it names the offending entry. That is the one
+    /// setting here where the failure has a direction: a dropped range is a proxy whose headers are
+    /// suddenly disbelieved, so a rate limit keyed on the address throttles every user at once and
+    /// the reason is not in the logs.
+    pub fn client_ip(&self) -> std::result::Result<crate::clientip::ClientIpPolicy, String> {
+        let Some(proxy) = &self.proxy else {
+            return Ok(crate::clientip::ClientIpPolicy::off());
+        };
+        crate::clientip::ClientIpPolicy::new(&proxy.trusted_subnets, &proxy.trusted_headers)
+            .map_err(|reason| format!("server.proxy.trusted_subnets: {reason}"))
+    }
+
+    /// The rate-limit policy this deployment asks for, or the reason it is not usable.
+    ///
+    /// `Ok(None)` when there is no `[server.rate_limit]` table, which is the default and means no
+    /// limiter is consulted at all — not a limiter configured to allow everything.
+    ///
+    /// **Built once and shared by both front-ends.** Two policies would give a client twice the
+    /// configured allowance depending on which protocol received the request, which is the same
+    /// one-front-end-only failure the shared site table exists to prevent.
+    pub fn rate_limiter(
+        &self,
+    ) -> std::result::Result<Option<crate::ratelimit::RateLimitPolicy>, String> {
+        let Some(limit) = &self.rate_limit else {
+            return Ok(None);
+        };
+        crate::ratelimit::RateLimitPolicy::new(
+            limit.key,
+            limit.header.as_deref(),
+            limit.rate,
+            std::time::Duration::from_millis(limit.interval_ms),
+            limit.burst,
+            limit.max_entries,
+        )
+        .map(Some)
+        .map_err(|reason| format!("server.rate_limit: {reason}"))
+    }
+}
