@@ -1068,6 +1068,37 @@ fn resolved_site_tls(config: &Config, config_dir: &Path) -> Vec<(String, TlsPath
         .collect()
 }
 
+/// Report the `Strict-Transport-Security` policy each site will actually send.
+///
+/// Printed per site rather than once, because the whole point of the per-site key is that one site
+/// can differ — and an operator reading `check` needs to see the header a given name's clients
+/// receive. `(none)` for a site is a fact worth printing: it is what a browser will store for that
+/// name, and it distinguishes "no policy" from "the deployment's policy, inherited".
+fn print_hsts(config: &Config, sites: &Sites) {
+    let default = sites.default_site();
+    match (&default.hsts, &config.server.hsts) {
+        (Some(policy), _) => println!("  hsts:             {policy}"),
+        (None, Some(_)) => println!("  hsts:             (disabled)"),
+        (None, None) => {}
+    }
+    // Only sites that state a table of their own, plus any whose resolved policy differs from the
+    // deployment's. A site that inherits silently is the ordinary case, and repeating the same
+    // header under every name would bury the one that differs.
+    for site in sites.named().values() {
+        let differs = site.hsts != default.hsts;
+        if !differs {
+            continue;
+        }
+        match &site.hsts {
+            Some(policy) => println!("    site {}:        {policy}", site.name),
+            None => println!(
+                "    site {}:        (none: emits no header, though the deployment has one)",
+                site.name
+            ),
+        }
+    }
+}
+
 /// How long a certificate is valid for, and whether that is a problem.
 ///
 /// The direct mitigation for ACME's failure mode, which is **silence**: issuance that never
@@ -1465,11 +1496,10 @@ fn serve(
     let tls_active = config.server.tls.is_some();
     let https_address = config.server.https.clone();
     let tls_on_http = tls_active && https_address.is_none();
-    let wants_redirect = config.server.redirect_to_https;
 
-    // The redirect lives on whichever listener serves cleartext. With a split :80/:443 that is
-    // `http` (which has no TLS of its own), and with TLS sharing the port it is the cleartext
-    // half of that one listener. Validation has already ensured some plaintext listener exists.
+    // Which sites redirect is the site table's answer — a site's own key, or `[server]`'s for the
+    // sites that inherit. What this function supplies is only the *target*: the port that actually
+    // speaks TLS, which no site can know.
     //
     // Only a TCP listener has a port. A unix socket cannot be reached over a redirect at all,
     // so it yields `None` and the redirect falls back to the listener's own port.
@@ -1482,8 +1512,9 @@ fn serve(
     };
 
     // `tls` and the redirect are separate settings on purpose: the plaintext listener in a
-    // split deployment carries the redirect with *no* acceptor, and giving it one would turn it
-    // into a TLS port that no cleartext client could reach.
+    // split deployment names the `https` port with *no* acceptor, and giving it one would turn it
+    // into a TLS port that no cleartext client could reach. Which sites actually redirect comes
+    // from the site table, so this key is only the target's port.
     let http_settings = volucer_http::ListenerSettings {
         tls: if tls_on_http {
             Some(volucer_http::TlsSettings {
@@ -1493,7 +1524,6 @@ fn serve(
         } else {
             None
         },
-        redirect_to_https: wants_redirect && config.server.has_plaintext_listener(),
         https_port,
     };
 
@@ -1774,7 +1804,6 @@ fn serve(
                         config: &config,
                         config_dir,
                     }),
-                    redirect_to_https: false,
                     https_port,
                 },
             )
@@ -3085,6 +3114,12 @@ fn check(
     let sites =
         volucer_core::Sites::from_config_with(&config, &document_root, front_controller.as_deref());
 
+    // The `Strict-Transport-Security` policy, and where it applies. The *resolved* value is printed
+    // rather than the keys as written, because a site that inherits is the ordinary case and an
+    // operator asking "what header do my names' clients actually get" cannot answer it from the
+    // file alone — the same reason the site table prints what it inherits one layer down.
+    print_hsts(&config, &sites);
+
     println!("  routes:");
     if config.server.routes.is_empty() {
         println!("    (none: every request goes to the default backend)");
@@ -3107,8 +3142,28 @@ fn check(
     // already printed above, and repeating it per site would make the table read as
     // though every site had been configured with the same values.
     for (name, site) in &config.sites {
-        println!("    {name}: {}", site.hosts.join(", "));
+        // The name, and what the site is reachable by. An address-only site has no hosts, and
+        // printing an empty list would read as a mistake rather than as the nginx `default_server`
+        // shape it is — so the two halves are printed together.
+        let mut reachable = Vec::new();
+        if !site.hosts.is_empty() {
+            reachable.push(site.hosts.join(", "));
+        }
+        if !site.addresses.is_empty() {
+            reachable.push(format!("addresses {}", site.addresses.join(", ")));
+        }
+        println!("    {name}: {}", reachable.join(" @ "));
         println!("      document root:    {}", site.document_root.display());
+        if let Some(protocols) = &site.protocols {
+            println!(
+                "      protocols:        {}",
+                protocols
+                    .iter()
+                    .map(|protocol| protocol.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if let Some(controller) = &site.front_controller {
             match controller.as_path() {
                 Some(path) => println!("      front controller: {path}"),
@@ -3117,6 +3172,26 @@ fn check(
         }
         if let Some(serve_only) = site.serve_only {
             println!("      serve only:       {serve_only}");
+        }
+        // Only a site that *states* the key is printed here, following this block's rule. The
+        // resolved value for every site is printed by `print_hsts` and by the redirect line
+        // below it, which is where "what will actually happen" is answered.
+        if let Some(redirect) = site.redirect_to_https {
+            println!("      redirect to https: {redirect}");
+        }
+        if let Some(hsts) = &site.hsts {
+            // The **resolved** value, not this table alone: a site that states one directive
+            // keeps the server's others, so printing the table as written would understate what
+            // a client actually receives — and this line exists to answer exactly that.
+            let resolved = sites.named().get(name).and_then(|site| site.hsts.as_ref());
+            println!(
+                "      hsts:             {}",
+                match resolved {
+                    Some(policy) => policy.header_value(),
+                    None if !hsts.is_enabled() => "off".to_string(),
+                    None => "(no policy: max_age_s is unset)".to_string(),
+                }
+            );
         }
         if let Some(extensions) = sites.named().get(name) {
             if !extensions.script_extensions.is_default() {
@@ -3572,6 +3647,10 @@ mod tests {
             compression: volucer_core::config::CompressionSetting::default(),
             routes: Vec::new(),
             default_backend: None,
+            binding: volucer_core::sites::SiteBinding::Any,
+            protocols: volucer_core::sites::SiteProtocols::default(),
+            redirect_to_https: false,
+            hsts: None,
         };
         let routing = routing_of(&site);
         assert_eq!(routing.front_controller.as_deref(), Some("index.php"));
@@ -3617,6 +3696,10 @@ document_root = "/from/file"
             compression: volucer_core::config::CompressionSetting::default(),
             routes: Vec::new(),
             default_backend: None,
+            binding: volucer_core::sites::SiteBinding::Any,
+            protocols: volucer_core::sites::SiteProtocols::default(),
+            redirect_to_https: false,
+            hsts: None,
         };
         assert_eq!(routing_of(&site).front_controller, None);
     }

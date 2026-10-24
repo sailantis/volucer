@@ -145,7 +145,8 @@ certificate, or you have ACME configured to get one.
 | `env` | table | empty | Environment variables every started process inherits. |
 | `tls` | table | absent | TLS configuration. Presence enables it. |
 | `acme` | table | absent | Automatic certificates. Presence enables it. |
-| `redirect_to_https` | bool | `false` | Answer cleartext requests with a 301 to the `https://` equivalent. |
+| `redirect_to_https` | bool | `false` | Answer cleartext requests with a 301 to the `https://` equivalent. Per site too. See [TLS and ACME](05-TLS-AND-ACME.md). |
+| `hsts` | table | absent | `Strict-Transport-Security` for every site that does not state its own. See [TLS and ACME](05-TLS-AND-ACME.md). |
 | `access_log` | table | absent | The access log. Presence enables it. |
 | `proxy` | table | absent | Which peers may assert a client address. |
 | `rate_limit` | table | absent | The rate limiter. Presence enables it. |
@@ -371,11 +372,14 @@ one, so an upgrade that misses it stops with a sentence rather than an unknown-f
 ## `[sites.<name>]`
 
 A site is one application, identified by the `Host` header. `hosts` and `document_root` are
-required; everything else is inherited from `[server]` when you leave it out.
+required; everything else is inherited from `[server]` when you leave it out — except
+`addresses`, which makes `hosts` optional.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `hosts` | array of strings | **required** | The host names this site answers to. |
+| `hosts` | array of strings | **required** unless `addresses` is set | The host names this site answers to. |
+| `addresses` | array of strings | any address | The **local** addresses this site answers on, e.g. `["192.168.9.123"]` or `["192.168.9.0/24"]`. |
+| `protocols` | array of strings | all | `"http"`, `"https"` and/or `"fastcgi"` — the front-ends this site answers on. |
 | `document_root` | path | **required** | Where this site's files live. |
 | `front_controller` | string | inherited | This site's front controller. |
 | `script_extensions` | array of strings | inherited | This site's executed extensions. |
@@ -386,6 +390,29 @@ required; everything else is inherited from `[server]` when you leave it out.
 | `serve_only` | string | inherited | This site's serving policy. |
 | `tls` | table | inherited | This site's certificate and key. |
 | `acme` | table | inherited | This site's ACME settings. |
+
+### `addresses` and `protocols`
+
+Both narrow a site to the connections it will serve, and both are decided **before** the
+`Host` header is consulted — see
+[Routing and Sites](03-ROUTING-AND-SITES.md#binding-a-site-to-addresses-and-protocols) for the
+matching order and the reasoning.
+
+`addresses` is the **local** address the socket accepted the connection on, not the client's:
+the `Host` header is written by the caller, so it cannot be the only thing selecting an
+internal site. Entries are addresses or CIDR ranges, with the same syntax as
+`[server.proxy].trusted_subnets`:
+
+```toml
+[sites.internal]
+hosts     = ["internal.corp"]
+addresses = ["192.168.9.123", "10.0.0.0/8"]
+document_root = "/srv/internal"
+```
+
+A site that states `addresses` and no `hosts` is a default for those addresses — nginx's
+`default_server` — and answers everything that reaches them, including an unclaimed name.
+`[server]` is the fallback for everything no site claims and cannot itself be bound.
 
 ## `[backends.<name>]`
 

@@ -297,11 +297,14 @@ fn rejects_a_site_that_would_never_be_reached() {
 http = "127.0.0.1:8080"
 "#;
 
-    // No hosts.
+    // Neither a host nor an address: nothing could ever select it.
     let text = format!("{base}\n[sites.a]\nhosts = []\ndocument_root = \"/srv/a\"\n");
     let config = Config::from_toml(&text).expect("parses");
     let err = config.validate().expect_err("must fail");
-    assert!(err.to_string().contains("hosts is empty"), "{err}");
+    assert!(
+        err.to_string().contains("neither `hosts` nor `addresses`"),
+        "{err}"
+    );
 
     // Nothing on disk to serve.
     let text = format!("{base}\n[sites.a]\nhosts = [\"a.test\"]\ndocument_root = \"\"\n");
@@ -425,6 +428,316 @@ front_controller = true
     let config = Config::from_toml(text).expect("parses");
     let err = config.validate().expect_err("must fail");
     assert!(err.to_string().contains("front_controller"), "{err}");
+}
+
+// ---- Per-site redirect and HSTS --------------------------------------------------
+
+/// The split `:80`/`:443` shape, which is the one both keys below need: a plaintext listener
+/// beside a TLS endpoint, so a redirect has somewhere to go and HSTS has somewhere to be sent.
+fn split_https(extra_server: &str, site: &str) -> String {
+    format!(
+        r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+{extra_server}
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+
+[sites.a]
+hosts = ["a.test"]
+document_root = "/srv/a"
+{site}
+"#
+    )
+}
+
+#[test]
+fn a_site_redirects_only_when_it_has_somewhere_to_send_a_client() {
+    // The two halves of "a redirect would be inert": no cleartext to receive, and no TLS to send
+    // to. Both are refused rather than accepted, because a redirect a site never performs is a
+    // line in the file that does nothing.
+    let text = split_https("", "protocols = [\"https\"]\nredirect_to_https = true");
+    let err = Config::from_toml(&text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(
+        err.to_string().contains("does not include \"http\""),
+        "{err}"
+    );
+
+    let text = split_https("", "protocols = [\"http\"]\nredirect_to_https = true");
+    let err = Config::from_toml(&text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(
+        err.to_string().contains("does not include \"https\""),
+        "{err}"
+    );
+
+    // Both halves present: accepted, and this is the pair the feature exists for — a site that
+    // is reached over cleartext and answers by pointing at its own TLS endpoint.
+    Config::from_toml(&split_https(
+        "",
+        "protocols = [\"http\", \"https\"]\nredirect_to_https = true",
+    ))
+    .expect("parses")
+    .validate()
+    .expect("a site with both protocols can redirect from one to the other");
+}
+
+#[test]
+fn a_site_that_says_nothing_inherits_the_deployments_redirect() {
+    // Inheritance in both directions, because the point of the key is that one site can differ
+    // from a deployment-wide default rather than that every site must restate it.
+    let on = Config::from_toml(&split_https(
+        "redirect_to_https = true",
+        "protocols = [\"http\", \"https\"]",
+    ))
+    .expect("parses");
+    on.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&on, std::path::Path::new("/srv"));
+    assert!(
+        sites.named()["a"].redirect_to_https,
+        "a site that states nothing inherits the server's answer"
+    );
+    assert!(sites.default_site().redirect_to_https);
+
+    // And the override that turns it off for one site, which is the case that motivated the key:
+    // an internal site that is deliberately cleartext beside a public one that redirects.
+    let off = Config::from_toml(&split_https(
+        "redirect_to_https = true",
+        "protocols = [\"http\", \"https\"]\nredirect_to_https = false",
+    ))
+    .expect("parses");
+    off.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&off, std::path::Path::new("/srv"));
+    assert!(!sites.named()["a"].redirect_to_https);
+    assert!(sites.default_site().redirect_to_https);
+}
+
+#[test]
+fn hsts_needs_a_duration_it_can_inherit_or_state() {
+    // Nothing above the site to inherit from, and the site states none: there is no policy to
+    // send, so the table would be a key that emits nothing.
+    let text = split_https("", "[sites.a.hsts]\nenabled = true");
+    let err = Config::from_toml(&text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(err.to_string().contains("max_age_s"), "{err}");
+
+    // Stated on the site: fine, and the header is what the policy says.
+    let config = Config::from_toml(&split_https("", "[sites.a.hsts]\nmax_age_s = 300"));
+    let config = config.expect("parses");
+    config
+        .validate()
+        .expect("a site may state its own duration");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv"));
+    assert_eq!(
+        sites.named()["a"].hsts.as_ref().map(|p| p.header_value()),
+        Some("max-age=300".to_string())
+    );
+    assert!(
+        sites.default_site().hsts.is_none(),
+        "a site's table is not the deployment's"
+    );
+}
+
+#[test]
+fn a_site_inherits_the_servers_policy_key_by_key() {
+    // The inheritance that matters for a policy: a site naming one directive must keep the
+    // server's others, or "I only wanted a longer max-age" would silently drop includeSubDomains.
+    let text = split_https(
+        "[server.hsts]\nmax_age_s = 600\ninclude_subdomains = true",
+        "[sites.a.hsts]\nmax_age_s = 31536000",
+    );
+    let config = Config::from_toml(&text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv"));
+    let policy = sites.named()["a"].hsts.as_ref().expect("a policy");
+    assert_eq!(policy.max_age_s, 31_536_000);
+    assert!(
+        policy.include_subdomains,
+        "the server's includeSubDomains must survive a site stating only max_age_s"
+    );
+    assert_eq!(
+        sites.default_site().hsts.as_ref().map(|p| p.header_value()),
+        Some("max-age=600; includeSubDomains".to_string())
+    );
+}
+
+#[test]
+fn a_site_can_turn_off_a_policy_it_would_inherit() {
+    // `enabled` is a key rather than the table's presence for exactly this: the site has to be
+    // able to say "not for me" without deleting a setting it also wants the rest of.
+    let text = split_https(
+        "[server.hsts]\nmax_age_s = 600",
+        "[sites.a.hsts]\nenabled = false",
+    );
+    let config = Config::from_toml(&text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv"));
+    assert!(sites.named()["a"].hsts.is_none());
+    assert!(
+        sites.default_site().hsts.is_some(),
+        "the deployment keeps its own policy"
+    );
+}
+
+#[test]
+fn hsts_is_refused_where_it_could_never_be_honoured() {
+    // An address-only site: a browser files a policy against a *name*, so a policy on a site
+    // selected by address alone is one every client that could reach it would ignore.
+    let text = r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+
+[sites.internal]
+addresses = ["192.168.9.123"]
+document_root = "/srv/internal"
+
+[sites.internal.hsts]
+max_age_s = 600
+"#;
+    let err = Config::from_toml(text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(err.to_string().contains("no `hosts`"), "{err}");
+
+    // A site restricted to cleartext never answers over a secure transport, and RFC 6797 §7.2
+    // forbids the header anywhere else.
+    let text = split_https(
+        "",
+        "protocols = [\"http\"]\n[sites.a.hsts]\nmax_age_s = 600",
+    );
+    let err = Config::from_toml(&text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(
+        err.to_string().contains("does not include \"https\""),
+        "{err}"
+    );
+
+    // No TLS at all, so there is no secure transport to send it on.
+    let text = r#"
+[server]
+http = "127.0.0.1:80"
+
+[server.hsts]
+max_age_s = 600
+"#;
+    let err = Config::from_toml(text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(err.to_string().contains("[server.tls]"), "{err}");
+}
+
+#[test]
+fn preload_is_refused_below_the_lists_own_bar() {
+    // Preload is the one setting here that ships inside browsers, so the two requirements the
+    // list actually enforces are checked rather than accepted and rejected years later.
+    let short = split_https(
+        "",
+        "[sites.a.hsts]\nmax_age_s = 600\ninclude_subdomains = true\npreload = true",
+    );
+    let err = Config::from_toml(&short)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(err.to_string().contains("one year"), "{err}");
+
+    let no_subdomains = split_https("", "[sites.a.hsts]\nmax_age_s = 31536000\npreload = true");
+    let err = Config::from_toml(&no_subdomains)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(err.to_string().contains("include_subdomains"), "{err}");
+
+    Config::from_toml(&split_https(
+        "",
+        "[sites.a.hsts]\nmax_age_s = 31536000\ninclude_subdomains = true\npreload = true",
+    ))
+    .expect("parses")
+    .validate()
+    .expect("a year with subdomains is what the preload list asks for");
+}
+
+#[test]
+fn a_zero_max_age_is_refused_because_the_header_means_something_else_by_it() {
+    // `max-age=0` is not "off"; it is "delete the policy". Writing it in a table is a second
+    // statement about the same thing, so the table is refused and `enabled = false` is the answer.
+    let text = split_https("", "[sites.a.hsts]\nmax_age_s = 0");
+    let err = Config::from_toml(&text)
+        .expect("parses")
+        .validate()
+        .expect_err("must fail");
+    assert!(err.to_string().contains("delete this policy"), "{err}");
+}
+
+#[test]
+fn a_wildcard_site_still_carries_its_policy() {
+    // A wildcard is a pattern rather than a name, so it is not checked against the preflight
+    // subdomain rule — but it is a legitimate site, and its policy must resolve like any other.
+    let text = r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+
+[sites.wild]
+hosts = ["*.example.com"]
+document_root = "/srv/wild"
+
+[sites.wild.hsts]
+max_age_s = 600
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv"));
+    assert_eq!(
+        sites.named()["wild"].hsts.as_ref().map(|p| p.max_age_s),
+        Some(600)
+    );
+}
+
+#[test]
+fn the_header_value_is_spelled_the_way_the_specification_writes_it() {
+    use crate::config::HstsPolicy;
+
+    // Directive order and spelling are what an operator reads in `check` and in their own
+    // responses; `includeSubDomains` keeps its camel case because every published example does.
+    let bare = HstsPolicy {
+        max_age_s: 600,
+        include_subdomains: false,
+        preload: false,
+    };
+    assert_eq!(bare.header_value(), "max-age=600");
+
+    let full = HstsPolicy {
+        max_age_s: 31_536_000,
+        include_subdomains: true,
+        preload: true,
+    };
+    assert_eq!(
+        full.header_value(),
+        "max-age=31536000; includeSubDomains; preload"
+    );
 }
 
 // ---- TLS -------------------------------------------------------------------------

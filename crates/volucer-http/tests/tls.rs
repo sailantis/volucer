@@ -83,11 +83,21 @@ impl Drop for Cert {
 /// Written to disk rather than built in memory because the path *resolution* is part of what is
 /// under test: `certs/server.crt` must be read relative to this file's directory.
 fn write_config(cert: &Cert, body: &str) -> Config {
+    write_config_with(cert, "", body)
+}
+
+/// [`write_config`], with keys for `[server]` as a separate argument.
+///
+/// Two arguments because the redirect is a `[server]` key while `body` lands in `[server.tls]` —
+/// appending it to the TLS table would make `redirect_to_https = true` a parse error rather than
+/// the setting under test.
+fn write_config_with(cert: &Cert, server: &str, body: &str) -> Config {
     let text = format!(
         r#"
 [server]
 http = "127.0.0.1:0"
 document_root = '{}'
+{server}
 
 [server.tls]
 certificate = "certs/server.crt"
@@ -132,7 +142,7 @@ async fn start_keeping(
                 config: &config,
                 config_dir,
             }),
-            redirect_to_https: false,
+
             https_port: None,
         },
     )
@@ -172,7 +182,7 @@ async fn start_with_resolver(
                 config: &config,
                 config_dir,
             }),
-            redirect_to_https: false,
+
             https_port: None,
         },
     )
@@ -469,8 +479,17 @@ async fn a_redirect_does_not_turn_a_plaintext_listener_into_a_tls_port() {
     // the redirect was originally derived from the presence of TLS settings, so the plaintext
     // listener built an acceptor and stopped answering cleartext at all. A client would have
     // seen a connection that accepted and then hung or failed, with nothing in the log.
+    //
+    // The config states the split shape — `http` plaintext beside a dedicated `https` — because
+    // that is the deployment a redirect on a plaintext listener belongs to, and validation now
+    // requires one. Only the plaintext listener is started, which is the point: it must answer
+    // cleartext despite redirecting.
     let cert = Cert::new("noregress", "example.test");
-    let config = write_config(&cert, "");
+    let config = write_config_with(
+        &cert,
+        "https = \"127.0.0.1:1\"\nredirect_to_https = true",
+        "",
+    );
     let addr = start_plaintext_redirecting(config, cert.dir(), Some(443)).await;
 
     let response = fetch_cleartext_with_host(addr, "example.test")
@@ -488,7 +507,7 @@ async fn redirect_to_https_answers_cleartext_with_a_301() {
     // The redirect must name the https port, not the port the request arrived on — otherwise it
     // sends the client back to the plaintext port it just used, which is a loop.
     let cert = Cert::new("redirect", "example.test");
-    let config = write_config(&cert, "plain = true");
+    let config = write_config_with(&cert, "redirect_to_https = true", "plain = true");
     let addr = start_redirecting(config, cert.dir()).await;
 
     let response = fetch_cleartext_with_host(addr, "example.test")
@@ -528,7 +547,7 @@ async fn redirect_on_the_default_port_leaves_it_out_of_the_location() {
     // listener cannot bind 443 without privileges, so the port is supplied directly — which is
     // also the shape a split :80/:443 deployment uses, where `https_port` is what matters.
     let cert = Cert::new("redirect443", "example.test");
-    let config = write_config(&cert, "plain = true");
+    let config = write_config_with(&cert, "redirect_to_https = true", "plain = true");
     let addr = start_plaintext_redirecting(config, cert.dir(), Some(443)).await;
 
     let response = fetch_cleartext_with_host(addr, "example.test")
@@ -545,7 +564,7 @@ async fn redirect_on_the_default_port_leaves_it_out_of_the_location() {
 async fn a_redirect_keeps_the_path_and_query() {
     // A redirect that dropped the path would send every request to the front controller.
     let cert = Cert::new("redirectpath", "example.test");
-    let config = write_config(&cert, "plain = true");
+    let config = write_config_with(&cert, "redirect_to_https = true", "plain = true");
     let addr = start_redirecting(config, cert.dir()).await;
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
@@ -570,10 +589,151 @@ async fn a_redirect_keeps_the_path_and_query() {
     );
 }
 
+#[tokio::test]
+async fn a_site_that_states_redirect_to_https_false_is_not_redirected() {
+    // The case the per-site key exists for: one deployment, a public site that redirects and an
+    // internal one that is deliberately cleartext. A deployment-wide bool cannot express it, and
+    // the internal site would be bounced to a scheme it does not serve.
+    let cert = Cert::new("perSiteRedirect", "example.test");
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+https = "127.0.0.1:1"
+document_root = '{}'
+redirect_to_https = true
+
+[server.tls]
+certificate = "certs/server.crt"
+key = "certs/server.key"
+
+[sites.plain]
+hosts = ["plain.test"]
+document_root = '{}'
+redirect_to_https = false
+"#,
+        cert.dir().display(),
+        cert.dir().display()
+    );
+    std::fs::write(cert.dir().join("volucer.toml"), &text).expect("write config");
+    let config = Config::from_toml(&text).expect("config parses");
+    config.validate().expect("config validates");
+
+    // Only the plaintext listener is started, which is the split `:80`/`:443` shape: `http`
+    // carries the redirect with no acceptor of its own, and the `https` port is never bound.
+    let addr = start_plaintext_redirecting(config, cert.dir(), Some(443)).await;
+
+    // A name the deployment redirects, so the test cannot pass by nothing being configured.
+    let redirected = fetch_cleartext_with_host(addr, "unknown.test")
+        .await
+        .expect("answered");
+    let text = String::from_utf8_lossy(&redirected);
+    assert!(
+        text.starts_with("HTTP/1.1 301"),
+        "the deployment's policy still applies to a site that says nothing: {text}"
+    );
+
+    // And the site that opted out is served, not redirected.
+    let served = fetch_cleartext_with_host(addr, "plain.test")
+        .await
+        .expect("answered");
+    let text = String::from_utf8_lossy(&served);
+    assert!(
+        !text.starts_with("HTTP/1.1 301") && !text.contains("location:"),
+        "a site that turned the redirect off must not be bounced: {text}"
+    );
+}
+
+#[tokio::test]
+async fn hsts_is_sent_over_tls_and_never_over_cleartext() {
+    // The rule this pins is RFC 6797 §7.2, and it is the one thing about HSTS a server can get
+    // wrong by being helpful: the header is forbidden on a non-secure transport, so a
+    // `plain = true` port must send it on the TLS half and never on the cleartext one.
+    let cert = Cert::new("hsts", "example.test");
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = '{}'
+
+[server.tls]
+certificate = "certs/server.crt"
+key = "certs/server.key"
+plain = true
+
+[server.hsts]
+max_age_s = 600
+include_subdomains = true
+"#,
+        cert.dir().display()
+    );
+    std::fs::write(cert.dir().join("volucer.toml"), &text).expect("write config");
+    let config = Config::from_toml(&text).expect("config parses");
+    config.validate().expect("config validates");
+    let addr = start(config, cert.dir()).await;
+
+    let tls = fetch(addr, "example.test", &["http/1.1"]).await;
+    let text = String::from_utf8_lossy(&tls.response).to_ascii_lowercase();
+    assert!(
+        text.contains("strict-transport-security: max-age=600; includesubdomains"),
+        "the policy must be on every TLS answer: {text}"
+    );
+
+    // The cleartext half of the same socket: no header, because §7.2 forbids it there.
+    let cleartext = fetch_cleartext_with_host(addr, "example.test")
+        .await
+        .expect("answered");
+    let text = String::from_utf8_lossy(&cleartext).to_ascii_lowercase();
+    assert!(
+        !text.contains("strict-transport-security"),
+        "a cleartext answer must not carry the header: {text}"
+    );
+}
+
+#[tokio::test]
+async fn hsts_rides_on_error_answers_too() {
+    // A policy belongs to the *name*, so a 404 tells the browser about it just as a 200 does —
+    // this is `nginx`'s `add_header … always`, and the reason the header is applied where every
+    // answer passes rather than at each success path.
+    let cert = Cert::new("hstsError", "example.test");
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = '{}'
+
+[server.tls]
+certificate = "certs/server.crt"
+key = "certs/server.key"
+
+[server.hsts]
+max_age_s = 600
+"#,
+        cert.dir().display()
+    );
+    std::fs::write(cert.dir().join("volucer.toml"), &text).expect("write config");
+    let config = Config::from_toml(&text).expect("config parses");
+    config.validate().expect("config validates");
+    let addr = start(config, cert.dir()).await;
+
+    // No static file and no backend, so this is a 404 or a 5xx — either way an error answer.
+    let seen = fetch(addr, "example.test", &["http/1.1"]).await;
+    let text = String::from_utf8_lossy(&seen.response).to_ascii_lowercase();
+    assert!(
+        !text.starts_with("http/1.1 200"),
+        "the fixture must actually produce a non-200: {text}"
+    );
+    assert!(
+        text.contains("strict-transport-security: max-age=600"),
+        "an error answer must carry the policy as well: {text}"
+    );
+}
+
 /// Start a listener that serves TLS **and** redirects cleartext on the same port.
 ///
 /// The `plain = true` shape: one socket carries both protocols, and only the cleartext half is
-/// redirected.
+/// redirected. Whether a given site redirects is its own key, so the config is what decides —
+/// this helper now only supplies the shape of the socket.
 async fn start_redirecting(config: Config, config_dir: &Path) -> SocketAddr {
     start_redirecting_to(config, config_dir, None, true).await
 }
@@ -611,7 +771,7 @@ async fn start_redirecting_to(
                 config: &config,
                 config_dir,
             }),
-            redirect_to_https: true,
+
             https_port,
         },
     )
@@ -715,7 +875,7 @@ key = "certs/absent.key"
                 config: &config,
                 config_dir: &config_dir,
             }),
-            redirect_to_https: false,
+
             https_port: None,
         },
     )
@@ -926,7 +1086,7 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
                 config: &config,
                 config_dir: cert.dir(),
             }),
-            redirect_to_https: false,
+
             https_port: None,
         },
     )

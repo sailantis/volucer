@@ -115,8 +115,13 @@ pub const DEFAULT_TRUSTED_HEADERS: &[&str] = &[
 /// address family, and it is the *security-relevant* comparison in this module. A dependency here
 /// would be a dependency whose absence from `Cargo.lock` is currently a feature, and it would put
 /// the trust check behind a version bump.
+///
+/// **Public because a site's address binding is the same comparison.** "Whose address is this" and
+/// "which local address did this connection arrive on" are both `contains` against a list of ranges,
+/// and a second implementation of it would be a second chance to get the masking wrong in the one
+/// place where getting it wrong serves an internal site to the public internet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cidr {
+pub struct Cidr {
     base: IpAddr,
     /// Prefix length: how many leading bits must match.
     bits: u8,
@@ -132,7 +137,7 @@ impl Cidr {
     /// which is what the operator wrote the `/8` for. Refusing it would be defensible, but the
     /// masking direction is the one the prefix itself asks for, and the alternative — trusting
     /// `10.1.2.3` while appearing to trust a `/8` — is the failure that would actually be dangerous.
-    fn parse(spec: &str) -> Result<Self, String> {
+    pub fn parse(spec: &str) -> Result<Self, String> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Err("an empty address range".to_string());
@@ -165,11 +170,27 @@ impl Cidr {
         Ok(Cidr { base, bits })
     }
 
+    /// The prefix length this range was written with.
+    ///
+    /// Exposed for the one caller that needs to compare two *matching* ranges rather than to
+    /// test membership: an address-only site is chosen by the narrowest range that admits the
+    /// connection, which is the same "most specific wins" rule the host table uses for wildcards.
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+
     /// Whether `address` is inside this range.
     ///
     /// A v4 range never contains a v6 address and vice versa, and the match says so rather than
     /// silently comparing a masked `u32` against a masked `u128`.
-    fn contains(&self, address: IpAddr) -> bool {
+    ///
+    /// **A v4-mapped v6 address is not a v4 address here**, and that is deliberate rather than an
+    /// oversight: `::ffff:10.0.0.1` is a v6 peer, so a `10.0.0.0/8` binding does not admit it. A
+    /// socket bound to `::` accepts v4 clients as mapped addresses on some platforms, so a
+    /// deployment that binds an internal site to a v4 range and listens on `[::]` gets a refusal it
+    /// can see rather than a site it did not mean to expose. Binding the listener to `0.0.0.0` (or
+    /// naming the mapped range explicitly) is the fix, and the documentation says so.
+    pub fn contains(&self, address: IpAddr) -> bool {
         match (self.base, address) {
             (IpAddr::V4(base), IpAddr::V4(address)) => {
                 let mask = v4_mask(self.bits);

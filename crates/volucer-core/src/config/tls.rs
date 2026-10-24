@@ -92,6 +92,146 @@ pub struct SiteTlsConfig {
     pub key: Option<PathBuf>,
 }
 
+/// `[server.hsts]` / `[sites.<name>.hsts]`: `Strict-Transport-Security` (RFC 6797).
+///
+/// # Why a table, and why the switch is inside it
+///
+/// Every key but `enabled` is a number or a flag the deployment has to choose, and `max-age` has no
+/// default this server can guess: a policy nobody chose is a pin a browser keeps enforcing until
+/// the site is reached again **over TLS**, so a wrong value is not undone by editing the file. A
+/// bare `hsts = true` would therefore have to invent a duration, and the duration it would have to
+/// invent is the one the preload list demands.
+///
+/// The switch is a *key* rather than the table's presence, which is the one place this departs from
+/// `[server.tls]` and `[server.acme]`. Those two create the thing they describe, so their presence
+/// is the switch. This table only tunes a response header, and a site has to be able to say "not
+/// for me" about a policy it inherits — `enabled = false` is the only way to write that, because
+/// removing the table means "inherit".
+///
+/// # What it cannot do
+///
+/// HSTS is keyed by the **host name in the browser's own store** (RFC 6797 §8.3), so an IP literal
+/// never matches a known host. A site with no `hosts` — the address-only `default_server` shape — can
+/// therefore never have its policy honoured, and writing one there is an error rather than an inert
+/// key.
+///
+/// # Where it is sent, and where it is not
+///
+/// Only over a **secure transport** (§7.2 forbids the header anywhere else, and browsers ignore it
+/// there). Over FastCGI volucer sends nothing at all: the proxy in front terminates TLS and writes
+/// its own headers, and `HTTPS` is the proxy's claim rather than this server's fact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HstsConfig {
+    /// Whether this table emits a policy.
+    ///
+    /// Defaults to `true`, so a table that does not mention it means what it says. `false` makes the
+    /// table an explicit **off**, which is what a site needs in order to overrule an inherited
+    /// `[server.hsts]`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// `max-age`, in seconds: how long a browser enforces the policy.
+    ///
+    /// Required on `[server.hsts]`, where there is nothing to inherit from, and required on a
+    /// site's table unless the server states one. `0` is refused: in the header it means "delete the
+    /// policy", so writing it here would be a table saying two things at once — turn HSTS off with
+    /// `enabled = false` instead.
+    #[serde(default)]
+    pub max_age_s: Option<u64>,
+
+    /// `includeSubDomains`: apply the policy to every subdomain of the names this site serves.
+    ///
+    /// **This reaches names this file never mentions.** A browser that has visited `example.com`
+    /// then refuses cleartext to `anything.example.com`, including an internal name that resolves to
+    /// a private address — which is why `preflight` warns when another site in this deployment is
+    /// such a subdomain.
+    #[serde(default)]
+    pub include_subdomains: Option<bool>,
+
+    /// `preload`: signal that these names may be added to browsers' built-in HSTS list.
+    ///
+    /// Refused without `include_subdomains` and a `max_age_s` of at least a year, which is the
+    /// preload list's own bar. This is the closest thing in this file to an irreversible change:
+    /// removal takes months, and the names ship inside browsers.
+    #[serde(default)]
+    pub preload: Option<bool>,
+}
+
+impl HstsConfig {
+    /// Whether this table asks for a policy, before inheritance is considered.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The policy this table produces, with `inherited` supplying whatever it does not state.
+    ///
+    /// `None` means "send no header": either the table is off, or it states no `max_age_s` and
+    /// inherits none either. Validation refuses the second case, so a `None` from that cause means
+    /// the table was resolved without `validate` — and omitting the header is the direction that
+    /// cannot pin a browser to a policy nobody wrote.
+    pub fn resolved(&self, inherited: Option<&HstsPolicy>) -> Option<HstsPolicy> {
+        if !self.is_enabled() {
+            return None;
+        }
+        Some(HstsPolicy {
+            max_age_s: self
+                .max_age_s
+                .or(inherited.map(|policy| policy.max_age_s))?,
+            include_subdomains: self
+                .include_subdomains
+                .or(inherited.map(|policy| policy.include_subdomains))
+                .unwrap_or(false),
+            preload: self
+                .preload
+                .or(inherited.map(|policy| policy.preload))
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// A `Strict-Transport-Security` policy, with inheritance already applied.
+///
+/// Resolved rather than left as the table, for the reason the static layer and the route table are:
+/// the header is built on every response over TLS, and a request path that walked an inheritance
+/// chain per request would be answering a question the site table already answered once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HstsPolicy {
+    /// `max-age`, in seconds.
+    pub max_age_s: u64,
+    /// Whether subdomains of the site's names are covered too.
+    pub include_subdomains: bool,
+    /// Whether the policy asks to be preloaded.
+    pub preload: bool,
+}
+
+impl HstsPolicy {
+    /// The `max-age` the preload list requires: one year, in seconds.
+    pub const PRELOAD_MIN_MAX_AGE_S: u64 = 31_536_000;
+
+    /// The header value.
+    ///
+    /// `includeSubDomains` keeps its camel case because that is what the preload list and every
+    /// published example spell; directive names are case-insensitive (§6.1), so the spelling is for
+    /// readers rather than for parsers.
+    pub fn header_value(&self) -> String {
+        let mut value = format!("max-age={}", self.max_age_s);
+        if self.include_subdomains {
+            value.push_str("; includeSubDomains");
+        }
+        if self.preload {
+            value.push_str("; preload");
+        }
+        value
+    }
+}
+
+impl std::fmt::Display for HstsPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.header_value())
+    }
+}
+
 /// `[server.acme]`: obtain this deployment's certificates automatically (RFC 8555).
 ///
 /// # Why this is a table and not a boolean

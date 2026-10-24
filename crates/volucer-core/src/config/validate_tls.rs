@@ -9,6 +9,11 @@ impl Config {
     /// nothing, and then does something the file does not say — a listener that accepts and
     /// fails every handshake, or a per-site key that silently has no effect.
     pub(super) fn validate_tls(&self) -> Result<()> {
+        // The deployment's policy, before the listener rules: it is one statement about this
+        // server's responses, and every rule about it is independent of which listener carries
+        // TLS. A site's own table is checked in `validate_sites`, against these same answers.
+        self.validate_server_hsts()?;
+
         let Some(tls) = &self.server.tls else {
             // No `[server.tls]`: TLS is not configured, so a listener that needs it is the
             // mistake to report. Saying so by name is the difference between "why does my
@@ -177,6 +182,69 @@ impl Config {
             ));
         }
 
+        Ok(())
+    }
+
+    /// `[server.hsts]` on its own terms, and whether the deployment has anywhere to send it.
+    ///
+    /// Separate from [`Config::validate_tls`]'s listener rules because the failure it prevents is a
+    /// different one: a policy the file states and no response ever carries. `max_age_s` is required
+    /// here — there is nothing above this table to inherit from — and a policy with no TLS endpoint
+    /// at all can never be emitted, since RFC 6797 §7.2 forbids the header over a non-secure
+    /// transport.
+    fn validate_server_hsts(&self) -> Result<()> {
+        let Some(hsts) = &self.server.hsts else {
+            return Ok(());
+        };
+        if !hsts.is_enabled() {
+            // `enabled = false` makes this table defaults only, so its other keys still apply to
+            // sites that inherit them — which is why the site rules read it as well.
+            return Ok(());
+        }
+        let Some(max_age_s) = hsts.max_age_s else {
+            return Err(Error::Config(
+                "[server.hsts] states no max_age_s; a policy needs a duration, and there is \
+                 nothing above this table to inherit one from"
+                    .to_string(),
+            ));
+        };
+        if max_age_s == 0 {
+            return Err(Error::Config(
+                "[server.hsts].max_age_s is 0, which in the header means \"delete this policy\"; \
+                 remove the table instead of writing a zero duration"
+                    .to_string(),
+            ));
+        }
+        let include_subdomains = hsts.include_subdomains.unwrap_or(false);
+        if hsts.preload.unwrap_or(false) {
+            if !include_subdomains {
+                return Err(Error::Config(
+                    "[server.hsts].preload is true without include_subdomains; the preload list \
+                     requires it, and a name added without it stops covering the subdomains it was \
+                     submitted for"
+                        .to_string(),
+                ));
+            }
+            if max_age_s < HstsPolicy::PRELOAD_MIN_MAX_AGE_S {
+                return Err(Error::Config(format!(
+                    "[server.hsts].preload is true with max_age_s = {max_age_s}; the preload list \
+                     requires at least {} (one year)",
+                    HstsPolicy::PRELOAD_MIN_MAX_AGE_S
+                )));
+            }
+        }
+        // No TLS anywhere: the header is forbidden over a non-secure transport (§7.2), so a policy
+        // here would be one this deployment could never emit. A site with its own `[sites.x.tls]`
+        // still needs `[server.tls]`, so this one question covers every site.
+        let serves_tls = self.server.tls.is_some();
+        if !serves_tls {
+            return Err(Error::Config(
+                "[server.hsts] is set but [server.tls] is not, so no response is ever sent over a \
+                 secure transport and the header would never be emitted (RFC 6797 §7.2 forbids it \
+                 over cleartext)"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }

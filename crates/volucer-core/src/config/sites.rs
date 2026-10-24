@@ -19,7 +19,77 @@ pub struct SiteConfig {
     /// An exact name, case-insensitively, with any `:port` ignored — or a
     /// leading `*.` wildcard, which matches one or more labels (`*.example.com`
     /// matches `a.example.com` and `a.b.example.com`).
+    ///
+    /// **Empty is allowed only together with [`SiteConfig::addresses`].** A site with neither
+    /// would be reachable by nothing, and a site with addresses alone is the deployment this key
+    /// exists beside: an internal name served only to the addresses it belongs to, so that a
+    /// client reaching the public address cannot select it by sending the name.
+    #[serde(default)]
     pub hosts: Vec<String>,
+
+    /// The **local** addresses this site answers on, e.g. `["192.168.9.123"]`.
+    ///
+    /// This is the destination of the connection — the address the socket is bound to — not the
+    /// client's address. `REMOTE_ADDR` is a client's claim about itself once a proxy is in front,
+    /// but `getsockname` is a fact about this machine's own socket, and it is the half a `Host`
+    /// header cannot provide: `Host` is written by the client, so a site claiming
+    /// `host.internal.example` is selectable by anyone who can reach the port and type the name.
+    /// Naming the addresses makes it a comparison against the kernel's answer instead.
+    ///
+    /// Entries are addresses or CIDR ranges, and the forms follow `[server.proxy].trusted_subnets`
+    /// exactly — one parser, one set of rules, so a range means the same thing in both places:
+    ///
+    /// - `192.168.9.123` — one address, the usual case.
+    /// - `192.168.9.0/24` — a range, for a site reachable on a whole interface.
+    /// - `::1` or `fd00::/8` — IPv6, which is matched as IPv6. **A v4-mapped v6 address is not a v4
+    ///   address**, so a listener on `[::]` that receives `::ffff:192.168.9.123` does not select a
+    ///   site bound to `192.168.9.123`. Bind the listener to `0.0.0.0` instead, or write the mapped
+    ///   range out.
+    ///
+    /// **Absent means "any address", which is the existing behaviour and the safe default**: a
+    /// deployment that says nothing keeps serving whatever its listener reaches. Listing addresses
+    /// narrows the site to them.
+    ///
+    /// A request whose local address matches no site falls to `[server]` — the default site — even
+    /// when its `Host` names a site, because a site bound to addresses does not answer elsewhere.
+    /// That is the property that makes the binding worth writing: the name alone stops being
+    /// enough.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+
+    /// The protocols this site answers on: `"http"`, `"https"` or `"fastcgi"`.
+    ///
+    /// Absent means every protocol the deployment serves, which is the existing behaviour. Naming
+    /// them is how a site is kept off a listener it has no business on — an internal admin site
+    /// that is only ever TLS, or one that is only reachable from the proxy in front.
+    ///
+    /// The value is the *front-end* that received the request, not the `X-Forwarded-Proto` a
+    /// client may claim: `https` means "arrived on a TLS-speaking listener", and over FastCGI it
+    /// means `HTTPS` was set by the proxy. A site is not selectable by a header any more than it
+    /// is selectable by a name.
+    #[serde(default)]
+    pub protocols: Option<Vec<SiteProtocol>>,
+
+    /// Answer this site's cleartext requests with a `301` to the `https://` equivalent.
+    ///
+    /// Absent inherits `[server].redirect_to_https`. It is per site because **only a site knows
+    /// whether it has an `https` endpoint to send a client to**: a site bound to an internal
+    /// address with `protocols = ["http"]` is deliberately cleartext, and a deployment-wide
+    /// redirect would bounce it to a scheme it does not serve.
+    ///
+    /// Refused when it would be inert — `true` on a site whose `protocols` excludes `"http"`,
+    /// because such a site never sees a cleartext request to redirect.
+    #[serde(default)]
+    pub redirect_to_https: Option<bool>,
+
+    /// `Strict-Transport-Security`, for this site.
+    ///
+    /// Absent inherits `[server.hsts]`. A table here states only the keys it changes, so a site
+    /// that keeps the deployment's policy but widens `max_age_s` names one key.
+    ///
+    /// See [`HstsConfig`] for why the switch is inside the table rather than the table's presence.
+    #[serde(default)]
+    pub hsts: Option<HstsConfig>,
 
     /// Directory that this site's scripts and files resolve against.
     ///
@@ -128,6 +198,45 @@ impl ServeOnly {
 }
 
 impl std::fmt::Display for ServeOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A front-end a site can be restricted to.
+///
+/// Named for the *listener*, not for the wire format, because that is what the deployment
+/// configures and what the operator can reason about: `https` is "arrived on the TLS listener", and
+/// over FastCGI it is "the proxy set `HTTPS`", which is a fact about the proxy's configuration
+/// rather than about the client.
+///
+/// `http` and `https` are separate values even though one listener can carry both
+/// (`[server.tls].plain`), because a site restricted to `https` must not answer the cleartext half
+/// of that same port — which is precisely the case the same-port sniff creates and the reason this
+/// is decided per *connection* rather than per listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteProtocol {
+    /// A cleartext HTTP request.
+    Http = 1,
+    /// A request that arrived over TLS.
+    Https = 2,
+    /// A request forwarded over the FastCGI listener, from nginx or another web server.
+    Fastcgi = 4,
+}
+
+impl SiteProtocol {
+    /// The name as it is written in configuration, for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SiteProtocol::Http => "http",
+            SiteProtocol::Https => "https",
+            SiteProtocol::Fastcgi => "fastcgi",
+        }
+    }
+}
+
+impl std::fmt::Display for SiteProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }

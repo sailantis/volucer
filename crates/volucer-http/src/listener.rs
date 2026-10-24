@@ -35,13 +35,15 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::header::{
-    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, VARY,
+    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+    STRICT_TRANSPORT_SECURITY, VARY,
 };
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
 use volucer_core::sites::Sites;
+use volucer_core::SiteProtocol;
 use volucer_fcgi::{cgi, RequestInfo, Route, Routing};
 use volucer_server::{Dispatcher, ServerError};
 use volucer_watch::{RegisteredFrontEnd, Registry, SharedState, Swappable};
@@ -175,13 +177,12 @@ pub struct TlsSettings<'a> {
 pub struct ListenerSettings<'a> {
     /// TLS for this listener, or `None` for a plaintext one.
     pub tls: Option<TlsSettings<'a>>,
-    /// Answer cleartext requests with a `301` to the `https://` equivalent.
-    ///
-    /// Per listener rather than per configuration, because only the listener that serves
-    /// cleartext may redirect: with a separate `https` port the plaintext listener carries it,
-    /// and with TLS sharing the port only the cleartext half of that listener does.
-    pub redirect_to_https: bool,
     /// The port a redirect should name, when it is not this listener's own.
+    ///
+    /// **Whether** to redirect is not a listener setting: it is a site's, resolved from
+    /// `redirect_to_https` on the site or on `[server]`. A listener only contributes the facts a
+    /// redirect needs — this port, and whether the connection arrived over TLS — because those are
+    /// properties of the socket rather than of any site.
     pub https_port: Option<u16>,
 }
 
@@ -241,9 +242,11 @@ struct FrontEnd {
     /// The port this listener is bound to, for `SERVER_PORT` when the client
     /// sends no `Host`.
     server_port: u16,
-    /// Answer cleartext requests with a `301` to the `https://` equivalent.
-    redirect_to_https: bool,
     /// The port a redirect should name, when it differs from this listener's own.
+    ///
+    /// Here rather than resolved per request because it is a property of the socket: a redirect
+    /// must name the endpoint that actually speaks TLS, and only the listener knows where that is.
+    /// Whether any given request *is* redirected is a site's answer, not this one's.
     https_port: Option<u16>,
     /// Request identity and the access log, shared with the FastCGI front-end.
     ///
@@ -704,10 +707,9 @@ impl HttpListener {
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
-        // The redirect settings come from the listener's own settings, so a plaintext listener in
-        // a split :80/:443 deployment can carry them with no TLS of its own — which is exactly
-        // why they are separate from `tls` rather than derived from it.
-        let redirect_to_https = settings.redirect_to_https;
+        // The redirect *target* comes from the listener's own settings, so a plaintext listener in
+        // a split :80/:443 deployment can name the `https` port with no TLS of its own — which is
+        // exactly why this is separate from `tls` rather than derived from it.
         let requested_https_port = settings.https_port;
         let resolver = handles.tls.clone();
 
@@ -797,11 +799,21 @@ impl HttpListener {
         // cleartext to `https://host:this-port` is a real redirect to a real endpoint, not a
         // loop, since the client comes back speaking TLS.
         let https_port = requested_https_port.unwrap_or(port);
-        if redirect_to_https {
+
+        // Which sites redirect is the *site table's* answer, so the report is derived from the
+        // same table the request path reads rather than from a listener flag. A listener only
+        // knows whether it can redirect at all: it must be able to receive cleartext.
+        let table = handles.shared.sites();
+        let redirecting: Vec<&str> = std::iter::once(table.default_site())
+            .chain(table.named().values())
+            .filter(|site| site.redirect_to_https)
+            .map(|site| site.name.as_str())
+            .collect();
+        if accept_plain && !redirecting.is_empty() {
             tracing::info!(
                 https_port,
-                plaintext_accepted = accept_plain,
-                "cleartext requests will be answered with a 301 to https"
+                sites = %redirecting.join(", "),
+                "cleartext requests will be answered with a 301 to https for these sites"
             );
         }
 
@@ -832,7 +844,6 @@ impl HttpListener {
                 stats: Arc::new(HttpStats::default()),
                 shutdown: Arc::new(AtomicBool::new(false)),
                 server_port: port,
-                redirect_to_https,
                 https_port: Some(https_port),
                 observe: Arc::clone(&handles.observe),
                 client_ip: Arc::clone(&handles.client_ip),
@@ -914,6 +925,15 @@ impl HttpListener {
                         continue;
                     }
 
+                    // **The local address, read from the accepted socket.** This is the address the
+                    // client actually reached, which is what a site's `addresses` binding compares
+                    // against. The configured address is not a substitute: a listener on
+                    // `0.0.0.0:8080` reports the wildcard, and the whole point of the binding is to
+                    // tell `135.181.172.123` from `192.168.9.123` on that same socket. Reading it
+                    // here rather than in `prepare` keeps it off the request path — it is one
+                    // `getsockname` per *connection*, and keep-alive means many requests each.
+                    let local = stream.local_addr().ok().map(|address| address.ip());
+
                     // Nagle's algorithm is disabled on the raw socket, which is the one place
                     // it can be: the stream is wrapped by TLS from here on, and a `TlsStream`
                     // has no `set_nodelay`.
@@ -921,7 +941,8 @@ impl HttpListener {
                     let front_end = Arc::clone(&front_end);
                     let tls = tls.clone();
                     tokio::spawn(async move {
-                        serve_accepted(stream, tls, accept_plain, front_end.clone(), peer).await;
+                        serve_accepted(stream, tls, accept_plain, front_end.clone(), peer, local)
+                            .await;
                         front_end.stats.connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -974,9 +995,10 @@ async fn serve_accepted(
     accept_plain: bool,
     front_end: Arc<FrontEnd>,
     peer: SocketAddr,
+    local: Option<std::net::IpAddr>,
 ) {
     let Some(acceptor) = tls else {
-        if let Err(err) = serve_connection(stream, front_end, peer, true).await {
+        if let Err(err) = serve_connection(stream, front_end, peer, local, true).await {
             tracing::debug!(%peer, %err, "http connection ended");
         }
         return;
@@ -987,7 +1009,7 @@ async fn serve_accepted(
             .stats
             .plaintext_on_tls_port
             .fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = serve_connection(stream, front_end, peer, true).await {
+        if let Err(err) = serve_connection(stream, front_end, peer, local, true).await {
             tracing::debug!(%peer, %err, "http connection ended");
         }
         return;
@@ -997,7 +1019,7 @@ async fn serve_accepted(
         Ok(tls_stream) => {
             front_end.stats.handshakes.fetch_add(1, Ordering::Relaxed);
             // `false`: this connection is already encrypted, so a redirect would loop it.
-            if let Err(err) = serve_connection(tls_stream, front_end, peer, false).await {
+            if let Err(err) = serve_connection(tls_stream, front_end, peer, local, false).await {
                 tracing::debug!(%peer, %err, "https connection ended");
             }
         }
@@ -1036,6 +1058,7 @@ async fn serve_connection<S>(
     stream: S,
     front_end: Arc<FrontEnd>,
     peer: SocketAddr,
+    local: Option<std::net::IpAddr>,
     cleartext: bool,
 ) -> Result<()>
 where
@@ -1061,7 +1084,9 @@ where
                 .client_ip
                 .resolve(peer_ip, &HttpHeaders(request.headers()));
             let remote_addr = resolved.to_string();
-            Ok::<_, Infallible>(handle(request, front_end, remote_addr, resolved, cleartext).await)
+            Ok::<_, Infallible>(
+                handle(request, front_end, remote_addr, resolved, local, cleartext).await,
+            )
         }
     });
 
@@ -1093,6 +1118,7 @@ async fn handle(
     front_end: Arc<FrontEnd>,
     remote_addr: String,
     resolved_peer: std::net::IpAddr,
+    local: Option<std::net::IpAddr>,
     cleartext: bool,
 ) -> Response<ResponseBody> {
     // Identity first, before anything can fail. A request that is rejected, redirected or 404s
@@ -1116,18 +1142,28 @@ async fn handle(
     let referer = header_str(request.headers(), "referer").map(str::to_owned);
     let peer: Option<std::net::IpAddr> = remote_addr.parse().ok();
 
-    let mut response =
-        match prepare(request, &front_end, remote_addr, resolved_peer, cleartext).await {
-            Ok(response) => {
-                front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
-                response
-            }
-            Err(err) => {
-                front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(status = err.status(), %err, "http request failed");
-                error_response(&err)
-            }
-        };
+    let mut hsts: Option<volucer_core::config::HstsPolicy> = None;
+    let mut response = match prepare(
+        request,
+        &front_end,
+        remote_addr,
+        resolved_peer,
+        local,
+        cleartext,
+        &mut hsts,
+    )
+    .await
+    {
+        Ok(response) => {
+            front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
+            response
+        }
+        Err(err) => {
+            front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(status = err.status(), %err, "http request failed");
+            error_response(&err)
+        }
+    };
 
     // **The id is echoed on every answer, including error pages.** A client that sends an id and
     // cannot find it on the response has no way to quote it, and an error is the case where they
@@ -1138,6 +1174,24 @@ async fn handle(
             if let Ok(value) = HeaderValue::from_str(&context.id.as_str()) {
                 response.headers_mut().insert(name, value);
             }
+        }
+    }
+
+    // **`Strict-Transport-Security`, on every answer over TLS.** Here rather than in `prepare`
+    // because this is the one point every response passes through — including the ones
+    // `error_response` built from an `Err`, which matters: a policy belongs to the *name*, so a 404
+    // or a 500 has as much business telling the browser about it as a 200 does. `nginx` spells this
+    // `add_header … always`, and it is the behaviour an operator migrating from it expects.
+    //
+    // `hsts` is `None` for a cleartext connection, which is not a missing case but the rule: RFC
+    // 6797 §7.2 forbids the header over a non-secure transport. It is also `None` for a site with no
+    // policy, and for the redirect answer, which returns before `prepare` resolves anything — also
+    // correct, since a redirect is cleartext by definition.
+    if let Some(policy) = &hsts {
+        if let Ok(value) = HeaderValue::from_str(&policy.header_value()) {
+            response
+                .headers_mut()
+                .insert(STRICT_TRANSPORT_SECURITY, value);
         }
     }
 
@@ -1276,7 +1330,9 @@ async fn prepare(
     front_end: &Arc<FrontEnd>,
     remote_addr: String,
     resolved_peer: std::net::IpAddr,
+    local: Option<std::net::IpAddr>,
     cleartext: bool,
+    hsts: &mut Option<volucer_core::config::HstsPolicy>,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
 
@@ -1330,21 +1386,42 @@ async fn prepare(
         }
     }
 
-    // A plaintext listener may redirect before anything else looks at the request. Done here
-    // rather than in the accept path because it needs the `Host` and the path, and it is checked
-    // before the site is resolved so a redirect costs one comparison rather than a lookup.
+    // The site is resolved before the redirect, because **the redirect is per site**: a site bound
+    // to an internal address with `protocols = ["http"]` is deliberately cleartext, and bouncing it
+    // to `https` would send its clients to a scheme it does not serve. `[server.redirect_to_https]`
+    // is what a site that states nothing inherits, so the deployment-wide key keeps its meaning and
+    // a site that wants to differ says so.
     //
-    // Gated on `cleartext`, which is the whole correctness of it when TLS shares the port: a
-    // connection that arrived over TLS has already done what the redirect asks for, so
-    // redirecting it would loop the client for ever. The flag is per connection, not per
-    // listener, because with `plain = true` one listener carries both.
-    if front_end.redirect_to_https && cleartext {
-        let host = parts
-            .headers
-            .get(HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        let authority = redirect_authority(host, front_end.https_port, front_end.server_port);
+    // Still before anything that costs work — one map probe plus a comparison, with nothing read
+    // from the body. `cleartext` is what makes it safe when TLS shares the port: a connection that
+    // arrived over TLS has already done what the redirect asks for, so redirecting it would loop
+    // the client for ever. That flag is per connection, not per listener, because with
+    // `plain = true` one listener carries both.
+    let host = parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    let state = front_end.state();
+    // The protocol is decided by the **connection**, not by a header: `cleartext` is the listener's
+    // own fact, and `X-Forwarded-Proto` is a client's claim. A site restricted to `https` must not
+    // be selectable by a cleartext request that says otherwise — the same argument that makes the
+    // local address the trustworthy half of the binding.
+    let protocol = if cleartext {
+        SiteProtocol::Http
+    } else {
+        SiteProtocol::Https
+    };
+    let resolved = state.resolve_request(host, local, protocol);
+    let site = resolved.site;
+    let (routing, statics, site_compression) =
+        (resolved.routing, resolved.statics, resolved.compression);
+
+    if cleartext && site.redirect_to_https {
+        let authority = redirect_authority(
+            host.unwrap_or_default(),
+            front_end.https_port,
+            front_end.server_port,
+        );
         let target = format!(
             "https://{authority}{}",
             parts
@@ -1353,6 +1430,9 @@ async fn prepare(
                 .map(|pq| pq.as_str())
                 .unwrap_or("/")
         );
+        // The redirect is a cleartext answer, so it carries no `Strict-Transport-Security`: RFC 6797
+        // §7.2 forbids the header on a non-secure transport, and the client learns the policy on the
+        // TLS response that follows instead.
         return Ok(Response::builder()
             .status(301)
             .header(hyper::header::LOCATION, target)
@@ -1361,23 +1441,12 @@ async fn prepare(
             .expect("a 301 with a location is a valid response"));
     }
 
-    // The site is resolved first, because everything after this is per site: which
-    // document root a path resolves under, which front controller serves it, and which
-    // static layer answers it. A map probe on the runtime thread, not work.
-    //
-    // One snapshot for the whole request: the three maps are taken together so a reload
-    // landing mid-request cannot have this request resolve its site against one table and
-    // route against another. The reload therefore takes effect on the next request, which
-    // is the only ordering an operator can reason about.
-    let host = parts
-        .headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok());
-    let state = front_end.state();
-    let resolved = state.resolve(host);
-    let site = resolved.site;
-    let (routing, statics, site_compression) =
-        (resolved.routing, resolved.statics, resolved.compression);
+    // The policy travels out of `prepare` as a **value** rather than being applied here, because
+    // `handle` is where every answer is stamped — including the error pages this function returns
+    // as `Err`. A policy on a 404 matters as much as one on a 200: both tell the browser what this
+    // name is. `resolved` borrows the snapshot, so it cannot be returned.
+    *hsts = if cleartext { None } else { site.hsts.clone() };
+
     // Static content is decided before the body is read: a `GET` for a file has
     // no body worth buffering, and refusing to buffer one it will never use is
     // the point of a limit.

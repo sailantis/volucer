@@ -637,6 +637,156 @@ fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A site bound to an address is not selectable by name from another one.
+///
+/// The end-to-end half of `a_bound_site_is_refused_by_name_on_another_address`: the rule is unit
+/// tested, and this proves the listener feeds it the address the connection **actually arrived on**
+/// rather than the configured one. A listener bound to `0.0.0.0` reports the wildcard from its
+/// configuration, so a front-end that passed that through would make every binding useless on the
+/// exact deployment the key exists for — which no unit test of `Sites` could catch.
+///
+/// Two loopback addresses rather than a real interface, because `127.0.0.2` is a distinct
+/// destination on every platform this runs on and needs no privilege to use.
+#[test]
+fn a_site_bound_to_an_address_is_not_reachable_by_name_elsewhere() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-site-binding-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("public")).expect("create the public root");
+    std::fs::create_dir_all(root.join("internal")).expect("create the internal root");
+    std::fs::write(root.join("public/index.html"), "PUBLIC").expect("write the public page");
+    std::fs::write(root.join("internal/index.html"), "INTERNAL").expect("write the internal page");
+
+    let root_toml = root.display().to_string().replace('\\', "/");
+    let config = format!(
+        r#"
+[server]
+http = "0.0.0.0:{port}"
+document_root = "{root}/public"
+static_files = true
+
+[sites.internal]
+hosts = ["internal.test"]
+addresses = ["127.0.0.2"]
+document_root = "{root}/internal"
+"#,
+        port = 19500 + (std::process::id() % 400),
+        root = root_toml,
+    );
+    let config_path = root.join("volucer.toml");
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let Some(http_address) = server.http_address.clone() else {
+        panic!("the HTTP listener did not report an address");
+    };
+    // The banner reports the configured wildcard; the port is what an address needs.
+    let port = http_address
+        .rsplit(':')
+        .next()
+        .expect("a port in the address");
+
+    // The name on the address it is bound to: the site answers.
+    let bound = http_get_with(
+        &format!("127.0.0.2:{port}"),
+        "/index.html",
+        &[("Host", "internal.test")],
+    );
+    assert_eq!(bound.status, 200, "{bound:?}");
+    assert_eq!(bound.text(), "INTERNAL");
+
+    // The same name on the other address: refused, and the public site answers instead. This is
+    // the assertion the whole feature exists for — a client that reaches the public address and
+    // types the internal name must not be served the internal root.
+    let other = http_get_with(
+        &format!("127.0.0.1:{port}"),
+        "/index.html",
+        &[("Host", "internal.test")],
+    );
+    assert_eq!(other.status, 200, "{other:?}");
+    assert_eq!(
+        other.text(),
+        "PUBLIC",
+        "a bound site must not be selectable by name from an address it does not name"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An address-only site answers an unclaimed name on its address.
+#[test]
+fn an_address_only_site_answers_on_its_address_alone() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-address-only-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("public")).expect("create the public root");
+    std::fs::create_dir_all(root.join("internal")).expect("create the internal root");
+    std::fs::write(root.join("public/index.html"), "PUBLIC").expect("write the public page");
+    std::fs::write(root.join("internal/index.html"), "INTERNAL").expect("write the internal page");
+
+    let root_toml = root.display().to_string().replace('\\', "/");
+    let config = format!(
+        r#"
+[server]
+http = "0.0.0.0:{port}"
+document_root = "{root}/public"
+static_files = true
+
+[sites.internal]
+addresses = ["127.0.0.2"]
+document_root = "{root}/internal"
+"#,
+        port = 19900 + (std::process::id() % 90),
+        root = root_toml,
+    );
+    let config_path = root.join("volucer.toml");
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let Some(http_address) = server.http_address.clone() else {
+        panic!("the HTTP listener did not report an address");
+    };
+    let port = http_address
+        .rsplit(':')
+        .next()
+        .expect("a port in the address");
+
+    // Nobody configured this name, so `default_server` semantics apply on the bound address.
+    let bound = http_get_with(
+        &format!("127.0.0.2:{port}"),
+        "/index.html",
+        &[("Host", "nothing.test")],
+    );
+    assert_eq!(bound.status, 200, "{bound:?}");
+    assert_eq!(bound.text(), "INTERNAL");
+
+    let other = http_get_with(
+        &format!("127.0.0.1:{port}"),
+        "/index.html",
+        &[("Host", "nothing.test")],
+    );
+    assert_eq!(other.status, 200, "{other:?}");
+    assert_eq!(other.text(), "PUBLIC");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A minimal HTTP response reader, for the dual-listener smoke test.
 #[derive(Debug)]
 struct HttpResponse {
@@ -673,7 +823,16 @@ fn http_request(address: &str, method: &str, path: &str, extra: &[(&str, &str)])
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("a read timeout");
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: example.test\r\n");
+    let mut request = format!("{method} {path} HTTP/1.1\r\n");
+    // A caller that supplies its own `Host` gets exactly that one: two `Host` headers would be an
+    // invalid request, and `hyper` would answer on the first — which reads as "the header the test
+    // sent was ignored" rather than as the malformed request it is.
+    if !extra
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        request.push_str("Host: example.test\r\n");
+    }
     for (name, value) in extra {
         request.push_str(name);
         request.push_str(": ");

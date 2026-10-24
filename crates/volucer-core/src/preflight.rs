@@ -217,8 +217,75 @@ pub fn inspect_with(
 
     inspect_programs(config, &mut warnings);
     inspect_tls_with(config, config_path, &mut warnings);
+    inspect_hsts(config, &mut warnings);
 
     warnings
+}
+
+/// Report `Strict-Transport-Security` policies that reach further than the site they are written on.
+///
+/// The one HSTS mistake this file can see and the browser cannot: `includeSubDomains` binds names
+/// the configuration never mentions, and if one of them is another site in this same deployment then
+/// a browser that has visited the parent will refuse cleartext to it — including when that site was
+/// deliberately cleartext, or reachable only on an internal address.
+///
+/// A warning rather than an error, because the policy may be exactly what the operator wants: the
+/// subdomain may be TLS-only and public. What must not happen is that they did not notice.
+fn inspect_hsts(config: &Config, warnings: &mut Vec<Warning>) {
+    // Every site's resolved policy, since inheritance is what makes the parent's policy reach a
+    // subdomain it does not own.
+    let sites = Sites::from_config_with(config, Path::new("."), None);
+
+    for (parent_name, parent) in &config.sites {
+        // A site with no names has nothing for a browser to file a policy against, and validation
+        // has already refused one that states its own.
+        if parent.hosts.is_empty() {
+            continue;
+        }
+        let Some(policy) = sites
+            .named()
+            .get(parent_name)
+            .and_then(|site| site.hsts.as_ref())
+        else {
+            continue;
+        };
+        if !policy.include_subdomains {
+            continue;
+        }
+        for host in &parent.hosts {
+            // A wildcard names a pattern rather than a domain to be a superdomain *of*; skipping it
+            // keeps this a report about concrete names, which is what a browser matches.
+            if host.contains('*') {
+                continue;
+            }
+            let suffix = format!(".{}", host.trim_end_matches('.').to_ascii_lowercase());
+            // **Every** site, not only those with a policy of their own: the site that needs the
+            // warning most is the one nobody wrote an HSTS table for, whose cleartext or internal
+            // addresses the parent's policy now silently forecloses.
+            for (child_name, child) in &config.sites {
+                if child_name == parent_name {
+                    continue;
+                }
+                for name in &child.hosts {
+                    if name.contains('*') || !name.to_ascii_lowercase().ends_with(&suffix) {
+                        continue;
+                    }
+                    warnings.push(Warning::with_hint(
+                        format!(
+                            "sites.{parent_name} sets includeSubDomains for {host}, which covers \
+                             sites.{child_name} ({name}) too — a browser that has seen the \
+                             policy will refuse cleartext to that name, including any internal \
+                             address it resolves to"
+                        ),
+                        format!(
+                            "make sure {name} serves TLS on every address it answers, or drop \
+                             includeSubDomains from sites.{parent_name}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Report TLS settings whose files are missing or unusable.
@@ -1210,6 +1277,91 @@ origin = "unix:{}"
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
             warnings[0].message.contains("nothing is listening"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A policy that reaches a sibling site is reported, because the file is the only place the
+    /// overlap is visible: the browser applies `includeSubDomains` to names this deployment never
+    /// wrote in one table.
+    #[test]
+    fn a_parent_policy_covering_a_sibling_site_is_reported() {
+        let root = Fixture::new("hsts-subdomains");
+        root.write("index.php");
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+https = "127.0.0.1:8443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+
+[sites.shop]
+hosts = ["example.com"]
+document_root = "."
+
+[sites.shop.hsts]
+max_age_s = 600
+include_subdomains = true
+
+[sites.admin]
+hosts = ["admin.example.com"]
+document_root = "."
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("valid");
+        let warnings = inspect(&config, root.path());
+        let message = warnings
+            .iter()
+            .find(|w| w.message.contains("includeSubDomains"))
+            .unwrap_or_else(|| panic!("the overlap must be reported: {warnings:?}"));
+        assert!(message.message.contains("admin.example.com"), "{message:?}");
+        assert!(
+            message.hint.as_deref().is_some_and(|h| h.contains("TLS")),
+            "the hint must name the fix: {message:?}"
+        );
+
+        // Without `includeSubDomains` there is no overlap to report — the policy stops at the
+        // name it was written for.
+        let text = text.replace("include_subdomains = true", "");
+        let config = Config::from_toml(&text).expect("parses");
+        config.validate().expect("valid");
+        let warnings = inspect(&config, root.path());
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.message.contains("includeSubDomains")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A subdomain that only *inherits* from the parent is not a second site, so it is not an
+    /// overlap — the warning would otherwise fire on every wildcard deployment.
+    #[test]
+    fn a_site_is_not_reported_for_covering_itself() {
+        let root = Fixture::new("hsts-self");
+        root.write("index.php");
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+https = "127.0.0.1:8443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+
+[server.hsts]
+max_age_s = 600
+include_subdomains = true
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("valid");
+        let warnings = inspect(&config, root.path());
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.message.contains("includeSubDomains")),
             "{warnings:?}"
         );
     }

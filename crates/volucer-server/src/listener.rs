@@ -573,7 +573,22 @@ fn serve_connection(
         // per-connection snapshot would serve the old configuration for the life of that
         // connection. That is what this line was written to fix, and the test pins it.
         let snapshot = sites.sites();
-        let site = snapshot.resolve(host.as_deref());
+        // The local address a FastCGI request arrived on, for a site's `addresses` binding.
+        //
+        // **`SERVER_ADDR`, which nginx sets from `$server_addr` in its own `fastcgi_params`**, is the
+        // address the client reached — the same fact `getsockname` gives this process on a socket it
+        // owns. It is not a client's claim: nginx fills it in from the socket it accepted, so it has
+        // the same standing as the HTTP path's `getsockname`.
+        //
+        // The socket's own address is the fallback for a proxy that forwards raw FastCGI without
+        // `SERVER_ADDR` — but that is *nginx's* peer address, not the client's destination, so it is
+        // only right when volucer is the thing being reached directly. A deployment that binds sites
+        // to addresses behind a proxy has to let the proxy tell it which address was reached, and
+        // this is the parameter it does that with.
+        let local = param(request.params.as_slice(), b"SERVER_ADDR")
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok());
+        let site =
+            snapshot.resolve_request(host.as_deref(), local, volucer_core::SiteProtocol::Fastcgi);
         // **Identity is resolved per request, here, on the request path.** nginx keeps its upstream
         // alive, so the next request very often arrives on a connection accepted long before it; a
         // per-connection id would give two requests the same id, which is worse than no id at all

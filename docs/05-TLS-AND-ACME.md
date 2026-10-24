@@ -89,6 +89,91 @@ default.
 protocols, and a redirect on the TLS half would send the client back to where it just came
 from — an infinite loop. The decision is per connection for exactly that reason.
 
+### Redirecting one site rather than all of them
+
+`redirect_to_https` is also a **site** key, and a site that states nothing inherits the
+deployment's answer:
+
+```toml
+[server]
+redirect_to_https = true
+
+[sites.corp]
+hosts = ["internal.corp"]
+addresses = ["192.168.9.123"]
+protocols = ["http", "https"]
+redirect_to_https = false     # deliberately cleartext on this address
+```
+
+This is the case a single deployment-wide boolean cannot express. A site bound to an
+internal address with `protocols = ["http"]` is *deliberately* cleartext — it has no
+certificate for that name and no reason for one — and redirecting it would send its clients
+to a scheme it does not serve.
+
+Two combinations are refused as inert rather than accepted:
+
+- `redirect_to_https = true` on a site whose `protocols` excludes `"http"` — such a site
+  never receives a cleartext request to redirect.
+- `redirect_to_https = true` on a site whose `protocols` excludes `"https"` — the redirect
+  would point at a scheme this site does not answer.
+
+The redirect is resolved **from the site**, so it is decided after site selection rather
+than before it. It stays ahead of everything that costs work: a redirect is one host probe
+and a comparison, and the body has not been read at that point.
+
+### `Strict-Transport-Security`
+
+```toml
+[server.hsts]
+max_age_s = 300
+include_subdomains = false
+
+[sites.shop.hsts]
+max_age_s = 31536000
+include_subdomains = true
+preload = true
+```
+
+`[server.hsts]` is what a site inherits; a site's own table names only the directives it
+changes, so the example above keeps the server's `includeSubdomains` where it does not
+override it. **Absent means no header at all**, the same rule `redirect_to_https` follows.
+
+`max_age_s` is required on `[server.hsts]`, because there is nothing above it to inherit
+from. There is deliberately no bare `hsts = true`: a policy nobody chose is a pin a browser
+keeps enforcing until the name is reached again *over TLS*, so a wrong duration is not
+undone by editing the file.
+
+`enabled = false` on a site turns off a policy it would otherwise inherit. That is why the
+switch is a key rather than the table's presence — removing the table means "inherit".
+
+`max_age_s = 0` is refused: in the header it means "delete this policy", so writing it in a
+table would be two statements about one thing.
+
+`preload = true` requires `include_subdomains = true` and at least a year
+(`31536000`), which is what the preload list itself enforces.
+
+**Sent only over a secure transport.** RFC 6797 §7.2 forbids the header on a non-secure
+transport, so a `plain = true` port sends it on the TLS half and never on the cleartext one,
+and a redirect answer — cleartext by definition — does not carry it. It **is** sent on error
+answers: a policy belongs to the name, so a 404 tells the browser about it just as a 200
+does (nginx's `add_header … always`).
+
+**Not sent over FastCGI.** The proxy in front terminates TLS and writes its own response
+headers; `HTTPS` is the proxy's claim rather than a fact about this server's socket.
+
+Two placements are refused because the header could never be honoured:
+
+- A site with no `hosts` — the address-only `default_server` shape. A browser stores a policy
+  against a **host name** and never against an IP (RFC 6797 §8.3), so every client that could
+  reach such a site would ignore it.
+- A site whose `protocols` excludes `"https"`, and a deployment with no `[server.tls]` at
+  all: there is no secure transport to send it on.
+
+`volucer check` warns when `include_subdomains` on one site covers another site in the same
+file — a browser that has visited the parent then refuses cleartext to the child, including
+an internal address it resolves to. HSTS is deliberately *not* address-bound: a policy set on
+a public address applies to the name wherever it resolves.
+
 ## Per-site certificates
 
 ```toml

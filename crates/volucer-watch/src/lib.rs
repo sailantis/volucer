@@ -293,8 +293,33 @@ impl Reloaded {
     ///
     /// One call rather than a resolve followed by a lookup, because the two must agree: see
     /// [`Resolved`].
+    ///
+    /// **The host-only form**, for a caller with no connection to describe. The request path uses
+    /// [`Reloaded::resolve_request`], which also consults the site's address binding and protocol
+    /// restriction.
     pub fn resolve(&self, host: Option<&str>) -> Resolved<'_> {
         let site = self.sites.resolve(host);
+        let (routing, statics, compression) = self.for_site(site);
+        Resolved {
+            site,
+            routing,
+            statics,
+            compression,
+        }
+    }
+
+    /// [`Reloaded::resolve`] for a real connection: the name, the local address, the protocol.
+    ///
+    /// The request-path entry point. Everything it returns comes from this one snapshot, so a
+    /// request is served under one generation even if a reload lands while it is in flight — the
+    /// property the in-flight test pins.
+    pub fn resolve_request(
+        &self,
+        host: Option<&str>,
+        local: Option<std::net::IpAddr>,
+        protocol: volucer_core::config::SiteProtocol,
+    ) -> Resolved<'_> {
+        let site = self.sites.resolve_request(host, local, protocol);
         let (routing, statics, compression) = self.for_site(site);
         Resolved {
             site,

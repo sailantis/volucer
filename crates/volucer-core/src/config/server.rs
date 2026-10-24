@@ -190,6 +190,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub redirect_to_https: bool,
 
+    /// `Strict-Transport-Security` for every site that does not state its own.
+    ///
+    /// Absent is the default, and it means **no header**: adding one changes what an existing
+    /// deployment's browsers do, and a policy is a deployment's decision rather than a server's —
+    /// the same rule `redirect_to_https` follows.
+    ///
+    /// `max_age_s` is required here because there is nothing to inherit from; a site's table may
+    /// leave it out and inherit this one. See [`HstsConfig`] for what the policy cannot reach and
+    /// where the header is sent.
+    #[serde(default)]
+    pub hsts: Option<HstsConfig>,
+
     /// The access log. **Absent is what turns it off**, which is the default.
     ///
     /// Off by default on the same rule `static_files` follows: an existing deployment must not

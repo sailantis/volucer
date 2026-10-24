@@ -12,7 +12,7 @@ pub mod ratelimit;
 pub mod script;
 pub mod sites;
 pub use clientip::{ClientIpPolicy, HeaderLookup};
-pub use config::{BackendConfig, Config, Listener, ServerConfig};
+pub use config::{BackendConfig, Config, Listener, ServerConfig, SiteProtocol};
 pub use error::{Error, Result};
 pub use hostmap::HostMap;
 pub use php::{PhpBinary, Sapi};

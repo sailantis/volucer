@@ -19,10 +19,102 @@
 //! question the file can answer and a `stat` per request is too late to ask it.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, RouteConfig, ServeOnly, SiteConfig, StaticConfig, StaticsSetting};
+use crate::clientip::Cidr;
+use crate::config::{
+    Config, RouteConfig, ServeOnly, SiteConfig, SiteProtocol, StaticConfig, StaticsSetting,
+};
 use crate::hostmap::HostMap;
+
+/// Which addresses a site answers on, resolved once at startup.
+///
+/// `Any` rather than an empty list for the unbound case, because the request path must not have to
+/// ask "is this empty, and what does empty mean": a deployment that named no address serves every
+/// address, and that is a different statement from a site bound to nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SiteBinding {
+    /// No `addresses` key: this site answers on whatever the listener reached.
+    #[default]
+    Any,
+    /// One or more ranges, parsed at startup so the request path is a comparison and nothing else.
+    Ranges(Vec<Cidr>),
+}
+
+impl SiteBinding {
+    /// Whether a connection that arrived on `local` may select this site.
+    ///
+    /// The comparison is against the **local** address — what `getsockname` reports for the accepted
+    /// socket — and not the peer. That is the whole point of the key: a client chooses the `Host` it
+    /// sends, and a client chooses the address it connects to only insofar as DNS and routing let
+    /// it, so the local address is the one thing about a request an attacker cannot rewrite.
+    pub fn admits(&self, local: IpAddr) -> bool {
+        match self {
+            SiteBinding::Any => true,
+            SiteBinding::Ranges(ranges) => ranges.iter().any(|range| range.contains(local)),
+        }
+    }
+
+    /// Whether this site is bound to specific addresses at all.
+    pub fn is_bound(&self) -> bool {
+        matches!(self, SiteBinding::Ranges(_))
+    }
+
+    /// The narrowest range that admits `local`, for choosing between two bound sites.
+    ///
+    /// `None` when nothing admits the address, which is the caller's signal to fall back to the
+    /// default site. The narrowest wins because a site bound to `192.168.9.0/24` and one bound to
+    /// `192.168.9.123` both admit the same connection, and the more specific one is the one that
+    /// says what the operator meant — the same "most specific wins" rule the host table follows
+    /// for wildcards, so the two halves of site selection read the same way.
+    pub fn specificity(&self, local: IpAddr) -> Option<u8> {
+        match self {
+            // Any is the least specific possible answer: it matches everything, so it must lose to
+            // any explicit range. `0` rather than `None`, because it *does* admit the address.
+            SiteBinding::Any => Some(0),
+            SiteBinding::Ranges(ranges) => ranges
+                .iter()
+                .filter(|range| range.contains(local))
+                .map(Cidr::bits)
+                .max(),
+        }
+    }
+}
+
+/// The protocols a site answers on, resolved once at startup.
+///
+/// Bit flags rather than a `Vec`, because the request path asks one question per request — "is my
+/// protocol in this set" — and a vector would be a linear scan for an answer that cannot change. The
+/// unset case is every bit, so an unconfigured site keeps serving whatever reaches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiteProtocols(u8);
+
+impl Default for SiteProtocols {
+    /// Absent means every protocol, which is the behaviour that existed before the key.
+    fn default() -> Self {
+        SiteProtocols(
+            SiteProtocol::Http as u8 | SiteProtocol::Https as u8 | SiteProtocol::Fastcgi as u8,
+        )
+    }
+}
+
+impl SiteProtocols {
+    /// The set a configured list names, with duplicates and unknown entries already refused by
+    /// validation.
+    pub fn from_config(protocols: &[SiteProtocol]) -> Self {
+        let mut bits = 0;
+        for protocol in protocols {
+            bits |= *protocol as u8;
+        }
+        SiteProtocols(bits)
+    }
+
+    /// Whether this site answers on `protocol`.
+    pub fn admits(self, protocol: SiteProtocol) -> bool {
+        self.0 & (protocol as u8) != 0
+    }
+}
 
 /// The settings a request is served with, after a host has been resolved.
 ///
@@ -66,6 +158,26 @@ pub struct ResolvedSite {
     pub routes: Vec<RouteConfig>,
     /// The backend a request matching no route goes to.
     pub default_backend: Option<String>,
+    /// The local addresses this site answers on; see [`SiteBinding`].
+    ///
+    /// Carried on the site rather than asked of the configuration per request for the reason every
+    /// other resolved field is: the site table is built once, and the request path must not parse
+    /// a range or reach back into a `SiteConfig` that a reload may have replaced.
+    pub binding: SiteBinding,
+    /// The protocols this site answers on; see [`SiteProtocols`].
+    pub protocols: SiteProtocols,
+    /// Whether this site answers its own cleartext requests with a `301` to `https://`.
+    ///
+    /// Resolved here rather than read from the configuration per request for the same reason
+    /// everything else on this type is: the answer is a site's, and the request path must not
+    /// reach back into a `SiteConfig` that a reload may have replaced. `[server]` is what a site
+    /// inherits when it states nothing, so the default site carries `server.redirect_to_https`.
+    pub redirect_to_https: bool,
+    /// The `Strict-Transport-Security` policy for this site, with inheritance applied.
+    ///
+    /// `None` is "send no header" — either nobody asked for one, or this site turned off a policy
+    /// it would otherwise inherit. Sent only over TLS; see [`HstsPolicy`].
+    pub hsts: Option<crate::config::HstsPolicy>,
 }
 
 /// The site table, with the `[server]` values it falls back to.
@@ -84,6 +196,18 @@ pub struct Sites {
     /// [`HostMap`] so the certificate table and the route table share it rather than each
     /// growing a copy that could drift.
     hosts: HostMap<String>,
+    /// Sites that name addresses and no hosts, narrowest range first.
+    ///
+    /// A site with no `hosts` is a *default for the addresses it names*: it is chosen when the
+    /// connection arrived on one of them and no name claimed it. Kept as a list, pre-sorted, rather
+    /// than folded into [`Sites::hosts`] — a host map is keyed by a name this site does not have,
+    /// and inventing one (`*`) would claim every name rather than the addresses it was written for.
+    ///
+    /// Sorted by descending range width so the first match is the most specific, which is the same
+    /// rule the host table applies to wildcards, so both halves of selection read the same way. The
+    /// sort is done once here rather than per request, for the same reason the routings are
+    /// prebuilt: it is a property of the configuration.
+    address_only: Vec<(String, SiteBinding)>,
 }
 
 impl Sites {
@@ -132,6 +256,20 @@ impl Sites {
             compression: default_compression.clone(),
             routes: config.server.routes.clone(),
             default_backend: config.server.default_backend.clone(),
+            // `[server]` is the fallback site and cannot be bound: it is what answers a connection
+            // no site claims, so a binding here would be a way to answer nothing at all. A
+            // deployment that wants the default site restricted writes a site for it and leaves
+            // `[server]` as the refusal.
+            binding: SiteBinding::Any,
+            protocols: SiteProtocols::default(),
+            // `[server]` is the fallback site, and it *is* the deployment's own settings, so these
+            // two are the server's rather than inherited from anywhere.
+            redirect_to_https: config.server.redirect_to_https,
+            hsts: config
+                .server
+                .hsts
+                .as_ref()
+                .and_then(|hsts| hsts.resolved(None)),
         };
         suppress_unused_static_layer(
             &mut default,
@@ -141,6 +279,7 @@ impl Sites {
 
         let mut named = BTreeMap::new();
         let mut hosts: HostMap<String> = HostMap::new();
+        let mut address_only: Vec<(String, SiteBinding)> = Vec::new();
 
         for (name, site) in &config.sites {
             let mut resolved = resolve_site(
@@ -153,6 +292,8 @@ impl Sites {
                 &default_compression,
                 &config.server.routes,
                 config.server.default_backend.as_deref(),
+                config.server.redirect_to_https,
+                default.hsts.as_ref(),
             );
             suppress_unused_static_layer(
                 &mut resolved,
@@ -167,13 +308,29 @@ impl Sites {
                 hosts.insert(host, name.clone());
             }
 
+            // An address-only site is not in the host map at all, so it is recorded separately.
+            // Its binding is already resolved, so this is a move rather than a second parse.
+            if site.hosts.is_empty() && resolved.binding.is_bound() {
+                address_only.push((name.clone(), resolved.binding.clone()));
+            }
+
             named.insert(name.clone(), resolved);
         }
+
+        // Narrowest last, so a linear scan takes the most specific first. See the field's doc: the
+        // order is the rule, and computing it here keeps it out of the request path.
+        address_only.sort_by_key(|(_, binding)| {
+            std::cmp::Reverse(match binding {
+                SiteBinding::Ranges(ranges) => ranges.iter().map(Cidr::bits).max().unwrap_or(0),
+                SiteBinding::Any => 0,
+            })
+        });
 
         Sites {
             default,
             named,
             hosts,
+            address_only,
         }
     }
 
@@ -194,6 +351,11 @@ impl Sites {
     /// site. A host with a port, and a host in any case, matches the same as one
     /// without — the `Host` header is a client's word and neither a port nor a case
     /// is part of the name a site claims.
+    ///
+    /// **This is the host-only answer.** It takes no address and no protocol, so a site bound to
+    /// addresses is returned here without its binding being consulted — correct for a caller that
+    /// has no connection to describe (a diagnostic that asks "which site claims this name"), and
+    /// wrong for a request. The request path uses [`Sites::resolve_request`].
     pub fn resolve(&self, host: Option<&str>) -> &ResolvedSite {
         let Some(host) = host else {
             return &self.default;
@@ -210,6 +372,73 @@ impl Sites {
             .get(host)
             .and_then(|name| self.named.get(name.as_str()))
             .unwrap_or(&self.default)
+    }
+
+    /// The site that serves **this connection**: a name, the address it arrived on, and the
+    /// protocol it arrived over.
+    ///
+    /// This is the request-path answer, and it is the one that makes a bound site worth writing.
+    /// The order is the security property — the first two rules are the ones that cannot be
+    /// influenced by what a client sends:
+    ///
+    /// 1. **A site that names protocols must admit `protocol`.** The listener is a fact about the
+    ///    connection: a site restricted to `https` does not answer the cleartext half of a
+    ///    `plain = true` port, however the request is written.
+    /// 2. **A site that names addresses must admit `local`.** The name is a client's choice and the
+    ///    local address is the kernel's answer, so a site bound to an internal address cannot be
+    ///    selected by a client that reached a public one.
+    /// 3. Among the sites that survive, the host rule applies unchanged — exact, then longest
+    ///    wildcard — to the ones that **do** survive. A name claimed only by an ineligible site
+    ///    therefore falls through to a less specific pattern that can serve this connection, or to
+    ///    an address-only site, or to the default — never to the ineligible site.
+    /// 4. An **address-only** site (one with no `hosts`) is considered last, and the narrowest range
+    ///    that admits `local` wins. This is the nginx `default_server` shape: one application on one
+    ///    internal address, with no hostname to invent for it.
+    ///
+    /// A site that states neither binding behaves exactly as before — the filters admit everything
+    /// — so a deployment that does not use these keys pays one comparison per candidate and nothing
+    /// else.
+    pub fn resolve_request(
+        &self,
+        host: Option<&str>,
+        local: Option<IpAddr>,
+        protocol: SiteProtocol,
+    ) -> &ResolvedSite {
+        let admits = |site: &ResolvedSite| admits_connection(site, local, protocol);
+
+        // The most specific site whose name matches *and* which can serve this connection. The
+        // `keep` predicate runs inside the walk, so a rejected exact name still falls through to
+        // the wildcards rather than hiding them — see `HostMap::get_where`.
+        let named = host
+            .map(crate::hostmap::strip_port)
+            .filter(|host| !host.is_empty())
+            .and_then(|host| {
+                self.hosts
+                    .get_where(host, |name| {
+                        self.named.get(name.as_str()).is_some_and(admits)
+                    })
+                    .and_then(|name| self.named.get(name.as_str()))
+            });
+
+        if let Some(site) = named {
+            return site;
+        }
+
+        // Nothing claimed it by name. An address-only site is the answer when one admits this
+        // connection, and an unknown local address (a unix socket) admits none of them.
+        if let Some(local) = local {
+            for (name, binding) in &self.address_only {
+                if binding.admits(local) {
+                    if let Some(site) = self.named.get(name.as_str()) {
+                        if admits(site) {
+                            return site;
+                        }
+                    }
+                }
+            }
+        }
+
+        &self.default
     }
 
     /// The host patterns this deployment claims, for diagnostics.
@@ -231,6 +460,26 @@ impl Sites {
             .chain(self.named.values())
             .filter(|site| site.static_files_suppressed)
             .collect()
+    }
+}
+
+/// Whether a site may serve a connection described by `local` and `protocol`.
+///
+/// The one place the two filters are applied, so site selection and the diagnostics that explain it
+/// cannot disagree about whether a site is eligible.
+///
+/// An **unknown** local address (`None`) fails closed for a bound site: admitting a site that names
+/// addresses without being able to check them is the one direction that exposes an internal site
+/// rather than hiding it. It is unreachable today — both front-ends bind a `TcpListener`, and
+/// `server.http = "unix:…"` is refused at bind time with "invalid port value" — so this is a guard
+/// that costs a comparison and cannot be triggered, rather than a path anything takes.
+fn admits_connection(site: &ResolvedSite, local: Option<IpAddr>, protocol: SiteProtocol) -> bool {
+    if !site.protocols.admits(protocol) {
+        return false;
+    }
+    match local {
+        Some(address) => site.binding.admits(address),
+        None => !site.binding.is_bound(),
     }
 }
 
@@ -340,6 +589,8 @@ fn resolve_site(
     default_compression: &crate::config::CompressionSetting,
     default_routes: &[RouteConfig],
     default_backend: Option<&str>,
+    default_redirect_to_https: bool,
+    default_hsts: Option<&crate::config::HstsPolicy>,
 ) -> ResolvedSite {
     let front_controller = match &site.front_controller {
         Some(controller) => controller.as_path().map(str::to_string),
@@ -370,6 +621,21 @@ fn resolve_site(
         None => default_compression.clone(),
     };
 
+    // Parsed here rather than on the request path, and *tolerantly*: validation has already refused
+    // an entry that does not parse, so a malformed one reaching this point means the table was built
+    // without `validate` — and dropping it is the direction that cannot expose a site. An entry that
+    // silently vanished is reported by `check`, which prints the binding it actually holds.
+    let binding = if site.addresses.is_empty() {
+        SiteBinding::Any
+    } else {
+        SiteBinding::Ranges(
+            site.addresses
+                .iter()
+                .filter_map(|spec| Cidr::parse(spec).ok())
+                .collect(),
+        )
+    };
+
     ResolvedSite {
         name: name.to_string(),
         document_root: site.document_root.clone(),
@@ -389,6 +655,21 @@ fn resolve_site(
             .default_backend
             .clone()
             .or_else(|| default_backend.map(str::to_string)),
+        binding,
+        protocols: site
+            .protocols
+            .as_deref()
+            .map(SiteProtocols::from_config)
+            .unwrap_or_default(),
+        // Both are the server's answer unless the site states one, which is the same direction
+        // every other per-site key inherits in. `default_hsts` is passed already resolved, so a
+        // site that states `max_age_s` alone keeps the server's other two directives rather than
+        // resetting them.
+        redirect_to_https: site.redirect_to_https.unwrap_or(default_redirect_to_https),
+        hsts: match &site.hsts {
+            Some(hsts) => hsts.resolved(default_hsts),
+            None => default_hsts.cloned(),
+        },
     }
 }
 
@@ -407,6 +688,10 @@ mod tests {
         let config = Config::from_toml(text).expect("config parses");
         config.validate().expect("config validates");
         config
+    }
+
+    fn ip(spec: &str) -> IpAddr {
+        spec.parse().expect("the test names a valid address")
     }
 
     const TWO_SITES: &str = r#"
@@ -523,6 +808,356 @@ document_root = "/srv/narrow"
         // `*.shop.example.com` is a subdomain rule, so the bare name it hangs off
         // is not a match — it is a different site's or the default's.
         assert_eq!(sites.resolve_str("shop.example.com").name, "<default>");
+    }
+
+    /// A site bound to addresses is unreachable by name from anywhere else.
+    ///
+    /// This is the whole of the key: `Host` is written by the client, so before this a site named
+    /// `internal.corp` was selectable by anyone who could reach the port. The binding makes the
+    /// kernel's answer part of the decision.
+    #[test]
+    fn a_bound_site_is_refused_by_name_on_another_address() {
+        let text = r#"
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/public"
+
+[sites.internal]
+hosts = ["internal.corp"]
+addresses = ["192.168.9.123"]
+document_root = "/srv/internal"
+"#;
+        let config = config(text);
+        let sites = Sites::from_config(&config, Path::new("/srv/public"));
+        let internal = ip("192.168.9.123");
+        let public = ip("135.181.172.123");
+
+        // On the bound address the name selects the site.
+        assert_eq!(
+            sites
+                .resolve_request(Some("internal.corp"), Some(internal), SiteProtocol::Http)
+                .name,
+            "internal"
+        );
+
+        // From the public address the *same name* is refused, and falls to the default site —
+        // not to the internal one, which is the entire point.
+        assert_eq!(
+            sites
+                .resolve_request(Some("internal.corp"), Some(public), SiteProtocol::Http)
+                .name,
+            "<default>"
+        );
+
+        // And a name nobody claims never reached it either.
+        assert_eq!(
+            sites
+                .resolve_request(Some("other.test"), Some(internal), SiteProtocol::Http)
+                .name,
+            "<default>"
+        );
+    }
+
+    /// A site that names addresses and no hosts is a default for those addresses.
+    ///
+    /// The nginx `default_server` shape: one application on one internal address, with no hostname
+    /// to invent. It must answer an unclaimed name — and only there.
+    #[test]
+    fn an_address_only_site_answers_unclaimed_names_on_its_address() {
+        let text = r#"
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/public"
+
+[sites.internal]
+addresses = ["192.168.9.0/24"]
+document_root = "/srv/internal"
+"#;
+        let config = config(text);
+        let sites = Sites::from_config(&config, Path::new("/srv/public"));
+
+        assert_eq!(
+            sites
+                .resolve_request(
+                    Some("anything.test"),
+                    Some(ip("192.168.9.5")),
+                    SiteProtocol::Http
+                )
+                .name,
+            "internal"
+        );
+        assert_eq!(
+            sites
+                .resolve_request(None, Some(ip("192.168.9.5")), SiteProtocol::Http)
+                .name,
+            "internal"
+        );
+        assert_eq!(
+            sites
+                .resolve_request(
+                    Some("anything.test"),
+                    Some(ip("135.181.172.123")),
+                    SiteProtocol::Http
+                )
+                .name,
+            "<default>"
+        );
+    }
+
+    /// Between two bound sites, the narrower range wins.
+    ///
+    /// The same specificity rule the host table applies to wildcards, so both halves of selection
+    /// read the same way — and so a `/32` carved out of a `/24` is reachable.
+    #[test]
+    fn a_narrower_address_binding_beats_a_wider_one() {
+        let text = r#"
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/public"
+
+[sites.wide]
+addresses = ["192.168.9.0/24"]
+document_root = "/srv/wide"
+
+[sites.narrow]
+addresses = ["192.168.9.123"]
+document_root = "/srv/narrow"
+"#;
+        let config = config(text);
+        let sites = Sites::from_config(&config, Path::new("/srv/public"));
+
+        assert_eq!(
+            sites
+                .resolve_request(None, Some(ip("192.168.9.123")), SiteProtocol::Http)
+                .name,
+            "narrow"
+        );
+        assert_eq!(
+            sites
+                .resolve_request(None, Some(ip("192.168.9.200")), SiteProtocol::Http)
+                .name,
+            "wide"
+        );
+    }
+
+    /// A protocol restriction is decided by the connection, not by a header.
+    #[test]
+    fn a_site_restricted_to_https_does_not_answer_cleartext() {
+        let text = r#"
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/public"
+
+[sites.secure]
+hosts = ["secure.test"]
+protocols = ["https"]
+document_root = "/srv/secure"
+"#;
+        let config = config(text);
+        let sites = Sites::from_config(&config, Path::new("/srv/public"));
+        let any = Some(ip("127.0.0.1"));
+
+        assert_eq!(
+            sites
+                .resolve_request(Some("secure.test"), any, SiteProtocol::Https)
+                .name,
+            "secure"
+        );
+        assert_eq!(
+            sites
+                .resolve_request(Some("secure.test"), any, SiteProtocol::Http)
+                .name,
+            "<default>"
+        );
+        // And the FastCGI front-end is a third protocol, not a synonym for either.
+        assert_eq!(
+            sites
+                .resolve_request(Some("secure.test"), any, SiteProtocol::Fastcgi)
+                .name,
+            "<default>"
+        );
+    }
+
+    /// A name claimed by an ineligible site must not hide an eligible wildcard.
+    ///
+    /// The failure this prevents is subtle: an exact name bound to one address would otherwise
+    /// *shadow* the wildcard that could serve the connection, and the request would fall all the
+    /// way to the default rather than to the site that claims it by pattern.
+    #[test]
+    fn a_refused_exact_name_falls_through_to_a_wildcard_that_admits() {
+        let text = r#"
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/public"
+
+[sites.exact]
+hosts = ["api.corp.test"]
+addresses = ["192.168.9.123"]
+document_root = "/srv/exact"
+
+[sites.wild]
+hosts = ["*.corp.test"]
+document_root = "/srv/wild"
+"#;
+        let config = config(text);
+        let sites = Sites::from_config(&config, Path::new("/srv/public"));
+
+        // On the bound address the exact name wins, as it always does.
+        assert_eq!(
+            sites
+                .resolve_request(
+                    Some("api.corp.test"),
+                    Some(ip("192.168.9.123")),
+                    SiteProtocol::Http
+                )
+                .name,
+            "exact"
+        );
+        // Elsewhere it is refused, and the wildcard serves it rather than the default.
+        assert_eq!(
+            sites
+                .resolve_request(
+                    Some("api.corp.test"),
+                    Some(ip("135.181.172.123")),
+                    SiteProtocol::Http
+                )
+                .name,
+            "wild"
+        );
+    }
+
+    /// A v4 binding does not admit a v4-mapped v6 peer address.
+    ///
+    /// Deliberate rather than an oversight: the refusal is visible, where silently comparing the
+    /// masked halves would serve an internal site on a socket the operator did not think about.
+    #[test]
+    fn a_binding_compares_within_one_address_family() {
+        let text = r#"
+[server]
+http = "[::]:8080"
+document_root = "/srv/public"
+
+[sites.internal]
+hosts = ["internal.corp"]
+addresses = ["192.168.9.123"]
+document_root = "/srv/internal"
+"#;
+        let config = config(text);
+        let sites = Sites::from_config(&config, Path::new("/srv/public"));
+
+        assert_eq!(
+            sites
+                .resolve_request(
+                    Some("internal.corp"),
+                    Some(ip("::ffff:192.168.9.123")),
+                    SiteProtocol::Http
+                )
+                .name,
+            "<default>",
+            "a mapped v6 address is a v6 address"
+        );
+        assert_eq!(
+            sites
+                .resolve_request(
+                    Some("internal.corp"),
+                    Some(ip("192.168.9.123")),
+                    SiteProtocol::Http
+                )
+                .name,
+            "internal"
+        );
+    }
+
+    /// A site with neither a name nor an address is refused rather than silently unreachable.
+    #[test]
+    fn a_site_with_no_name_and_no_address_is_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[sites.nothing]
+document_root = "/srv/nothing"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("a site nothing can reach is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("hosts") && message.contains("addresses"),
+            "the message must name both keys, got: {message}"
+        );
+    }
+
+    /// A malformed address is refused, because the failure it hides is a site served too widely.
+    #[test]
+    fn a_site_with_a_malformed_address_is_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[sites.typo]
+hosts = ["typo.test"]
+addresses = ["192.168.9.300"]
+document_root = "/srv/typo"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("a bad address is refused");
+        assert!(
+            err.to_string().contains("sites.typo.addresses"),
+            "the message must name the key, got: {err}"
+        );
+    }
+
+    /// An empty protocol list would make a site reachable by nothing, so it is refused.
+    #[test]
+    fn a_site_with_an_empty_protocol_list_is_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[sites.none]
+hosts = ["none.test"]
+protocols = []
+document_root = "/srv/none"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("an empty list is a site on no protocol");
+        assert!(
+            err.to_string().contains("protocols"),
+            "the message must name the key, got: {err}"
+        );
+    }
+
+    /// Two address-only sites claiming one address cannot be told apart.
+    #[test]
+    fn two_address_only_sites_claiming_one_address_are_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[sites.a]
+addresses = ["192.168.9.123"]
+document_root = "/srv/a"
+
+[sites.b]
+addresses = ["192.168.9.123"]
+document_root = "/srv/b"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("two defaults for one address are ambiguous");
+        assert!(
+            err.to_string().contains("address-only"),
+            "the message must explain the rule, got: {err}"
+        );
     }
 
     #[test]

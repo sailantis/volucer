@@ -119,6 +119,47 @@ impl<V> HostMap<V> {
         host.and_then(|host| self.get(host))
     }
 
+    /// [`HostMap::get`], skipping entries the caller will not accept.
+    ///
+    /// The rule is `get`'s — exact, then longest wildcard — applied to the entries that survive
+    /// `keep`. It exists for one caller: a site is matched by name only among the sites whose
+    /// address binding and protocol admit the connection, and "the name wins unless it names a site
+    /// that cannot serve this connection" has to be one walk rather than a lookup followed by a
+    /// retry, or an exact name that is rejected would hide a wildcard that is not.
+    ///
+    /// A skip does not shorten the wildcard walk: the loop still strips one label at a time, so a
+    /// rejected exact name falls through to the wildcards in the same longest-first order.
+    pub fn get_where<F>(&self, host: &str, keep: F) -> Option<&V>
+    where
+        F: Fn(&V) -> bool,
+    {
+        let host = strip_port(host);
+        if host.is_empty() {
+            return None;
+        }
+        let host = host.to_ascii_lowercase();
+
+        if let Some(value) = self.exact.get(&host) {
+            if keep(value) {
+                return Some(value);
+            }
+        }
+
+        let mut rest = host.as_str();
+        while let Some((label, tail)) = rest.split_once('.') {
+            if !label.is_empty() {
+                if let Some(value) = self.wildcard.get(tail) {
+                    if keep(value) {
+                        return Some(value);
+                    }
+                }
+            }
+            rest = tail;
+        }
+
+        None
+    }
+
     /// Whether any pattern is stored.
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.wildcard.is_empty()

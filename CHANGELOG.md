@@ -9,6 +9,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`redirect_to_https` is a per-site key.** A site that states nothing inherits `[server]`'s
+  answer, and a site can turn it off — which is the deployment a single boolean cannot express: an
+  internal site bound to a private address with `protocols = ["http"]` is deliberately cleartext,
+  and a deployment-wide redirect used to bounce it to a scheme it does not serve. The redirect is
+  now resolved **from the site**, so it is decided after site selection, and setting it `true` on a
+  site whose `protocols` excludes `http` or `https` is refused as inert.
+- **`Strict-Transport-Security`**, as `[server.hsts]` and `[sites.<name>.hsts]`:
+  `max_age_s`, `include_subdomains`, `preload` and `enabled`. A site inherits per key, so naming
+  only `max_age_s` keeps the server's `includeSubDomains`. Sent on **every** answer over TLS —
+  error pages included, like nginx's `add_header … always` — and never over cleartext (RFC 6797
+  §7.2) or FastCGI. Refused where it could never be honoured: a site with no `hosts` (a browser
+  files a policy against a name, never an IP), a site whose `protocols` excludes `https`, and a
+  deployment with no `[server.tls]`. `preload = true` requires `include_subdomains` and at least a
+  year, and `max_age_s = 0` is refused because in the header it means "delete this policy".
+  `volucer check` prints the resolved policy per site and warns when `include_subdomains` on one
+  site covers another site in the same file — a browser that has seen the parent then refuses
+  cleartext to the child, including any internal address it resolves to.
+- **Sites can be bound to addresses and protocols.** `[sites.<name>].addresses` restricts a site
+  to the **local** addresses a connection arrived on (`192.168.9.123` or `192.168.9.0/24`), and
+  `.protocols` restricts it to `http`, `https` or `fastcgi`. Both are decided before the `Host`
+  header is consulted, so a site naming an internal address can no longer be selected by a client
+  that reached a public one and typed the name — the reason the key exists. A site with
+  `addresses` and no `hosts` is a default for those addresses, which is nginx's `default_server`
+  shape. `volucer check` prints both. See
+  [Routing and Sites](docs/03-ROUTING-AND-SITES.md#binding-a-site-to-addresses-and-protocols).
 - **The configuration can be the command line alone.** `serve` and `check` now take `-o`
   (`--override`) `KEY=VALUE` pairs, repeatable, plus `--listen` and `--fastcgi` as shorthand for
   `server.http` and `server.fastcgi`. `-c`/`--config` is optional: with no flag and no
@@ -55,6 +80,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The redirect is decided by the site, not by the listener.** `ListenerSettings::redirect_to_https`
+  is gone: a listener now supplies only the port a redirect should name, and *whether* a request is
+  redirected comes from the resolved site. A cleartext listener that no site redirects on no longer
+  logs that it will.
 - **`default_backend` and `routes` now belong in `[server]`.** Old top-level keys fail with a
   migration hint; the compatibility shim will be removed in the next release.
 - **`config.describe` redacts `env` and `headers` values and URL userinfo.**

@@ -134,7 +134,19 @@ fastcgi = "127.0.0.1:9080"
 # Answer cleartext requests with a 301 to the https:// equivalent. Off by
 # default: it changes what an existing cleartext deployment does. Needs a
 # plaintext listener to act on -- either a separate `https`, or `plain = true`.
+# Also a per-site key ([sites.<name>].redirect_to_https), for the deployment
+# where one site is deliberately cleartext and the rest are not.
 # redirect_to_https = false
+#
+# Strict-Transport-Security, sent on every HTTPS answer for the sites that do
+# not state their own. Absent means no header. `max_age_s` is required here
+# because there is nothing to inherit from; `max_age_s = 0` is refused (in the
+# header it means "delete the policy"), and `preload = true` needs
+# include_subdomains and at least a year.
+# [server.hsts]
+# max_age_s = 300
+# include_subdomains = false
+# preload = false
 #
 # A per-site certificate, presented by SNI for that site's hosts. Only the
 # certificate and key can be per site, because the name is claimed before any
@@ -227,6 +239,42 @@ fastcgi = "127.0.0.1:9080"
 # [sites.corp.acme]
 # enabled = true                # false = keep these settings, order nothing
 # domains = ["corp.internal"]   # or omit to derive from hosts
+
+# ---------------------------------------------------------------------------
+# Binding a site to addresses and protocols.
+#
+# `hosts` alone is a CLIENT'S statement: the Host header is whatever the caller
+# typed, so a site claiming an internal name is reachable by anyone who can reach
+# the port and send that name. `addresses` makes the decision depend on the
+# destination instead — the address the socket accepted the connection on, which
+# is the kernel's answer rather than the client's.
+#
+# Entries are addresses or CIDR ranges, with the same syntax as
+# [server.proxy].trusted_subnets. Absent means "any address", which is the
+# existing behaviour.
+#
+# `protocols` narrows to "http", "https" and/or "fastcgi" — the front-end that
+# received the request, not X-Forwarded-Proto. A site restricted to "https" does
+# not answer the cleartext half of a `plain = true` port.
+#
+# A site with `addresses` and NO `hosts` is a default for those addresses: it
+# answers everything that reaches them, including a name nobody configured. That
+# is nginx's `default_server` shape, and it is the one case where a site needs no
+# hostname at all.
+# ---------------------------------------------------------------------------
+# [sites.internal]
+# hosts = ["internal.corp"]
+# addresses = ["192.168.9.123"]        # ...and only on this address
+# protocols = ["http", "https"]        # ...and only over these
+# document_root = "/srv/internal"
+# redirect_to_https = false            # deliberately cleartext on this address
+#
+# [sites.internal.hsts]
+# enabled = false                      # no policy for a name with no TLS audience
+#
+# [sites.intranet]
+# addresses = ["10.0.0.0/8"]           # no hosts: a default for the range
+# document_root = "/srv/intranet"
 
 # ---------------------------------------------------------------------------
 # Static files, served from the document root without waking PHP at all. This is

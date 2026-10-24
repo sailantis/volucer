@@ -148,19 +148,109 @@ first, which is what makes two roots possible in one process.
 - The rule is: an exact name, then the **longest** matching wildcard, then `[server]`. A
   host nobody claims is the default site's.
 
+### Binding a site to addresses and protocols
+
+`hosts` alone is a **client's** statement: the `Host` header is whatever the caller typed, so
+a site claiming `internal.corp` is reachable by anyone who can reach the port and send that
+name. Two further keys make the decision depend on facts about the connection instead.
+
+```toml
+[server]
+http          = "0.0.0.0:8080"       # one socket, several addresses
+document_root = "/srv/public"
+front_controller = "index.php"
+
+[sites.internal]
+hosts     = ["internal.corp"]        # the name, for convenience
+addresses = ["192.168.9.123"]        # ...but only on this address
+document_root = "/srv/internal"
+
+[sites.admin]
+hosts     = ["admin.example.com"]
+addresses = ["192.168.9.0/24"]
+protocols = ["https"]                # and only over TLS
+document_root = "/srv/admin"
+```
+
+| Key | What it does |
+|---|---|
+| `addresses` | The **local** addresses this site answers on. Absent means any. |
+| `protocols` | `"http"`, `"https"`, `"fastcgi"`. Absent means all. |
+
+`addresses` is the **destination** of the connection — the address the socket is bound to —
+not the client's address. That is the whole point: `REMOTE_ADDR` is a client's claim once a
+proxy is in front, but the local address is what the kernel accepted the connection on, and a
+client cannot rewrite it. A request to `135.181.172.123` can therefore not select a site bound
+to `192.168.9.123`, whatever `Host` it sends.
+
+Entries are addresses or CIDR ranges, parsed by the same code as
+`[server.proxy].trusted_subnets`, so a range means the same thing in both places:
+
+- `192.168.9.123` — one address, the usual case.
+- `192.168.9.0/24` — a whole interface.
+- `::1`, `fd00::/8` — IPv6. **A v4-mapped v6 address is not a v4 address**, so a listener on
+  `[::]` that accepts `::ffff:192.168.9.123` does not select a site bound to
+  `192.168.9.123`. Bind the listener to `0.0.0.0`, or write the mapped range out.
+
+`protocols` is the **front-end** that received the request, not `X-Forwarded-Proto`:
+`https` means "arrived on a TLS-speaking listener", so a site restricted to `https` does not
+answer the cleartext half of a `[server.tls] plain = true` port. Over FastCGI it means the
+proxy set `HTTPS`.
+
+### Which site wins
+
+The order is what makes the binding worth writing — the first two rules cannot be influenced
+by what a client sends:
+
+1. A site that names `protocols` must admit the protocol the request arrived over.
+2. A site that names `addresses` must admit the local address it arrived on.
+3. Among the sites that survive, the host rule applies unchanged — exact, then longest
+   wildcard — **to the ones that survive**. A name claimed only by an ineligible site falls
+   through to a less specific pattern that can serve this connection, then to an address-only
+   site, and finally to `[server]`. It never falls back to the ineligible site.
+4. An **address-only** site — one with `addresses` and no `hosts` — is the last resort, and
+   the narrowest range that admits the address wins. This is nginx's `default_server` shape:
+   one application on one internal address, with no hostname to invent for it.
+
+```toml
+[sites.internal]
+addresses     = ["192.168.9.123"]    # no `hosts` at all
+document_root = "/srv/internal"
+```
+
+Such a site answers **every** request that reaches that address, including one whose `Host`
+names nothing configured. That is intended, and it is why the key is worth writing: the
+address is the part of the request an attacker does not choose.
+
+Two address-only sites may not claim the same address — which one won would depend on
+declaration order, and neither the file nor a reader could predict it.
+
+### A note on `check`
+
+`volucer check` prints each site's `hosts`, `addresses` and `protocols`, so what a site is
+actually bound to is visible without reading the file. It prints the **resolved** HSTS
+policy in the header form a client receives, rather than the keys a site happened to write —
+a site that inherits is the ordinary case, and "what header does this name actually get" is
+the question the line exists to answer.
+
 ### What a site inherits
 
 Every key except `hosts` and `document_root` falls back to the `[server]` value, so a site
 that states only a root and a host list inherits the rest.
 
 `static_files` falls back **per key**: a site naming `precompressed` keeps the server's
-`cache_control`. The same is true of `compression` and `acme`.
+`cache_control`. The same is true of `compression`, `acme` and `hsts`.
 
 A site's `routes` **replaces** `[server.routes]`. It is not merged, so a host that states
 one route does not inherit the other twenty.
 
 `default_backend` inherits the same way and is what `/assets/missing.png` falls to when a
 `policy = "static"` route names no backend of its own.
+
+`redirect_to_https` inherits too, and is the one inherited key that is a *behavioural*
+default rather than a setting: a site bound to an internal address may be deliberately
+cleartext, so it can turn off a redirect it would otherwise inherit. See
+[TLS and ACME](05-TLS-AND-ACME.md).
 
 ### `front_controller = false`
 
