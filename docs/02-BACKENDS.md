@@ -185,6 +185,32 @@ backend "app" could not connect to its relay "unix:/run/app/workers.sock": …
 Everything else — the handshake, the per-slot exchange, the recycling rules — is the same
 as `worker`.
 
+### A PHP that loads `grpc` must be started with `GRPC_ENABLE_FORK_SUPPORT=1`
+
+A detail about the *supervisor's* process, but it fails as a stalled pool, so it belongs
+here rather than in the application's own documentation.
+
+`grpc` starts an executor, a resolver and a timer thread when its module initialises. A
+`fork()` after that inherits their locks, and the child deadlocks the first time it calls
+`exit()` — inside grpc's own module shutdown. Nothing crashes: the child sits in state `S`
+on a futex for ever, so `SIGCHLD` never fires, the master never reaps it, and a supervisor
+with a `children` cap stops accepting once the cap is reached. From volucer's side the
+symptom is a slot that stops answering after a few recycles.
+
+Measured on a CLI PHP that loads grpc: nine stuck children after eight recycles, and none
+with the variable set. It has to be an environment variable rather than
+`-d grpc.enable_fork_support=1` and not `putenv()` from PHP — grpc starts those threads in
+its module init, before any script runs, so a value set from PHP changes what `--ri grpc`
+reports and nothing else.
+
+```ini
+# worker.service, or your container's environment
+Environment=GRPC_ENABLE_FORK_SUPPORT=1
+```
+
+`Volucer\Supervisor::serve()` warns when it detects the hazard, but a warning is not a
+fix: the threads exist before any PHP code runs.
+
 ## `external`
 
 An already-running FastCGI server.

@@ -252,6 +252,24 @@ impl Supervisor {
             // than hard-coded so `VOLUCER_SDK_DIR` can point anywhere.
             .arg(sdk_dir().join("autoload.php"))
             .arg(relay)
+            // **A supervisor forks, so grpc has to be told.**
+            //
+            // `grpc` starts an executor, a resolver and a timer thread at module init. A
+            // `fork()` after that inherits their locks, and the child deadlocks the moment it
+            // calls `exit()` — in grpc's own module shutdown, so the child is visible in
+            // `S` (sleeping on a futex), not `Z`. The fixture's `SIGCHLD` handler then never
+            // runs for it, which reads from the outside as "the supervisor does not reap".
+            //
+            // Measured on a machine whose PHP loads grpc: 9 children after 8 recycles with this
+            // variable unset, 0 with it set. The variable is grpc's own documented opt-in for
+            // processes that fork, and it has to be an environment variable rather than an
+            // `-d` flag because grpc's `grpc.enable_fork_support` ini setting is read too late
+            // in module init.
+            //
+            // Set here rather than in the fixture's PHP so it is one place: this is the half
+            // that forks. A real supervisor has the same obligation, which is why
+            // `Volucer\Supervisor` documents it as well.
+            .env("GRPC_ENABLE_FORK_SUPPORT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -479,9 +497,44 @@ fn a_prefork_supervisor_reaps_its_children() {
     // already closed here, so the honest ceiling is "not one per connection".
     assert!(
         live_or_zombie.len() < 4,
-        "the supervisor has {} unreaped children after 8 recycles: {list:?}",
-        live_or_zombie.len()
+        "the supervisor has {} unreaped children after 8 recycles: {list:?}{}\n\
+         The `SIGCHLD` handler is in the fixture, so a stuck child is the likelier cause than a \
+         missing handler: `grpc` starts an executor thread at module init and a `fork()` after \
+         that deadlocks in the child's `exit()`, so the child stays in `S` and never signals. \
+         Such a child is in state `S`, not `Z` — check `/proc/<pid>/stat`. The fixture sets \
+         `GRPC_ENABLE_FORK_SUPPORT=1` for exactly this reason; a `php` that ignores the \
+         variable, or an environment that unsets it, reproduces this.",
+        live_or_zombie.len(),
+        describe_states(&live_or_zombie),
     );
+}
+
+/// The process state letters of the pids, for a failure message that distinguishes "never
+/// exited" from "exited and was not reaped".
+///
+/// The distinction is the whole diagnosis: `Z` is a reaping failure, which is what this test is
+/// about; `S` is a child that is still alive, which means `exit()` itself is stuck and no
+/// `SIGCHLD` was ever going to arrive. `kill(pid, 0)` cannot tell the two apart — it succeeds for
+/// a zombie — so the letter after the command name in `/proc/<pid>/stat` is the only answer.
+fn describe_states(pids: &[&str]) -> String {
+    let mut counts: std::collections::BTreeMap<char, usize> = Default::default();
+    for pid in pids {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.trim_start().chars().next())
+            .unwrap_or('?');
+        *counts.entry(state).or_default() += 1;
+    }
+    let rendered: Vec<String> = counts
+        .into_iter()
+        .map(|(state, count)| format!("{count} in state {state}"))
+        .collect();
+    if rendered.is_empty() {
+        String::new()
+    } else {
+        format!(" ({}).", rendered.join(", "))
+    }
 }
 
 /// `max_requests` recycles a slot by reconnecting, which is the only recycling an attached pool
