@@ -9,50 +9,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **`redirect_to_https` is a per-site key.** A site that states nothing inherits `[server]`'s
-  answer, and a site can turn it off — which is the deployment a single boolean cannot express: an
-  internal site bound to a private address with `protocols = ["http"]` is deliberately cleartext,
-  and a deployment-wide redirect used to bounce it to a scheme it does not serve. The redirect is
-  now resolved **from the site**, so it is decided after site selection, and setting it `true` on a
-  site whose `protocols` excludes `http` or `https` is refused as inert.
-- **`Strict-Transport-Security`**, as `[server.hsts]` and `[sites.<name>.hsts]`:
-  `max_age_s`, `include_subdomains`, `preload` and `enabled`. A site inherits per key, so naming
-  only `max_age_s` keeps the server's `includeSubDomains`. Sent on **every** answer over TLS —
-  error pages included, like nginx's `add_header … always` — and never over cleartext (RFC 6797
-  §7.2) or FastCGI. Refused where it could never be honoured: a site with no `hosts` (a browser
-  files a policy against a name, never an IP), a site whose `protocols` excludes `https`, and a
-  deployment with no `[server.tls]`. `preload = true` requires `include_subdomains` and at least a
-  year, and `max_age_s = 0` is refused because in the header it means "delete this policy".
-  `volucer check` prints the resolved policy per site and warns when `include_subdomains` on one
-  site covers another site in the same file — a browser that has seen the parent then refuses
-  cleartext to the child, including any internal address it resolves to.
-- **Sites can be bound to addresses and protocols.** `[sites.<name>].addresses` restricts a site
-  to the **local** addresses a connection arrived on (`192.168.9.123` or `192.168.9.0/24`), and
-  `.protocols` restricts it to `http`, `https` or `fastcgi`. Both are decided before the `Host`
-  header is consulted, so a site naming an internal address can no longer be selected by a client
-  that reached a public one and typed the name — the reason the key exists. A site with
-  `addresses` and no `hosts` is a default for those addresses, which is nginx's `default_server`
-  shape. `volucer check` prints both. See
+- **`redirect_to_https` is configurable per site** and inherits `[server]` by default. Internal
+  HTTP-only sites can disable redirects; enabling the setting when the site's protocols exclude
+  `http` or `https` is rejected.
+- **HTTP Strict Transport Security (HSTS)** is configurable in `[server.hsts]` and
+  `[sites.<name>.hsts]` with `max_age_s`, `include_subdomains`, `preload` and `enabled`; sites
+  inherit each unset key. The header is sent on every TLS response, including errors, never on
+  cleartext or FastCGI. Invalid or unusable policies are rejected (including missing TLS/host,
+  unsupported HTTPS, zero max-age, or preload without subdomains and a one-year max-age).
+  `volucer check` shows resolved policies and warns when one site's subdomain policy covers another.
+- **Sites can be restricted by local address and protocol.** `[sites.<name>].addresses` accepts
+  addresses or CIDRs, and `.protocols` accepts `http`, `https` or `fastcgi`; both are matched
+  before `Host`. Sites without `hosts` can serve as defaults for their addresses.
+  `volucer check` reports these settings. See
   [Routing and Sites](docs/03-ROUTING-AND-SITES.md#binding-a-site-to-addresses-and-protocols).
-- **The configuration can be the command line alone.** `serve` and `check` now take `-o`
-  (`--override`) `KEY=VALUE` pairs, repeatable, plus `--listen` and `--fastcgi` as shorthand for
-  `server.http` and `server.fastcgi`. `-c`/`--config` is optional: with no flag and no
-  `volucer.toml` beside the working directory, the server starts from an empty table and everything
-  comes from the overrides. This removes the failure that a container with a `CMD` and nothing to
-  mount could not start at all — `Config::load` read a file unconditionally, so the process died
-  with `failed to read volucer.toml` before it had a chance to be told anything.
-  - Overrides are laid onto the `toml::Table` the file produced and deserialized **once**, so the
-    value is typed by TOML (`workers=8` is a number) and `deny_unknown_fields` still refuses a
-    typo — `-o server.htpp=…` is a startup error naming the key, not a setting that parses and is
-    ignored. `${NAME}` is expanded first, as in the file.
-  - `--listen` and `--fastcgi` apply before every `-o` pair, so `-o server.http=…` wins over
-    `--listen …` rather than depending on argument order.
-  - An explicit `-c` naming a missing file is still an error: "I said nothing" and "I named a file
-    that is not there" are different, and only the first may fall back.
-  - With no file, relative paths (`server.tls.certificate`, `[server.acme].cache`,
-    `[server.access_log].path`, a file KV store's `path`) resolve against the working directory,
-    which `check` prints. A `SIGHUP` replays the overrides exactly as given.
-  - Arrays of tables and `map` values have no dotted spelling and stay file-only.
+- **`serve` and `check` can configure the server from CLI overrides.** Repeat `-o`/`--override
+  KEY=VALUE`, or use `--listen` and `--fastcgi`; `-c`/`--config` is optional when the default file
+  is absent. Without a file, settings come from the overrides. They are applied to the TOML table
+  and parsed once, preserving TOML types, environment expansion and unknown-key validation.
+  Shorthand options apply before overrides, so overrides take precedence. An explicitly named
+  missing config remains an error. Without a config, relative paths resolve from the working
+  directory (shown by `check`), and `SIGHUP` reapplies the overrides. Arrays of tables and maps
+  remain file-only.
 - **`volucer health`** checks a configured status or metrics endpoint, with `--url`, `--ready`,
   `VOLUCER_HEALTH_URL` and `VOLUCER_HEALTH_CONFIG` support. Wildcard listeners use loopback;
   missing endpoints, HTTPS URLs and non-2xx responses fail with diagnostic output.
