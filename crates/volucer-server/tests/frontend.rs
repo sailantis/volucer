@@ -120,13 +120,16 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         backends: [(
             "cgi".to_string(),
             BackendConfig::SpawnCgi(SpawnCgiConfig {
-                binary: binary.to_path_buf(),
+                binary: Some(binary.to_path_buf()),
+                command: None,
                 workers: 1,
                 bind_host: "127.0.0.1".to_string(),
                 base_port,
                 socket: None,
                 max_requests: None,
                 children: 0,
+                capacity: 0,
+                working_dir: None,
                 env: Default::default(),
             }),
         )]

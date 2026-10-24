@@ -112,6 +112,15 @@ the reasoning behind it lives in the source comments and in the documentation un
 
 ### Fixed
 
+- **`cargo clippy --workspace --all-targets` did not compile, so `Clippy` and `MSRV` were red
+  from the commit that added `command` onward.** `spawn_cgi` gained `command`, `capacity` and
+  `working_dir`, and the commit updated `tests/pool.rs` but not `tests/frontend.rs`, which still
+  built a `SpawnCgiConfig` without them and gave `binary` a `PathBuf` for a field that had become
+  `Option<PathBuf>` (E0063 and E0308). The Windows-only unit test in `src/pool.rs` also still
+  called `bind_argument` with one argument after it grew a `SpawnDriver` (E0061) — invisible on
+  the `ubuntu-latest` `Clippy` job, which is the only place `-D warnings` runs, and never reached
+  by the `Test` jobs because they `needs: [fmt, clippy]` and were skipped. A test that does not
+  compile is a test that does not run, and `tests/frontend.rs` had not executed since.
 - **The CGI environment was wrong for every non-PHP application, in three ways that PHP could
   not reveal.** All three are the same class of bug: the variables were built to PHP's habits
   because PHP was the only backend, and each one is silently wrong for a WSGI or Rack

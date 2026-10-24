@@ -1330,7 +1330,7 @@ mod tests {
     fn a_pipe_slot_address_binds_and_connects_by_name() {
         let pipe = SlotAddress::Pipe(PathBuf::from(r"\\.\pipe\volucer-cgi.0"));
         assert_eq!(
-            pipe.bind_argument("127.0.0.1"),
+            pipe.bind_argument("127.0.0.1", SpawnDriver::PhpCgi),
             r"\\.\pipe\volucer-cgi.0",
             "php-cgi takes the pipe name verbatim, not `host:port`"
         );
