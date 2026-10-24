@@ -224,7 +224,12 @@ if [ "$os" != windows ]; then
     path_install() {
         _dest=$1
         shift
-        env -u VOLUCER_MODIFY_PATH \
+        # The two directory overrides are cleared here rather than per case, because a runner
+        # that exports either one would let the installer write outside the sandbox: that is how
+        # this file edited `$XDG_CONFIG_HOME/fish/config.fish` on `ubuntu-latest` while passing on
+        # a machine with neither variable set. An explicit assignment in `"$@"` still wins,
+        # because `env` applies its own arguments in order.
+        env -u VOLUCER_MODIFY_PATH -u XDG_CONFIG_HOME -u ZDOTDIR \
             VOLUCER_VERSION="$tag" \
             VOLUCER_INSTALL_DIR="$_dest" \
             VOLUCER_DOWNLOAD_URL="$base_url" \
@@ -362,14 +367,34 @@ if [ "$os" != windows ]; then
 
     # fish does not read `.bashrc`, and its syntax for PATH is not `export`. A line in the
     # wrong file is an edit that does nothing, which is worse than no edit at all.
+    #
+    # `XDG_CONFIG_HOME` is cleared as well as redirected: the installer honours it, so a runner
+    # that has one set would send the write somewhere this case does not look - which is exactly
+    # how this failed on `ubuntu-latest` and passed on a machine with no `XDG_CONFIG_HOME`. The
+    # variable is part of the answer here, so it has to be part of the fixture.
     home_fish="${work}/home-fish"
-    mkdir -p "$home_fish"
+    mkdir -p "$home_fish/xdg"
     out=$(path_install "${work}/bin-fish" HOME="$home_fish" SHELL=/usr/bin/fish \
-        PATH="/usr/bin:/bin")
-    if grep -q 'set -gx PATH' "$home_fish/.config/fish/config.fish" 2>/dev/null; then
-        check ok 'fish gets a line in config.fish, in fish syntax'
+        XDG_CONFIG_HOME="$home_fish/xdg" PATH="/usr/bin:/bin")
+    if grep -q 'set -gx PATH' "$home_fish/xdg/fish/config.fish" 2>/dev/null &&
+        [ ! -e "$home_fish/.profile" ]; then
+        check ok "fish gets a line in config.fish, in fish syntax, and XDG_CONFIG_HOME is honoured"
     else
         check fail 'fish did not get a usable PATH line'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # The unset case is the ordinary one: a fish user who has not moved their config directory
+    # reads `~/.config/fish/config.fish`, and `XDG_CONFIG_HOME` has to be genuinely absent rather
+    # than set to a default, because `:-` in the installer is what the answer depends on.
+    home_fish2="${work}/home-fish2"
+    mkdir -p "$home_fish2"
+    out=$(path_install "${work}/bin-fish2" HOME="$home_fish2" SHELL=/usr/bin/fish \
+        PATH="/usr/bin:/bin")
+    if grep -q 'set -gx PATH' "$home_fish2/.config/fish/config.fish" 2>/dev/null; then
+        check ok 'fish without XDG_CONFIG_HOME gets a line under ~/.config'
+    else
+        check fail 'fish did not get a usable PATH line when XDG_CONFIG_HOME was unset'
         printf '%s\n' "$out" >&2
     fi
 
