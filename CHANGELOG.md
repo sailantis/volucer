@@ -2,303 +2,87 @@
 
 All notable changes to volucer are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
-project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-Entries name the failure a change removes, not only the feature it adds, because the failures
-are what an operator has to recognise. Where a number decided a change, the number is here —
-the reasoning behind it lives in the source comments and in the documentation under [`docs/`](docs/README.md).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
 ### Added
 
-- **`volucer health`, because a container image with no shell cannot run `curl`.** The `musl`
-  image is `FROM scratch`, so the conventional `HEALTHCHECK CMD curl -f http://localhost/health`
-  is a line that never executes — and Docker does not report that as a broken check. It reports
-  the container as `unhealthy` after the start period with no output at all, which is the least
-  actionable failure a container can have. The subcommand reproduces `curl -f`'s contract (exit
-  `0` only for a `2xx`, nonzero otherwise) and adds what a one-liner throws away: the status code
-  and the server's own response body go to stderr, which is what `docker inspect` shows. It reads
-  the probe address from `[status]`, or from `[metrics]` when that is the only one present,
-  because the two share one listener; `--url` overrides, `--ready` asks the traffic question
-  rather than the liveness one, and `VOLUCER_HEALTH_URL` and `VOLUCER_HEALTH_CONFIG` are the
-  forms a `HEALTHCHECK` can set. A wildcard listener (`0.0.0.0:2114`, `[::]:2114`) is probed on
-  loopback, because that is the shape a container binds and neither address is a destination.
-  Two refusals matter more than the happy path: a configuration with no `[status]` and no
-  `[metrics]` is a **failed** probe rather than a skipped one (a container that serves no
-  `/health` cannot be checked, and green would hide it), and an `https://` URL is named as the
-  mistake it is rather than failing at a handshake.
-- **Both Docker images declare a `HEALTHCHECK`, and the release workflow smoke-tests it.** The
-  check runs `/usr/local/bin/volucer health` in exec form, so it works in the `scratch` image
-  where a shell-form check cannot. It probes `/health` and not `/ready` on purpose: Docker
-  restarts a container whose check fails, and a server still booting its worker pool must not be
-  killed for it. `docker run version` could not exercise any of that — it needs a server that is
-  actually serving — so the workflow now starts a container, polls Docker's own health state, and
-  then asserts the check *fails* against a closed port, because a probe that cannot fail is a
-  probe that always passes.
-- **`.dockerignore`.** `COPY . .` is deliberate (the build needs the whole workspace), which made
-  the context everything in the checkout: `target/` alone was 47.7 GB and `.git/` 49.6 MB on the
-  machine this was measured on, all of it uploaded and written into a layer before the compiler
-  started. Excluding them also stops a host `target/` — the wrong architecture, the wrong
-  profile, and on Windows a set of `.pdb` files — from invalidating the build layer on every
-  compile.
-- **`spawn_cgi` runs any FastCGI server, not only `php-cgi`.** A new `command` key takes a
-  program that starts one slot — `gunicorn myapp.wsgi --bind {address}`, a `flup` server, a
-  Rack adapter — and the placeholder is replaced per slot with the address that slot must
-  bind. The same string is exported as `VOLUCER_FCGI_ADDRESS` for a program that reads it from
-  the environment, so a server needing no placeholder needs no argument either. `binary` and
-  `command` are mutually exclusive and each keeps its own semantics: a `binary` deployment is
-  still `php-cgi`, with `children` as its prefork count and a named pipe on Windows; a
-  `command` deployment uses `capacity` for the same number and TCP. A command that names
-  neither the placeholder nor a reader of the variable is refused at startup, because it would
-  bind somewhere the pool cannot reach and every request would be a 502 after a ten-second
-  timeout. What the pool guarantees is unchanged and now driver-independent: started, waited
-  for, health-checked, restarted on death, recycled on `max_requests`, killed as a process
-  group. A command that exits is reported once rather than retried across ten ports — the
-  retry exists for `php-cgi` losing a bind race, and nothing known is true of another program
-  that died.
-- **`spawn_cgi` takes `working_dir`.** The key `worker`, a job consumer and `upstream` already
-  had, and its absence was the one thing that made a non-PHP command unusable: a Python
-  application finds its modules relative to the working directory and a Ruby one finds
-  `config.ru` there, so a supervisor that guessed would start the process somewhere it cannot
-  boot.
-- **`CHANGELOG.md`.** What changed between two tags could only be read out of the commit log,
-  and the release notes for 0.1.0 and 0.2.0 were written after the fact. This file is that
-  description, kept as the releases happen — and it is why `docs/11-OPERATIONS.md` now sends an
-  operator here before an upgrade instead of to "the release notes".
-- **`${NAME}` and `${NAME:-default}` in the configuration file.** Expanded from the server's
-  environment before the file is parsed, so a key that is not a string works too:
-  `workers = ${WORKERS:-0}`, `http = "127.0.0.1:${PORT:-8080}"`. Only the braced form is
-  expanded — a bare `$NAME` is left as written, unlike RoadRunner — because a password or a
-  DSN may contain `$` and a rule that expanded it would make the file mean something its
-  author did not write. `$$` is one literal `$`. **An unset variable with no default stops
-  the server**, naming the variable and the line: an empty listener address is a server that
-  binds nothing, for a reason nothing logs. A value containing a line break or a NUL byte is
-  refused, because the substitution produces TOML text and a newline inside a value could
-  introduce a table header the file does not contain. Expansion lives in `Config::load`, not
-  in `from_toml`, so the ~230 test fixtures that parse text do not depend on the machine.
-- **`[server.env]`: an environment baseline every started process inherits.** A worker pool,
-  a job consumer, a `php-cgi` slot and a supervised origin; a backend's own `env` is merged
-  over it, so the shared value is written once and the exception stays on the table that
-  needs it. Names are passed **exactly as written** — RoadRunner uppercases `server.env`
-  keys, and a server that silently renamed one would leave an application reading `app_env`
-  from a file that says `APP_ENV`. `attach` does not receive it, because volucer starts those
-  processes not at all. An unusable name (`=`, NUL) is refused at startup rather than failing
-  at spawn with an `InvalidInput` that names no key.
-- **`spawn_cgi` takes an `env` table.** It was the only kind that starts a process and had no
-  way to configure it: the CGI environment volucer builds per request carries request data and
-  nothing else, so a deployment whose PHP configuration was entirely `spawn_cgi` could not set
-  `APP_ENV` at all. Written after `PHP_FCGI_CHILDREN`/`PHP_FCGI_MAX_REQUESTS`, so the table
-  cannot move either number the pool enforces.
-- **`VOLUCER_VERSION` is set for every process volucer starts**, after the configured `env`, so
-  it cannot be shadowed. A `php-cgi` per-request process and a supervised origin have no channel
-  to ask the server what it is, which is why the variable exists; nothing in the SDK reads it.
-- **The installers check the build provenance attestation.** `VOLUCER_VERIFY` (`install.ps1`:
-  `-Verify`) takes `auto` (default), `require` or `off`. `auto` verifies the attestation the
-  release workflow already writes with `actions/attest-build-provenance` — signed by GitHub's
-  OIDC identity and recorded in Sigstore's transparency log, so a hostile download origin cannot
-  forge it — when the GitHub CLI is installed, authenticated, and the archive came from the GitHub
-  release origin, and otherwise **prints plainly that the archive was checked only against the
-  checksum beside it**. `require` refuses to install when the attestation cannot be checked, for a
-  deployment that must not take the weaker guarantee; `off` does not mention it. A _failed_
-  verification is fatal in every mode, and `off` is the deliberate way past it. The mode is
-  validated before the download, because an installer that fetches five megabytes and then
-  reports that its own argument was misspelled has spent the operator's time to learn something
-  it could have said immediately.
-- **`install.sh` puts the binary's directory on `PATH`.** Installing to `~/.local/bin` and then
-  printing "add it, e.g. `export PATH=…`" left the operator's *next* command — `volucer` — failing
-  on a fresh account, which is the state most installs happen in. The directory is now added to
-  the file the operator's shell actually reads: `~/.bashrc` for bash (falling back to
-  `~/.profile` when there is none, which is what a login bash reads), `~/.zshrc` for zsh,
-  `~/.config/fish/config.fish` for fish, and `~/.profile` for anything else. `install.ps1` already
-  did the equivalent with one registry value; this is the Unix half of the same promise.
-  Four things make the edit safe rather than hidden. It is **idempotent** — the marker comment
-  and the destination path are both checked, so a second release does not append a second line,
-  and a stock Debian or Ubuntu `~/.profile` that already spells it `$HOME/.local/bin` is
-  recognised rather than duplicated (a *commented-out* mention does not count, because it does
-  not put anything on `PATH`). It **writes through a symlink** to its target, so a dotfiles
-  repository keeps owning the file instead of being replaced by a regular one. It **names the
-  file and the exact line** it added, plus how to undo it. And **`VOLUCER_MODIFY_PATH=0`** turns
-  it off entirely, for CI and managed hosts, with the by-hand instruction printed instead. The
-  mode is validated before the download, like `VOLUCER_VERIFY`, because a value read in the last
-  block of the script would otherwise be reported after the binary was already replaced — and not
-  at all on a host where the directory is already on `PATH`.
-- **`install.ps1` takes `-ModifyPath 0`** (`VOLUCER_MODIFY_PATH`), the same opt-out as the shell
-  installer, and `install.ps1`'s own `install-selftest.sh` now uses it everywhere. It had been
-  appending one entry to the machine's **user `PATH`** per test case into a temporary directory
-  the test then deleted: 43 dead entries on the machine this was found on, each one a directory
-  that no longer exists, in a value every new process reads. The suite now also asserts the
-  default still adds the directory — and removes it again afterwards — so the two behaviours are
-  both pinned and the machine is left as it was found. `install.ps1` now prints how to undo the
-  edit, too, which it did not before.
+- **`volucer health`** checks a configured status or metrics endpoint, with `--url`, `--ready`,
+  `VOLUCER_HEALTH_URL` and `VOLUCER_HEALTH_CONFIG` support. Wildcard listeners use loopback;
+  missing endpoints, HTTPS URLs and non-2xx responses fail with diagnostic output.
+- **Docker health checks** run `volucer health` in both images. The release workflow tests healthy
+  and failing probes.
+- **`.dockerignore`** excludes `.git/` and `target/` from Docker build contexts.
+- **Generic `spawn_cgi` commands** support an address placeholder or `VOLUCER_FCGI_ADDRESS`,
+  `capacity`, and TCP. They are mutually exclusive with `binary`; invalid commands fail at
+  startup. Process supervision and recycling work with either driver.
+- **`spawn_cgi.working_dir`** sets the working directory for non-PHP applications.
+- **Changelog** documents releases; the operations guide links to it.
+- **Configuration environment expansion** supports `${NAME}`, `${NAME:-default}` and `$$`.
+  Unset variables without defaults and values containing newlines or NUL bytes fail at load time.
+- **`[server.env]`** provides environment variables to spawned processes; backend values override
+  it. Names are preserved, `attach` processes are unaffected, and invalid names fail at startup.
+- **`spawn_cgi.env`** configures process variables without overriding pool-managed FastCGI values.
+- **`VOLUCER_VERSION`** is set for every process volucer starts and cannot be overridden.
+- **Installer provenance verification** supports `auto`, `require` and `off` through
+  `VOLUCER_VERIFY` (`install.ps1 -Verify`). Failed verification is fatal; checksum-only
+  verification is reported when attestation cannot be checked.
+- **`install.sh` adds its install directory to `PATH`** by default. The update is idempotent and
+  symlink-safe; `VOLUCER_MODIFY_PATH=0` opts out.
+- **`install.ps1 -ModifyPath 0`** (or `VOLUCER_MODIFY_PATH=0`) opts out of PATH changes. Its
+  self-tests verify default behavior and the opt-out without leaving stale entries.
 
 ### Changed
 
-- **`default_backend` and `routes` moved into `[server]`.** They were the only two bare keys at
-  the top of the file, and that is where the confusion came from: every other key is a table, so
-  a reader met `default_backend = "app"` alone above `[server]` and had to be told _why_ it
-  could not go below it (TOML reads everything after a `[table]` header as belonging to that
-  table). Both are site settings, and `[server]` **is** the unnamed site — the docs have said so
-  since `sites` existed — so they belong beside `document_root` and `front_controller`, which is
-  also the table `[sites.<name>]` inherits from. The precedence is unchanged in either spelling;
-  only the table changed. **A configuration using the old spelling is refused at startup with a
-  message naming the new one**, rather than with toml's `unknown field 'default_backend'`: the
-  key did not disappear, it moved one table down, and an operator who pastes their existing file
-  into a new binary deserves that sentence. The shim is removed in the release after this one.
-- **`config.describe` now redacts two things it previously let through.** The rule was a
-  sensitive _key name_ only, so a credential that arrived inside a **value** passed straight to
-  a worker. Two structural rules are added: the values of any `env` or `headers` map
-  are elided **with their keys kept** (`[telemetry.headers]`'s own documentation claimed this
-  already worked, and it did not — the header name `x-honeycomb-team` contains no word the name
-  rule matches), and a URL's userinfo is replaced with `******` so
-  `redis://user:pw@host/db` is described as `redis://******@host/db` (`RedisKvConfig::url`'s
-  documentation made the same claim, and the fixture that was supposed to pin it asserted the
-  sensitive-named keys only). Both are what make a `${DATABASE_PASSWORD}` or a
-  `${TELEMETRY_KEY}` safe to put in the file, which is the pairing this release intends.
-- **`spawn_cgi` starts its slots concurrently.** Each slot owns its own address and its own
-  process tree, and nothing in the start-up loop reads another slot's state, so starting them
-  one at a time was a serialisation with no purpose — every per-slot wait, multiplied by the
-  number of slots. At `workers = 32` the pool took 10–14 s to start and now takes about 2.1 s,
-  measured on the server's own log timestamps with the resulting `php-cgi` process count as
-  ground truth. Port allocation is still serial, and has to be: `port_is_free` is a
-  probe-then-bind, so two threads probing at once would hand the same port to two children.
-  Only the spawn and the wait run in parallel.
-- **`docs/` is a guide a reader can follow**, page by page.
+- **`default_backend` and `routes` now belong in `[server]`.** Old top-level keys fail with a
+  migration hint; the compatibility shim will be removed in the next release.
+- **`config.describe` redacts `env` and `headers` values and URL userinfo.**
+- **`spawn_cgi` starts slots concurrently.** Port allocation remains serial; at 32 workers,
+  startup fell from 10–14 seconds to about 2.1 seconds.
+- **`docs/` is organized as a step-by-step guide.**
 
 ### Fixed
 
-- **A FastCGI slot died a microsecond after it started listening, so the request after a
-  successful one came back `502`.** `PR_SET_PDEATHSIG` is bound to the **thread that called
-  `fork`**, not to the process: the kernel records that thread as the child's parent and
-  delivers the signal when *it* exits. The commit that made pool start-up parallel moved slot
-  spawning onto `std::thread::scope`, and those threads return as soon as their slot is up — so
-  every `php-cgi` was `SIGKILL`ed right after binding. From the outside a slot served one
-  request and then refused the next, which is why `Test (ubuntu-latest)` had been red since
-  that commit and why the failures looked like a flake: four different tests failed across
-  runs, always with `Connection refused`. Proven by a C program that forks a child with the
-  hook installed from a thread and then joins it — the child is a zombie one second later,
-  while the same child forked from the main thread is alive — and the same behaviour is now
-  pinned by two unit tests in `lifecycle.rs`, one of which asserts the *failure* so the other
-  cannot pass vacuously. Children are spawned by `lifecycle::spawn`, which forks on one thread
-  owned by the module and living for the life of the process; all three spawn sites use it,
-  because the `command` driver and both pool kinds can also be restarted from a request
-  thread. The measured cost of serialising the fork is about 2.5 ms per child, against the
-  readiness waits that decide start-up and still run in parallel. macOS and Windows were never
-  affected — neither has `PR_SET_PDEATHSIG` — which is why only the Linux runner was red.
-- **`cargo clippy --workspace --all-targets` did not compile, so `Clippy` and `MSRV` were red
-  from the commit that added `command` onward.** `spawn_cgi` gained `command`, `capacity` and
-  `working_dir`, and the commit updated `tests/pool.rs` but not `tests/frontend.rs`, which still
-  built a `SpawnCgiConfig` without them and gave `binary` a `PathBuf` for a field that had become
-  `Option<PathBuf>` (E0063 and E0308). The Windows-only unit test in `src/pool.rs` also still
-  called `bind_argument` with one argument after it grew a `SpawnDriver` (E0061) — invisible on
-  the `ubuntu-latest` `Clippy` job, which is the only place `-D warnings` runs, and never reached
-  by the `Test` jobs because they `needs: [fmt, clippy]` and were skipped. A test that does not
-  compile is a test that does not run, and `tests/frontend.rs` had not executed since.
-- **The CGI environment was wrong for every non-PHP application, in three ways that PHP could
-  not reveal.** All three are the same class of bug: the variables were built to PHP's habits
-  because PHP was the only backend, and each one is silently wrong for a WSGI or Rack
-  application. (1) **The site root carried no `PATH_INFO`.** It was omitted for `/` and for an
-  empty value alike, which is fine for PHP — it routes on `REQUEST_URI` — and wrong for a
-  runtime that dispatches on `PATH_INFO`, where an absent variable is not the same thing as
-  `"/"`: a request for `/` arrived with no path at all. It is now sent whenever it is non-empty,
-  including `"/"`. (2) **A bare `Location` was answered `200` instead of `302`.** RFC 3875
-  §6.2.3 leaves the status to the server when the application states none, and a `Location`
-  with no `Status:` is the spec's way of asking for a redirect; nginx, Caddy and Apache all
-  resolve it that way. PHP frameworks always send `Status`, so this could only ever misfire for
-  another runtime — and a `302` turned into a `200` is a header no client follows. An explicit
-  `Status` still wins. (3) **A request header named `Proxy` became `HTTP_PROXY`** — httpoxy
-  (CVE-2016-5385 and its siblings). Python, Ruby and Go HTTP clients read `HTTP_PROXY` from the
-  environment to decide where to send their *outbound* requests, so a client sending
-  `Proxy: http://attacker/` chose the proxy for the application's own upstream calls. The header
-  is now dropped rather than renamed: it has no CGI meaning, and no request may name a proxy.
-- **A `spawn_cgi` slot's stdout and stderr were discarded, and pool errors named the wrong
-  backend.** The pipes go to `Stdio::null()`, which for `php-cgi` cost a lost extension warning
-  and for any other driver cost the traceback that explains a 502 — the same reason
-  `upstream_pool` has always drained both. Separately, every transport failure was reported as
-  `backend: "spawn_cgi"` regardless of the configured name, so a deployment with two FastCGI
-  backends could not tell which one refused a request, and the message named a configuration
-  block that may not exist.
-- **A path containing `..` could reach a script outside the document root, and php-cgi ran it.**
-  `route()` refused any percent-decoded path that climbed out of the root, but `route_or_dispatch()`
-  — the function the server actually calls for a route that has already claimed a backend — treated
-  that `NotFound` as "names no script" and built a fallback `SCRIPT_FILENAME` from the path, with
-  no second check. So `/../secret.php` composed with the root and escaped it, and on Windows
-  `/C:/Windows/Temp/evil.php` was worse: `Path::join` discards the root for a drive-prefixed
-  component, so the script could be anywhere on the volume. A deployment that lets a request reach
-  a path-interpreting backend through a route with a script-extension `path_suffix` could be made
-  to execute a `.php` file the site never pointed at — an uploaded file, or one belonging to
-  another site on the same host — as the service account. The same refusal `route()` makes is now
-  made again inside the fallback, with the reason in the comment: every path arriving there has
-  already been answered `NotFound`, so the check has to be repeated rather than assumed.
-- **The ACME cache published the account key and the certificate's private key.** The cache holds
-  both, and `rustls-acme`'s `DirCache` writes them with the process umask — `0644` in a `0755`
-  directory on a stock system — so any local user on the host could read the key to the site's
-  certificate, and with the account key could order certificates as that deployment. The cache
-  directory is now `0700` and the files in it `0600`, applied on **every** start rather than only
-  when the directory is first created, because "already exists" is the case that is already wrong:
-  an upgrading deployment finds a `0755` directory and `0644` keys, and a renewal is up to sixty
-  days away. A `cache` path that is a file rather than a directory is refused at startup by name,
-  instead of surfacing later as a network error from a CA.
-- **The installers trusted a checksum fetched from the same server as the archive.** That detects
-  corruption and nothing else: whoever can replace the archive can replace the `.sha256` beside
-  it, and the default path is `releases/latest/`, which moves. The provenance attestation above
-  closes that gap. The `wget` path also gained `--https-only` where the flag exists, which is the
-  GNU-wget-only equivalent of the `--proto '=https'` the `curl` path already had, and it is
-  guarded so a BusyBox wget without the flag is not broken by it.
-- **A `spawn_cgi` slot could adopt a stranger's listener and answer 502.** The port a slot was
-  about to use was freed by a `port_is_free` probe and bound by `php-cgi` a moment later, so
-  between the two another process could take it. The startup probe connected successfully
-  against _somebody else's_ listener, recorded the slot as healthy, and the first real request
-  came back a 502 behind an otherwise green startup banner. A connect is now followed by a
-  bounded settle and then a check that **our own child is still alive** — which is the only
-  evidence that separates "our backend is up" from "someone is on our port". A child that lost
-  the bind exits, that exit is now seen, and it becomes the `StartupExited` error the pool
-  already retries on a fresh port.
-- **`serve` refused an https-only configuration that `check` accepted.** `https` is a listener
-  in its own right rather than a mode of `http`, so a deployment whose whole point was to answer
-  on `:443` could not start at all while `volucer check` reported the same file as fine.
-- **A failed end-to-end test now says why.** The tests spawned the server with stderr discarded,
-  so a 502 arrived with no explanation and the only way to diagnose it was to guess and rerun.
-  stderr is captured from spawn time and attached to the assertion that failed.
+- **FastCGI children no longer die after startup on Linux.** Forking uses a long-lived thread so
+  `PR_SET_PDEATHSIG` does not kill children when temporary startup threads exit.
+- **Clippy and MSRV builds compile again.** Stale frontend and Windows-only test calls were fixed.
+- **CGI variables now work for non-PHP applications:** root requests receive `PATH_INFO`, bare
+  `Location` responses default to 302, and the unsafe `Proxy` request header is dropped.
+- **`spawn_cgi` logs child output and reports the configured backend name** on transport errors.
+- **Fallback script paths are checked against traversal**, including Windows drive-prefixed paths.
+- **ACME cache keys are private:** directories are set to `0700` and files to `0600` on every
+  start; a cache path that is not a directory fails at startup.
+- **Installer downloads use HTTPS where supported**, and provenance verification closes the
+  gap in relying only on a checksum served alongside the archive.
+- **FastCGI startup detects port conflicts** by confirming the child remains alive after a
+  successful connection.
+- **`serve` accepts HTTPS-only configurations**, matching `check`.
+- **End-to-end test failures include server stderr** for easier diagnosis.
 
 ## [0.2.0] - 2026-10-22
 
 ### Added
 
-- **`attach` backend** — a worker pool volucer dials instead of spawning. A supervisor boots
-  the application once, forks, and listens on a unix relay; volucer connects and starts no
-  process at all. Each connection is a slot with the same handshake, exchange thread, recycling
-  and metrics as a spawned worker.
-- **`spawn_cgi` `children`** — several `php-cgi` children behind one slot, sharing one listening
-  socket and one OPcache segment. Measured at 4.5x less resident memory than one process per
-  slot for 16 PHP processes, and 9.5x less for 64.
-- **`socket` on the worker transport** — where a `transport = "socket"` worker listens, in the
-  same dialect `external`, `attach` and `spawn_cgi` already take.
-- **`max_connections` for external backends** — opt-in back-pressure. Neither `php-cgi` nor
-  `php-fpm` enforces what its `FCGI_MAX_CONNS` advertises, so the value is never inferred from
-  the far side.
+- **`attach` backend** connects to externally supervised worker pools without spawning processes.
+- **`spawn_cgi.children`** runs multiple PHP children per slot, reducing measured memory use by
+  4.5x at 16 processes and 9.5x at 64.
+- **Worker transport sockets** support the same configuration as other socket backends.
+- **`max_connections`** adds opt-in back-pressure for external backends.
 
 ### Fixed
 
-- **A rotating test failure that was one production port race.** `CgiPool::start` probed a port
-  and then handed it to `php-cgi`, which binds it later; one lost bind failed the pool and the
-  server printed no banner. `spawn_port_slot` now retries only on `StartupExited`, because that
-  error means the bind failed and another port is the fix — a child still running but never
-  accepting is a real misconfiguration and is returned unchanged.
-- **The prefork supervisor leaked a zombie per recycled connection** — one for each child that
-  exited, measured at exactly 10 for 10 connections. `SIGCHLD` with a `WNOHANG` loop is the fix.
-- **A killed server left its PHP processes running on Unix.** The process group and
-  `PR_SET_PDEATHSIG` were documented in `lifecycle.rs` and implemented neither, so a `SIGKILL`ed
-  server leaked `php-cgi` and workers with their ports still bound. Both halves are real now, and
-  every kill site goes through them.
+- **FastCGI port races** retry only when a child exits during startup.
+- **Prefork supervisors** reap exited children and avoid zombies.
+- **Unix shutdown** terminates PHP and worker processes through process groups and
+  `PR_SET_PDEATHSIG`.
 
 ### Changed
 
-- **The static layer turns itself off where it can never help.** For a front-controller
-  application every request names a path that is not a file, so the layer answered `NotAFile` on
-  all of them after a `stat` and a hop to the blocking pool. Measured at 18–26% of throughput on
-  `/` and 7–14% on `/items`. An explicit setting still wins.
+- **Static serving disables itself for front-controller apps** unless explicitly enabled,
+  avoiding unnecessary filesystem checks (measured throughput gains: 18–26% on `/` and 7–14%
+  on `/items`).
 
 ## [0.1.0] - 2026-10-18
 
@@ -306,26 +90,17 @@ The first release: one binary that serves PHP without embedding it.
 
 ### Added
 
-- **Two ways to run a request, behind one dispatcher** — a resident worker that boots the
-  application once, and `php-cgi` that boots it per request. One process can answer one route
-  from a worker and the next from `php-cgi`, chosen per route in one configuration file.
-- **Backends** — `worker` (spawned), `external` (an existing `php-fpm`), `spawn_cgi` (a
-  supervised `php-cgi` pool) and an HTTP origin, with supervision, recycling and connection
-  recovery; FastCGI over TCP, unix sockets and Windows named pipes.
-- **Front-ends** — HTTP on hyper and FastCGI, from the same process, with routing, multiple
-  sites, static files, and on-the-fly compression of backend responses.
-- **TLS and ACME** — SNI, ALPN, plain and TLS on one port, a certificate per site, automatic
-  issuance and renewal, and a redirect from cleartext.
-- **Reload** — `SIGHUP` re-reads the configuration, whole-or-nothing, and never stops the
-  server; restart-only settings are reported rather than silently ignored.
-- **Observability** — access logs, request ids and distributed tracing, rate limiting, metrics
-  and a status endpoint, and the client IP behind a proxy.
-- **Worker services** — key-value storage, locks, jobs and gRPC from inside a running request,
-  over a specified worker protocol with PHP, Python and Ruby SDKs.
-- **`volucer check`** — names every listener, every backend and every PHP binary it found, and
-  why it chose it.
-- **Packaging** — tagged archives for six targets, an installer script for each family, and a
-  systemd unit.
+- **Worker and `php-cgi` request handling** with per-route backend selection.
+- **Backends:** spawned workers, external `php-fpm`, supervised `php-cgi` pools and HTTP origins;
+  FastCGI supports TCP, Unix sockets and Windows named pipes.
+- **HTTP and FastCGI front ends** with routing, multiple sites, static files and compression.
+- **TLS and ACME** with SNI, ALPN, per-site certificates, automatic renewal and HTTP redirects.
+- **Whole-process configuration reloads** on `SIGHUP`; restart-only changes are reported.
+- **Observability** with access logs, request IDs, tracing, rate limits, metrics, status and
+  proxy-aware client IPs.
+- **Worker services** for key-value storage, locks, jobs and gRPC, with PHP, Python and Ruby SDKs.
+- **`volucer check`** reports listeners, backends, PHP binaries and selection reasons.
+- **Release archives for six targets**, platform installers and a systemd unit.
 
 [Unreleased]: https://github.com/sailantis/volucer/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/sailantis/volucer/compare/v0.1.0...v0.2.0
