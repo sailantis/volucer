@@ -9,6 +9,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The configuration can be the command line alone.** `serve` and `check` now take `-o`
+  (`--override`) `KEY=VALUE` pairs, repeatable, plus `--listen` and `--fastcgi` as shorthand for
+  `server.http` and `server.fastcgi`. `-c`/`--config` is optional: with no flag and no
+  `volucer.toml` beside the working directory, the server starts from an empty table and everything
+  comes from the overrides. This removes the failure that a container with a `CMD` and nothing to
+  mount could not start at all — `Config::load` read a file unconditionally, so the process died
+  with `failed to read volucer.toml` before it had a chance to be told anything.
+  - Overrides are laid onto the `toml::Table` the file produced and deserialized **once**, so the
+    value is typed by TOML (`workers=8` is a number) and `deny_unknown_fields` still refuses a
+    typo — `-o server.htpp=…` is a startup error naming the key, not a setting that parses and is
+    ignored. `${NAME}` is expanded first, as in the file.
+  - `--listen` and `--fastcgi` apply before every `-o` pair, so `-o server.http=…` wins over
+    `--listen …` rather than depending on argument order.
+  - An explicit `-c` naming a missing file is still an error: "I said nothing" and "I named a file
+    that is not there" are different, and only the first may fall back.
+  - With no file, relative paths (`server.tls.certificate`, `[server.acme].cache`,
+    `[server.access_log].path`, a file KV store's `path`) resolve against the working directory,
+    which `check` prints. A `SIGHUP` replays the overrides exactly as given.
+  - Arrays of tables and `map` values have no dotted spelling and stay file-only.
 - **`volucer health`** checks a configured status or metrics endpoint, with `--url`, `--ready`,
   `VOLUCER_HEALTH_URL` and `VOLUCER_HEALTH_CONFIG` support. Wildcard listeners use loopback;
   missing endpoints, HTTPS URLs and non-2xx responses fail with diagnostic output.

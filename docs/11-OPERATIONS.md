@@ -162,6 +162,25 @@ WantedBy=multi-user.target
 applies it whole, or refuses it and keeps serving the previous one. Without a unit there is
 nothing to wire the signal to.
 
+**A unit can also carry the configuration instead of a file**, which is one thing fewer to
+mount and one thing fewer to read from disk:
+
+```ini
+ExecStart=/usr/local/bin/volucer serve \
+    --listen 127.0.0.1:8080 \
+    -o server.document_root=/srv/public \
+    -o server.front_controller=index.php \
+    -o backends.app.kind=worker \
+    -o "backends.app.command=php /srv/public/worker.php" \
+    -o backends.app.workers=0
+```
+
+The overrides are replayed by `SIGHUP` exactly as they were given, so a reload never installs a
+configuration nobody wrote. Without a file there is nothing new to read, so a reload re-applies
+the same command line — which is what a `logrotate` postrotate hook needs, and which still
+refreshes the certificate table. A changed `ExecStart` takes effect when the service is restarted:
+a flag is not a file, so there is nothing for the signal to pick up.
+
 `SIGTERM` drains: the listeners stop, in-flight requests finish, and the pool's PHP children
 are killed with their parent rather than orphaned.
 
@@ -270,6 +289,22 @@ docker run --rm \
     -v "$PWD/public:/srv/public:ro" \
     volucer
 ```
+
+**The image can also be run with no configuration file at all**, which is the shape that needs
+nothing mounted and no entrypoint script to generate one:
+
+```console
+docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" volucer \
+    serve --listen 0.0.0.0:8080 --document-root /srv/public \
+        -o server.front_controller=index.php \
+        -o backends.app.kind=worker \
+        -o "backends.app.command=php /srv/public/worker.php" \
+        -o status.address=0.0.0.0:9080
+```
+
+The `HEALTHCHECK` reads `[status]` from a file, so a fileless container needs the probe pointed
+at the URL instead: `HEALTHCHECK CMD ["/volucer", "health", "--url",
+"http://127.0.0.1:9080/health"]`. See [Health checks](#health-checks-in-the-image) below.
 
 The configuration has to do two things a host deployment does not, and neither is optional:
 

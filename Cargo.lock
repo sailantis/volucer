@@ -1935,6 +1935,7 @@ dependencies = [
  "signal-hook",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "volucer-acme",

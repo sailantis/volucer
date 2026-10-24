@@ -32,6 +32,10 @@ volucer-otlp.workspace = true
 volucer-acme.workspace = true
 clap.workspace = true
 futures.workspace = true
+# The command line is a configuration *source*, not a second parser: `-o key=value` pairs are laid
+# onto a `toml::Table` and deserialized once, which is what keeps `deny_unknown_fields` and the
+# file's own typing in force for a flag. See `Source` in `main.rs`.
+toml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

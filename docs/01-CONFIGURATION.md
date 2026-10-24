@@ -10,11 +10,46 @@ tells you what they are called and what happens if you leave them out.
 Volucer reads a TOML file, `volucer.toml` by default. Point it somewhere else with
 `volucer serve --config <path>`.
 
+**The file is optional.** When neither `--config` nor a `volucer.toml` beside the working
+directory exists, the configuration comes from the command line alone — `-o key=value` (and
+`--listen` / `--fastcgi`) — and the two sources are the same table by the time anything reads
+them. See [Getting Started](00-GETTING-STARTED.md#without-a-file-at-all) for the flag rules and
+the limits.
+
 **Unknown keys are an error, not a warning.** The configuration is parsed strictly, so a
 typo stops the server at startup rather than silently doing nothing. This is deliberate: a
 key that parses and is ignored looks supported and cannot work.
 
 The one exception is a `deny_unknown_fields`-free path in a few places noted below.
+
+## The command line as a source
+
+`-o section.key=value` lays one value onto the table the file produced (or onto an empty one),
+**before** deserialization. Three consequences follow from that order, and they are the whole
+design:
+
+| Rule | Why |
+|---|---|
+| The value is read as a TOML literal. | `-o workers=8` is a number because TOML says so, not because a table of key types says so. `127.0.0.1:8080` is not valid TOML, so it stays the string it looks like. Quote it to force a string when a value would otherwise read as a number or a boolean. |
+| An unknown key is refused by name. | The same `deny_unknown_fields` that guards the file guards a flag, so `-o server.htpp=…` is a startup error rather than a setting that parses, is ignored, and looks supported. |
+| `${NAME}` is expanded first. | A pair goes through the same expansion as the file's text, so `-o 'server.http=${HOST:-127.0.0.1}:8080'` works. |
+
+`--listen` and `--fastcgi` are sugar for `-o server.http=…` and `-o server.fastcgi=…`, applied
+**before** every `-o` pair — so an explicit `-o server.http=…` wins over `--listen …`.
+
+Arrays of tables (`[[server.routes]]`, `[sites.<name>]`) and `map` values have no dotted
+spelling and stay file-only.
+
+**One key cannot be spelled as an override**: `server.front_controller`. Its empty string is
+reserved to mean "serve only real files", and TOML cannot tell an empty string from a missing
+key there — which is why `validate` refuses it. Use the flag for that one,
+`volucer serve --front-controller ''`, which is the documented spelling.
+
+**Relative paths and the command line.** `server.tls.certificate`, `server.tls.key`,
+`[server.acme].cache`, a file KV store's `path` and `[server.access_log].path` resolve against
+the **config file's directory**. With no file, they resolve against the **working directory** —
+the only directory left once there is no file to be beside. `volucer check` prints the resolved
+value either way.
 
 ## Environment variables in the file
 

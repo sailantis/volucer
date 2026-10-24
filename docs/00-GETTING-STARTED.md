@@ -245,13 +245,63 @@ Your application is now on <http://127.0.0.1:8080>.
 
 | Option | Effect |
 |---|---|
-| `-c`, `--config <PATH>` | The configuration file. Defaults to `volucer.toml`. |
+| `-c`, `--config <PATH>` | The configuration file. Defaults to `volucer.toml` in the working directory, and is optional — see below. |
+| `-o`, `--override <KEY=VALUE>` | Set one key, in `dot.notation`. Repeatable. |
+| `--listen <ADDR>` | Shorthand for `-o server.http=<ADDR>`. |
+| `--fastcgi <ADDR>` | Shorthand for `-o server.fastcgi=<ADDR>`. |
 | `--document-root <PATH>` | Override `server.document_root`. |
 | `--front-controller <NAME>` | Override `server.front_controller`. Set it to an empty string to serve only real files. |
 | `--max-connections <N>` | Maximum concurrent client connections. Defaults to `512`. |
 
 A flag always wins over the file. That is deliberate: a systemd unit or a container image
 can describe its whole deployment in one file and not carry arguments.
+
+### Without a file at all
+
+The file is one *source* of configuration and the command line is another. When neither `-c`
+nor a `volucer.toml` beside the working directory exists, everything comes from `-o` (and
+`--listen` / `--fastcgi`), which is the shape a container `CMD` or a systemd `ExecStart` wants:
+
+```console
+volucer serve \
+    --listen 0.0.0.0:8080 \
+    -o server.document_root=public \
+    -o server.front_controller=index.php \
+    -o backends.app.kind=worker \
+    -o backends.app.command="php worker.php" \
+    -o backends.app.workers=8
+```
+
+```ini
+# the same deployment as a unit, with no file to mount
+ExecStart=/usr/local/bin/volucer serve --listen 0.0.0.0:8080 \
+    -o server.document_root=/srv/public \
+    -o backends.app.kind=worker \
+    -o backends.app.command="php /srv/public/worker.php"
+```
+
+Three rules make the pair predictable:
+
+- **The value is a TOML literal.** `-o backends.app.workers=8` is a number;
+  `-o server.http=127.0.0.1:8080` is the string it looks like, because that is not valid TOML.
+  Quote it to force a string — `-o 'server.http="0.0.0.0:8080"'` — which is what a value that
+  happens to read as a number or a boolean needs.
+- **`--listen` and `--fastcgi` are applied before `-o`**, so `-o server.http=…` wins over
+  `--listen …` rather than depending on where the flags appeared.
+- **A key that does not exist is a startup error**, exactly as a typo in the file is. A
+  `-o server.htpp=…` stops the server and names the key; it does not quietly serve on a
+  default port.
+
+Two limits are worth knowing. Arrays of tables (`[[server.routes]]`, a site's own `[sites.x]`)
+and `map` values have no `dot.notation` spelling and stay file-only; and `server.front_controller`
+is the one key whose empty value is reserved, so "serve only real files" is spelled
+`--front-controller ''` rather than `-o server.front_controller=`. With **no file**, relative
+paths — `server.tls.certificate`, `[server.acme].cache`, the access-log path — resolve against
+the **working directory**, because there is no file directory to resolve them against;
+`volucer check` prints the resolved value.
+
+An explicit `-c` naming a file that is not there remains an error: that is the difference
+between "I said nothing" and "I named a file that should be there".
 
 `--front-controller ''` is worth knowing about. By default a path that names no file is
 handed to the front controller with `PATH_INFO` set, which is what keeps a framework

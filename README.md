@@ -99,6 +99,24 @@ volucer serve
 `volucer check` reports configured listeners and backends, discovered PHP binaries, and
 configuration warnings.
 
+**A file is not required.** The same deployment can be stated on the command line, which is what
+a container `CMD` or a systemd `ExecStart` wants — `-o` takes any key in `dot.notation`, and
+`--listen` is shorthand for `server.http`:
+
+```sh
+volucer serve --listen 0.0.0.0:8080 \
+    -o server.document_root=public \
+    -o server.front_controller=index.php \
+    -o backends.app.kind=worker \
+    -o backends.app.command="php worker.php" \
+    -o backends.app.workers=8
+```
+
+Unknown keys are refused and the value is read as a TOML literal, so the strictness and the
+defaults are the file's own. See [Configuration](docs/01-CONFIGURATION.md#the-command-line-as-a-source)
+for the two limits (arrays of tables and maps stay file-only) and for how relative paths resolve
+when there is no file.
+
 [**Getting started →**](docs/00-GETTING-STARTED.md)
 
 ## Documentation

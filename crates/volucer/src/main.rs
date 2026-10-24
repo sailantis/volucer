@@ -40,8 +40,39 @@ enum Command {
     /// Run the configured listeners and backends.
     Serve {
         /// Path to `volucer.toml`.
-        #[arg(short, long, default_value = "volucer.toml")]
-        config: PathBuf,
+        ///
+        /// Defaults to `volucer.toml` in the working directory when that file exists. Without a
+        /// file — no `-c`, and no `volucer.toml` beside the working directory — the configuration
+        /// comes from the command line alone, so at least one listener must be given with
+        /// `--listen`, `--fastcgi` or `-o server.http=…`.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// HTTP listener, e.g. `127.0.0.1:8080`.
+        ///
+        /// Shorthand for `-o server.http=<ADDR>`, and applied **before** every `-o` pair, so an
+        /// explicit `-o server.http=…` wins over this flag rather than depending on argument order.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+
+        /// FastCGI listener, e.g. `127.0.0.1:9000` or `unix:/run/volucer.sock`.
+        ///
+        /// Shorthand for `-o server.fastcgi=<ADDR>`, with the same precedence rule as `--listen`.
+        #[arg(long, value_name = "ADDR")]
+        fastcgi: Option<String>,
+
+        /// Set one configuration key, in `dot.notation=value` form. Repeatable.
+        ///
+        /// The value is read as a TOML literal, so `-o backends.app.workers=8` is a number and
+        /// `-o server.http=127.0.0.1:8080` is the string it looks like. Quote it to force a
+        /// string: `-o 'server.http="0.0.0.0:8080"'`. `${NAME}` and `${NAME:-default}` are
+        /// expanded first, as in the file.
+        ///
+        /// **A key that does not exist is an error**, exactly as a typo in `volucer.toml` is —
+        /// the strictness is the feature. Applied in the order given, after `--listen` and
+        /// `--fastcgi`, so a later pair wins over an earlier one.
+        #[arg(short = 'o', long = "override", value_name = "KEY=VALUE")]
+        overrides: Vec<String>,
 
         /// Document root that PHP scripts are resolved against.
         ///
@@ -64,9 +95,25 @@ enum Command {
 
     /// Validate the configuration and report what was found on this host.
     Check {
-        /// Path to `volucer.toml`.
-        #[arg(short, long, default_value = "volucer.toml")]
-        config: PathBuf,
+        /// Path to `volucer.toml`. Optional, with the same rule as `serve`.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// HTTP listener to check, overriding `server.http`. See `serve --listen`.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+
+        /// FastCGI listener to check, overriding `server.fastcgi`.
+        #[arg(long, value_name = "ADDR")]
+        fastcgi: Option<String>,
+
+        /// Set one configuration key, in `dot.notation=value` form. Repeatable.
+        ///
+        /// The same keys, typing and expansion as `serve --override`, and the same refusal of an
+        /// unknown one — which is what makes `check` a rehearsal of `serve` rather than a second
+        /// opinion about the file.
+        #[arg(short = 'o', long = "override", value_name = "KEY=VALUE")]
+        overrides: Vec<String>,
 
         /// Document root to check, overriding `server.document_root`.
         #[arg(long)]
@@ -135,20 +182,30 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Serve {
             config,
+            listen,
+            fastcgi,
+            overrides,
             document_root,
             front_controller,
             max_connections,
         } => serve(
-            &config,
+            &Source::resolve(config, listen, fastcgi, overrides),
             document_root.as_deref(),
             front_controller.as_deref(),
             max_connections,
         ),
         Command::Check {
             config,
+            listen,
+            fastcgi,
+            overrides,
             document_root,
             php_dirs,
-        } => check(&config, document_root.as_deref(), &php_dirs).map_err(ServerError::from),
+        } => check(
+            &Source::resolve(config, listen, fastcgi, overrides),
+            document_root.as_deref(),
+            &php_dirs,
+        ),
         Command::Health {
             url,
             config,
@@ -244,11 +301,10 @@ impl Telemetry {
 /// separately would make "spans are configured but nothing records them" a state that compiles.
 fn build_observability_with_exporter(
     config: &Config,
-    config_path: &Path,
+    config_dir: &Path,
 ) -> (volucer_observe::Observability, Telemetry) {
     let mut observe = match &config.server.access_log {
         Some(log) => {
-            let config_dir = config_path.parent().unwrap_or_else(|| Path::new(""));
             let path = resolve_access_log_path(&log.path, config_dir);
             let format = match log.format {
                 AccessLogFormat::Combined => volucer_observe::access_log::Format::Combined,
@@ -645,11 +701,199 @@ fn init_tracing(verbosity: u8) {
         .try_init();
 }
 
-fn load_and_validate(path: &Path) -> Result<Config, ServerError> {
-    let config = Config::load(path)?;
-    config.validate()?;
-    tracing::info!(path = %path.display(), "configuration loaded");
-    Ok(config)
+/// Where a run's configuration comes from: a file, the command line, or both.
+///
+/// **Two sources, one deserializer.** The file is read into a `toml::Table`, every override is laid
+/// on top of it in order, and the result goes through `Config::from_table` — so a file, an `-o`
+/// pair and a `SIGHUP` reload are defaulted, validated and refused by exactly one piece of code.
+/// The alternative, a `serde`-only path for flags, would be a second answer to "what does this
+/// configuration say", which is the drift `check` exists to prevent.
+///
+/// The pairs are kept as written rather than as parsed values because [`Reloader`] has to replay
+/// them: a reload that re-parsed a *different* representation of the same flags would be a second
+/// reading of them, and the one thing a reload must never do is change the meaning of a running
+/// deployment.
+#[derive(Clone)]
+struct Source {
+    /// The file, when there is one. `Some` for an explicit `-c` — which is then a hard error if it
+    /// cannot be read, so a typo cannot silently become a default server — and for the default
+    /// `volucer.toml` when that file exists.
+    path: Option<PathBuf>,
+    /// Every `-o` pair in the order it applies: `--listen` and `--fastcgi` first, then the
+    /// `-o/--override` pairs as given.
+    pairs: Vec<String>,
+}
+
+impl Source {
+    /// Assemble the source from the parsed command line.
+    ///
+    /// `--listen` and `--fastcgi` are converted into override pairs **here** rather than special-
+    /// cased at each use, so precedence is a property of one list: an explicit `-o server.http=…`
+    /// comes after the sugar and therefore wins, and the order does not depend on where the flags
+    /// appeared on the command line.
+    fn resolve(
+        config: Option<PathBuf>,
+        listen: Option<String>,
+        fastcgi: Option<String>,
+        overrides: Vec<String>,
+    ) -> Self {
+        let mut pairs = Vec::with_capacity(overrides.len() + 2);
+        for (key, address) in [("server.http", listen), ("server.fastcgi", fastcgi)] {
+            if let Some(address) = address {
+                // Quoted as a TOML string rather than left to the literal reader below: a listener
+                // may be `unix:/run/app.sock`, which no TOML grammar accepts unquoted, and a bare
+                // `8080` would otherwise be read as a number and refused by the type check.
+                // `toml_edit`-free spelling, so a Windows path cannot be re-escaped by accident.
+                pairs.push(format!(
+                    "{key}=\"{}\"",
+                    address.replace('\\', "\\\\").replace('"', "\\\"")
+                ));
+            }
+        }
+        pairs.extend(overrides);
+
+        // The default file is used only when it is *there*. A missing `volucer.toml` and no `-c`
+        // means the command line is the whole configuration; an explicit `-c` naming a missing file
+        // stays an error, because that is the difference between "I said nothing" and "I named a
+        // file that is not there".
+        let path = match config {
+            Some(path) => Some(path),
+            None => {
+                let default = PathBuf::from(DEFAULT_CONFIG);
+                default.exists().then_some(default)
+            }
+        };
+
+        Self { path, pairs }
+    }
+
+    /// Read, merge and validate. The only way `serve`, `check` and a reload build a `Config`.
+    fn load(&self) -> Result<Config, ServerError> {
+        let mut table = match &self.path {
+            Some(path) => Config::table_from_path(path)?,
+            None => toml::Table::new(),
+        };
+        for pair in &self.pairs {
+            apply_override(&mut table, pair)?;
+        }
+        let config = Config::from_table(table)?;
+        config.validate()?;
+        tracing::info!(source = %self.describe(), "configuration loaded");
+        Ok(config)
+    }
+
+    /// The directory relative paths resolve against.
+    ///
+    /// The file's own directory, which is the rule `[server.tls]`'s `certificate`, `[server.acme]`'s
+    /// `cache` and the access log already follow — and **the working directory when there is no
+    /// file**, the only answer left once the file is gone. One function so `serve`, `check` and the
+    /// preflight cannot disagree, and so a fileless deployment's certificate is looked for where the
+    /// process was started rather than in a directory that does not exist.
+    fn dir(&self) -> PathBuf {
+        match &self.path {
+            Some(path) => path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("")),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from("")),
+        }
+    }
+
+    /// How this configuration is named in `serve`'s banner and in `check`'s first line.
+    fn describe(&self) -> String {
+        match &self.path {
+            Some(path) => path.display().to_string(),
+            None => format!("command line ({} override(s), no file)", self.pairs.len()),
+        }
+    }
+}
+
+/// The file used when `-c` is not given and this exists.
+const DEFAULT_CONFIG: &str = "volucer.toml";
+
+/// One override's text as a TOML value.
+///
+/// **Parsed as a value, not as a document.** `str::parse::<toml::Value>` reads a whole
+/// configuration, so `8` and `127.0.0.1:8080` both fail there and a caller that fell back to a
+/// string would make every override a string — including `workers=8`, which then fails the type
+/// check with a message about the *value* rather than about the number it was. The wrapping below
+/// is what asks the grammar the value question, so quoting, integers, floats, booleans, arrays and
+/// datetimes all behave exactly as they do in the file.
+///
+/// A value that still does not parse is a **string**, which is the answer a listener needs:
+/// `127.0.0.1:8080` and `unix:/run/app.sock` are not TOML and are the two most common things to
+/// pass.
+fn literal(text: &str) -> toml::Value {
+    format!("value = {text}")
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|mut table| table.remove("value"))
+        .unwrap_or_else(|| toml::Value::String(text.to_string()))
+}
+
+/// Lay one `KEY=VALUE` pair onto the table.
+///
+/// The value is read by [`literal`], which is what gives `-o backends.app.workers=8` an integer and
+/// `-o server.http=127.0.0.1:8080` the string it looks like — no per-key knowledge here, and no way
+/// for this function to disagree with the file's own typing.
+fn apply_override(table: &mut toml::Table, pair: &str) -> Result<(), ServerError> {
+    let (key, raw) = pair.split_once('=').ok_or_else(|| {
+        invalid_override(format!(
+            "--override {pair:?} is not KEY=VALUE; write -o server.http=127.0.0.1:8080 \
+             (quote the whole pair in a shell)"
+        ))
+    })?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(invalid_override(format!(
+            "--override {pair:?} names no key; write it as KEY=VALUE"
+        )));
+    }
+
+    // Expanded before it is parsed, so `${PORT:-8080}` works in a listener position exactly as it
+    // does in the file — where the substitution is on the *text* for the same reason.
+    let expanded = volucer_core::env::expand(raw.trim())
+        .map_err(|reason| invalid_override(format!("--override {key}: {reason}")))?;
+    let value = literal(&expanded);
+
+    let mut cursor = table;
+    let mut segments = key.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if segment.is_empty() {
+            return Err(invalid_override(format!(
+                "--override {key:?} has an empty key segment; a dotted key is `section.key`"
+            )));
+        }
+        if segments.peek().is_none() {
+            cursor.insert(segment.to_string(), value);
+            return Ok(());
+        }
+        // A table in the way, or a table created for a key that did not exist yet. A *non*-table in
+        // the way is refused rather than replaced: `-o server=1 -o server.http=…` would otherwise
+        // silently choose depending on the order the pairs were written in.
+        let entry = cursor
+            .entry(segment.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        cursor = match entry {
+            toml::Value::Table(table) => table,
+            other => {
+                return Err(invalid_override(format!(
+                    "--override {key:?} passes through {segment:?}, which is already set to {}; \
+                     name a section, not a value",
+                    other.type_str()
+                )))
+            }
+        };
+    }
+    Ok(())
+}
+
+/// One `-o` pair that cannot be applied.
+///
+/// `volucer_core::Error::Config` rather than a new variant: a bad override *is* a configuration
+/// error, and it reaches the operator through the same `configuration error: …` line as a bad file.
+fn invalid_override(reason: String) -> ServerError {
+    ServerError::from(volucer_core::Error::Config(reason))
 }
 
 /// Build the routing for a site from the site table.
@@ -699,24 +943,25 @@ fn absolute_document_root(root: &Path) -> PathBuf {
         .unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// Resolve a TLS path against the directory holding the config file.
+/// Resolve a TLS path against the directory the configuration was read from.
 ///
 /// Deliberately **not** the document-root rule, which is relative to the process's working
 /// directory. A certificate beside `volucer.toml` is the common case, and resolving it
 /// against wherever the process happened to start is a footgun with a security consequence:
 /// the server would start with whatever certificate it found, or fail to start at all, for a
 /// reason invisible in the file. An absolute path is used as written.
-fn resolve_tls_path(path: &Path, config_path: &Path) -> PathBuf {
+///
+/// `config_dir` is the file's directory — or the working directory when the deployment has no
+/// file at all, which [`Source::dir`] resolves once and every caller shares, so a fileless `check`
+/// and a fileless `serve` name the same certificate.
+fn resolve_tls_path(path: &Path, config_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
     }
-    match config_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(path),
-        // A bare filename such as `volucer.toml` has an empty parent, which means the
-        // working directory — the same answer `Path::parent` gives and the one a reader
-        // expects.
-        _ => path.to_path_buf(),
-    }
+    // A bare filename such as `volucer.toml` has an empty parent, which means the working
+    // directory — the same answer `Path::parent` gives and the one a reader expects. Joining an
+    // empty directory is exactly that, so one arm covers both.
+    config_dir.join(path)
 }
 
 /// One ACME table: the deployment's, or a site's.
@@ -774,13 +1019,13 @@ fn acme_authority(authority: volucer_core::config::Authority) -> volucer_acme::A
 /// `None` when the pair is stated only partly, which `Config::validate` refuses, or when it is left
 /// out entirely so a placeholder is generated — in which case there is no path to resolve and
 /// `check` reports the generation rather than a file.
-fn resolved_server_tls(config: &Config, config_path: &Path) -> Option<TlsPaths> {
+fn resolved_server_tls(config: &Config, config_dir: &Path) -> Option<TlsPaths> {
     let tls = config.server.tls.as_ref()?;
     let certificate = tls.certificate.as_ref()?;
     let key = tls.key.as_ref()?;
     Some(TlsPaths {
-        certificate: resolve_tls_path(certificate, config_path),
-        key: resolve_tls_path(key, config_path),
+        certificate: resolve_tls_path(certificate, config_dir),
+        key: resolve_tls_path(key, config_dir),
     })
 }
 
@@ -804,7 +1049,7 @@ struct TlsPaths {
 }
 
 /// Every `(site name, paths)` that states its own certificate, resolved.
-fn resolved_site_tls(config: &Config, config_path: &Path) -> Vec<(String, TlsPaths)> {
+fn resolved_site_tls(config: &Config, config_dir: &Path) -> Vec<(String, TlsPaths)> {
     config
         .sites
         .iter()
@@ -815,8 +1060,8 @@ fn resolved_site_tls(config: &Config, config_path: &Path) -> Vec<(String, TlsPat
             Some((
                 name.clone(),
                 TlsPaths {
-                    certificate: resolve_tls_path(certificate, config_path),
-                    key: resolve_tls_path(key, config_path),
+                    certificate: resolve_tls_path(certificate, config_dir),
+                    key: resolve_tls_path(key, config_dir),
                 },
             ))
         })
@@ -1001,12 +1246,12 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// the async boundary made concrete: the runtime exists for the HTTP front-end,
 /// and nothing else in the program depends on it.
 fn serve(
-    path: &Path,
+    source: &Source,
     document_root_flag: Option<&Path>,
     front_controller_flag: Option<&str>,
     max_connections: usize,
 ) -> Result<(), ServerError> {
-    let config = load_and_validate(path)?;
+    let config = source.load()?;
     let document_root = absolute_document_root(&resolve_document_root(document_root_flag, &config));
     let front_controller = config
         .server
@@ -1063,7 +1308,7 @@ fn serve(
         // `[server]` list has to reach the dispatch path, and rebuilding the value here is how
         // one of the two would quietly get the default list instead.
         routing_of(sites.default_site()),
-        path.parent().unwrap_or_else(|| Path::new("")),
+        &source.dir(),
     )?;
     for name in dispatcher.backend_names() {
         tracing::info!(backend = %name, "backend ready");
@@ -1129,7 +1374,9 @@ fn serve(
     // front controller PHP will not run, and noticing it in the log is worth
     // more than the process refusing to start. Only in the log, so a deployment
     // that creates the root during startup still works.
-    for warning in volucer_core::preflight::inspect_with(&config, &document_root, Some(path)) {
+    for warning in
+        volucer_core::preflight::inspect_with(&config, &document_root, source.path.as_deref())
+    {
         tracing::warn!("{}", warning.message);
         if let Some(hint) = &warning.hint {
             tracing::warn!("  {hint}");
@@ -1166,7 +1413,7 @@ fn serve(
     // The exporter comes back with it and is held for the rest of the run: dropping it stops the
     // thread, and its last flush is what puts the final seconds of a deployment's traffic into its
     // traces. `telemetry` is therefore deliberately *not* a local of a helper.
-    let (observe, telemetry) = build_observability_with_exporter(&config, path);
+    let (observe, telemetry) = build_observability_with_exporter(&config, &source.dir());
     let observe = Arc::new(observe);
     if let Some(endpoint) = telemetry.endpoint() {
         println!("  telemetry:        {endpoint}");
@@ -1214,7 +1461,7 @@ fn serve(
     // TLS applies to `http` unless a dedicated `https` listener was configured, in which case
     // `http` stays plaintext and `https` carries it. Validation has already refused every
     // combination outside that matrix, so this only picks between the two shapes.
-    let config_dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let config_dir = &source.dir();
     let tls_active = config.server.tls.is_some();
     let https_address = config.server.https.clone();
     let tls_on_http = tls_active && https_address.is_none();
@@ -1579,7 +1826,7 @@ fn serve(
         Arc::clone(&registry),
         tls_state.clone(),
         Arc::clone(&observe),
-        path.to_path_buf(),
+        source,
         document_root_flag.map(Path::to_path_buf),
         front_controller_flag.map(str::to_string),
     );
@@ -2019,9 +2266,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// instead of in every call site.
 #[cfg_attr(windows, allow(dead_code))]
 struct Reloader {
-    /// The path named on the command line. Re-read as-is, which is open decision 9.1's answer:
-    /// what an operator expects from `SIGHUP`, and no new concept such as a marker file.
-    config_path: PathBuf,
+    /// Where the configuration came from, replayed exactly as it was given: the file (if any) with
+    /// the same overrides in the same order. Open decision 9.1's answer — what an operator expects
+    /// from `SIGHUP`, and no new concept such as a marker file.
+    ///
+    /// **A `Source` rather than a path**, because a reload that dropped the overrides would install
+    /// a configuration nobody wrote: a deployment started with `-o server.document_root=public`
+    /// would move its root to `.` and start serving 404s, with the change attributed to whatever
+    /// the operator edited.
+    source: Source,
     /// The document root and front controller **the command line resolved**.
     ///
     /// Replayed on a reload because they are part of what the configuration *means*: a deployment
@@ -2062,6 +2315,13 @@ impl Reloader {
     /// A reload that succeeds still may not have changed anything the implementation can honour;
     /// the settings that are **restart-only** are named in [`restart_only`] and printed, so an
     /// operator who edited one learns it here rather than from behaviour.
+    ///
+    /// **A fileless deployment reloads to the same configuration it started with**, because the
+    /// overrides are replayed rather than re-read. That is the honest answer to a `SIGHUP`: flags
+    /// are not a file, so there is nothing new to pick up, and a reload that changed them would have
+    /// to invent a source. The pair is still re-applied, so a reload that *refuses* (say, because a
+    /// certificate the overrides name has gone) leaves the previous one serving rather than
+    /// half-installing one.
     #[cfg_attr(windows, allow(dead_code))]
     fn reload(&self) {
         // **The access log is reopened first, and unconditionally — before the file is even read.**
@@ -2084,17 +2344,18 @@ impl Reloader {
             tracing::info!("access log reopened for a rotation");
         }
 
-        let config = match Config::load(&self.config_path) {
+        let config = match self.source.load() {
             Ok(config) => config,
+            // `Source::load` reports the same three failures `serve` refuses at startup: an
+            // unreadable file, a bad override, and a configuration that parses and does not
+            // validate. All of them are *refusals* here — nothing is installed — which is the only
+            // safe direction. A reload that half-applied a file would leave the operator unable to
+            // tell which half took effect.
             Err(err) => {
-                tracing::error!(%err, "reload refused: the configuration could not be read");
+                tracing::error!(%err, "reload refused: the configuration was not accepted");
                 return;
             }
         };
-        if let Err(err) = config.validate() {
-            tracing::error!(%err, "reload refused: the configuration is not valid");
-            return;
-        }
 
         // The site table, with the command line replayed, exactly as `serve` built the first one.
         // Built before anything is installed, so a table that cannot be built is a refusal rather
@@ -2112,7 +2373,7 @@ impl Reloader {
         let _previous = self.registry.apply(sites);
         tracing::info!(
             generation,
-            file = %self.config_path.display(),
+            source = %self.source.describe(),
             document_root = %document_root.display(),
             sites = config.sites.len(),
             "configuration reloaded"
@@ -2194,7 +2455,7 @@ fn install_shutdown_handler(
     registry: Arc<volucer_http::Registry>,
     tls: Option<Arc<volucer_http::SniResolver>>,
     observe: Arc<volucer_observe::Observability>,
-    config_path: PathBuf,
+    source: &Source,
     document_root_flag: Option<PathBuf>,
     front_controller_flag: Option<String>,
 ) {
@@ -2222,7 +2483,7 @@ fn install_shutdown_handler(
     };
 
     let reloader = Reloader {
-        config_path,
+        source: source.clone(),
         document_root_flag,
         front_controller_flag,
         registry,
@@ -2309,19 +2570,25 @@ mod signals {
 
 /// `check` validates configuration and reports the PHP binaries found here.
 fn check(
-    path: &Path,
+    source: &Source,
     document_root_flag: Option<&Path>,
     extra_php_dirs: &[PathBuf],
-) -> Result<(), volucer_core::Error> {
-    let config = Config::load(path)?;
-    config.validate()?;
+) -> Result<(), ServerError> {
+    let config = source.load()?;
 
     // The same resolution `serve` performs, so this reports the deployment that
     // would actually start rather than the one written in the file.
     let document_root = absolute_document_root(&resolve_document_root(document_root_flag, &config));
     let front_controller = config.server.resolve_front_controller(None);
+    // Where relative paths resolve: the file's directory, or the working directory for a fileless
+    // deployment. Taken once, from the same helper `serve` uses, so the two cannot disagree about
+    // which certificate `check` inspected.
+    let config_dir = source.dir();
 
-    println!("configuration: {}", path.display());
+    // The *source* rather than a path, because a deployment with no file has no path to print —
+    // and "which of these two is my server running" is the first question a `check` report has to
+    // answer when the same binary can be started either way.
+    println!("configuration: {}", source.describe());
     println!("  listeners:");
     match &config.server.http {
         Some(http) => println!("    http:    {http}"),
@@ -2394,7 +2661,7 @@ fn check(
     // chose, and the difference between "I forgot the certificate" and "it will be generated until
     // ACME issues" is the difference between a bug report and the intended behaviour.
     let generated_tls = server_tls_is_generated(&config);
-    match (resolved_server_tls(&config, path), generated_tls) {
+    match (resolved_server_tls(&config, &config_dir), generated_tls) {
         (Some(server_tls), _) => {
             let tls = config
                 .server
@@ -2453,7 +2720,7 @@ fn check(
     // A site's certificate is printed only when the site states one, for the same reason the
     // site table prints only stated keys: listing the inherited value per site would read as
     // though every site had been configured with it.
-    for (name, site_tls) in resolved_site_tls(&config, path) {
+    for (name, site_tls) in resolved_site_tls(&config, &config_dir) {
         println!("    site {name}:        {}", site_tls.certificate.display());
     }
 
@@ -2492,7 +2759,7 @@ fn check(
                 ),
                 false => println!("    contact:          {}", acme.contact.join(", ")),
             }
-            let cache = resolve_tls_path(&acme.cache, path);
+            let cache = resolve_tls_path(&acme.cache, &config_dir);
             println!("    cache:            {}", cache.display());
             // The cached certificate is *hashed* by the crate, so the file name is not derivable
             // here — what can be said is whether the directory has anything in it, which is the
@@ -2518,12 +2785,12 @@ fn check(
             // The days left on each certificate this deployment serves. Reported whenever ACME is
             // configured, because the *question* — is anything about to expire — is the same
             // whether or not issuance is working, and expiry is this feature's only symptom.
-            if let Some(server_tls) = resolved_server_tls(&config, path) {
+            if let Some(server_tls) = resolved_server_tls(&config, &config_dir) {
                 if let Some(lifetime) = certificate_lifetime(&server_tls.certificate) {
                     println!("      {}", lifetime.report("serving certificate"));
                 }
             }
-            for (name, site_tls) in resolved_site_tls(&config, path) {
+            for (name, site_tls) in resolved_site_tls(&config, &config_dir) {
                 if let Some(lifetime) = certificate_lifetime(&site_tls.certificate) {
                     println!(
                         "      {}",
@@ -2583,7 +2850,7 @@ fn check(
             ),
             false => println!("    contact:          {}", contact.join(", ")),
         }
-        let cache = resolve_tls_path(&site_acme.resolved_cache(&config.server.acme), path);
+        let cache = resolve_tls_path(&site_acme.resolved_cache(&config.server.acme), &config_dir);
         println!("    cache:            {}", cache.display());
     }
 
@@ -2764,10 +3031,7 @@ fn check(
         for (name, storage) in &config.kv {
             match storage {
                 volucer_core::config::KvStorageConfig::File(file) => {
-                    let resolved = volucer_core::config::resolve_kv_path(
-                        &file.path,
-                        path.parent().unwrap_or_else(|| Path::new("")),
-                    );
+                    let resolved = volucer_core::config::resolve_kv_path(&file.path, &config_dir);
                     println!("    {name}: file, {}", resolved.display());
                     println!(
                         "      bound:            {} MiB, counted from what is already there",
@@ -2947,8 +3211,7 @@ fn check(
     // reports is a key an operator cannot confirm.
     match &config.server.access_log {
         Some(log) => {
-            let resolved =
-                resolve_access_log_path(&log.path, path.parent().unwrap_or_else(|| Path::new("")));
+            let resolved = resolve_access_log_path(&log.path, &config_dir);
             println!("  access log:");
             println!("    path:   {}", resolved.display());
             println!(
@@ -3066,7 +3329,8 @@ fn check(
     // Warnings, not errors: every one of these is a normal intermediate state on
     // the way to a working deployment, and refusing to report anything else
     // because the root is not there yet would be the wrong trade.
-    let warnings = volucer_core::preflight::inspect_with(&config, &document_root, Some(path));
+    let warnings =
+        volucer_core::preflight::inspect_with(&config, &document_root, source.path.as_deref());
     if !warnings.is_empty() {
         println!("  warnings:");
         for warning in &warnings {
@@ -3160,6 +3424,116 @@ fn print_advertised_capacity(external: &volucer_core::config::ExternalConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override is typed by TOML, and a listener that is not TOML is still a string.
+    ///
+    /// The pair this pins is the one that broke: `str::parse::<toml::Value>` reads a whole
+    /// *document*, so `8` and `127.0.0.1:8080` both failed there and every override became a string
+    /// — which surfaced as `http: "\"127.0.0.1:8080\""` in the error, a quoted listener, and as
+    /// `workers = "8"` failing the type check. Both halves are asserted because a fix for the first
+    /// that broke the second would be the same bug with the sign flipped.
+    #[test]
+    fn an_override_is_typed_like_the_file_it_lands_in() {
+        assert_eq!(literal("8"), toml::Value::Integer(8));
+        assert_eq!(literal("true"), toml::Value::Boolean(true));
+        assert_eq!(literal("0.5"), toml::Value::Float(0.5));
+        assert_eq!(literal("\"quoted\""), toml::Value::String("quoted".into()));
+        assert_eq!(
+            literal("127.0.0.1:8080"),
+            toml::Value::String("127.0.0.1:8080".into()),
+            "a listener is not TOML, so it is the string it looks like"
+        );
+        assert_eq!(
+            literal("unix:/run/app.sock"),
+            toml::Value::String("unix:/run/app.sock".into())
+        );
+    }
+
+    /// A dotted pair builds the tables it needs, and a pair that contradicts an earlier one is
+    /// refused rather than silently ordered.
+    ///
+    /// The refusal matters because both forms are *writable*: `-o server=1 -o server.http=…` would
+    /// otherwise choose by argument order, which is the kind of precedence an operator cannot see in
+    /// the file they are reasoning about.
+    #[test]
+    fn an_override_builds_tables_and_refuses_to_replace_a_value() {
+        let mut table = toml::Table::new();
+        apply_override(&mut table, "backends.app.kind=worker").expect("a nested key is created");
+        apply_override(&mut table, "backends.app.command=\"php worker.php\"")
+            .expect("a quoted value is a string");
+        apply_override(&mut table, "backends.app.workers=3").expect("a sibling is added");
+
+        let config = Config::from_table(table.clone()).expect("the table deserializes");
+        match config.backends.get("app").expect("the backend exists") {
+            volucer_core::BackendConfig::Worker(worker) => {
+                assert_eq!(
+                    worker.workers, 3,
+                    "`workers=3` must be a number, not a string"
+                );
+                assert_eq!(worker.command, "php worker.php");
+            }
+            other => panic!("`kind = worker` must build a worker: {other:?}"),
+        }
+
+        let mut table = toml::Table::new();
+        apply_override(&mut table, "server=1").expect("a scalar is a valid override");
+        let err = apply_override(&mut table, "server.http=127.0.0.1:8080")
+            .expect_err("a value cannot be walked through");
+        assert!(
+            err.to_string().contains("server"),
+            "the refusal must name the key it could not pass through: {err}"
+        );
+    }
+
+    /// A pair that is not `KEY=VALUE`, or names no key, is an error rather than a no-op.
+    #[test]
+    fn a_malformed_override_names_what_is_wrong() {
+        let mut table = toml::Table::new();
+        for pair in ["server.http", "=127.0.0.1:8080", "server..http=8080"] {
+            let err = apply_override(&mut table, pair).expect_err("a malformed pair is refused");
+            assert!(
+                err.to_string().contains("override"),
+                "the message must say it is an override that is wrong: {err}"
+            );
+        }
+    }
+
+    /// `--listen` becomes a quoted `server.http` pair, placed before every `-o`.
+    ///
+    /// Asserted on the assembled pairs rather than on a running server: the precedence rule is one
+    /// ordering decision, and a test that started a process to see it would fail for a port reason
+    /// and say nothing about the order.
+    #[test]
+    fn the_listen_sugar_precedes_the_overrides() {
+        let source = Source::resolve(
+            None,
+            Some("127.0.0.1:8080".to_string()),
+            Some("unix:/run/app.sock".to_string()),
+            vec!["server.http=127.0.0.1:9090".to_string()],
+        );
+
+        assert_eq!(
+            source.pairs,
+            vec![
+                "server.http=\"127.0.0.1:8080\"".to_string(),
+                "server.fastcgi=\"unix:/run/app.sock\"".to_string(),
+                "server.http=127.0.0.1:9090".to_string(),
+            ],
+            "the sugar is applied first, so an explicit -o wins"
+        );
+        // The last pair is the one a table keeps, which is the whole of the precedence rule.
+        let mut table = toml::Table::new();
+        for pair in &source.pairs {
+            apply_override(&mut table, pair).expect("each pair applies");
+        }
+        let config = Config::from_table(table).expect("the table deserializes");
+        assert_eq!(config.server.http.as_deref(), Some("127.0.0.1:9090"));
+        assert_eq!(
+            config.server.fastcgi.as_deref(),
+            Some("unix:/run/app.sock"),
+            "the fastcgi sugar is untouched by the http override"
+        );
+    }
 
     #[test]
     fn the_contention_line_carries_every_number_it_is_given() {

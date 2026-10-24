@@ -203,12 +203,23 @@ impl Server {
     }
 
     fn spawn(binary: &Path, config: &Path, extra: &[&str], cwd: Option<&Path>) -> Option<Self> {
+        let mut args = vec![
+            std::ffi::OsStr::new("serve"),
+            std::ffi::OsStr::new("--config"),
+            config.as_os_str(),
+        ];
+        args.extend(extra.iter().map(std::ffi::OsStr::new));
+        Server::spawn_args(binary, &args, cwd)
+    }
+
+    /// Start the server from a bare argument list, with **no** `--config`.
+    ///
+    /// The whole point of the fileless mode: a deployment whose configuration is the command line
+    /// has no `serve --config …` prefix to add, so a helper that always wrote one could not test it.
+    fn spawn_args(binary: &Path, args: &[&std::ffi::OsStr], cwd: Option<&Path>) -> Option<Self> {
         let mut command = Command::new(binary);
         command
-            .arg("serve")
-            .arg("--config")
-            .arg(config)
-            .args(extra)
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
@@ -2595,6 +2606,68 @@ extern "C" {
     fn libc_kill(pid: i32, signal: i32) -> i32;
 }
 
+/// A fileless deployment survives `SIGHUP` and keeps serving the same configuration.
+///
+/// There is nothing for the signal to re-read, so the honest answers are "the same" or "refused".
+/// Both are safe; what must not happen is a reload that *installs* something — a root of `.`, a
+/// listener dropped — because the overrides would then have been lost by an operator who only
+/// asked for a log rotation. Asserted against a real process for the same reason the fileed case
+/// is: the mechanism is a signal.
+#[cfg(unix)]
+#[test]
+fn a_fileless_deployment_survives_a_reload_unchanged() {
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-fileless-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("public")).expect("create the document root");
+    std::fs::write(root.join("public/whoami.txt"), "still-here").expect("write the marker");
+
+    let document_root = format!("server.document_root={}", root.join("public").display());
+    let args = [
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "-o",
+        &document_root,
+        "-o",
+        "server.static_files.enabled=true",
+        "--front-controller=",
+    ];
+    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+    let Some(server) = Server::spawn_args(&binary, &os_args, Some(&root)) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("--listen configures an http listener");
+    assert_eq!(http_get(&address, "/whoami.txt").text(), "still-here");
+
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert_eq!(
+        http_get(&address, "/whoami.txt").text(),
+        "still-here",
+        "a reload with no file has nothing to install, so the same root must keep answering"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `SIGHUP` reloads a running server, and a file it cannot apply changes nothing.
 ///
 /// The deliverable of this phase, asserted the only way that means anything: against a **real
@@ -3990,6 +4063,270 @@ fn the_worker_list_and_the_reset_agree_about_a_worker_in_a_second_pool() {
     assert_eq!(missing.status, 404, "{missing:?}");
 
     drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Run a subcommand that **must exit**, and fail rather than hang if it does not.
+///
+/// `Command::output` waits forever, so a regression that turned "refused at startup" into
+/// "serving happily" would wedge the whole suite instead of failing one test. A deadline turns
+/// that into a message that names the hang.
+fn run_to_exit(binary: &Path, args: &[&str]) -> std::process::Output {
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the child starts");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(_) => return child.wait_with_output().expect("collect the output"),
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                panic!("`{} {args:?}` did not exit within 30 s", binary.display());
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// A whole deployment from the command line: no `volucer.toml` at all.
+///
+/// The failure this pins is the one that made the feature necessary — `Config::load` read a file
+/// unconditionally, so a container that had a `CMD` and nothing to mount could not start. The
+/// document root is given by `-o` and the listener by `--listen`, which is also the pair that
+/// proves the two mechanisms cooperate rather than one shadowing the other.
+#[test]
+fn a_configuration_can_be_the_command_line_alone() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-no-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("public")).expect("create the document root");
+    std::fs::write(root.join("public/hello.txt"), "from-the-command-line")
+        .expect("write a document");
+
+    // `--listen` with port 0, read back from the banner: the assertion is about configuration, not
+    // about a port, and a reserved port would be one more thing to get wrong.
+    let root_arg = format!("server.document_root={}", root.join("public").display());
+    let args = [
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "-o",
+        &root_arg,
+        "-o",
+        "server.static_files.enabled=true",
+    ];
+    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+    let Some(server) = Server::spawn_args(&binary, &os_args, Some(&root)) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+
+    let address = server
+        .http_address
+        .clone()
+        .expect("--listen configures an http listener");
+    assert_eq!(
+        http_get(&address, "/hello.txt").text(),
+        "from-the-command-line",
+        "-o server.document_root must reach the static layer"
+    );
+    assert!(
+        !root.join("volucer.toml").exists(),
+        "the test directory must have no configuration file, or it would prove nothing"
+    );
+
+    // `check` is the rehearsal of exactly that command line, so it has to accept it too — and to
+    // say where the configuration came from, since a fileless deployment has no path to print.
+    let check = run_to_exit(
+        &binary,
+        &[
+            "check",
+            "--listen",
+            "127.0.0.1:0",
+            "-o",
+            &root_arg,
+            "-o",
+            "server.static_files.enabled=true",
+        ],
+    );
+    assert!(check.status.success(), "{check:?}");
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("configuration: command line"),
+        "a fileless deployment must be named as such: {stdout}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `-o` beats the file, and `-o` beats `--listen`.
+///
+/// The precedence rule has two halves and both are order-dependent in the code: the pairs are laid
+/// on the file's table, and the sugar is placed before the `-o` list. A test that only checked "a
+/// file may be overridden" would pass against an implementation where `-o` won by accident of
+/// argument order on the command line, so `--listen` is given a port that would *fail to bind* if
+/// it were the one used.
+#[test]
+fn an_override_wins_over_the_file_and_over_the_listen_sugar() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-override-wins-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let from_file = root.join("from-file");
+    let from_flag = root.join("from-flag");
+    for dir in [&from_file, &from_flag] {
+        std::fs::create_dir_all(dir).expect("create a document root");
+    }
+    std::fs::write(from_file.join("whoami.txt"), "FILE").expect("write the marker");
+    std::fs::write(from_flag.join("whoami.txt"), "FLAG").expect("write the marker");
+
+    let Some(ports) = free_port_run(2) else {
+        eprintln!("skipping: no two free ports");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let (sugar_port, override_port) = (ports, ports + 1);
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {}\n\n\
+             [server.static_files]\nenabled = true\n",
+            toml_string(&from_file.display().to_string())
+        ),
+    )
+    .expect("write the config");
+
+    let document_root = format!("server.document_root={}", from_flag.display());
+    let http = format!("server.http=127.0.0.1:{override_port}");
+    let listen = format!("127.0.0.1:{sugar_port}");
+    let server = Server::start_with(
+        &binary,
+        &config_path,
+        &["--listen", &listen, "-o", &document_root, "-o", &http],
+    );
+    let Some(server) = server else {
+        let _ = std::fs::remove_dir_all(&root);
+        panic!("the server did not start; the banner would name the listener it chose");
+    };
+
+    assert!(
+        server
+            .http_address
+            .as_deref()
+            .is_some_and(|address| address.ends_with(&format!(":{override_port}"))),
+        "-o server.http must win over --listen: the banner says {:?}",
+        server.http_address
+    );
+    assert_eq!(
+        http_get(&format!("127.0.0.1:{override_port}"), "/whoami.txt").text(),
+        "FLAG",
+        "-o server.document_root must win over the file's document_root"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An override the schema does not have is a startup error, exactly as a typo in the file is.
+///
+/// **This is the property the feature would be worse without.** A command line that accepted
+/// `-o server.htpp=…` silently would be a deployment that looks configured, serves on the wrong
+/// port, and gives an operator nothing to search for — which is why the override is laid onto a
+/// *table* and deserialized by the same strict parser the file goes through.
+#[test]
+fn an_override_naming_an_unknown_key_is_refused() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-bad-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+
+    // Via `serve`, which must refuse *before* it binds — the same `Source::load` `check` uses, and
+    // the one an operator will actually run.
+    let output = run_to_exit(
+        &binary,
+        &[
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "-o",
+            "server.htpp=127.0.0.1:8080",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "a typo in an override must stop the server: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("htpp"),
+        "the refusal must name the key that is wrong: {stderr}"
+    );
+
+    // And the same through `check`, so the rehearsal cannot accept what the server refuses.
+    let check = run_to_exit(&binary, &["check", "-o", "server.htpp=127.0.0.1:8080"]);
+    assert!(!check.status.success(), "{check:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `-c` that names a file which is not there is still an error.
+///
+/// The distinction the fileless mode turns on: **no flag** means "the command line is my
+/// configuration", while a flag naming a missing file means "I expected this file". Falling back
+/// silently would turn a mistyped path into a server started from defaults, which is the failure a
+/// typo most deserves to be caught as.
+#[test]
+fn an_explicit_config_that_does_not_exist_is_an_error() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-missing-c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    let missing = root.join("nope.toml");
+
+    for subcommand in ["serve", "check"] {
+        let output = run_to_exit(
+            &binary,
+            &[
+                subcommand,
+                "--config",
+                missing.to_str().expect("a utf-8 path"),
+                "-o",
+                "server.http=127.0.0.1:0",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "`{subcommand}` must refuse an explicitly named file that is not there: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("nope.toml"),
+            "the refusal must name the path it could not read: {stderr}"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -4458,18 +4458,48 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
-    /// Read, expand and parse a configuration file.
+    /// Parse a configuration from an already-built TOML table.
     ///
-    /// Expansion happens on the file's **text**, before parsing, so `${...}` works in a number,
-    /// port or listener position as well as in a string — see [`crate::env`] for why that is the
-    /// only form that can. A reference to an unset variable with no `${NAME:-default}` is an error
-    /// rather than an empty string.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// **The entry point a merged configuration uses**, and what makes the command line a second
+    /// source rather than a second parser: [`Self::from_toml`] is this function after a parse, so
+    /// a file, an `-o` pair and a reload are checked, defaulted and refused by exactly one
+    /// deserializer. `deny_unknown_fields` is what that buys — an `-o server.htpp=127.0.0.1:8080`
+    /// is a startup error naming the key, exactly as the same typo in a file is, rather than a
+    /// setting that parses, is ignored, and looks supported.
+    ///
+    /// A *type* error here carries no line number, and that is the honest answer rather than a
+    /// missing one: a value written on a command line has no line to point at. [`Self::load`] keeps
+    /// the file's own spanned message for the case where nothing was overridden.
+    pub fn from_table(table: toml::Table) -> Result<Self> {
+        Ok(toml::Value::Table(table).try_into()?)
+    }
+
+    /// Read and expand a configuration file into its raw table.
+    ///
+    /// The mergeable form of a file, for a caller that has overrides to lay on top of it. Kept
+    /// beside [`Self::load`] so the read and the expansion happen in one place: two reads with two
+    /// `${...}` rules is how `serve` and a reload would come to disagree about the same file.
+    pub fn table_from_path(path: &Path) -> Result<toml::Table> {
+        Ok(toml::from_str(&Self::expanded_text(path)?)?)
+    }
+
+    /// The file's text with `${...}` expanded, still as TOML.
+    ///
+    /// Expansion happens on the **text**, before parsing, so `${...}` works in a number, port or
+    /// listener position as well as in a string — see [`crate::env`] for why that is the only form
+    /// that can. A reference to an unset variable with no `${NAME:-default}` is an error rather
+    /// than an empty string.
+    fn expanded_text(path: &Path) -> Result<String> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml(&crate::env::expand(&text).map_err(Error::Config)?)
+        crate::env::expand(&text).map_err(Error::Config)
+    }
+
+    /// Read, expand and parse a configuration file.
+    pub fn load(path: &Path) -> Result<Self> {
+        Self::from_toml(&Self::expanded_text(path)?)
     }
 
     /// Reject configurations that cannot work, with actionable messages.
@@ -6259,6 +6289,46 @@ pub fn parse_listener(spec: &str) -> std::result::Result<Listener, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table is the same configuration a file is, and strictness survives the trip.
+    ///
+    /// The three claims are the ones the command line depends on: typing comes from TOML (so
+    /// `workers = 8` is a number without this code knowing what a worker is), a table deserializes
+    /// to the same `Config` the parser produces, and an unknown key is still refused by name. The
+    /// last is what makes `-o` safe to offer: a typo on a command line is the failure mode with the
+    /// least visible evidence, and this is the assertion that it is caught.
+    #[test]
+    fn a_table_deserializes_like_the_file_it_came_from() {
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n\n[backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"\nworkers = 3\n";
+        let from_text = Config::from_toml(text).expect("the text parses");
+        let table: toml::Table = toml::from_str(text).expect("the text is a table");
+        let from_table = Config::from_table(table).expect("the table deserializes");
+
+        assert_eq!(
+            from_table.server.http.as_deref(),
+            from_text.server.http.as_deref()
+        );
+        assert_eq!(from_table.backends.len(), from_text.backends.len());
+        match from_table.backends.get("app").expect("the backend") {
+            BackendConfig::Worker(worker) => {
+                assert_eq!(worker.workers, 3);
+                assert_eq!(worker.command, "php worker.php");
+            }
+            other => panic!("`kind = \"worker\"` must build a worker: {other:?}"),
+        }
+
+        // The strictness that makes a `-o` pair safe to offer.
+        let mut table: toml::Table =
+            toml::from_str("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("the text is a table");
+        table
+            .entry("server".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .expect("a table")
+            .insert("htpp".to_string(), toml::Value::String("x".into()));
+        let err = Config::from_table(table).expect_err("an unknown key is refused");
+        assert!(err.to_string().contains("htpp"), "{err}");
+    }
 
     /// `max_connections` is off by default, and `0` is refused rather than read as "off".
     ///
