@@ -12,6 +12,16 @@
 //!   child **and its own children**; `PR_SET_PDEATHSIG` is what covers the parent
 //!   dying *without getting to kill anything* — a `SIGKILL`, an abort, an OOM kill.
 //!
+//! **`PR_SET_PDEATHSIG` is bound to the thread that called `fork`, not to the process.**
+//! The kernel records the parent as that thread, and delivers the signal when *that thread*
+//! exits — which a worker thread does the moment its work is done, long before the process
+//! does. So a child must always be forked from a thread that outlives it, and every spawn
+//! here goes through [`spawn`], which forks on one thread owned by this module and living
+//! for the life of the process. Calling `Command::spawn` directly is how this was broken
+//! once already: slots were spawned on `std::thread::scope` threads, and every `php-cgi`
+//! was `SIGKILL`ed microseconds after it started listening, which surfaced as a 502 on the
+//! request after the one that had just succeeded.
+//!
 //! **Both halves are implemented here.** An earlier version of this file described
 //! them and implemented neither: `killpg` appeared nowhere, every kill was
 //! `Child::kill` on a single pid, and the group existed only as a comment. The
@@ -204,6 +214,12 @@ fn create_job() -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
 /// tidy: `PR_SET_PDEATHSIG` is set by the child on itself, because `prctl` takes no pid, and a
 /// process group is a spawn-time attribute. There is no later moment at which either can be
 /// done, so a guard that appeared to do it would be lying.
+///
+/// **A command configured here must be started with [`spawn`], not `Command::spawn`.** The
+/// hook below records the *calling thread* as the child's parent, so a child forked from a
+/// thread that returns is killed by the signal this very hook asked for. [`spawn`] forks on a
+/// thread that outlives every child; calling `Command::spawn` directly is the bug this module
+/// documents at the top.
 pub fn configure_command(command: &mut std::process::Command) {
     #[cfg(unix)]
     {
@@ -251,8 +267,88 @@ pub fn configure_command(command: &mut std::process::Command) {
     }
 }
 
+/// One job handed to the spawn thread: it spawns and answers on its own channel.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// The thread that owns every `fork`, created once and living for the life of the process.
+///
+/// **Why a thread at all.** `PR_SET_PDEATHSIG` — see [`configure_command`] — is tied to the
+/// thread that called `fork`, so a child forked from a thread that then returns is killed as
+/// soon as that thread does. That is not a long shot: the pool spawns its slots on
+/// `std::thread::scope` threads so start-up is parallel, and those return as soon as a slot
+/// is listening. Every child then died a few microseconds later, which looked like a slot
+/// that served the first request and refused the second. Forking here, on a thread nothing
+/// else owns, decouples the child's lifetime from whichever thread asked for it.
+///
+/// Cached as a `OnceLock` of a `Result` rather than retried: a thread that cannot be created
+/// is a process out of resources, and a retry per spawn would only make the failure slower.
+static SPAWNER: std::sync::OnceLock<std::result::Result<std::sync::mpsc::Sender<Job>, String>> =
+    std::sync::OnceLock::new();
+
+fn sender() -> std::io::Result<&'static std::sync::mpsc::Sender<Job>> {
+    SPAWNER
+        .get_or_init(|| {
+            let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("volucer-spawn".to_string())
+                .spawn(move || {
+                    for job in queue {
+                        // A panicking job must not take the spawner with it: every later
+                        // `spawn` in the process would fail for a fault that belonged to one
+                        // child. The caller is told through its own disconnected channel.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                })
+                .map(|_| jobs)
+                .map_err(|err| err.to_string())
+        })
+        .as_ref()
+        .map_err(|reason| std::io::Error::other(reason.clone()))
+}
+
+/// Start a configured child on the process-wide spawn thread.
+///
+/// The replacement for `Command::spawn` at every site that follows [`configure_command`],
+/// and the only correct one on Linux: see [`SPAWNER`] for what forking on a short-lived
+/// thread costs. It is a drop-in — same signature, same error — so a caller reads it as
+/// "spawn, but somewhere that lasts".
+///
+/// The spawn happens on another thread, which means this blocks until that thread gets to
+/// the job. The work there is one `fork` and one `exec` — measured at about 2.5 ms per
+/// `php-cgi` on the development machine — and callers that want several at once still get it
+/// from the threads they call this from; the waits that dominate start-up (readiness probes,
+/// the settle after a connect) stay where they were, in the caller.
+pub fn spawn(command: std::process::Command) -> std::io::Result<Child> {
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    // `&mut` binding, because `Command::spawn` takes one and the closure owns the value.
+    let mut command = command;
+    sender()?
+        .send(Box::new(move || {
+            // Discarded deliberately: a send only fails when the caller gave up, and there is
+            // nothing useful to do about a child whose requester is gone.
+            let _ = result_tx.send(command.spawn());
+        }))
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the spawn thread has stopped",
+            )
+        })?;
+    result_rx.recv().unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the spawn thread panicked instead of starting the child",
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    // `Duration` is used only by the Linux-gated thread tests below, so it must be gated too
+    // or the Windows build sees an unused import.
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
+
     use super::*;
 
     fn trivial_sleep() -> std::process::Command {
@@ -270,7 +366,7 @@ mod tests {
         let mut command = trivial_sleep();
         configure_command(&mut command);
 
-        let mut child = command.spawn().expect("spawn a trivial process");
+        let mut child = spawn(command).expect("spawn a trivial process");
         guard.adopt(&child).expect("adopt the child");
         let _ = child.wait();
     }
@@ -301,7 +397,7 @@ mod tests {
             .stdout(std::process::Stdio::piped());
         configure_command(&mut command);
 
-        let mut child = command.spawn().expect("spawn the shim");
+        let mut child = spawn(command).expect("spawn the shim");
         let mut stdout = child.stdout.take().expect("stdout was piped");
         let mut buffer = [0u8; 32];
         let read = stdout.read(&mut buffer).expect("read the grandchild pid");
@@ -337,7 +433,7 @@ mod tests {
         let mut command = std::process::Command::new("sleep");
         command.arg("2");
         configure_command(&mut command);
-        let mut child = command.spawn().expect("spawn");
+        let mut child = spawn(command).expect("spawn");
 
         // SAFETY: `getpgid` on a pid we just spawned is a documented, safe call.
         let pgid = unsafe { libc::getpgid(child.id() as libc::pid_t) };
@@ -379,15 +475,104 @@ mod tests {
     /// spawn, which is the shape a bad syscall would take.
     ///
     /// `PR_SET_PDEATHSIG` itself cannot be observed from in-process without killing the test
-    /// runner, so what the kernel did is asserted by `scripts/verify-fixes.sh` on the bench
-    /// host instead — it `SIGKILL`s a real server and counts the children that survive.
+    /// runner, so what the kernel did is asserted by the two tests below instead — they
+    /// observe a real child, and one of them observes the *absence* of the protection so that
+    /// the other cannot be vacuous.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_configured_command_still_spawns_and_reaps() {
         let mut command = trivial_sleep();
         configure_command(&mut command);
-        let mut child = command.spawn().expect("a hooked spawn still works");
+        let mut child = spawn(command).expect("a hooked spawn still works");
         let status = child.wait().expect("and reaps");
         assert!(status.success(), "and the child ran to completion");
+    }
+
+    /// The state letter from `/proc/<pid>/stat`, or `None` once the entry is gone.
+    ///
+    /// `kill(pid, 0)` is not the question: it succeeds for a zombie, and a zombie is exactly
+    /// what a `SIGKILL`ed child is until somebody reaps it. The letter after the command name
+    /// is the only honest answer, and the command name is parenthesised and may itself contain
+    /// spaces and `)`, so the split is on the **last** one.
+    #[cfg(target_os = "linux")]
+    fn process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    /// **A child forked from a thread that then exits must still be alive.**
+    ///
+    /// This is the regression that took `Test (ubuntu-latest)` down. `PR_SET_PDEATHSIG` is
+    /// bound to the thread that called `fork`, not to the process, so a `php-cgi` forked from
+    /// one of `CgiPool`'s scoped start-up threads was `SIGKILL`ed as soon as that thread
+    /// returned — microseconds after it began listening. The symptom was a 502 on the request
+    /// after the one that had just been served, which is why it first looked like a flake.
+    ///
+    /// The thread here is a `scope` thread that returns immediately, the same shape the pool
+    /// used, and the assertion is on the child itself rather than on the route that spawned it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_spawned_from_a_short_lived_thread_outlives_it() {
+        let mut child = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut command = std::process::Command::new("sleep");
+                    command.arg("30");
+                    configure_command(&mut command);
+                    spawn(command).expect("spawn on the spawn thread")
+                })
+                .join()
+                .expect("the spawning thread did not panic")
+        });
+
+        // Long enough for the forking thread to be gone and for the kernel to have delivered
+        // the signal if it was going to — the real failure showed up within microseconds.
+        std::thread::sleep(Duration::from_millis(300));
+        let state = process_state(child.id());
+        assert!(
+            matches!(state, Some('S' | 'R' | 'D')),
+            "the child {} should still be running after its spawning thread exited, but its \
+             state is {state:?} (Z means the kernel killed it when the thread went away)",
+            child.id()
+        );
+
+        kill(&mut child).expect("kill it");
+        let _ = child.wait();
+    }
+
+    /// The control for the test above: forking on a short-lived thread **directly** does kill
+    /// the child.
+    ///
+    /// Without this, `a_child_spawned_from_a_short_lived_thread_outlives_it` would pass on a
+    /// platform that ignored the hook entirely and prove nothing — the point is that the
+    /// assertion above can fail, and this shows it failing for the reason claimed. It also
+    /// pins the kernel behaviour the fix rests on, so a future change to the hook that quietly
+    /// stopped installing `PR_SET_PDEATHSIG` would be caught here rather than as 502s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forking_on_a_short_lived_thread_kills_the_child() {
+        let mut child = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut command = std::process::Command::new("sleep");
+                    command.arg("30");
+                    configure_command(&mut command);
+                    command.spawn().expect("spawn directly, the wrong way")
+                })
+                .join()
+                .expect("the spawning thread did not panic")
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        let state = process_state(child.id());
+        assert!(
+            !matches!(state, Some('S' | 'R' | 'D')),
+            "forking directly from a short-lived thread should kill the child, but {} is still \
+             in state {state:?} — if this passes, `spawn` is not the protection that was \
+             measured",
+            child.id()
+        );
+
+        let _ = child.wait();
     }
 }

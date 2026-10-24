@@ -458,6 +458,62 @@ fn starts_a_pool_and_serves_requests_through_every_slot() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A slot spawned at start-up is still alive a second later.
+///
+/// **This is the regression that made the Linux runner red.** `PR_SET_PDEATHSIG` is bound to
+/// the thread that called `fork`, and start-up spawns slots on `std::thread::scope` threads so
+/// they boot in parallel. Those threads return as soon as their slot is listening, and the
+/// kernel then `SIGKILL`ed every child — so a pool that had just answered one request refused
+/// the next with `Connection refused`. The assertion is deliberately about *elapsed time plus
+/// liveness* rather than about a second request: a pool whose children are being killed
+/// immediately can still pass a single request if it is fast enough, which is why this was
+/// mistaken for a flake.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_slot_started_at_startup_is_still_running_a_moment_later() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(3) else {
+        eprintln!("skipping: no run of three free ports");
+        return;
+    };
+
+    let (root, _script_name) = fixture("longevity");
+    let mut pool = CgiPool::start("test", &config_for(&binary, 3, base)).expect("pool starts");
+    let pids = pool.pids();
+
+    // The start-up threads have certainly exited by now; the children must not have.
+    std::thread::sleep(Duration::from_millis(300));
+    for pid in &pids {
+        // `is_running` is not the question: `/proc/<pid>` also exists for a zombie, and a
+        // `SIGKILL`ed child is exactly that until it is reaped. The state letter is.
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.trim_start().chars().next());
+        assert!(
+            matches!(state, Some('S' | 'R' | 'D')),
+            "slot {pid} was started but did not survive its spawning thread exiting (state \
+             {state:?}; Z means the kernel killed it)"
+        );
+    }
+
+    // And the pool still answers, which is what an operator sees.
+    for index in 0..3 {
+        let response = pool
+            .request(&request_for(&root, "index.php", &format!("alive{index}")))
+            .expect("a slot answered");
+        let stdout = String::from_utf8_lossy(&response.stdout);
+        assert!(stdout.contains(&format!("MARK=alive{index}")), "{stdout:?}");
+    }
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_killed_slot_is_replaced_and_the_pool_keeps_serving() {
     let _serial = serial();

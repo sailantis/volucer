@@ -50,7 +50,7 @@ use volucer_core::program::{resolve_program, split_command};
 use volucer_fcgi::Endpoint;
 
 use crate::error::{Hint, Result, ServerError};
-use crate::lifecycle::{configure_command, LifecycleGuard};
+use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
 
 /// How often the watcher looks at the child.
 ///
@@ -173,7 +173,10 @@ impl Shared {
         // The process group / job object membership that makes it die with us.
         configure_command(&mut command);
 
-        let mut child = command.spawn().map_err(|source| ServerError::Spawn {
+        // Through `lifecycle::spawn`, so the fork happens on a thread that outlives the
+        // child — this runs on the watcher thread on a restart, and `PR_SET_PDEATHSIG` is
+        // tied to the forking thread.
+        let mut child = spawn(command).map_err(|source| ServerError::Spawn {
             binary: self.spec.binary.clone(),
             source,
         })?;

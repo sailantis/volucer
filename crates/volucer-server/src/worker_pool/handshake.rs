@@ -7,7 +7,7 @@ use super::exchange::{Channel, ChannelExchange};
 use super::spec::{AttachSpec, Launch, Spec};
 use crate::calls::MethodRegistry;
 use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
-use crate::lifecycle::{configure_command, LifecycleGuard};
+use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, ChildStderr, Command, Stdio};
@@ -634,7 +634,9 @@ fn boot_spawned(
     }
     configure_command(&mut command);
 
-    let mut child = command.spawn().map_err(|source| ServerError::Spawn {
+    // Through `lifecycle::spawn`: `PR_SET_PDEATHSIG` binds the child to the forking thread,
+    // and a worker may be booted from a request thread on a restart.
+    let mut child = spawn(command).map_err(|source| ServerError::Spawn {
         binary: binary.clone(),
         source,
     })?;

@@ -168,6 +168,24 @@ the reasoning behind it lives in the source comments and in the documentation un
 
 ### Fixed
 
+- **A FastCGI slot died a microsecond after it started listening, so the request after a
+  successful one came back `502`.** `PR_SET_PDEATHSIG` is bound to the **thread that called
+  `fork`**, not to the process: the kernel records that thread as the child's parent and
+  delivers the signal when *it* exits. The commit that made pool start-up parallel moved slot
+  spawning onto `std::thread::scope`, and those threads return as soon as their slot is up — so
+  every `php-cgi` was `SIGKILL`ed right after binding. From the outside a slot served one
+  request and then refused the next, which is why `Test (ubuntu-latest)` had been red since
+  that commit and why the failures looked like a flake: four different tests failed across
+  runs, always with `Connection refused`. Proven by a C program that forks a child with the
+  hook installed from a thread and then joins it — the child is a zombie one second later,
+  while the same child forked from the main thread is alive — and the same behaviour is now
+  pinned by two unit tests in `lifecycle.rs`, one of which asserts the *failure* so the other
+  cannot pass vacuously. Children are spawned by `lifecycle::spawn`, which forks on one thread
+  owned by the module and living for the life of the process; all three spawn sites use it,
+  because the `command` driver and both pool kinds can also be restarted from a request
+  thread. The measured cost of serialising the fork is about 2.5 ms per child, against the
+  readiness waits that decide start-up and still run in parallel. macOS and Windows were never
+  affected — neither has `PR_SET_PDEATHSIG` — which is why only the Linux runner was red.
 - **`cargo clippy --workspace --all-targets` did not compile, so `Clippy` and `MSRV` were red
   from the commit that added `command` onward.** `spawn_cgi` gained `command`, `capacity` and
   `working_dir`, and the commit updated `tests/pool.rs` but not `tests/frontend.rs`, which still

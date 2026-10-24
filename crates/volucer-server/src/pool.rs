@@ -48,7 +48,7 @@ use volucer_core::program::{resolve_program, split_command};
 use volucer_fcgi::{Client, Endpoint, Request, Response};
 
 use crate::error::{Hint, Result, ServerError};
-use crate::lifecycle::{configure_command, LifecycleGuard};
+use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
 
 /// How long to wait for a slot to start accepting connections.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -873,7 +873,11 @@ impl CgiPool {
             .stderr(Stdio::piped());
         configure_command(&mut command);
 
-        let mut child = command.spawn().map_err(|source| ServerError::Spawn {
+        // Through `lifecycle::spawn` rather than `command.spawn()`: this runs on whichever
+        // thread asked for a slot — a `thread::scope` thread at start-up, a request thread on
+        // a restart — and on Linux `PR_SET_PDEATHSIG` ties the child to *that* thread's
+        // lifetime. See `lifecycle`'s module doc.
+        let mut child = spawn(command).map_err(|source| ServerError::Spawn {
             binary: self.launch.binary().to_path_buf(),
             source,
         })?;
