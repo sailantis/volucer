@@ -205,6 +205,43 @@ elided — so a credential supplied this way never travels to a worker.
 `volucer check` performs the same expansion, so a missing variable is reported by `check` before
 `serve` is ever restarted onto it.
 
+## Health checks
+
+The `[status]` listener answers two probes, and the difference between them is the one an
+orchestrator acts on:
+
+```toml
+[status]
+address = "127.0.0.1:2114"
+```
+
+```console
+volucer health --url http://127.0.0.1:2114/health   # is the process running?
+volucer health --url http://127.0.0.1:2114/ready    # should traffic be sent here?
+```
+
+`curl -sf` does the same thing against the same URLs — `volucer health` exists because a
+`scratch` container has no `curl` to run it with, not because the endpoints need a client.
+See [the Docker section](#health-checks-in-the-image) for that case.
+
+**`/health` answers 200 while the process is running**, even if nothing is ready yet. It is
+the answer to "should this container be restarted", and restarting a server that is merely
+still booting turns a slow start into a crash loop.
+
+**`/ready` answers the configured `unavailable_status_code` — `503` by default — until every
+service reports ready.** It is the answer to "should traffic be sent here", and a probe that
+returned 200 while the pools were still booting is how a rolling deploy sends traffic to a
+server that answers 502.
+
+Every other path is a 404, on both, so neither endpoint becomes a second way to ask whether
+the server is up.
+
+Bind it to loopback or a private interface and reach it through your orchestrator's network.
+
+`allow_worker_reset` adds the worker-control routes to the same listener. Read
+[Observability](06-OBSERVABILITY.md#the-worker-control-routes) before turning it on — there
+is no authentication on those routes.
+
 ## Docker
 
 `packaging/docker/Dockerfile` builds two images from the one crate — a glibc image and a
@@ -212,11 +249,134 @@ elided — so a credential supplied this way never travels to a worker.
 
 ```console
 docker build --target musl -t volucer .
+docker build --target glibc -t volucer:glibc .
 ```
 
 The musl image is the smaller of the two and has no libc dependency, which matters for a
 `scratch` base. There is no archive to fetch and nothing to verify by hand, because the
-binary is built into the image.
+binary is built into the image. `.dockerignore` keeps `target/` and `.git/` out of the build
+context, which they would otherwise dominate: a checkout of this repository has a `target/`
+directory in the tens of gigabytes, and every byte of it would be uploaded and written into a
+layer before the compiler started.
+
+### Running it
+
+Both images have the same contract, so the same invocation works for either:
+
+```console
+docker run --rm \
+    -p 8080:8080 -p 9080:9080 \
+    -v "$PWD/volucer.toml:/etc/volucer/volucer.toml:ro" \
+    -v "$PWD/public:/srv/public:ro" \
+    volucer
+```
+
+The configuration has to do two things a host deployment does not, and neither is optional:
+
+```toml
+[server]
+http = "0.0.0.0:8080"          # not 127.0.0.1: the port has to be reachable from outside
+document_root = "/srv/public"
+
+[status]
+address = "0.0.0.0:9080"       # what `docker exec ... health` probes, and what EXPOSE names
+```
+
+A `127.0.0.1` listener is reachable only from inside the container's network namespace, so
+`-p 8080:8080` publishes a port nothing answers on. The failure looks like a broken image, and
+it is a bind address.
+
+### Health checks in the image
+
+Both images declare a `HEALTHCHECK`, and it is the binary itself rather than `curl`:
+
+```dockerfile
+HEALTHCHECK CMD ["/usr/local/bin/volucer", "health"]
+```
+
+That is not a stylistic choice. The `musl` target is `FROM scratch`, which has no shell, no
+`curl` and no `/bin/sh` — so the conventional `HEALTHCHECK CMD curl -f http://localhost/health`
+would be a line that never executes. Docker does not report that as a broken check; it reports
+the container as `unhealthy` after the start period with no output at all, which is the least
+actionable failure a container can have. The subcommand reproduces `curl -f`'s contract — exit
+`0` or nonzero — and adds the detail that a shell one-liner throws away.
+
+`volucer health` reads the address from `[status]`, or from `[metrics]` when that is the only
+one present, because the two share one listener. It exits `0` only for a `2xx`; anything else,
+including a `404` from an image whose configuration lost its `[status]` table, fails the probe.
+The reason goes to stderr, which Docker keeps in the health log — so `docker inspect` answers
+"why is this unhealthy" with the server's own words rather than a bare timeout:
+
+```console
+$ docker inspect --format '{{json .State.Health}}' volucer | jq -r '.Log[].Output'
+volucer: could not connect to 127.0.0.1:9080: connection refused
+```
+
+Three things decide what it probes, in increasing precedence:
+
+| Setting | Effect |
+|---|---|
+| `VOLUCER_HEALTH_CONFIG` | The configuration file the probe reads. Defaults to `/etc/volucer/volucer.toml` in the image, so a deployment that overrides `CMD` to mount its file elsewhere overrides this too. |
+| `VOLUCER_HEALTH_URL` | A URL to probe instead of reading the configuration. |
+| `--url` / `--config` | The flags, which win over both — so a variable someone forgot does not fight a probe typed by hand. |
+
+`/health` is what the image's check uses, and `/ready` is deliberately *not*: Docker restarts
+a container whose health check fails, and a server still booting its worker pool must not be
+killed for it. `/ready` is the traffic question, and answering it here would turn a slow start
+into a crash loop — the exact inversion the two endpoints exist to prevent. Probe it separately
+where a load balancer reads it:
+
+```console
+docker exec volucer volucer health --ready
+```
+
+### Compose
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      target: musl
+    ports:
+      - "8080:8080"
+      - "9080:9080"
+    volumes:
+      - ./volucer.toml:/etc/volucer/volucer.toml:ro
+      - ./public:/srv/public:ro
+    environment:
+      APP_ENV: production
+    env_file:
+      - secrets.env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/volucer", "health", "--ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+```
+
+The `healthcheck:` block is not redundant with the one in the image: it replaces it, and this
+is where `/ready` belongs. `restart: unless-stopped` with an `unhealthy` container is a restart
+loop, which is why the image's own default asks the liveness question and this one — read by
+whatever routes traffic — asks the readiness one.
+
+`start_period` is the number worth thinking about rather than copying: it has to exceed the
+longest time the pool takes to boot, or a server that is starting correctly is restarted for
+being slow. `volucer check` reports what the deployment will start before it starts it.
+
+Environment variables reach the configuration through `${...}` — `http = "0.0.0.0:${PORT:-8080}"`
+— because volucer deliberately loads no `.env` file of its own. `env_file:` and
+`docker run --env-file` already do that, and a second loader would be a second precedence rule
+for one job.
+
+### Publishing
+
+The release workflow builds both images and **does not push them**: this repository has never
+published to a registry, and a workflow that starts pushing on its first run is not one to find
+that out with. `docker/build-push-action` is already wired with `push: false`, so publishing is
+a login (`.github/workflows/release.yml`) and `push: true`.
 
 ## The access log and logrotate
 
@@ -238,39 +398,6 @@ change to the filesystem, and a config that fails to parse is not a reason to ke
 into a renamed file.
 
 See [Observability](06-OBSERVABILITY.md#the-access-log) for the format.
-
-## Health checks
-
-The `[status]` listener answers two probes, and the difference between them is the one an
-orchestrator acts on:
-
-```toml
-[status]
-address = "127.0.0.1:2114"
-```
-
-```console
-curl -sf http://127.0.0.1:2114/health   # is the process running?
-curl -sf http://127.0.0.1:2114/ready    # should traffic be sent here?
-```
-
-**`/health` answers 200 while the process is running**, even if nothing is ready yet. It is
-the answer to "should this container be restarted", and restarting a server that is merely
-still booting turns a slow start into a crash loop.
-
-**`/ready` answers the configured `unavailable_status_code` — `503` by default — until every
-service reports ready.** It is the answer to "should traffic be sent here", and a probe that
-returned 200 while the pools were still booting is how a rolling deploy sends traffic to a
-server that answers 502.
-
-Every other path is a 404, on both, so neither endpoint becomes a second way to ask whether
-the server is up.
-
-Bind it to loopback or a private interface and reach it through your orchestrator's network.
-
-`allow_worker_reset` adds the worker-control routes to the same listener. Read
-[Observability](06-OBSERVABILITY.md#the-worker-control-routes) before turning it on — there
-is no authentication on those routes.
 
 ## Installing the binary
 

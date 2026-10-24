@@ -1,5 +1,7 @@
 //! The `volucer` command line interface.
 
+use std::io::{IsTerminal, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +77,53 @@ enum Command {
         php_dirs: Vec<PathBuf>,
     },
 
+    /// Ask a running server whether it is healthy, or ready for traffic.
+    ///
+    /// A subcommand rather than a `curl` in a `HEALTHCHECK` line because the `scratch` image has
+    /// no shell and no `curl` — a container health check that cannot execute is a check that
+    /// silently never runs, and Docker reads "never ran" as "start-period never elapsed" rather
+    /// than as an error. This also makes the probe work in a `distroless` deployment, and makes
+    /// the check assert the two things this server distinguishes: `/health` asks whether the
+    /// process is alive, `/ready` whether it should be sent traffic.
+    Health {
+        /// The URL to probe, e.g. `http://127.0.0.1:2114/health`.
+        ///
+        /// A full URL rather than an address, so the probe does not have to know which listener
+        /// serves the route. Wins over `--config` and over `VOLUCER_HEALTH_URL`.
+        #[arg(long, conflicts_with = "config")]
+        url: Option<String>,
+
+        /// Probe the listener this configuration file names.
+        ///
+        /// The address comes from `[status]`, or from `[metrics]` when that is the only one
+        /// present, because the two share one listener. An unspecified host (`0.0.0.0`, `::`) is
+        /// probed on loopback, which is what a container's own address means from inside it.
+        ///
+        /// Defaults to `VOLUCER_HEALTH_CONFIG`, and then to `volucer.toml` beside the working
+        /// directory — so a `HEALTHCHECK` written for the documented `/etc/volucer/volucer.toml`
+        /// keeps working when a deployment overrides `CMD` to point somewhere else, without the
+        /// image having to guess. A file that cannot be read is a *failed* probe rather than a
+        /// skipped one: a container with no configuration cannot serve, and reporting it healthy
+        /// because the check could not read its file is the failure a health check exists to
+        /// prevent.
+        #[arg(long, conflicts_with = "url")]
+        config: Option<PathBuf>,
+
+        /// Probe `/ready` instead of `/health`.
+        ///
+        /// The two answer different questions, and a container is normally kept alive by `/health`
+        /// and kept out of a load balancer by `/ready`. Use this one for the second.
+        #[arg(long)]
+        ready: bool,
+
+        /// How long to wait for an answer, in milliseconds.
+        ///
+        /// Defaults lower than Docker's own 30 s health-check timeout: a probe that waits longer
+        /// than the orchestrator does is a probe whose result is never read.
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+    },
+
     /// Print the version, the PHP floor, and the protocols this build speaks.
     Version,
 }
@@ -100,6 +149,16 @@ fn main() -> ExitCode {
             document_root,
             php_dirs,
         } => check(&config, document_root.as_deref(), &php_dirs).map_err(ServerError::from),
+        Command::Health {
+            url,
+            config,
+            ready,
+            timeout_ms,
+        } => health(url.as_deref(), config.as_deref(), ready, timeout_ms).map_err(|err| {
+            ServerError::Probe {
+                reason: err.to_string(),
+            }
+        }),
         Command::Version => {
             version();
             Ok(())
@@ -259,6 +318,264 @@ fn build_observability_with_exporter(
     }
 }
 
+/// Why a `health` probe failed, kept separate from [`volucer_core::Error`] because none of its
+/// causes are configuration: the probe is a client, and the file it might otherwise complain about
+/// is not one it reads.
+#[derive(Debug, thiserror::Error)]
+enum HealthError {
+    #[error(
+        "the configuration has no [status] or [metrics] table, so this server serves no \
+         /health or /ready to probe; pass --url instead"
+    )]
+    NoProbeListener,
+
+    #[error("{url} is not an http:// URL; `health` speaks plain HTTP, because the [status] listener has no TLS of its own")]
+    NotHttp { url: String },
+
+    #[error("{url} does not say where to connect: expected http://host:port/path")]
+    NoAuthority { url: String },
+
+    #[error("could not connect to {address}: {source}")]
+    Connect {
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("could not send the probe to {address}: {source}")]
+    Write {
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("could not read the answer from {address}: {source}")]
+    Read {
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("{address} did not answer within {timeout_ms} ms")]
+    Timeout { address: String, timeout_ms: u64 },
+
+    #[error("{address} answered {status}: the probe failed. The body was: {body}")]
+    Unhealthy {
+        address: String,
+        status: u16,
+        body: String,
+    },
+
+    #[error("{address} answered something that is not HTTP/1.x: {head}")]
+    NotHttpResponse { address: String, head: String },
+
+    #[error(transparent)]
+    Config(Box<volucer_core::Error>),
+}
+
+/// `health` asks a running server whether it is healthy, so a container image with no shell and no
+/// `curl` can still be probed.
+///
+/// **The exit status is the whole interface**, because that is all a `HEALTHCHECK` reads: `0` for
+/// healthy, `1` for anything else. The reason goes to stderr, which Docker keeps in the container's
+/// health log — so `docker inspect` answers "why is this unhealthy" with the server's own words
+/// (`not ready\nworker pool: 3 of 8 slots booting`) instead of a bare timeout.
+///
+/// One HTTP/1.1 request over `std::net::TcpStream` rather than a client crate: the request is a
+/// literal and the response is reduced to a status code, so a TLS stack, a connection pool and a
+/// URL parser would all be dependency weight for a program whose entire job is one `GET`. The
+/// `Connection: close` framing means the read ends on EOF, which is why nothing here parses
+/// `Content-Length` — a probe that fails because the framing changed would be a false alarm.
+fn health(
+    url: Option<&str>,
+    config: Option<&Path>,
+    ready: bool,
+    timeout_ms: u64,
+) -> Result<(), HealthError> {
+    let path = if ready { "/ready" } else { "/health" };
+    // `VOLUCER_HEALTH_URL` is what a `HEALTHCHECK` in an image can set without rewriting its
+    // command: Docker's `--health-cmd` and Compose's `healthcheck.test` are fixed at build time,
+    // while the environment is the one part a deployment overrides. The flag wins, so an operator
+    // debugging by hand is never surprised by a variable they forgot.
+    let url = url.map(str::to_string).or_else(|| {
+        std::env::var("VOLUCER_HEALTH_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let url = match (url.as_deref(), config) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(config)) => probe_url_for(config, path)?,
+        (None, None) => {
+            // Last resort, and deliberately the same default `serve` has: a `HEALTHCHECK` that
+            // passes nothing at all should probe the file the `CMD` would have served.
+            let default = std::env::var_os("VOLUCER_HEALTH_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("volucer.toml"));
+            probe_url_for(&default, path)?
+        }
+    };
+    probe(&url, timeout_ms)
+}
+
+/// The URL a configuration file's own listeners are reachable on.
+fn probe_url_for(config: &Path, path: &str) -> Result<String, HealthError> {
+    let loaded = Config::load(config).map_err(|err| HealthError::Config(Box::new(err)))?;
+    // `[status]` first, then `[metrics]`: the two share one listener, and `build_status` already
+    // refuses a configuration where they disagree, so either name points at the port the routes
+    // are on.
+    let address = loaded
+        .status
+        .as_ref()
+        .map(|status| status.address.clone())
+        .or_else(|| {
+            loaded
+                .metrics
+                .as_ref()
+                .map(|metrics| metrics.address.clone())
+        })
+        .ok_or(HealthError::NoProbeListener)?;
+    Ok(format!("http://{}{path}", probe_host(&address)))
+}
+
+/// The address to probe a listener on, from the address it binds.
+///
+/// A wildcard bind has to be turned into something connectable: `0.0.0.0:2114` and `[::]:2114` are
+/// not destinations, and a `HEALTHCHECK` that tried to connect to them would fail on the one
+/// configuration a container actually uses — the default, where the listener has to be reachable
+/// from outside the container. Loopback is the address the process itself answers on.
+fn probe_host(address: &str) -> String {
+    let (host, port) = match address.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => return address.to_string(),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host {
+        "0.0.0.0" | "" => format!("127.0.0.1:{port}"),
+        "::" => format!("[::1]:{port}"),
+        _ if address.starts_with('[') => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
+fn probe(url: &str, timeout_ms: u64) -> Result<(), HealthError> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| HealthError::NotHttp {
+            url: url.to_string(),
+        })?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return Err(HealthError::NoAuthority {
+            url: url.to_string(),
+        });
+    }
+
+    let timeout = Duration::from_millis(timeout_ms);
+    // `to_socket_addrs` rather than `format!("{authority}")` into a `TcpStream`: `[::1]:2114` is a
+    // valid authority that a `&str` split on `:` cannot parse, and a probe that only works for
+    // IPv4 would fail on the one deployment that set `[status] address` to a v6 literal.
+    let addresses: Vec<_> = authority
+        .to_socket_addrs()
+        .map_err(|source| HealthError::Connect {
+            address: authority.to_string(),
+            source,
+        })?
+        .collect();
+    // Every resolved address is tried, because a `localhost` that resolves to `::1` first on a
+    // server bound only to `127.0.0.1` is the ordinary case, not the exotic one — and a probe that
+    // gave up after the first failure would report a healthy server as unhealthy.
+    let mut last: Option<(std::net::SocketAddr, std::io::Error)> = None;
+    let mut stream = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(source) => last = Some((address, source)),
+        }
+    }
+    let Some(mut stream) = stream else {
+        // A name that resolved to nothing is not a connection failure the OS can report, so it is
+        // described as what it is rather than as a fabricated "connection refused".
+        let (address, source) = match last {
+            Some(pair) => pair,
+            None => {
+                return Err(HealthError::Connect {
+                    address: authority.to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the name resolved to no address",
+                    ),
+                });
+            }
+        };
+        return Err(HealthError::Connect {
+            address: address.to_string(),
+            source,
+        });
+    };
+
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|source| HealthError::Connect {
+            address: authority.to_string(),
+            source,
+        })?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: volucer-healthcheck\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|source| HealthError::Write {
+            address: authority.to_string(),
+            source,
+        })?;
+
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|source| match source.kind() {
+            // A read that timed out is the one failure worth its own variant: "the server is
+            // alive but wedged" is a different operator action from "nothing is listening".
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => HealthError::Timeout {
+                address: authority.to_string(),
+                timeout_ms,
+            },
+            _ => HealthError::Read {
+                address: authority.to_string(),
+                source,
+            },
+        })?;
+
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| HealthError::NotHttpResponse {
+            address: authority.to_string(),
+            head: head.lines().next().unwrap_or("").to_string(),
+        })?;
+
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(HealthError::Unhealthy {
+            address: authority.to_string(),
+            status,
+            body: body.trim().to_string(),
+        })
+    }
+}
+
 /// `version` prints what is running, and what that build can do.
 ///
 /// The PHP floor is here because it is a build fact an operator has to be able
@@ -314,9 +631,16 @@ fn init_tracing(verbosity: u8) {
     // It also makes the three sinks this server will have *separately* silenceable: stdout for
     // program output, stderr for diagnostics, and the access log's own file — which is why a
     // single `RUST_LOG` filter must not be able to quiet the access log as well.
+    //
+    // Colour follows whether stderr is a terminal. `fmt`'s default is to emit ANSI escapes
+    // unconditionally, and every line ends up somewhere that keeps them: a container's log, a
+    // `docker inspect` health entry, a systemd journal, a file. `\u{1b}[31mERROR\u{1b}[0m` is the
+    // same information as `ERROR` with seven bytes of noise in front of it, and a health check that
+    // fails on a misconfiguration writes the operator's only explanation there.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_target(false)
         .try_init();
 }

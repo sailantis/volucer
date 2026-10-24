@@ -106,6 +106,11 @@ whose name depends on the shell.
 docker build --target musl -t volucer .
 ```
 
+The image declares a `HEALTHCHECK` that runs `volucer health`, which reads the probe address
+from `[status]` — the `scratch` target has no shell and no `curl`, so the check has to be the
+binary itself. See [Operations](11-OPERATIONS.md#docker) for the `docker run` and Compose
+invocations, and for which of `/health` and `/ready` belongs in which place.
+
 ### Directly
 
 Download the archive for your platform from the
@@ -271,6 +276,18 @@ volucer 0.1.0
   observability:    access log (combined or json), W3C tracecontext
   traces:           OTLP/HTTP export (POST /v1/traces, default port 4318)
 ```
+
+## Check whether a running server is healthy
+
+```console
+volucer health --config volucer.toml          # /health: is the process alive?
+volucer health --config volucer.toml --ready  # /ready: should traffic be sent here?
+volucer health --url http://127.0.0.1:2114/health
+```
+
+It exits `0` or nonzero and says why on stderr, which is exactly what a `HEALTHCHECK` reads —
+and unlike `curl`, it exists inside a container image that has no shell. See
+[Operations](11-OPERATIONS.md#health-checks).
 
 ## What to read next
 

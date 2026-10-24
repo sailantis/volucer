@@ -1,0 +1,46 @@
+# The build context is what `docker build` uploads before a single line of the Dockerfile runs,
+# so everything excluded here is time saved on every build and a layer that cannot invalidate the
+# cache. `COPY . .` in the builder is deliberate - `cargo build` needs the whole workspace - which
+# is exactly why this file has to name the things it does not need.
+#
+# Measured on a checkout of this repository: `target/` alone was 47.7 GB, and `.git/` 49.6 MB. Both
+# were being sent to the daemon and written into a layer *before* the compiler started.
+
+# Build output. The image builds its own, and a host `target/` is the wrong architecture, the
+# wrong profile, or both — on Windows it also contains `.pdb` files nothing in a Linux image reads.
+target/
+
+# Version control. `COPY . .` does not need the history; the release workflow checks out before it
+# builds, so nothing in the Dockerfile reads a git ref.
+.git/
+.github/
+
+# Documentation and packaging are not compiled. The exception is `packaging/docker`, which the
+# Dockerfile itself is under — but the file is passed with `-f`, not copied.
+docs/
+packaging/
+
+# Editor and OS noise, which changes constantly and would invalidate the build layer for a reason
+# no compile depends on.
+.idea/
+.vscode/
+.vscode-test/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local scratch output. `temp/` is in `.gitignore` for the same reason: it is a working directory,
+# not an input.
+temp/
+
+# Anything a local `.cargo/config.toml` set up for the host machine. The image's toolchain is
+# declared by the base image tag, so a host override that pointed `rustc` somewhere else would
+# produce a binary the Dockerfile's comments do not describe.
+.cargo/config.toml
+.cargo/config
+
+# Environment files. A `.env` on a developer's machine names a database and a key; neither belongs
+# in an image layer, and a build that depended on one would work only on that machine.
+.env
+.env.*

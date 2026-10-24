@@ -118,6 +118,17 @@ pub enum ServerError {
     #[error("a listener could not start: {reason}")]
     Listener { reason: String },
 
+    /// A `volucer health` probe failed.
+    ///
+    /// Its own variant rather than [`ServerError::Listener`] because the failure is on the *client*
+    /// side of a connection to a server that is already running: the operator's next move is to
+    /// read the container's health log, not to look for a port in use. The message is folded in
+    /// rather than kept as a `#[source]` because the detail that matters to an orchestrator is the
+    /// one line of it — a `HEALTHCHECK` records the whole rendered message, and a chain rendered
+    /// across three lines would be three lines of `docker inspect` for one cause.
+    #[error("{reason}")]
+    Probe { reason: String },
+
     #[error(transparent)]
     Fcgi(#[from] volucer_fcgi::FcgiError),
 

@@ -61,6 +61,16 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/sailantis/volucer/
 
 The binary lands in `%LOCALAPPDATA%\volucer\bin`, which the installer adds to your user `PATH`. Open a new shell afterwards for that to take effect. Pass `-ModifyPath 0` (or set `VOLUCER_MODIFY_PATH=0`) to leave the environment alone.
 
+### In a container
+
+`packaging/docker/Dockerfile` builds two images from one crate — a glibc image and a `scratch`-based musl image:
+
+```console
+docker build --target musl -t volucer .
+```
+
+The image declares a `HEALTHCHECK` that runs `volucer health`, which reads the probe address from `[status]` — the `scratch` target has no shell and no `curl`, so the check has to be the binary itself. See [Operations](docs/11-OPERATIONS.md#docker) for the `docker run` and Compose invocations, and for which of `/health` and `/ready` belongs in which place.
+
 ### Build from source
 
 ```sh

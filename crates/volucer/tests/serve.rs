@@ -1551,6 +1551,187 @@ fn version_prints_the_protocol_and_the_php_floor() {
     );
 }
 
+/// `health` is what a `HEALTHCHECK` runs, so its exit status is the interface.
+///
+/// The `scratch` image has no shell and no `curl`, which is the whole reason this subcommand
+/// exists — and it means the only thing Docker reads is the exit code. Every case here is asserted
+/// on the code rather than on the message, except where the message is what an operator would read
+/// out of `docker inspect` afterwards.
+#[test]
+fn health_reads_its_target_from_the_configuration_and_exits_on_the_answer() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-health-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    std::fs::write(root.join("index.html"), "hello").expect("write a document");
+
+    // A wildcard bind, because that is what a container uses and it is the case a naive probe gets
+    // wrong: `0.0.0.0:2114` is not a destination, so `health` has to map it to loopback. The content
+    // port is allocated by the OS; the status port is reserved here, because a probe reads the
+    // *file* and `:0` means "the OS decides", which is a number no configuration can state.
+    let document_root = toml_string(&root.display().to_string());
+    let status_port = free_port_run(1).expect("a free port for the status listener");
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
+         [status]\naddress = \"127.0.0.1:{status_port}\"\n"
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let Some(status_address) = server.status_address.clone() else {
+        panic!("the status listener did not report an address; the banner was not parsed");
+    };
+    assert!(
+        status_address.ends_with(&format!(":{status_port}")),
+        "the reserved port was taken between the probe and the bind ({status_address}); the \
+         assertions below would probe a port nothing listens on"
+    );
+
+    let run = |args: &[&str]| {
+        Command::new(&binary)
+            .arg("health")
+            .args(args)
+            .output()
+            .expect("the health command runs")
+    };
+
+    // The configuration names the listener, so a `HEALTHCHECK` in an image does not have to know
+    // the port — and does not break when a deployment moves it.
+    let healthy = run(&["--config", config_path.to_str().expect("a utf-8 path")]);
+    assert!(
+        healthy.status.success(),
+        "a running server must answer /health: {healthy:?}"
+    );
+
+    // `/ready` is the traffic question, and a server with nothing to boot is ready. Its own flag
+    // rather than a second subcommand, because the two are one probe with one different path.
+    let ready = run(&[
+        "--config",
+        config_path.to_str().expect("a utf-8 path"),
+        "--ready",
+    ]);
+    assert!(
+        ready.status.success(),
+        "a ready server answers /ready: {ready:?}"
+    );
+
+    // The same listener, addressed explicitly. This is the shape an operator debugging by hand
+    // uses, and it must agree with the configuration-derived one.
+    let url = format!("http://{status_address}/health");
+    let by_url = run(&["--url", &url]);
+    assert!(by_url.status.success(), "{by_url:?}");
+
+    // A 404 is a failed probe, not a pass. `curl -f` is what a shell health check usually writes,
+    // and the whole point of reproducing it is that a `200`-agnostic check would report an image
+    // whose `[status]` table is missing as healthy.
+    let missing = run(&["--url", &format!("http://{status_address}/nonexistent")]);
+    assert!(
+        !missing.status.success(),
+        "a 404 must fail the probe: {missing:?}"
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("404"),
+        "the status code has to be in the health log, or `docker inspect` says only \
+         `unhealthy`: {stderr}"
+    );
+
+    // Nothing listening. The timeout is short because the failure is a refusal here, not a hang.
+    let refused = run(&["--url", "http://127.0.0.1:1/health", "--timeout-ms", "200"]);
+    assert!(
+        !refused.status.success(),
+        "a closed port must fail the probe: {refused:?}"
+    );
+
+    // A URL scheme the listener does not speak is refused by name rather than attempted: the
+    // status listener has no TLS, so an `https://` probe would fail at the handshake with an error
+    // that says nothing about the mistake.
+    let tls = run(&["--url", "https://127.0.0.1:2114/health"]);
+    assert!(!tls.status.success(), "{tls:?}");
+    assert!(
+        String::from_utf8_lossy(&tls.stderr).contains("not an http:// URL"),
+        "an https probe must be refused by name: {}",
+        String::from_utf8_lossy(&tls.stderr)
+    );
+
+    // A configuration with no `[status]` and no `[metrics]` serves no probe at all. That is a
+    // failure and not a skip: a container built from such a file cannot be health checked, and
+    // reporting it healthy would hide the misconfiguration behind a green status.
+    let bare = root.join("bare.toml");
+    std::fs::write(
+        &bare,
+        format!("[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n"),
+    )
+    .expect("write a config with no probe listener");
+    let no_listener = run(&["--config", bare.to_str().expect("a utf-8 path")]);
+    assert!(!no_listener.status.success(), "{no_listener:?}");
+    assert!(
+        String::from_utf8_lossy(&no_listener.stderr).contains("[status]"),
+        "the message has to name the missing table: {}",
+        String::from_utf8_lossy(&no_listener.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A wildcard listener is what a container actually binds, and it is not a destination.
+///
+/// `0.0.0.0:2114` and `[::]:2114` are what an image's configuration says when the listener has to
+/// be reachable from outside the container. Connecting to them is not what a probe means, so
+/// `health` maps them to loopback — and this asserts the mapping on the strings, because the
+/// failure it prevents (a health check that passes on a developer's machine and fails in the
+/// image) is otherwise only observable by building one.
+#[test]
+fn health_probes_loopback_for_a_wildcard_listener() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-health-wild-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    std::fs::write(root.join("index.html"), "hello").expect("write a document");
+
+    // `127.0.0.1:0` for the content listener so the test does not depend on a free fixed port, and
+    // a wildcard for the status listener because that is the case under test.
+    let document_root = toml_string(&root.display().to_string());
+    let port = free_port_run(1).expect("a free port for the status listener");
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
+         [status]\naddress = \"0.0.0.0:{port}\"\n"
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(_server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+
+    let output = Command::new(&binary)
+        .arg("health")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the health command runs");
+    assert!(
+        output.status.success(),
+        "a wildcard listener has to be probed on loopback, not on 0.0.0.0: {output:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `check` describes the sites a deployment will serve, and where a route still
 /// checks the filesystem.
 ///

@@ -535,6 +535,10 @@ workers, reachable from anywhere, is a remote kill switch. Put `[status]` on loo
 a private interface and reach it through your orchestrator's network, or leave the flag
 off.
 
+`volucer health` reads `address` from this table, so a probe does not have to repeat the port
+— including in a container, where a wildcard `address` is normal and is probed on loopback.
+See [Operations](11-OPERATIONS.md#health-checks).
+
 ## `[telemetry]`
 
 | Key | Type | Default | What it does |

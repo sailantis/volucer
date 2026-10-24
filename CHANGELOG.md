@@ -13,6 +13,36 @@ the reasoning behind it lives in the source comments and in the documentation un
 
 ### Added
 
+- **`volucer health`, because a container image with no shell cannot run `curl`.** The `musl`
+  image is `FROM scratch`, so the conventional `HEALTHCHECK CMD curl -f http://localhost/health`
+  is a line that never executes — and Docker does not report that as a broken check. It reports
+  the container as `unhealthy` after the start period with no output at all, which is the least
+  actionable failure a container can have. The subcommand reproduces `curl -f`'s contract (exit
+  `0` only for a `2xx`, nonzero otherwise) and adds what a one-liner throws away: the status code
+  and the server's own response body go to stderr, which is what `docker inspect` shows. It reads
+  the probe address from `[status]`, or from `[metrics]` when that is the only one present,
+  because the two share one listener; `--url` overrides, `--ready` asks the traffic question
+  rather than the liveness one, and `VOLUCER_HEALTH_URL` and `VOLUCER_HEALTH_CONFIG` are the
+  forms a `HEALTHCHECK` can set. A wildcard listener (`0.0.0.0:2114`, `[::]:2114`) is probed on
+  loopback, because that is the shape a container binds and neither address is a destination.
+  Two refusals matter more than the happy path: a configuration with no `[status]` and no
+  `[metrics]` is a **failed** probe rather than a skipped one (a container that serves no
+  `/health` cannot be checked, and green would hide it), and an `https://` URL is named as the
+  mistake it is rather than failing at a handshake.
+- **Both Docker images declare a `HEALTHCHECK`, and the release workflow smoke-tests it.** The
+  check runs `/usr/local/bin/volucer health` in exec form, so it works in the `scratch` image
+  where a shell-form check cannot. It probes `/health` and not `/ready` on purpose: Docker
+  restarts a container whose check fails, and a server still booting its worker pool must not be
+  killed for it. `docker run version` could not exercise any of that — it needs a server that is
+  actually serving — so the workflow now starts a container, polls Docker's own health state, and
+  then asserts the check *fails* against a closed port, because a probe that cannot fail is a
+  probe that always passes.
+- **`.dockerignore`.** `COPY . .` is deliberate (the build needs the whole workspace), which made
+  the context everything in the checkout: `target/` alone was 47.7 GB and `.git/` 49.6 MB on the
+  machine this was measured on, all of it uploaded and written into a layer before the compiler
+  started. Excluding them also stops a host `target/` — the wrong architecture, the wrong
+  profile, and on Windows a set of `.pdb` files — from invalidating the build layer on every
+  compile.
 - **`spawn_cgi` runs any FastCGI server, not only `php-cgi`.** A new `command` key takes a
   program that starts one slot — `gunicorn myapp.wsgi --bind {address}`, a `flup` server, a
   Rack adapter — and the placeholder is replaced per slot with the address that slot must
