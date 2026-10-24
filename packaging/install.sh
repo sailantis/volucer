@@ -25,6 +25,9 @@
 #
 #   VOLUCER_VERSION      a tag to install (v0.1.0 or 0.1.0) instead of the newest release
 #   VOLUCER_INSTALL_DIR  where to put the binary (default: $HOME/.local/bin)
+#   VOLUCER_MODIFY_PATH  `1` (default) to add the install directory to PATH in the shell
+#                        profile this shell reads; `0` to leave every dotfile alone and only
+#                        print what to add by hand
 #   VOLUCER_API          the API root used to resolve the newest tag
 #   VOLUCER_DOWNLOAD_URL the base the assets are fetched from
 #   VOLUCER_FORCE        set to 1 to replace an existing binary
@@ -197,6 +200,16 @@ if [ "${VOLUCER_VERIFY:-auto}" = require ] &&
     die "VOLUCER_VERIFY=require, but ${DOWNLOAD_URL} is not the GitHub release origin; there is no attestation to check there"
 fi
 
+# Same reason, and one more: this setting is read in the last block of the script, so a typo in
+# it would otherwise be reported after the binary was already replaced - and would be missed
+# entirely on a host where the directory is already on PATH and that block never runs.
+case "${VOLUCER_MODIFY_PATH:-1}" in
+    0 | 1) ;;
+    *)
+        die "VOLUCER_MODIFY_PATH is \"${VOLUCER_MODIFY_PATH}\"; expected \"0\" or \"1\""
+        ;;
+esac
+
 # ----------------------------------------------------------------- version
 
 # The tag is resolved before the asset name, because the asset name contains the version:
@@ -359,7 +372,131 @@ mv "$staged" "$final" || die "could not move the binary to ${final}"
 note "installed ${final}"
 "$final" version 2>/dev/null | head -n 1 >&2 || true
 
+# ----------------------------------------------------------------- path
+
+# The operator's next action is opening a new shell, so the file used is the one an
+# *interactive* shell of theirs reads rather than the login-only one. zsh reads `.zshrc` in a
+# login shell too, while `.zprofile` is skipped by a non-login terminal - and a terminal that
+# is not a login shell is the common case on Linux. bash reads `.bashrc` in every interactive
+# non-login shell, and falls back to `.profile` on a host that has no `.bashrc`, which is what
+# a login bash reads.
+#
+# A `curl | sh` cannot ask, which is why this is a default and not a prompt. What makes it
+# safe instead of silent is the rest of this block: it is opt-out (`VOLUCER_MODIFY_PATH=0`),
+# it does nothing when the file already adds the directory - Debian and Ubuntu ship exactly
+# that line in the stock `~/.profile` - it resolves a symlinked profile before writing, so a
+# dotfiles repository keeps owning the file, and it prints the file, the exact line and how to
+# take it back out.
+path_profile() {
+    case "${SHELL:-}" in
+        */zsh) printf '%s' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        */fish) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
+        */bash)
+            if [ -f "${HOME}/.bashrc" ]; then
+                printf '%s' "${HOME}/.bashrc"
+            else
+                printf '%s' "${HOME}/.profile"
+            fi
+            ;;
+        *) printf '%s' "${HOME}/.profile" ;;
+    esac
+}
+
+# `readlink -f` is GNU-only; macOS has neither `-f` nor the same behaviour. The loop is the
+# portable form, and the depth limit is what stops a symlink cycle from hanging an installer.
+resolve_symlink() {
+    _path=$1
+    _hops=0
+    while [ -L "$_path" ] && [ "$_hops" -lt 40 ]; do
+        _link=$(readlink "$_path") || return 1
+        case "$_link" in
+            /*) _path=$_link ;;
+            *) _path="$(dirname "$_path")/${_link}" ;;
+        esac
+        _hops=$((_hops + 1))
+    done
+    printf '%s' "$_path"
+}
+
+add_to_path() {
+    case "${VOLUCER_MODIFY_PATH:-1}" in
+        1) ;;
+        0)
+            note "${dest_dir} is not on PATH; VOLUCER_MODIFY_PATH=0, so no file was changed"
+            note "add it by hand, e.g. export PATH=\"${dest_dir}:\$PATH\""
+            return 0
+            ;;
+    esac
+
+    if [ -z "${HOME:-}" ]; then
+        note "${dest_dir} is not on PATH, and HOME is unset, so there is no profile to edit"
+        return 0
+    fi
+
+    profile=$(path_profile)
+
+    # A dotfiles repository usually owns the profile through a symlink. Appending to the link
+    # would replace it with a regular file and lose the repository's copy - quietly, and until
+    # the next `chezmoi apply` or `stow` puts it back and drops the line again.
+    if [ -e "$profile" ]; then
+        if resolved=$(resolve_symlink "$profile"); then
+            profile=$resolved
+        fi
+    fi
+
+    case "${SHELL:-}" in
+        */fish) line="set -gx PATH \"${dest_dir}\" \$PATH" ;;
+        *) line="export PATH=\"${dest_dir}:\$PATH\"" ;;
+    esac
+
+    marker='# added by the volucer installer'
+    below_home=''
+    case "$dest_dir" in
+        "$HOME"/*) below_home=${dest_dir#"$HOME"} ;;
+    esac
+
+    # Comments are excluded from every spelling below. A file that merely mentions the
+    # directory - a commented-out block, a note to self - does not put it on PATH, and treating
+    # it as though it did would answer "open a new shell" to an operator whose new shell will
+    # not have the binary either.
+    profile_sets_path() {
+        [ -f "$profile" ] || return 1
+        _lines=$(grep -v '^[[:space:]]*#' "$profile" 2>/dev/null) || return 1
+        printf '%s\n' "$_lines" | grep -Fq -- "$dest_dir" && return 0
+        if [ -n "$below_home" ]; then
+            # A stock Debian `~/.profile` spells the default as `$HOME/.local/bin`, and a
+            # hand-written file often spells it `~/.local/bin`; neither is the expanded path
+            # this installer would write, and missing them duplicates a line that was there.
+            printf '%s\n' "$_lines" | grep -Fq -- "\$HOME${below_home}" && return 0
+            printf '%s\n' "$_lines" | grep -Fq -- "~${below_home}" && return 0
+        fi
+        return 1
+    }
+
+    already=0
+    if [ -f "$profile" ] && grep -Fq -- "$marker" "$profile" 2>/dev/null; then
+        already=1
+    elif profile_sets_path; then
+        already=1
+    fi
+
+    if [ "$already" = 1 ]; then
+        note "${profile} already adds ${dest_dir}; open a new shell to pick it up"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$profile")" 2>/dev/null || true
+    if printf '\n%s\n%s\n' "$marker" "$line" >>"$profile" 2>/dev/null; then
+        note "${dest_dir} was added to PATH in ${profile}"
+        note "    ${line}"
+        note "to undo it, delete that line and the comment above it, then open a new shell"
+    else
+        note "${dest_dir} is not on PATH and ${profile} could not be written"
+        note "add it by hand: ${line}"
+    fi
+}
+
 case ":${PATH}:" in
     *":${dest_dir}:"*) ;;
-    *) note "${dest_dir} is not on PATH; add it, e.g. export PATH=\"${dest_dir}:\$PATH\"" ;;
+    *) add_to_path ;;
 esac

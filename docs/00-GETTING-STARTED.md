@@ -41,7 +41,11 @@ behaviour, because Windows has no `php-fpm` at all.
 curl -fsSL https://github.com/sailantis/volucer/releases/latest/download/install.sh | sh
 ```
 
-The binary lands in `~/.local/bin`.
+The binary lands in `~/.local/bin`, which the installer adds to your `PATH` if it is not
+already there. It writes to the file your shell actually reads — `~/.bashrc` (or `~/.profile`
+when you have none), `~/.zshrc`, or `~/.config/fish/config.fish` — and prints the file and the
+exact line it added, so you can take it back out. Set `VOLUCER_MODIFY_PATH=0` to install
+without touching a dotfile.
 
 ### Windows
 
@@ -50,7 +54,8 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/sailantis/volucer/
 ```
 
 The binary lands in `%LOCALAPPDATA%\volucer\bin`, which the installer adds to your user
-`PATH`. Open a new shell afterwards for that to take effect.
+`PATH`. Open a new shell afterwards for that to take effect. Pass `-ModifyPath 0` (or set
+`VOLUCER_MODIFY_PATH=0`) to leave the environment alone.
 
 Both scripts resolve the newest release, download the archive for your platform, verify its
 SHA-256 **before** extracting anything, and only then put the binary in place. A failure at
@@ -77,16 +82,20 @@ cannot pass arguments. Both scripts read the same names:
 | `VOLUCER_VERSION` | Install a specific tag instead of the newest release. |
 | `VOLUCER_INSTALL_DIR` | Where to put the binary. |
 | `VOLUCER_FORCE=1` | Replace an existing binary. |
+| `VOLUCER_MODIFY_PATH` | `1` (default) or `0` — whether the installer may add the install directory to `PATH`. |
 | `VOLUCER_DOWNLOAD_URL` | A mirror, a GitHub Enterprise host, or an air-gapped host. |
 | `VOLUCER_API` | The release API root. |
 | `VOLUCER_VERIFY` | `auto` (default), `require` or `off` — whether to check the build provenance attestation. |
 
 `install.ps1` takes the same settings as parameters (`-Version`, `-InstallDir`, `-Force`,
-`-BaseUrl`, `-Verify`) and falls back to the environment variables, so a one-liner that can only
-set environment variables behaves the same as one that passes parameters.
+`-BaseUrl`, `-Verify`, `-ModifyPath`) and falls back to the environment variables, so a one-liner
+that can only set environment variables behaves the same as one that passes parameters.
 
 The shell script also honours `VOLUCER_LIBC` (`gnu` or `musl`) and `VOLUCER_ARCH`
-(`x86_64` or `aarch64`).
+(`x86_64` or `aarch64`). `install.ps1` takes the same `VOLUCER_MODIFY_PATH` setting as
+`-ModifyPath`, and defaults to the same `1`: on Windows the user `PATH` is a single registry
+value, so the edit is one value to add and one to take back out rather than a line in a file
+whose name depends on the shell.
 
 ### In a container
 

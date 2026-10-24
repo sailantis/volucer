@@ -39,6 +39,14 @@ rather than only against GitHub.
 `auto` (default), `require` or `off` - whether to check the build provenance attestation.
 `auto` checks when `gh` is installed and authenticated and the archive came from GitHub;
 `require` refuses to install without the check; `off` skips it.
+
+.PARAMETER ModifyPath
+
+`1` (default) or `0` - whether the user PATH may be edited. `0` installs the binary and leaves
+the machine's environment alone, printing the directory to add instead. It exists for the same
+reason as the shell installer's `VOLUCER_MODIFY_PATH`: an unattended or CI install has no
+operator to undo a change, and a test that installs into a temporary directory must not leave
+that directory on the machine's PATH afterwards.
 #>
 [CmdletBinding()]
 param(
@@ -46,11 +54,16 @@ param(
     [string] $InstallDir,
     [switch] $Force,
     [string] $BaseUrl = 'https://github.com/sailantis/volucer/releases/download',
-    [string] $Verify = $env:VOLUCER_VERIFY
+    [string] $Verify = $env:VOLUCER_VERIFY,
+    [string] $ModifyPath = $env:VOLUCER_MODIFY_PATH
 )
 
 if (-not $Verify) {
     $Verify = 'auto'
+}
+
+if (-not $ModifyPath) {
+    $ModifyPath = '1'
 }
 
 $ErrorActionPreference = 'Stop'
@@ -58,9 +71,14 @@ $ErrorActionPreference = 'Stop'
 $App = 'volucer'
 $Repository = 'sailantis/volucer'
 
-# Checked before anything is downloaded: an installer that fetches 5 MB and then reports that its
-# own argument was misspelled has spent the operator's time to learn something it could have said
-# immediately. Below `$Repository`, because the origin comparison needs it.
+# Both settings are checked before anything is downloaded: an installer that fetches 5 MB and
+# then reports that its own argument was misspelled has spent the operator's time to learn
+# something it could have said immediately. Below `$Repository`, because the origin comparison
+# needs it.
+if ($ModifyPath -notin @('0', '1')) {
+    throw "install: VOLUCER_MODIFY_PATH is '$ModifyPath'; expected '0' or '1'"
+}
+
 if ($Verify -notin @('auto', 'require', 'off')) {
     throw "install: Verify is '$Verify'; expected 'auto', 'require' or 'off'"
 }
@@ -249,6 +267,12 @@ try {
         Write-Note $reported
     }
 
+    if ($ModifyPath -eq '0') {
+        Write-Note "$InstallDir is not being added to PATH because -ModifyPath 0 was given"
+        Write-Note "add it yourself, or run this without that setting"
+        return
+    }
+
     # The directory is put on the *user* PATH rather than modified for this process only,
     # because the next thing the operator does is open a new shell.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -263,6 +287,7 @@ try {
         $updated = if ([string]::IsNullOrEmpty($userPath)) { $InstallDir } else { "$userPath;$InstallDir" }
         [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
         Write-Note "$InstallDir was added to your user PATH; open a new shell to use it"
+        Write-Note "to undo it, remove $InstallDir from your user PATH"
     }
 } finally {
     Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue

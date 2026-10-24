@@ -220,6 +220,11 @@ jobs:
           done
 
           destination="$(mktemp -d)"
+          # `VOLUCER_MODIFY_PATH=0` because this installs into a throwaway directory on an
+          # ephemeral runner: the PATH edit is the one thing here that would touch a real file
+          # for no benefit, and asserting the default from this job would be asserting it
+          # against a machine that is about to be destroyed.
+          VOLUCER_MODIFY_PATH=0 \
           VOLUCER_VERSION="${GITHUB_REF_NAME}" \
           VOLUCER_INSTALL_DIR="$destination" \
           VOLUCER_DOWNLOAD_URL="http://127.0.0.1:${port}/releases/download" \

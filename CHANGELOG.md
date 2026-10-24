@@ -76,6 +76,32 @@ the reasoning behind it lives in the source comments and in the documentation un
   validated before the download, because an installer that fetches five megabytes and then
   reports that its own argument was misspelled has spent the operator's time to learn something
   it could have said immediately.
+- **`install.sh` puts the binary's directory on `PATH`.** Installing to `~/.local/bin` and then
+  printing "add it, e.g. `export PATH=…`" left the operator's *next* command — `volucer` — failing
+  on a fresh account, which is the state most installs happen in. The directory is now added to
+  the file the operator's shell actually reads: `~/.bashrc` for bash (falling back to
+  `~/.profile` when there is none, which is what a login bash reads), `~/.zshrc` for zsh,
+  `~/.config/fish/config.fish` for fish, and `~/.profile` for anything else. `install.ps1` already
+  did the equivalent with one registry value; this is the Unix half of the same promise.
+  Four things make the edit safe rather than hidden. It is **idempotent** — the marker comment
+  and the destination path are both checked, so a second release does not append a second line,
+  and a stock Debian or Ubuntu `~/.profile` that already spells it `$HOME/.local/bin` is
+  recognised rather than duplicated (a *commented-out* mention does not count, because it does
+  not put anything on `PATH`). It **writes through a symlink** to its target, so a dotfiles
+  repository keeps owning the file instead of being replaced by a regular one. It **names the
+  file and the exact line** it added, plus how to undo it. And **`VOLUCER_MODIFY_PATH=0`** turns
+  it off entirely, for CI and managed hosts, with the by-hand instruction printed instead. The
+  mode is validated before the download, like `VOLUCER_VERIFY`, because a value read in the last
+  block of the script would otherwise be reported after the binary was already replaced — and not
+  at all on a host where the directory is already on `PATH`.
+- **`install.ps1` takes `-ModifyPath 0`** (`VOLUCER_MODIFY_PATH`), the same opt-out as the shell
+  installer, and `install.ps1`'s own `install-selftest.sh` now uses it everywhere. It had been
+  appending one entry to the machine's **user `PATH`** per test case into a temporary directory
+  the test then deleted: 43 dead entries on the machine this was found on, each one a directory
+  that no longer exists, in a value every new process reads. The suite now also asserts the
+  default still adds the directory — and removes it again afterwards — so the two behaviours are
+  both pinned and the machine is left as it was found. `install.ps1` now prints how to undo the
+  edit, too, which it did not before.
 
 ### Changed
 

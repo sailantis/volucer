@@ -47,7 +47,11 @@ Worker mode avoids repeated application boot. An attached worker and a preforked
 curl -fsSL https://github.com/sailantis/volucer/releases/latest/download/install.sh | sh
 ```
 
-The binary lands in `~/.local/bin`.
+The binary lands in `~/.local/bin`, which the installer adds to your `PATH` if it is not
+already there. It writes to the file your shell actually reads — `~/.bashrc` (or `~/.profile`
+when you have none), `~/.zshrc`, or `~/.config/fish/config.fish` — and prints the file and the
+exact line it added, so you can take it back out. Set `VOLUCER_MODIFY_PATH=0` to install
+without touching a dotfile.
 
 ### Windows
 
@@ -55,7 +59,7 @@ The binary lands in `~/.local/bin`.
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/sailantis/volucer/releases/latest/download/install.ps1 | iex"
 ```
 
-The binary lands in `%LOCALAPPDATA%\volucer\bin`, which the installer adds to your user `PATH`. Open a new shell afterwards for that to take effect.
+The binary lands in `%LOCALAPPDATA%\volucer\bin`, which the installer adds to your user `PATH`. Open a new shell afterwards for that to take effect. Pass `-ModifyPath 0` (or set `VOLUCER_MODIFY_PATH=0`) to leave the environment alone.
 
 ### Build from source
 

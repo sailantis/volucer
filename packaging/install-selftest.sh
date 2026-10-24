@@ -179,6 +179,7 @@ expect_install_sh_ok() {
     if VOLUCER_VERSION="$tag" \
         VOLUCER_INSTALL_DIR="$destination" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-$1" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out.sh" 2>&1; then
         if [ -f "${destination}/volucer" ] && [ -x "${destination}/volucer" ]; then
             check ok "$1: install.sh installed an executable"
@@ -211,6 +212,210 @@ if [ "$os" != windows ]; then
         check fail "${native_label}: the installed binary does not run"
     fi
 
+    # ----------------------------------------------------- install.sh and PATH
+
+    # The installer edits a dotfile by default, so these assertions are also the only thing
+    # keeping the suite from editing the machine it runs on: every case below sets HOME to a
+    # directory under $work and clears the directory out of PATH, which is the state a fresh
+    # account is in. `SHELL` is set explicitly rather than inherited, because the file chosen
+    # is a function of it and a CI runner's SHELL is not necessarily the operator's.
+    echo "== install.sh adds the install directory to PATH"
+
+    path_install() {
+        _dest=$1
+        shift
+        env -u VOLUCER_MODIFY_PATH \
+            VOLUCER_VERSION="$tag" \
+            VOLUCER_INSTALL_DIR="$_dest" \
+            VOLUCER_DOWNLOAD_URL="$base_url" \
+            VOLUCER_FORCE=1 \
+            "$@" \
+            "$VOLUCER_SH" packaging/install.sh 2>&1
+    }
+
+    # Not on PATH: the block is appended, and the output names the file it was appended to -
+    # which is the whole difference between a hidden edit and one the operator can undo.
+    # `.bashrc` is created first because every distribution that ships bash ships one, and it
+    # is the file an interactive non-login shell reads.
+    home_path="${work}/home-path"
+    mkdir -p "$home_path"
+    printf '# ~/.bashrc\n' >"$home_path/.bashrc"
+    out=$(path_install "${work}/bin-path" HOME="$home_path" SHELL=/bin/bash \
+        PATH="/usr/bin:/bin")
+    if grep -q 'export PATH=' "$home_path/.bashrc" 2>/dev/null; then
+        check ok 'a missing install directory is added to the shell profile'
+    else
+        check fail 'the install directory was not added to the shell profile'
+        printf '%s\n' "$out" >&2
+    fi
+
+    if printf '%s\n' "$out" | grep -q "${home_path}/.bashrc"; then
+        check ok 'the installer names the file it edited'
+    else
+        check fail 'the installer edited a file without naming it'
+        printf '%s\n' "$out" >&2
+    fi
+
+    if printf '%s\n' "$out" | grep -qi 'undo'; then
+        check ok 'the installer says how to undo the edit'
+    else
+        check fail 'the installer edited a dotfile without saying how to undo it'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # Re-running is the normal case - the second release someone installs. A second copy of the
+    # line is harmless in PATH and wrong in a file, and the test for it is the count.
+    before=$(grep -c 'export PATH=' "$home_path/.bashrc")
+    out=$(path_install "${work}/bin-path" HOME="$home_path" SHELL=/bin/bash \
+        PATH="/usr/bin:/bin")
+    after=$(grep -c 'export PATH=' "$home_path/.bashrc")
+    if [ "$before" = "$after" ]; then
+        check ok 'a second install does not append a duplicate line'
+    else
+        check fail 'a second install appended the line again'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # A bash with no `.bashrc` - a stripped-down server image, or macOS before anyone has
+    # opened Terminal - falls back to `~/.profile`, which is what a login shell reads. Creating
+    # a `.bashrc` there instead would leave the line unread by the login shells that are the
+    # norm on macOS.
+    home_norc="${work}/home-norc"
+    mkdir -p "$home_norc"
+    out=$(path_install "${work}/bin-norc" HOME="$home_norc" SHELL=/bin/bash \
+        PATH="/usr/bin:/bin")
+    if [ ! -e "$home_norc/.bashrc" ] && grep -q 'export PATH=' "$home_norc/.profile" 2>/dev/null; then
+        check ok 'bash without a .bashrc falls back to .profile'
+    else
+        check fail 'bash without a .bashrc did not fall back to .profile'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # A stock Debian or Ubuntu `~/.profile` already contains this, spelled `$HOME/.local/bin`
+    # rather than expanded. The default destination is exactly that directory, so a host that
+    # ships the line must not get a second one - and the check cannot be a substring search for
+    # the expanded path, because the expanded path is not what is written there.
+    home_debian="${work}/home-debian"
+    mkdir -p "$home_debian"
+    printf '# ~/.profile\nif [ -d "$HOME/.local/bin" ] ; then\n    PATH="$HOME/.local/bin:$PATH"\nfi\n' \
+        >"$home_debian/.profile"
+    cp "$home_debian/.profile" "${work}/profile-debian.before"
+    out=$(path_install "$home_debian/.local/bin" HOME="$home_debian" SHELL=/bin/sh \
+        PATH="/usr/bin:/bin")
+    if cmp -s "${work}/profile-debian.before" "$home_debian/.profile"; then
+        check ok 'a profile that already adds the directory is left alone'
+    else
+        check fail 'the installer duplicated a PATH line a stock profile already had'
+        printf '%s\n' "$out" >&2
+        diff "${work}/profile-debian.before" "$home_debian/.profile" >&2 || true
+    fi
+
+    # A mention in a comment is not a PATH entry. A file that says "# to add it: export
+    # PATH=$HOME/.local/bin:$PATH" tells the operator nothing by being left alone, and "open a
+    # new shell" is then the wrong answer - the new shell will not find the binary either.
+    home_comment="${work}/home-comment"
+    mkdir -p "$home_comment"
+    printf '# add it yourself: export PATH="$HOME/.local/bin:$PATH"\n' >"$home_comment/.bashrc"
+    out=$(path_install "$home_comment/.local/bin" HOME="$home_comment" SHELL=/bin/bash \
+        PATH="/usr/bin:/bin")
+    if [ "$(grep -c '^export PATH=' "$home_comment/.bashrc")" -eq 1 ]; then
+        check ok 'a commented-out PATH line does not count as already added'
+    else
+        check fail 'a comment mentioning the directory suppressed the real edit'
+        printf '%s\n' "$out" >&2
+        sed 's/^/      /' "$home_comment/.bashrc" >&2
+    fi
+
+    # Opt-out, which is what CI and a managed host need: the binary is installed, nothing else
+    # on the machine changes, and the operator is told what to add themselves.
+    home_optout="${work}/home-optout"
+    mkdir -p "$home_optout"
+    out=$(env VOLUCER_MODIFY_PATH=0 \
+        VOLUCER_VERSION="$tag" \
+        VOLUCER_INSTALL_DIR="${work}/bin-optout" \
+        VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="$home_optout" SHELL=/bin/bash PATH="/usr/bin:/bin" \
+        "$VOLUCER_SH" packaging/install.sh 2>&1)
+    if [ -f "${work}/bin-optout/volucer" ] && [ ! -e "$home_optout/.bashrc" ]; then
+        check ok 'VOLUCER_MODIFY_PATH=0 installs without touching the profile'
+    else
+        check fail 'VOLUCER_MODIFY_PATH=0 still wrote to the profile, or did not install'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # A dotfiles repository owns the profile through a symlink. Appending to the link would
+    # replace it with a regular file and lose the repository's copy at the next apply, so the
+    # target is what must be written and the link must survive as a link.
+    home_link="${work}/home-link"
+    mkdir -p "$home_link/dotfiles"
+    printf '# managed by a dotfiles repository\n' >"$home_link/dotfiles/bashrc"
+    ln -s dotfiles/bashrc "$home_link/.bashrc"
+    out=$(path_install "${work}/bin-link" HOME="$home_link" SHELL=/bin/bash \
+        PATH="/usr/bin:/bin")
+    if [ -L "$home_link/.bashrc" ] &&
+        grep -q 'export PATH=' "$home_link/dotfiles/bashrc" 2>/dev/null; then
+        check ok 'a symlinked profile is written through, not replaced'
+    else
+        check fail 'a symlinked profile was replaced or not written'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # fish does not read `.bashrc`, and its syntax for PATH is not `export`. A line in the
+    # wrong file is an edit that does nothing, which is worse than no edit at all.
+    home_fish="${work}/home-fish"
+    mkdir -p "$home_fish"
+    out=$(path_install "${work}/bin-fish" HOME="$home_fish" SHELL=/usr/bin/fish \
+        PATH="/usr/bin:/bin")
+    if grep -q 'set -gx PATH' "$home_fish/.config/fish/config.fish" 2>/dev/null; then
+        check ok 'fish gets a line in config.fish, in fish syntax'
+    else
+        check fail 'fish did not get a usable PATH line'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # zsh is macOS's default shell and reads `.zshrc` in a login shell, while `.zprofile` is
+    # skipped by a non-login terminal - so `.zshrc` is the file, and `~/.profile` is not.
+    # `ZDOTDIR` moves it, and a zsh user who has moved it does not read `$HOME/.zshrc` at all.
+    home_zsh="${work}/home-zsh"
+    mkdir -p "$home_zsh/zdot"
+    out=$(path_install "${work}/bin-zsh" HOME="$home_zsh" SHELL=/bin/zsh \
+        ZDOTDIR="$home_zsh/zdot" PATH="/usr/bin:/bin")
+    if grep -q 'export PATH=' "$home_zsh/zdot/.zshrc" 2>/dev/null &&
+        [ ! -e "$home_zsh/.profile" ]; then
+        check ok 'zsh gets a line in .zshrc, and ZDOTDIR is honoured'
+    else
+        check fail 'zsh did not get a line in the file it actually reads'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # Already on PATH is the case that must do nothing: a container image, a host where the
+    # directory was added long ago, or a rerun in the same shell.
+    home_onpath="${work}/home-onpath"
+    mkdir -p "$home_onpath"
+    out=$(path_install "${work}/bin-onpath" HOME="$home_onpath" SHELL=/bin/bash \
+        PATH="${work}/bin-onpath:/usr/bin:/bin")
+    if [ ! -e "$home_onpath/.bashrc" ]; then
+        check ok 'a directory already on PATH is not written to any profile'
+    else
+        check fail 'a directory already on PATH was added to a profile anyway'
+        printf '%s\n' "$out" >&2
+    fi
+
+    # A misspelt mode is refused before the download, like every other setting, rather than
+    # being read as "off" or "on" by whichever branch happens to be first.
+    out=$(env VOLUCER_MODIFY_PATH=yes \
+        VOLUCER_VERSION="$tag" \
+        VOLUCER_INSTALL_DIR="${work}/bin-modify-bad" \
+        VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-modify-bad" SHELL=/bin/bash PATH="/usr/bin:/bin" \
+        "$VOLUCER_SH" packaging/install.sh 2>&1) && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        check ok 'an unknown VOLUCER_MODIFY_PATH is refused'
+    else
+        check fail 'an unknown VOLUCER_MODIFY_PATH was accepted'
+        printf '%s\n' "$out" >&2
+    fi
+
     # Only Linux has two libcs, so these assertions are gated rather than rewritten: on macOS
     # `VOLUCER_LIBC=musl` must be *refused*, and asserting the Linux answer there is asserting
     # the wrong thing about the right script. The refusal itself is checked below.
@@ -225,6 +430,7 @@ if [ "$os" != windows ]; then
         VOLUCER_LIBC=musl \
         VOLUCER_INSTALL_DIR="${work}/bin-musl" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-musl" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-musl.sh" 2>&1 || true
 
     if grep -q 'x86_64-unknown-linux-musl' "${work}/out-musl.sh"; then
@@ -246,6 +452,7 @@ if [ "$os" != windows ]; then
     # an asset name that will 404.
     if VOLUCER_VERSION="$tag" VOLUCER_LIBC=musl VOLUCER_ARCH=aarch64 \
         VOLUCER_INSTALL_DIR="${work}/bin-arm-musl" VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-arm-musl" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-arm-musl.sh" 2>&1; then
         check fail 'arm64 musl was not refused'
     elif grep -q 'no musl archive for Linux on arm64' "${work}/out-arm-musl.sh"; then
@@ -259,6 +466,7 @@ if [ "$os" != windows ]; then
         # than silently ignored - a silently ignored override is worse than an unsupported one.
         if VOLUCER_VERSION="$tag" VOLUCER_LIBC=musl VOLUCER_INSTALL_DIR="${work}/bin-musl" \
             VOLUCER_DOWNLOAD_URL="$base_url" \
+            HOME="${work}/home-musl-macos" \
             "$VOLUCER_SH" packaging/install.sh >"${work}/out-musl.sh" 2>&1; then
             check fail 'VOLUCER_LIBC=musl was accepted on a platform with no musl libc'
         elif grep -q 'makes no sense on' "${work}/out-musl.sh"; then
@@ -273,6 +481,7 @@ if [ "$os" != windows ]; then
     if VOLUCER_VERSION="${tag}-corrupt" \
         VOLUCER_INSTALL_DIR="${work}/bin-corrupt" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-corrupt" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-corrupt.sh" 2>&1; then
         check fail 'install.sh accepted a corrupted archive'
     elif grep -q 'checksum does not match' "${work}/out-corrupt.sh"; then
@@ -286,6 +495,7 @@ if [ "$os" != windows ]; then
     if VOLUCER_VERSION="${tag}-nochecksum" \
         VOLUCER_INSTALL_DIR="${work}/bin-nochecksum" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-nochecksum" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-nochecksum.sh" 2>&1; then
         check fail 'install.sh installed without a checksum'
     else
@@ -298,6 +508,7 @@ if [ "$os" != windows ]; then
     if VOLUCER_VERSION="$tag" \
         VOLUCER_INSTALL_DIR="${work}/bin-${native_label}" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
+        HOME="${work}/home-overwrite" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-overwrite.sh" 2>&1; then
         check fail 'install.sh overwrote an existing binary without being asked'
     elif grep -q 'already exists' "${work}/out-overwrite.sh"; then
@@ -316,6 +527,7 @@ if [ "$os" != windows ]; then
         VOLUCER_INSTALL_DIR="${work}/bin-verify-auto" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
         VOLUCER_VERIFY=auto \
+        HOME="${work}/home-verify-auto" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-verify-auto.sh" 2>&1; then
         if grep -q 'provenance not checked' "${work}/out-verify-auto.sh"; then
             check ok 'auto says plainly that provenance was not checked'
@@ -333,6 +545,7 @@ if [ "$os" != windows ]; then
         VOLUCER_INSTALL_DIR="${work}/bin-verify-require" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
         VOLUCER_VERIFY=require \
+        HOME="${work}/home-verify-require" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-verify-require.sh" 2>&1; then
         check fail 'require installed from a mirror, where nothing could be verified'
     elif grep -q 'no attestation to check' "${work}/out-verify-require.sh"; then
@@ -347,6 +560,7 @@ if [ "$os" != windows ]; then
         VOLUCER_INSTALL_DIR="${work}/bin-verify-bad" \
         VOLUCER_DOWNLOAD_URL="$base_url" \
         VOLUCER_VERIFY=sometimes \
+        HOME="${work}/home-verify-bad" \
         "$VOLUCER_SH" packaging/install.sh >"${work}/out-verify-bad.sh" 2>&1; then
         check fail 'an unknown VOLUCER_VERIFY was accepted'
     elif grep -q 'expected "auto"' "${work}/out-verify-bad.sh"; then
@@ -381,10 +595,14 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
     # `-DestinationPath` and `Get-FileHash` are 5.1-compatible, so the version chosen here is
     # whichever is present rather than whichever supports a newer spelling.
     if [ "$os" = windows ]; then
+        # `-ModifyPath 0` on every case: these install into a temporary directory that the
+        # `finally` block deletes, so adding it to the machine's user PATH leaves an entry
+        # that names nothing - permanently, once per run. That is not hypothetical: it had
+        # accumulated 43 of them before anyone counted.
         if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Stop'
             \$destination = '${work_win}/ps-bin'
-            & '${script_win}' -Version '${tag}' -InstallDir \$destination -BaseUrl '${base_url}'
+            & '${script_win}' -Version '${tag}' -InstallDir \$destination -BaseUrl '${base_url}' -ModifyPath 0
             if (-not (Test-Path (Join-Path \$destination 'volucer.exe'))) {
                 Write-Error 'install.ps1 succeeded but installed nothing'
                 exit 1
@@ -396,9 +614,52 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
             sed 's/^/      /' "${work}/out-ps.txt" >&2
         fi
 
+        # The binary is installed and the machine's environment is untouched, which is what an
+        # unattended install has to promise. Asserting it here is the only thing that keeps the
+        # suite from writing to the PATH of whichever machine runs it.
         if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Stop'
-            & '${script_win}' -Version '${tag}-corrupt' -InstallDir '${work_win}/ps-corrupt' -BaseUrl '${base_url}'
+            \$before = [Environment]::GetEnvironmentVariable('Path', 'User')
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-modify-off' -BaseUrl '${base_url}' -ModifyPath 0
+            \$after = [Environment]::GetEnvironmentVariable('Path', 'User')
+            if (\$after -ne \$before) {
+                Write-Error 'the user PATH was edited despite -ModifyPath 0'
+                exit 1
+            }
+        " >"${work}/out-ps-modify-off.txt" 2>&1; then
+            check ok 'install.ps1 leaves the user PATH alone with -ModifyPath 0'
+        else
+            check fail 'install.ps1 edited the user PATH despite -ModifyPath 0'
+            sed 's/^/      /' "${work}/out-ps-modify-off.txt" >&2
+        fi
+
+        # And the default still does what the README says. It is run against the *user* PATH
+        # because that is the value the installer writes; the entry is removed again so the
+        # suite leaves the machine as it found it.
+        if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Stop'
+            \$dir = '${work_win}/ps-modify-on'
+            \$before = [Environment]::GetEnvironmentVariable('Path', 'User')
+            try {
+                & '${script_win}' -Version '${tag}' -InstallDir \$dir -BaseUrl '${base_url}'
+                \$after = [Environment]::GetEnvironmentVariable('Path', 'User')
+                if (\$after -notlike \"*\$dir*\") {
+                    Write-Error 'the install directory was not added to the user PATH'
+                    exit 1
+                }
+            } finally {
+                [Environment]::SetEnvironmentVariable('Path', \$before, 'User')
+            }
+        " >"${work}/out-ps-modify-on.txt" 2>&1; then
+            check ok 'install.ps1 adds the install directory to the user PATH by default'
+        else
+            check fail 'install.ps1 did not add the install directory to the user PATH'
+            sed 's/^/      /' "${work}/out-ps-modify-on.txt" >&2
+        fi
+
+        if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
+            \$ErrorActionPreference = 'Stop'
+            & '${script_win}' -Version '${tag}-corrupt' -InstallDir '${work_win}/ps-corrupt' -BaseUrl '${base_url}' -ModifyPath 0
         " >"${work}/out-ps-corrupt.txt" 2>&1; then
             check fail 'install.ps1 accepted a corrupted archive'
         elif grep -qi 'checksum does not match' "${work}/out-ps-corrupt.txt"; then
@@ -425,6 +686,7 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
             \$env:VOLUCER_VERSION = '${tag}'
             \$env:VOLUCER_INSTALL_DIR = '${work_win}/ps-env'
             \$env:VOLUCER_DOWNLOAD_URL = '${base_url}'
+            \$env:VOLUCER_MODIFY_PATH = '0'
             & '${script_win}'
             if (-not (Test-Path (Join-Path '${work_win}/ps-env' 'volucer.exe'))) {
                 Write-Error 'VOLUCER_INSTALL_DIR was ignored'
@@ -439,8 +701,8 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
 
         if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Stop'
-            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-overwrite' -BaseUrl '${base_url}'
-            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-overwrite' -BaseUrl '${base_url}'
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-overwrite' -BaseUrl '${base_url}' -ModifyPath 0
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-overwrite' -BaseUrl '${base_url}' -ModifyPath 0
         " >"${work}/out-ps-overwrite.txt" 2>&1; then
             check fail 'install.ps1 overwrote an existing binary without -Force'
         elif grep -qi 'already exists' "${work}/out-ps-overwrite.txt"; then
@@ -457,7 +719,7 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
         # 'downloading' as well as the message.
         if "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Stop'
-            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-auto' -BaseUrl '${base_url}' -Verify auto
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-auto' -BaseUrl '${base_url}' -Verify auto -ModifyPath 0
         " >"${work}/out-ps-verify-auto.txt" 2>&1; then
             if grep -qi 'provenance not checked' "${work}/out-ps-verify-auto.txt"; then
                 check ok 'install.ps1 says plainly that provenance was not checked on a mirror'
@@ -499,7 +761,7 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
         # wondering whether it ran.
         "$ps" -NoProfile -ExecutionPolicy Bypass -Command "
             \$ErrorActionPreference = 'Continue'
-            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-off' -BaseUrl '${base_url}' -Verify off
+            & '${script_win}' -Version '${tag}' -InstallDir '${work_win}/ps-verify-off' -BaseUrl '${base_url}' -Verify off -ModifyPath 0
         " >"${work}/out-ps-verify-off.txt" 2>&1 || true
         if grep -qi 'provenance' "${work}/out-ps-verify-off.txt"; then
             check fail 'install.ps1 -Verify off still reported on provenance'
@@ -516,7 +778,7 @@ if command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; the
             \$ErrorActionPreference = 'Continue'
             \$env:VOLUCER_VERSION = 'v0.0.9'
             \$env:VOLUCER_DOWNLOAD_URL = '${base_url}'
-            & '${script_win}' -InstallDir '${work_win}/ps-pinned'
+            & '${script_win}' -InstallDir '${work_win}/ps-pinned' -ModifyPath 0
         " >"${work}/out-ps-pinned.txt" 2>&1 || true
         # The exit status is deliberately not part of this: the download is expected to 404,
         # because the fixture serves one tag and this pins a different one, and PowerShell runs
