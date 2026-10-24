@@ -1,31 +1,29 @@
 ![Volucer](docs/images/volucer-logo-text.svg)
 
-<h3 align="center">A cross-platform application server for PHP, Python and Ruby</h3>
+<h3 align="center">A cross-platform high-performance application server built to speed up PHP, Python and Ruby</h3>
 
 <p align="center">
-Run PHP, Python and Ruby applications with one binary, using worker or FastCGI backends.
+Run PHP, Python and Ruby applications with one binary, using worker or FastCGI backends. Other languages can be served as well.
 </p>
 
 ---
 
-**Volucer** runs applications without embedding a runtime. It starts the application, supervises it, and serves it over HTTP or FastCGI. For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`. For Python and Ruby it speaks the worker protocol, which is a JSON frame format rather than a PHP interface, and it can also run any FastCGI server — `gunicorn`, `flup`, a Rack adapter. Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
+**Volucer** runs cross-platform applications. It starts the application, supervises it, and serves it over HTTP or FastCGI. For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`. For Python and Ruby SDKs exist that speak the worker protocol. Volucer can also run any FastCGI server — `gunicorn`, `flup`, a Rack adapter, or any other FastCGI-compatible backend. Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
 
 It runs on Linux, macOS, and Windows. Windows does not provide `php-fpm`; Volucer can supervise `php-cgi` there.
 
-**A Python or Ruby deployment needs no PHP on the host.** The PHP 8.2 floor applies to the PHP SDK alone — it is the version that has `memory_reset_peak_usage()`, which the PHP SDK calls so that each request reports its own peak memory rather than a figure that never falls. Nothing in the server enforces it, and a Python worker reports no PHP version at all.
-
 ## Two ways to run a request
 
-|                  | Boots the application | State between requests     | Good for                                 |
-| ---------------- | --------------------- | -------------------------- | ---------------------------------------- |
-| **Worker mode**  | Once, at startup      | Managed by the application | PHP, Python or Ruby applications         |
-| **FastCGI mode** | On every request      | Reset by the backend       | Any FastCGI application, PHP included    |
+|                  | Boots the application | State between requests     | Good for                         |
+| ---------------- | --------------------- | -------------------------- | -------------------------------- |
+| **Worker mode**  | Once, at startup      | Managed by the application | PHP, Python or Ruby applications |
+| **FastCGI mode** | On every request      | Reset by the backend       | Any FastCGI application          |
 
 Both modes use the same dispatcher. Routes can use different backends, configured in `volucer.toml`.
 
-**Worker mode is the language-agnostic one.** It starts a process, performs a protocol handshake, and keeps it resident — the command is yours to choose, so it can be `php worker.php`, `python worker.py` or `bundle exec worker.rb`.
+**Worker mode is language-agnostic.** It starts a process, performs a protocol handshake, and keeps it resident — the command is yours to choose, so it can be `php worker.php`, `python worker.py` or `bundle exec worker.rb` or any other command that runs a long-lived process.
 
-**FastCGI mode is per-request, and it is not a PHP feature.** FastCGI is a protocol, so a FastCGI-speaking WSGI, Rack or Go server is served exactly as `php-fpm` is. The backend either attaches to a pool somebody else runs (`external`), or Volucer starts and supervises the processes itself (`spawn_cgi`) — with `php-cgi` as one driver and any other FastCGI server as another:
+**FastCGI mode is per-request.** A FastCGI-speaking WSGI, Rack or Go server is served exactly as `php-fpm` is. The backend either attaches to a pool somebody else runs (`external`), or Volucer starts and supervises the processes itself (`spawn_cgi`) — with `php-cgi` as one driver and any other FastCGI server as another:
 
 ```toml
 [backends.py]
@@ -35,7 +33,7 @@ workers = 4
 capacity = 4
 ```
 
-For Python and Ruby, worker mode is usually the better of the two, because it boots the application once instead of per request.
+For PHP, Python and Ruby, worker mode is usually the better of the two, because it boots the application once instead of per request.
 
 Worker mode avoids repeated application boot. An attached worker and a preforked `php-cgi` pool can also share memory pages: benchmarks measured 4.5x lower PSS than one process per slot at 16 PHP processes and 9.5x lower at 64. See the [benchmarks](docs/12-BENCHMARKS.md) for the method and results.
 
@@ -126,11 +124,11 @@ The full guide is in [`docs/`](docs/README.md). Start with
 The worker protocol is specified, and the implementations use the same wire format. If your
 language is not listed, use the [specification](docs/worker-protocol.md) to implement a worker.
 
-| Language | Package                                                                           | Install                                    |
-| -------- | --------------------------------------------------------------------------------- | ------------------------------------------ |
+| Language | Package                                                                           | Install                                     |
+| -------- | --------------------------------------------------------------------------------- | ------------------------------------------- |
 | PHP      | [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk)       | `composer require sailantis/volucer-worker` |
-| Python   | [`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk) | `pip install volucer-worker`               |
-| Ruby     | [`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk)     | `gem install volucer-worker`               |
+| Python   | [`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk) | `pip install volucer-worker`                |
+| Ruby     | [`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk)     | `gem install volucer-worker`                |
 
 All three are transports, not frameworks: no router, no container, no middleware pipeline. The
 SDK is a codec and a channel, and adapting it to whatever your application already speaks is a
