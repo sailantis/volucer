@@ -355,6 +355,9 @@ fn attach_config(relay: String, workers: u32, max_requests: Option<u64>) -> Atta
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
     }
 }
 
