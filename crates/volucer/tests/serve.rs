@@ -510,10 +510,65 @@ fn sdk_skip_reason() -> Option<String> {
     None
 }
 
+/// Why a test that needs two loopback destinations cannot run here, if it cannot.
+///
+/// The `addresses` binding is proved against the address a connection actually arrived on, and
+/// two loopback addresses are the only way to do that without a real interface or any privilege.
+/// `127.0.0.2` is a destination out of the box on Linux and Windows. **macOS is the exception**:
+/// it puts only `127.0.0.1` on `lo0`, so a connection to `127.0.0.2` is routed nowhere and times
+/// out rather than being refused — which reads as a hang in the suite, not as a missing alias.
+///
+/// The probe binds the second address and connects to it, because that is the same two operations
+/// the tests perform and the same pair macOS answers differently from the rest.
+fn second_loopback_skip_reason() -> Option<String> {
+    const ADDRESS: &str = "127.0.0.2";
+
+    // Both halves are tried, because macOS answers differently depending on whether the address
+    // is refused at `bind` (`EADDRNOTAVAIL`) or accepted and then never routed. Either one means
+    // the same thing to a caller, so either one reports the same hint.
+    let unusable = |err: std::io::Error| {
+        Some(format!(
+            "{ADDRESS} is not a usable destination on this host ({err}); macOS has only \
+             127.0.0.1 on lo0 by default — run `sudo ifconfig lo0 alias {ADDRESS} up` to add it"
+        ))
+    };
+
+    let probe = match std::net::TcpListener::bind((ADDRESS, 0)) {
+        Ok(probe) => probe,
+        Err(err) => return unusable(err),
+    };
+    let address = match probe.local_addr() {
+        Ok(address) => address,
+        Err(err) => return unusable(err),
+    };
+    match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
+        // The probe never accepts, so a completed connection is the kernel routing a packet to a
+        // socket on that address and nothing else — which is all this needs to know.
+        Ok(_) => None,
+        Err(err) => unusable(err),
+    }
+}
+
 /// Skip a worker-backed test, loudly, when the SDK checkout is missing.
 macro_rules! require_sdk {
     () => {
         if let Some(reason) = sdk_skip_reason() {
+            if std::env::var("VOLUCER_E2E")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false)
+            {
+                panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
+            }
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
+}
+
+/// Skip a test that needs a second loopback destination, loudly, where the host has only one.
+macro_rules! require_second_loopback {
+    () => {
+        if let Some(reason) = second_loopback_skip_reason() {
             if std::env::var("VOLUCER_E2E")
                 .map(|v| !v.is_empty() && v != "0")
                 .unwrap_or(false)
@@ -649,6 +704,7 @@ fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
 /// destination on every platform this runs on and needs no privilege to use.
 #[test]
 fn a_site_bound_to_an_address_is_not_reachable_by_name_elsewhere() {
+    require_second_loopback!();
     let Some(binary) = volucer_binary() else {
         eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
         return;
@@ -724,6 +780,7 @@ document_root = "{root}/internal"
 /// An address-only site answers an unclaimed name on its address.
 #[test]
 fn an_address_only_site_answers_on_its_address_alone() {
+    require_second_loopback!();
     let Some(binary) = volucer_binary() else {
         eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
         return;

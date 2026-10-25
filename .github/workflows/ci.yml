@@ -83,6 +83,16 @@ jobs:
       - name: Install NASM (macOS)
         if: runner.os == 'macOS'
         run: brew install nasm
+
+      # The `addresses` site-binding tests reach a second loopback destination, which is how they
+      # prove the rule uses the address a connection arrived on. Linux and Windows route all of
+      # 127.0.0.0/8 to `lo0`; macOS puts only 127.0.0.1 there, so 127.0.0.2 is unroutable and the
+      # connection times out rather than being refused. The alias is what makes that address a
+      # destination, and adding it here keeps the test real rather than skipped.
+      - name: Add a second loopback address (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
         run: |
