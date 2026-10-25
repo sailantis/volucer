@@ -13,7 +13,7 @@ use super::*;
 /// | | `binary` (php-cgi) | `command` (anything else) |
 /// | --- | --- | --- |
 /// | how the address is given | `-b <address>` | `{address}` in the command, or `VOLUCER_FCGI_ADDRESS` |
-/// | concurrency inside a slot | `children` → `PHP_FCGI_CHILDREN` | `capacity` |
+/// | concurrency inside a slot | `children` → `PHP_FCGI_CHILDREN` | `concurrency` |
 /// | a unix socket on Windows | a named pipe, which is what `-b` binds there | TCP only |
 ///
 /// Exactly one of [`SpawnCgiConfig::binary`] and [`SpawnCgiConfig::command`] is set. `binary`
@@ -27,7 +27,7 @@ pub struct SpawnCgiConfig {
     ///
     /// Kept as its own key rather than folded into `command = "php-cgi -b {address}"` because
     /// the two are not the same thing: this one also means "export `PHP_FCGI_CHILDREN`",
-    /// "`children` is the slot's capacity", and "a Windows `socket` is a named pipe". A
+    /// "`children` is the slot's concurrency", and "a Windows `socket` is a named pipe". A
     /// deployment written before `command` existed must keep all three.
     #[serde(default)]
     pub binary: Option<PathBuf>,
@@ -41,6 +41,14 @@ pub struct SpawnCgiConfig {
     /// environment needs no placeholder at all. A placeholder is unavoidable for the majority
     /// that take it as an argument, and an argument is the only form a shell-free tokenizer can
     /// build safely.
+    ///
+    /// **[`FCGI_CONCURRENCY_PLACEHOLDER`] is the second**, replaced with the resolved
+    /// [`SpawnCgiConfig::concurrency`], so a program that is told how many workers to start is
+    /// told the number this file already states: `command = "gunicorn app.wsgi --workers
+    /// {concurrency} --bind {address}"`. `{workers}` is refused by name — a slot command has no
+    /// sibling count to be told — while every other brace is left exactly as written, because a
+    /// command may legitimately carry one (`--json {"a":1}`) and a placeholder checker invented
+    /// here would refuse a working deployment.
     ///
     /// **The process must serve FastCGI on that address and nothing else.** The pool connects
     /// to it, so an application server that ignores the address and picks its own is not
@@ -100,7 +108,7 @@ pub struct SpawnCgiConfig {
     /// — means one, which is what every configuration written before this key meant.
     ///
     /// **Only meaningful with `binary`.** With `command` the number is
-    /// [`SpawnCgiConfig::capacity`], because a prefork count is `php-cgi`'s own mechanism and
+    /// [`SpawnCgiConfig::concurrency`], because a prefork count is `php-cgi`'s own mechanism and
     /// exporting `PHP_FCGI_CHILDREN` to a Python process would be noise it cannot act on.
     /// Setting both is refused rather than silently preferring one.
     ///
@@ -115,7 +123,7 @@ pub struct SpawnCgiConfig {
     /// **Why this was `0` for so long, and why the reason no longer holds.** A slot
     /// that hides children cannot be counted, recycled or killed as a unit — that is a
     /// real problem and it is why the pool forced `PHP_FCGI_CHILDREN=0`. What changed
-    /// is the measurement: the pool can hold a slot's capacity (`children`) and a
+    /// is the measurement: the pool can hold a slot's concurrency (`children`) and a
     /// slot's address, so the children are no longer hidden from it. What has *not*
     /// changed is that `php-cgi` cannot multiplex — `FCGI_MPXS_CONNS` is `0`
     /// (`main/fastcgi.c:490`) and the accept loop is one request at a time per process
@@ -138,22 +146,39 @@ pub struct SpawnCgiConfig {
 
     /// How many requests one slot may serve **at once**. Only meaningful with `command`.
     ///
+    /// **Per slot, not for the backend.** The backend's total is `workers × concurrency`;
+    /// writing the total here would hold that many connections open to one address, where the
+    /// surplus waits in the socket backlog and nothing counts it.
+    ///
     /// The generic form of [`SpawnCgiConfig::children`], and it exists because the pool has to
-    /// know the number for a reason that is not PHP's: [`SpawnCgiConfig::slot_capacity`] is what
+    /// know the number for a reason that is not PHP's: [`SpawnCgiConfig::slot_concurrency`] is what
     /// admits concurrent requests to one address, and a slot with no prefork behind it can serve
     /// exactly one. An application server that does its own forking must not be handed more
     /// connections than it has children, or requests queue in the socket backlog where nothing
     /// counts them — which is the same argument `ExternalConfig::max_connections` makes about
     /// somebody else's pool.
     ///
-    /// `0` means one, the honest answer for a program volucer did not fork. Set it to the number
-    /// of workers your server was told to start (gunicorn's `workers`, puma's `threads`).
+    /// `0` means one, the honest answer for a program volucer did not fork.
+    ///
+    /// **This is the app server's own worker count, because `command` runs once per slot.**
+    /// Each slot executes the command with a different `{address}`, so whatever the command is
+    /// told to fork or thread belongs to *one* address — and that number is what a slot can
+    /// answer at once. Gunicorn's `--workers 4` in the command is therefore `concurrency = 4`,
+    /// not `workers`; the backend's process count is `workers × 4`, because the pool starts that
+    /// whole command `workers` times. A server that also threads multiplies the two: four
+    /// workers with four threads each is `concurrency = 16`.
+    ///
+    /// **A command may refer to it as [`FCGI_CONCURRENCY_PLACEHOLDER`] instead of repeating it**,
+    /// which is the recommended form: `command = "gunicorn app.wsgi --workers {concurrency}
+    /// --bind {address}"` states the number here and nowhere else. The substitution is the
+    /// resolved value ([`SpawnCgiConfig::slot_concurrency`]), so `concurrency = 0` gives the
+    /// program `1` rather than a zero it would read as "start no workers".
     ///
     /// Refused together with `children`: one of them describes a php-cgi prefork count and the
-    /// other describes the same capacity generically, and a file stating both says two different
-    /// things about one number.
+    /// other describes the same concurrency generically, and a file stating both says two
+    /// different things about one number.
     #[serde(default)]
-    pub capacity: u32,
+    pub concurrency: u32,
 
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
     /// `pm.max_requests`. **`0` means never recycle**, as it does there.
@@ -188,6 +213,19 @@ pub struct SpawnCgiConfig {
     /// enforces or the address it is about to connect to.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// The pre-0.3 spelling of [`SpawnCgiConfig::concurrency`].
+    ///
+    /// Accepted by the parser and refused by [`SpawnCgiConfig::validate`] with a sentence naming
+    /// the new key. Without it an upgrading operator reads `unknown field 'capacity'` from `toml`,
+    /// which is true and explains nothing: the key did not disappear, it was renamed because
+    /// `capacity` read like a total for the backend while the number is per slot.
+    ///
+    /// **Never serialized.** It exists to be read once and refused, and a shim that appeared in
+    /// `config.describe` would tell a reader this deployment sets a key the server will not start
+    /// with.
+    #[serde(default, rename = "capacity", skip_serializing)]
+    pub legacy_capacity: Option<u32>,
 }
 
 fn default_bind_host() -> String {
@@ -201,15 +239,66 @@ fn default_base_port() -> u16 {
 impl SpawnCgiConfig {
     /// How many requests this slot can serve at once.
     ///
-    /// `children.max(1)` for a `binary` deployment and `capacity.max(1)` for a `command` one,
+    /// `children.max(1)` for a `binary` deployment and `concurrency.max(1)` for a `command` one,
     /// and the `max(1)` is the whole point: zero means "no prefork", which is one process and
-    /// therefore one request. Written here rather than at the call site so the pool's capacity
+    /// therefore one request. Written here rather than at the call site so the pool's concurrency
     /// and the number of processes the driver was told to start cannot be computed differently
     /// in two places.
-    pub fn slot_capacity(&self) -> usize {
+    pub fn slot_concurrency(&self) -> usize {
         match self.driver() {
             SpawnDriver::PhpCgi => self.children.max(1) as usize,
-            SpawnDriver::Command => self.capacity.max(1) as usize,
+            SpawnDriver::Command => self.concurrency.max(1) as usize,
+        }
+    }
+
+    /// How many slots this backend starts, with `workers = 0` resolved.
+    ///
+    /// `0` means one per logical CPU, so anything that reports or multiplies the slot count has
+    /// to resolve it rather than print the configured zero. Here rather than at each call site
+    /// for the same reason as [`SpawnCgiConfig::slot_concurrency`]: `check` printing a different
+    /// process count from the one `serve` starts is the failure this prevents.
+    pub fn slot_count(&self) -> u64 {
+        if self.workers > 0 {
+            return self.workers as u64;
+        }
+        std::thread::available_parallelism()
+            .map(|count| count.get() as u64)
+            .unwrap_or(1)
+    }
+
+    /// How many OS processes this backend will run, as arithmetic a reader can check.
+    ///
+    /// **The number an operator cannot get from the file**, which is why it is a method rather
+    /// than left to prose: a `command` slot runs its program once and that program forks
+    /// `concurrency` children of its own, so `workers × concurrency` is the host total; a
+    /// `php-cgi` slot is `workers × (children + 1)` because php-cgi's children come *in
+    /// addition to* the master. Both multiply the same way but differ by one factor, and the
+    /// two are one line apart in the configuration.
+    ///
+    /// Returns the process count and the multiplication in the configuration's own key names, so
+    /// `check` prints `16 (workers 4 × concurrency 4)` rather than a bare total an operator has to
+    /// reverse. The keys are named because naming them is what makes the line teach the rule:
+    /// `concurrency` is per slot, and the product is the host.
+    pub fn process_count(&self) -> (u64, String) {
+        let slots = self.slot_count();
+        match self.driver() {
+            // The master always runs, so the factor is `children + 1`. `children` is printed as
+            // configured rather than as `fcgi_children()`, because it is the key the operator
+            // wrote and the `+1` is what the arithmetic accounts for.
+            SpawnDriver::PhpCgi => {
+                let factor = self.children as u64 + 1;
+                (
+                    slots * factor,
+                    format!("workers {slots} × (children {}+1)", self.children),
+                )
+            }
+            SpawnDriver::Command => {
+                let factor = self.slot_concurrency() as u64;
+                (
+                    slots * factor,
+                    format!("workers {slots} × concurrency {factor}"),
+                )
+            }
         }
     }
 
@@ -240,7 +329,7 @@ impl SpawnCgiConfig {
     /// spawns CHILDREN *children in addition to itself*, so `1` is a master plus one child —
     /// two processes and two PHP boots for a slot that can still only serve one request at a
     /// time, because one child accepts one connection. Measured: `1` gave two processes and
-    /// one pid answering. Writing `0` instead gives the one process the capacity asks for,
+    /// one pid answering. Writing `0` instead gives the one process the concurrency asks for,
     /// and keeps `children = 1` a truthful alias for the default rather than a setting that
     /// silently costs double.
     pub fn fcgi_children(&self) -> u32 {
@@ -256,6 +345,17 @@ impl SpawnCgiConfig {
     /// Split from `Config::validate` only to keep that function readable; the messages name the
     /// keys exactly as the file spells them.
     pub fn validate(&self, backend: &str) -> std::result::Result<(), String> {
+        // The rename is refused by name and with the new spelling, because `deny_unknown_fields`
+        // would otherwise report `capacity` as unknown — true, and useless to an operator whose
+        // file said exactly what the key used to be called.
+        if self.legacy_capacity.is_some() {
+            return Err(format!(
+                "backends.{backend}.capacity was renamed to `concurrency` in 0.3.0, because the \
+                 number is requests per slot and not a total for the backend (that is `workers` × \
+                 `concurrency`); write `concurrency = <n>` instead"
+            ));
+        }
+
         match (&self.binary, &self.command) {
             (None, None) => {
                 return Err(format!(
@@ -281,23 +381,44 @@ impl SpawnCgiConfig {
             _ => {}
         }
 
-        // `children` and `capacity` describe one number — how many requests one address serves
-        // at once — for the two drivers respectively. A file that sets both has said two
+        // `children` and `concurrency` describe one number — how many requests one address
+        // serves at once — for the two drivers respectively. A file that sets both has said two
         // different things about it, and silently picking one is how a pool ends up admitting
         // more than the server behind it can answer.
         if !self.is_php_cgi() && self.children > 0 {
             return Err(format!(
                 "backends.{backend}.children is php-cgi's prefork count and has no meaning with \
-                 `command`; use `capacity` for the number of requests one slot may serve at once"
+                 `command`; use `concurrency` for the number of requests one slot may serve at once"
             ));
         }
-        if self.is_php_cgi() && self.capacity > 0 {
+        if self.is_php_cgi() && self.concurrency > 0 {
             return Err(format!(
-                "backends.{backend}.capacity is the generic form of `children`; with `binary` the \
-                 prefork count is `children`, which is also what `PHP_FCGI_CHILDREN` receives — \
-                 set that instead"
+                "backends.{backend}.concurrency is the generic form of `children`; with `binary` \
+                 the prefork count is `children`, which is also what `PHP_FCGI_CHILDREN` receives \
+                 — set that instead"
             ));
         }
+
+        // `{workers}` has no meaning here, and passing it through would be the worst of both:
+        // the command starts, the program's argument parser rejects `{workers}` (or worse, reads
+        // it as a name), and the message names neither volucer nor the key. A slot is started
+        // once per slot with its own address, so it has no sibling count to be told.
+        if let Some(command) = &self.command {
+            if command.contains(WORKERS_PLACEHOLDER) {
+                return Err(format!(
+                    "backends.{backend}.command uses {WORKERS_PLACEHOLDER}, which does not exist: \
+                     each slot runs this command once, with its own address, so a slot has no \
+                     sibling count — `workers` is how many copies of this command volucer starts, \
+                     and the parallelism of one of them is `{FCGI_CONCURRENCY_PLACEHOLDER}` (write \
+                     `--workers {FCGI_CONCURRENCY_PLACEHOLDER}`, or set `concurrency` and name the \
+                     number in the command once)"
+                ));
+            }
+        }
+
+        // `{concurrency}` needs no refusal of its own for `binary`, because a `binary` table
+        // cannot reach here with a `command` at all: the `(Some, Some)` arm above already
+        // refuses naming both. Writing one would be dead code that looks like protection.
 
         crate::env::check_env_table(&format!("backends.{backend}.env"), &self.env)?;
 
@@ -330,12 +451,12 @@ impl SpawnCgiConfig {
         // sane deployment — a slot is meant to be roughly core-sized — and low
         // enough that a decimal-point mistake is a refusal.
         const MAX_PER_SLOT: u32 = 1024;
-        if self.children > MAX_PER_SLOT || self.capacity > MAX_PER_SLOT {
+        if self.children > MAX_PER_SLOT || self.concurrency > MAX_PER_SLOT {
             return Err(format!(
                 "backends.{backend} asks for {} processes behind one slot, above the {MAX_PER_SLOT} \
                  this pool will start per slot; that is almost certainly a typo — `workers` is how \
-                 many slots, `children`/`capacity` is how many serve each one",
-                self.children.max(self.capacity)
+                 many slots, `children`/`concurrency` is how many serve each one",
+                self.children.max(self.concurrency)
             ));
         }
 

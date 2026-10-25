@@ -509,10 +509,10 @@ Exactly one of `binary` and `command`:
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `binary` | path | — | The `php-cgi` executable. The `PHP_FCGI_*` driver. A bare name is looked up in the PHP search directories (`PATH` first); a value containing a separator is used as a path. |
-| `command` | string | — | A command that starts **one slot**, with `{address}` where it must bind. |
+| `command` | string | — | A command that starts **one slot**, with `{address}` where it must bind and optionally `{concurrency}` where its worker count belongs. |
 | `workers` | integer | `0` | How many slots. `0` means one per logical CPU. |
 | `children` | integer | `0` | `php-cgi` children behind each slot (`binary` only). `0` means no prefork. |
-| `capacity` | integer | `0` | Requests one slot serves at once (`command` only). `0` means one. |
+| `concurrency` | integer | `0` | Requests one slot serves at once (`command` only). `0` means one. |
 | `working_dir` | path | absent | Working directory for each started process. |
 | `bind_host` | string | `"127.0.0.1"` | Where the slots listen. Loopback only. |
 | `base_port` | integer | `19001` | The first port, when not using a socket. |
@@ -530,17 +530,50 @@ for the default.
 `command` is the non-PHP shape. `{address}` is replaced in every argument with the address
 that slot must bind, and the same string is exported as `VOLUCER_FCGI_ADDRESS`. A command
 using neither is refused at startup, because it would bind somewhere the pool cannot reach.
-`capacity` — not `children` — says how many requests one slot answers at once, which is the
-number your application server was told to fork; setting both keys is refused.
+`concurrency` — not `children` — says how many requests **one slot** answers at once. It is not
+the backend's total: that is `workers × concurrency`, and writing the total here would hold that
+many connections open to a single address.
+
+**The command runs once per slot**, each time with a different `{address}`, so whatever that
+command is told to fork belongs to one address — that number is `concurrency`. Gunicorn's
+`--workers 4` in the command means `concurrency = 4`; the pool then starts that command
+`workers` times, so the host runs `workers × 4` Gunicorn processes. If the server also threads,
+multiply: four workers with four threads each is `concurrency = 16`. In the example below,
+`workers = 4` and `concurrency = 4` start four Gunicorn instances of four workers each — sixteen
+processes, four per address. `volucer check` prints exactly that product as its `processes:`
+line, so the total is visible at deploy time rather than derived by hand.
+
+Setting both `children` and `concurrency` is refused. The key was called `capacity` before; that
+spelling is now refused with a message naming the replacement.
+
+**Write the worker count once, as `{concurrency}`.** The command is the second place the same
+number has to appear — a program that forks its own workers is told how many by that command —
+so `concurrency = 4` beside `--workers 4` states one fact twice with nothing checking that the two
+agree. `--workers {concurrency}` removes the second statement:
 
 ```toml
 [backends.py]
 kind = "spawn_cgi"
-command = "gunicorn myapp.wsgi --bind {address}"
-workers = 4
-capacity = 4
+command = "gunicorn myapp.wsgi --workers {concurrency} --bind {address}"
+workers = 4       # four slots: the command is started four times, four addresses
+concurrency = 4   # substituted above: each address serves four requests at once
 working_dir = "/srv/app"
 ```
+
+The substitution is the **resolved** number, so `concurrency = 0` (the default) gives the program
+`1` — the honest number for a slot the pool admits one request to — rather than a `0` it would read
+as "start no workers". `volucer check` prints the resolved command line as well as the product, so
+what the program will be told is visible before deploying.
+
+`{workers}` is deliberately **not** a placeholder and is refused by name. A slot's command is
+started once per slot with its own address, so the number of slots is not a fact about that
+process — it is a fact about how many copies volucer starts, and a program told it would be invited
+to divide work the pool has already divided. Any other braces are left exactly as written, so an
+argument like `--define={a:1}` still works.
+
+Writing the number in the command instead is legal and unchanged —
+`command = "gunicorn myapp.wsgi --workers 4 --bind {address}"` beside `concurrency = 4` starts the
+same sixteen processes — it simply leaves the two copies for you to keep in step.
 
 `socket` is a prefix too, and it means a unix socket on Linux and macOS and a **named
 pipe** on Windows, because that is what `php-cgi -b` binds there. `\\.\pipe\volucer-cgi`

@@ -137,23 +137,24 @@ enum Command {
         /// Shorthand for that backend's `workers`, and an error without one of those flags —
         /// there would be no backend of that name to size. Omitted, a slot is started per
         /// logical CPU, except for `--fcgi`, whose slots are `1` by default because the program
-        /// decides its own concurrency through `capacity`.
+        /// decides its own concurrency through `concurrency`.
         #[arg(long, value_name = "N", requires = "backend")]
         workers: Option<u32>,
 
         /// How many requests one `--fcgi` slot may serve at once.
         ///
-        /// Shorthand for `backends.app.capacity`, and it means something different from
-        /// `--workers`: `--workers` is how many processes, `--capacity` is how many connections
-        /// the pool holds open to each one. Set it to the number of children your FastCGI server
-        /// forks for itself — `gunicorn -w 4`, Puma's `threads 5`, or a Rack server's own worker
-        /// count — so the pool does not queue a request behind a slot that could answer it.
+        /// Shorthand for `backends.app.concurrency`, and it means something different from
+        /// `--workers`: `--workers` is how many slots, `--concurrency` is how many requests one
+        /// slot answers at once. Since `--fcgi` runs its command once per slot with a distinct
+        /// `{address}`, this is the app server's own worker count *for that one address* —
+        /// `gunicorn --workers 4` in the command means `--concurrency 4`, and the pool then runs
+        /// that command `--workers` times. Workers times threads if the server threads.
         ///
         /// Only meaningful with `--fcgi`, because a `worker` decides its own concurrency one
         /// request at a time and `php-cgi` expresses it as `children`; giving it to either is an
         /// error naming that.
-        #[arg(long, value_name = "N")]
-        capacity: Option<u32>,
+        #[arg(long, value_name = "N", alias = "capacity")]
+        concurrency: Option<u32>,
 
         /// Maximum concurrent client connections.
         #[arg(long, default_value_t = 512)]
@@ -221,9 +222,9 @@ enum Command {
         #[arg(long, value_name = "N", requires = "backend")]
         workers: Option<u32>,
 
-        /// How many requests one `--fcgi` slot may serve at once. See `serve --capacity`.
-        #[arg(long, value_name = "N")]
-        capacity: Option<u32>,
+        /// How many requests one `--fcgi` slot may serve at once. See `serve --concurrency`.
+        #[arg(long, value_name = "N", alias = "capacity")]
+        concurrency: Option<u32>,
 
         /// Extra directories to search for PHP binaries.
         #[arg(long = "php-dir")]
@@ -297,11 +298,11 @@ fn main() -> ExitCode {
             worker,
             fcgi,
             workers,
-            capacity,
+            concurrency,
             max_connections,
         } => {
             let backend = Backends::from_flags(php_cgi, worker, fcgi);
-            Sizing::from_flags(&backend, workers, capacity).and_then(|sizing| {
+            Sizing::from_flags(&backend, workers, concurrency).and_then(|sizing| {
                 // An explicit `--front-controller` wins over what `--fcgi` implies; both end up on
                 // the one flag path, which is the only spelling the empty value has.
                 let front_controller = front_controller
@@ -327,11 +328,11 @@ fn main() -> ExitCode {
             worker,
             fcgi,
             workers,
-            capacity,
+            concurrency,
             php_dirs,
         } => {
             let backend = Backends::from_flags(php_cgi, worker, fcgi);
-            Sizing::from_flags(&backend, workers, capacity).and_then(|sizing| {
+            Sizing::from_flags(&backend, workers, concurrency).and_then(|sizing| {
                 let front_controller = front_controller
                     .or_else(|| implied_front_controller(&backend).map(str::to_string));
                 check(
@@ -932,17 +933,17 @@ impl Source {
                 pairs.push(string_pair("server.default_backend", "app"));
                 pairs.push(string_pair("backends.app.kind", "spawn_cgi"));
                 pairs.push(string_pair("backends.app.command", &command));
-                // `capacity` rather than `children` is how many requests one slot answers, and
-                // `workers` is how many slots there are. One slot by default, because a FastCGI
-                // application server usually forks for itself; `--capacity` says how wide that
-                // fork is, so the pool holds enough connections to reach every child instead of
-                // queueing behind one.
+                // `concurrency` rather than `children` is how many requests one slot answers,
+                // and `workers` is how many slots there are. One slot by default, because a
+                // FastCGI application server usually forks for itself; `--concurrency` says how
+                // wide that fork is, so the pool holds enough connections to reach every child
+                // instead of queueing behind one.
                 pairs.push(count_pair(
                     "backends.app.workers",
                     sizing.workers.unwrap_or(1),
                 ));
-                if let Some(capacity) = sizing.capacity {
-                    pairs.push(count_pair("backends.app.capacity", capacity));
+                if let Some(concurrency) = sizing.concurrency {
+                    pairs.push(count_pair("backends.app.concurrency", concurrency));
                 }
                 // The front controller is *not* written here. "Only real files" is expressible
                 // only as a flag — `Config::validate` refuses an empty table key on purpose — so
@@ -1163,37 +1164,40 @@ impl Backends {
 /// The sizing a quick-start flag asked for: how many slots, and how wide each one is.
 ///
 /// A struct rather than two more positional arguments, because the two mean different things and
-/// only one of them applies to each backend: `workers` is processes, `capacity` is connections per
-/// process. `clap` keeps `--workers` to any backend and `--capacity` to `--fcgi`, so a `Backends`
+/// only one of them applies to each backend: `workers` is slots, `concurrency` is requests per
+/// slot. `clap` keeps `--workers` to any backend and `--concurrency` to `--fcgi`, so a `Backends`
 /// plus this is a complete statement of what the command line asked for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Sizing {
     workers: Option<u32>,
-    capacity: Option<u32>,
+    concurrency: Option<u32>,
 }
 
 impl Sizing {
-    /// Read the two flags, refusing `--capacity` for a backend it cannot describe.
+    /// Read the two flags, refusing `--concurrency` for a backend it cannot describe.
     ///
     /// **Checked here rather than by `requires = "fcgi"` on the argument**, because clap's
     /// `requires` is satisfied by *presence*: `--php-cgi` takes an optional value, so clap reads it
-    /// as never missing, and `--php-cgi --capacity 4` would pass a `requires` check while meaning
-    /// nothing. `backends.cgi.capacity` is a configuration error for that driver anyway, so the
-    /// only honest thing to do is say so before the configuration is built.
+    /// as never missing, and `--php-cgi --concurrency 4` would pass a `requires` check while
+    /// meaning nothing. `backends.cgi.concurrency` is a configuration error for that driver
+    /// anyway, so the only honest thing to do is say so before the configuration is built.
     fn from_flags(
         backend: &Backends,
         workers: Option<u32>,
-        capacity: Option<u32>,
+        concurrency: Option<u32>,
     ) -> Result<Self, ServerError> {
-        if capacity.is_some() && !matches!(backend, Backends::Fcgi(_)) {
+        if concurrency.is_some() && !matches!(backend, Backends::Fcgi(_)) {
             return Err(invalid_override(
-                "--capacity sets how many requests one --fcgi slot serves at once, so it needs \
+                "--concurrency sets how many requests one --fcgi slot serves at once, so it needs \
                  --fcgi: a worker answers one request at a time by construction, and a php-cgi \
                  pool expresses the same number as `children`"
                     .to_string(),
             ));
         }
-        Ok(Self { workers, capacity })
+        Ok(Self {
+            workers,
+            concurrency,
+        })
     }
 }
 
@@ -3402,7 +3406,7 @@ fn check(
         //
         // Both lines answer questions the file alone cannot. `driver` says which of the two
         // spawn shapes is in use, because a reader cannot tell from `binary`/`command` whether
-        // `children` or `capacity` is the one in force. The prefork line exists because
+        // `children` or `concurrency` is the one in force. The prefork line exists because
         // `workers` alone stopped being the process count when `children` did: `workers ×
         // (children + 1)` is what the machine will run, and a reader tuning memory needs that
         // number rather than the two factors to multiply themselves.
@@ -3430,31 +3434,51 @@ fn check(
                     "      program:           {}",
                     cgi.command.as_deref().unwrap_or("(none)").trim()
                 );
-                println!("      capacity:          {} per slot", cgi.slot_capacity());
+                println!(
+                    "      concurrency:       {} per slot",
+                    cgi.slot_concurrency()
+                );
+                // What the program will actually be told, when the command asks to be told.
+                //
+                // The line above states the number the pool admits; this one states the number
+                // the *program* receives, and they are the same by construction — which is the
+                // whole reason the placeholder exists. Printing it is what makes the `0` case
+                // visible: a file with no `concurrency` key and a command with `{concurrency}`
+                // resolves to `1`, not to `0`, and an operator who wrote neither number should
+                // be able to see that from `check` rather than from the program's behaviour.
+                // `{address}` is left as written because it is the one value the pool decides
+                // per slot, and inventing a slot number here would be a different address from
+                // the one `serve` binds.
+                if let Some(command) = &cgi.command {
+                    if command.contains(volucer_core::config::FCGI_CONCURRENCY_PLACEHOLDER) {
+                        println!(
+                            "      command resolves:  {}",
+                            command.replace(
+                                volucer_core::config::FCGI_CONCURRENCY_PLACEHOLDER,
+                                &cgi.slot_concurrency().to_string()
+                            )
+                        );
+                    }
+                }
                 if let Some(dir) = &cgi.working_dir {
                     println!("      working dir:       {}", dir.display());
                 }
             }
-            if cgi.children > 0 {
-                // `workers = 0` means one per core, so the slot count has to be resolved the
-                // same way the pool resolves it; printing the configured `0` would understate
-                // the process count by the width of the machine.
-                let slots = if cgi.workers > 0 {
-                    cgi.workers as u64
-                } else {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get() as u64)
-                        .unwrap_or(1)
-                };
-                println!(
-                    "      prefork:           children = {} per slot ({} PHP processes across {} \
-                     slot{})",
-                    cgi.children,
-                    slots * (cgi.children as u64 + 1),
-                    slots,
-                    if slots == 1 { "" } else { "s" }
-                );
-            }
+            // The host total, spelled as the multiplication that produces it.
+            //
+            // This is the line the file cannot answer. `workers` and `concurrency` are two
+            // numbers one row apart, and the process count is their product — for a `command`
+            // backend because the pool starts that program once per slot and the program forks
+            // its own concurrency, for php-cgi because `children` is added to the master. An
+            // operator sizing memory, file descriptors or a container's `pids_limit` needs the
+            // product, so printing it (and the working) turns a fact that lived only in the
+            // documentation into something `check` states about *this* deployment.
+            //
+            // It also replaces the separate prefork line that used to sit here. That line said
+            // the same arithmetic for php-cgi only, which left the `command` driver — the one
+            // whose `concurrency` is easiest to misread as a total — with no total at all.
+            let (processes, working) = cgi.process_count();
+            println!("      processes:         {processes} ({working})");
         }
         // A `kind = "upstream"` backend was reported here as "not served yet" for exactly one
         // commit — the one that built the client before any listener could reach it — and that line
@@ -4079,7 +4103,7 @@ mod tests {
             Backends::PhpCgi("C:/php-8.3.31/php-cgi.exe".to_string()),
             Sizing {
                 workers: Some(5),
-                capacity: None,
+                concurrency: None,
             },
         );
 
@@ -4109,7 +4133,7 @@ mod tests {
             Backends::PhpCgi("php-cgi".to_string()),
             Sizing {
                 workers: Some(5),
-                capacity: None,
+                concurrency: None,
             },
         );
 
@@ -4142,7 +4166,7 @@ mod tests {
             Backends::Worker("php worker.php".to_string()),
             Sizing {
                 workers: Some(5),
-                capacity: None,
+                concurrency: None,
             },
         );
 
@@ -4191,7 +4215,7 @@ mod tests {
                     Some("python fcgi_app.py --bind {address}")
                 );
                 assert!(cgi.binary.is_none(), "binary and command are exclusive");
-                assert_eq!(cgi.workers, 1, "one slot until capacity is widened");
+                assert_eq!(cgi.workers, 1, "one slot until concurrency is widened");
             }
             other => panic!("expected a spawn_cgi backend, got {other:?}"),
         }
@@ -4217,13 +4241,13 @@ mod tests {
         );
     }
 
-    /// `--capacity` widens a `--fcgi` slot without changing how many slots there are.
+    /// `--concurrency` widens a `--fcgi` slot without changing how many slots there are.
     ///
     /// The two are different numbers, and that is the whole reason the flag exists: `--workers` is
-    /// processes, `--capacity` is connections held open to each one. A FastCGI server that forks
-    /// four children behind one slot needs `capacity = 4` for the pool to reach all four.
+    /// slots, `--concurrency` is requests held open to each one. A FastCGI server that forks four
+    /// children behind one slot needs `concurrency = 4` for the pool to reach all four.
     #[test]
-    fn the_capacity_flag_widens_an_fcgi_slot() {
+    fn the_concurrency_flag_widens_an_fcgi_slot() {
         let source = Source::resolve_with_backends(
             None,
             Some("127.0.0.1:8080".to_string()),
@@ -4232,7 +4256,7 @@ mod tests {
             Backends::Fcgi("python fcgi_app.py --bind {address}".to_string()),
             Sizing {
                 workers: Some(2),
-                capacity: Some(4),
+                concurrency: Some(4),
             },
         );
 
@@ -4246,25 +4270,25 @@ mod tests {
         match config.backends.get("app").expect("the backend exists") {
             BackendConfig::SpawnCgi(cgi) => {
                 assert_eq!(cgi.workers, 2, "two slots");
-                assert_eq!(cgi.capacity, 4, "four requests each");
+                assert_eq!(cgi.concurrency, 4, "four requests each");
             }
             other => panic!("expected a spawn_cgi backend, got {other:?}"),
         }
     }
 
-    /// `--capacity` describes a `spawn_cgi` slot, so it is refused for the other two backends.
+    /// `--concurrency` describes a `spawn_cgi` slot, so it is refused for the other two backends.
     ///
     /// A `worker` answers one request at a time by construction and `php-cgi` spells the same
     /// number `children`, so accepting the flag there would either do nothing or mean something
-    /// else — and `backends.cgi.capacity` beside `binary` is a configuration error anyway. The
+    /// else — and `backends.cgi.concurrency` beside `binary` is a configuration error anyway. The
     /// refusal is ours rather than clap's, because `requires` is satisfied by *presence* and
     /// `--php-cgi`'s optional value counts as present.
     #[test]
-    fn capacity_without_fcgi_is_refused() {
+    fn concurrency_without_fcgi_is_refused() {
         for (backend, argv) in [
             (
                 Backends::PhpCgi("php-cgi".to_string()),
-                vec!["volucer", "serve", "--php-cgi", "--capacity", "4"],
+                vec!["volucer", "serve", "--php-cgi", "--concurrency", "4"],
             ),
             (
                 Backends::Worker("php worker.php".to_string()),
@@ -4273,24 +4297,29 @@ mod tests {
                     "serve",
                     "--worker",
                     "php worker.php",
-                    "--capacity",
+                    "--concurrency",
                     "4",
                 ],
             ),
-            (Backends::None, vec!["volucer", "serve", "--capacity", "4"]),
+            (
+                Backends::None,
+                vec!["volucer", "serve", "--concurrency", "4"],
+            ),
         ] {
             // Parsed, so the flag itself is accepted — the refusal is what the value *means*,
             // which only the backend choice can answer.
-            let cli = Cli::try_parse_from(&argv).expect("--capacity parses on its own");
+            let cli = Cli::try_parse_from(&argv).expect("--concurrency parses on its own");
             let Command::Serve {
-                workers, capacity, ..
+                workers,
+                concurrency,
+                ..
             } = cli.command
             else {
                 panic!("expected serve for {argv:?}")
             };
-            let err = Sizing::from_flags(&backend, workers, capacity)
-                .expect_err("capacity without --fcgi is refused");
-            assert!(err.to_string().contains("--capacity"), "{err}");
+            let err = Sizing::from_flags(&backend, workers, concurrency)
+                .expect_err("concurrency without --fcgi is refused");
+            assert!(err.to_string().contains("--concurrency"), "{err}");
             assert!(err.to_string().contains("--fcgi"), "{err}");
         }
 

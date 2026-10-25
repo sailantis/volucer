@@ -167,7 +167,9 @@ impl BackendConfig {
             BackendConfig::SpawnCgi(cgi) if cgi.is_php_cgi() => {
                 "one slot per listening socket, `children` requests each"
             }
-            BackendConfig::SpawnCgi(_) => "one slot per listening socket, `capacity` requests each",
+            BackendConfig::SpawnCgi(_) => {
+                "one slot per listening socket, `concurrency` requests each"
+            }
             BackendConfig::Upstream(_) => "the origin's own loop",
         }
     }

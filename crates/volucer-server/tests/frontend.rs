@@ -128,9 +128,10 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
                 socket: None,
                 max_requests: None,
                 children: 0,
-                capacity: 0,
+                concurrency: 0,
                 working_dir: None,
                 env: Default::default(),
+                legacy_capacity: None,
             }),
         )]
         .into_iter()

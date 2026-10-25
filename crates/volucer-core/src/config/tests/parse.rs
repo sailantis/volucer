@@ -389,14 +389,14 @@ fn a_worker_socket_path_uses_the_same_suffix_rule_as_cgi() {
     );
 }
 
-/// `children` decides both the pool's capacity and `PHP_FCGI_CHILDREN`, and the two must
+/// `children` decides both the pool's concurrency and `PHP_FCGI_CHILDREN`, and the two must
 /// agree — which means `children = 1` must not ask php-cgi for "a master plus one child".
 /// The failure this pins was measured, not hypothetical: with the raw value written
 /// through, `children = 1` started **two** processes and served one pid, so an operator
-/// who wrote `1` got two PHP boots for one request's worth of capacity. The mapping lives
+/// who wrote `1` got two PHP boots for one request's worth of concurrency. The mapping lives
 /// in `fcgi_children` and this is the test that keeps it there.
 #[test]
-fn children_decides_process_count_and_capacity_together() {
+fn children_decides_process_count_and_concurrency_together() {
     fn config(children: u32) -> SpawnCgiConfig {
         SpawnCgiConfig {
             binary: Some(PathBuf::from("/usr/bin/php-cgi")),
@@ -406,15 +406,16 @@ fn children_decides_process_count_and_capacity_together() {
             base_port: 19_001,
             socket: None,
             children,
-            capacity: 0,
+            concurrency: 0,
             max_requests: None,
             working_dir: None,
             env: Default::default(),
+            legacy_capacity: None,
         }
     }
 
     // `0` and `1` are one process and one request: php-cgi spawns CHILDREN *in addition
-    // to itself*, so writing `1` would be two processes for no extra capacity.
+    // to itself*, so writing `1` would be two processes for no extra concurrency.
     for children in [0, 1] {
         let c = config(children);
         assert_eq!(
@@ -423,7 +424,7 @@ fn children_decides_process_count_and_capacity_together() {
             "children={children} must mean one process"
         );
         assert_eq!(
-            c.slot_capacity(),
+            c.slot_concurrency(),
             1,
             "children={children} must mean one request"
         );
@@ -434,7 +435,7 @@ fn children_decides_process_count_and_capacity_together() {
     for children in [2u32, 4, 16, 1024] {
         let c = config(children);
         assert_eq!(c.fcgi_children(), children);
-        assert_eq!(c.slot_capacity(), children as usize);
+        assert_eq!(c.slot_concurrency(), children as usize);
     }
 }
 
@@ -504,9 +505,9 @@ command = "gunicorn app.wsgi --bind {address}"
     );
 }
 
-/// A `command` deployment is accepted, and `capacity` — not `children` — is its width.
+/// A `command` deployment is accepted, and `concurrency` — not `children` — is its width.
 #[test]
-fn a_command_driver_uses_capacity_for_its_slot_width() {
+fn a_command_driver_uses_concurrency_for_its_slot_width() {
     let text = r#"
 [server]
 default_backend = "py"
@@ -515,7 +516,7 @@ http = "127.0.0.1:8080"
 kind = "spawn_cgi"
 command = "gunicorn app.wsgi --bind {address}"
 workers = 2
-capacity = 4
+concurrency = 4
 "#;
     let config = Config::from_toml(text).expect("parses");
     config.validate().expect("validates");
@@ -524,18 +525,82 @@ capacity = 4
     };
     assert_eq!(cgi.driver(), SpawnDriver::Command);
     assert!(!cgi.is_php_cgi());
-    assert_eq!(cgi.slot_capacity(), 4);
+    assert_eq!(cgi.slot_concurrency(), 4);
     // Not consulted, so a `command` deployment does not accidentally write
     // `PHP_FCGI_CHILDREN` into a Python process.
     assert_eq!(cgi.fcgi_children(), 0);
+    // The host total is the product, and it is what `check` prints: the command runs once per
+    // slot, so four Gunicorn workers behind two slots is eight processes.
+    let (processes, working) = cgi.process_count();
+    assert_eq!(processes, 8, "2 slots × 4 concurrency");
+    assert!(
+        working.contains("workers 2") && working.contains("concurrency 4"),
+        "the working must name both keys so the rule is readable: {working}"
+    );
 }
 
-/// `children` and `capacity` describe one number, so a file setting both is refused.
+/// `process_count` resolves `workers = 0` rather than multiplying by zero.
+///
+/// The bug this pins is the obvious one: `0` means "one per logical CPU", so a bare product
+/// would report zero processes for a deployment that is about to start as many as the machine
+/// has cores — the opposite of what an operator reads the line for.
+#[test]
+fn the_process_count_resolves_a_zero_worker_count() {
+    let text = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --bind {address}"
+concurrency = 3
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("validates");
+    let BackendConfig::SpawnCgi(cgi) = &config.backends["py"] else {
+        panic!("expected spawn_cgi");
+    };
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(1);
+    assert_eq!(cgi.workers, 0, "the default is one per logical CPU");
+    assert_eq!(cgi.slot_count(), cores);
+    assert_eq!(cgi.process_count().0, cores * 3);
+}
+
+/// The php-cgi total counts the master, because `children` are spawned *in addition to it*.
+///
+/// This is the other half of the same arithmetic, and the reason the two drivers cannot share
+/// one formula: `workers × children` would be four processes short in the example below, and
+/// `check` is where an operator sizes `pids_limit`.
+#[test]
+fn the_process_count_of_a_php_cgi_pool_counts_the_master() {
+    let text = r#"
+[server]
+default_backend = "cgi"
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+workers = 4
+children = 4
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("validates");
+    let BackendConfig::SpawnCgi(cgi) = &config.backends["cgi"] else {
+        panic!("expected spawn_cgi");
+    };
+    // Four slots of one master plus four children: four more than `workers × children`.
+    assert_eq!(cgi.process_count().0, 20);
+    assert_ne!(cgi.process_count().0, 4 * 4, "the master is a process too");
+}
+
+/// `children` and `concurrency` describe one number, so a file setting both is refused.
 ///
 /// The failure this prevents is silent: whichever the pool preferred would be the width, and
 /// the other key would be a setting an operator believes is in force.
 #[test]
-fn children_and_capacity_cannot_both_describe_one_slot() {
+fn children_and_concurrency_cannot_both_describe_one_slot() {
     let command_with_children = r#"
 [server]
 default_backend = "py"
@@ -551,33 +616,164 @@ children = 4
         .expect_err("must be refused")
         .to_string();
     assert!(
-        err.contains("children") && err.contains("capacity"),
+        err.contains("children") && err.contains("concurrency"),
         "{err}"
     );
 
-    let binary_with_capacity = r#"
+    let binary_with_concurrency = r#"
 [server]
 default_backend = "cgi"
 http = "127.0.0.1:8080"
 [backends.cgi]
 kind = "spawn_cgi"
 binary = "/usr/bin/php-cgi"
-capacity = 4
+concurrency = 4
 "#;
-    let err = Config::from_toml(binary_with_capacity)
+    let err = Config::from_toml(binary_with_concurrency)
         .expect("parses")
         .validate()
         .expect_err("must be refused")
         .to_string();
     assert!(
-        err.contains("capacity") && err.contains("children"),
+        err.contains("concurrency") && err.contains("children"),
         "{err}"
     );
 }
 
-/// A `binary` deployment written before `command` existed keeps its meaning exactly.
+/// The renamed key is refused **by name**, not as an unknown field.
 ///
-/// The compatibility property that makes this an optional key rather than a new variant: a
+/// `deny_unknown_fields` would report `unknown field 'capacity'`, which is true and explains
+/// nothing: the key did not disappear, it was renamed because `capacity` read like a total for
+/// the backend while the number is per slot. Both halves are asserted — that the message names
+/// `concurrency`, and that the new spelling is what makes the same file parse and validate.
+#[test]
+fn the_old_capacity_key_is_refused_with_the_new_name() {
+    let old = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --bind {address}"
+workers = 4
+capacity = 4
+"#;
+    let err = Config::from_toml(old)
+        .expect("the old key still parses, so the refusal can name it")
+        .validate()
+        .expect_err("must be refused")
+        .to_string();
+    assert!(
+        err.contains("capacity") && err.contains("concurrency"),
+        "the refusal must name both spellings: {err}"
+    );
+
+    let new = old.replace("capacity = 4", "concurrency = 4");
+    Config::from_toml(&new)
+        .expect("parses")
+        .validate()
+        .expect("the new spelling is what the same file should say");
+}
+
+/// `{workers}` is refused by name, because a slot command has no sibling count.
+///
+/// The alternative is what used to happen: the text reaches the program as an argument, its
+/// parser rejects it, and the operator reads an error naming neither volucer nor the key. The
+/// refusal has to say what to write instead, so both halves are asserted.
+#[test]
+fn the_workers_placeholder_is_refused_with_the_concurrency_one() {
+    let text = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --workers {workers} --bind {address}"
+workers = 4
+concurrency = 4
+"#;
+    let err = Config::from_toml(text)
+        .expect("parses")
+        .validate()
+        .expect_err("must be refused")
+        .to_string();
+    assert!(
+        err.contains("{workers}") && err.contains("{concurrency}"),
+        "the refusal must name both the mistake and the replacement: {err}"
+    );
+}
+
+/// A token carrying both placeholders is substituted in one pass, and the two are independent.
+///
+/// `--workers {concurrency} --bind {address}` is the recommended form, so the pairing is the case
+/// that has to keep working as the substitution grows. The address is arbitrary here because this
+/// is the pool's `command()` being exercised, not a socket.
+#[test]
+fn a_command_carries_both_placeholders() {
+    let text = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --workers {concurrency} --bind {address}"
+workers = 2
+concurrency = 4
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("validates");
+    let BackendConfig::SpawnCgi(cgi) = &config.backends["py"] else {
+        panic!("expected spawn_cgi");
+    };
+    assert_eq!(cgi.slot_concurrency(), 4, "the number the pool admits");
+    // The same substitution the pool performs, asserted on the configured string so the test
+    // fails on the file rather than on a constructed `SlotLaunch`.
+    let resolved = cgi
+        .command
+        .as_deref()
+        .expect("command is set")
+        .replace(
+            FCGI_CONCURRENCY_PLACEHOLDER,
+            &cgi.slot_concurrency().to_string(),
+        )
+        .replace(FCGI_ADDRESS_PLACEHOLDER, "127.0.0.1:19001");
+    assert_eq!(
+        resolved,
+        "gunicorn app.wsgi --workers 4 --bind 127.0.0.1:19001"
+    );
+}
+
+/// `concurrency = 0` means one, so `{concurrency}` must substitute `1` and never `0`.
+///
+/// A program handed `--workers 0` starts no workers while the pool still admits one request to
+/// it — a slot that accepts and never answers. The distinction only exists because the resolved
+/// value and the configured value differ here.
+#[test]
+fn a_zero_concurrency_substitutes_the_resolved_one() {
+    let text = r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "gunicorn app.wsgi --workers {concurrency} --bind {address}"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("validates");
+    let BackendConfig::SpawnCgi(cgi) = &config.backends["py"] else {
+        panic!("expected spawn_cgi");
+    };
+    assert_eq!(cgi.concurrency, 0, "unset");
+    assert_eq!(cgi.slot_concurrency(), 1, "resolved: zero means one");
+    assert_ne!(
+        cgi.slot_concurrency().to_string(),
+        cgi.concurrency.to_string(),
+        "the substituted value is not the configured one, which is the point"
+    );
+}
+
+/// A `binary` deployment written before `command` existed keeps its meaning exactly.
+////// The compatibility property that makes this an optional key rather than a new variant: a
 /// file that names only `binary` must be `PhpCgi`, with `children` as its width and no
 /// requirement for a placeholder it has never heard of.
 #[test]
@@ -598,7 +794,7 @@ children = 8
     };
     assert_eq!(cgi.driver(), SpawnDriver::PhpCgi);
     assert!(cgi.is_php_cgi());
-    assert_eq!(cgi.slot_capacity(), 8);
+    assert_eq!(cgi.slot_concurrency(), 8);
     assert_eq!(cgi.fcgi_children(), 8);
     assert!(cgi.working_dir.is_none(), "an absent key stays absent");
 }

@@ -1,45 +1,53 @@
 ![Volucer](docs/images/volucer-logo-text.svg)
 
-<h3 align="center">A cross-platform application server built to speed up PHP, Python and Ruby</h3>
+<h3 align="center">A cross-platform application server for PHP, Python, Ruby, and more</h3>
 
 <p align="center">
-Run PHP, Python and Ruby applications with one binary, using worker or FastCGI backends. Other languages can be served as well.
+Run persistent worker applications with Volucer's PHP, Python, and Ruby SDKs, serve FastCGI applications, or route HTTP traffic to an existing server.
 </p>
 
 ---
 
-**Volucer** runs cross-platform applications. It starts the application, supervises it, and serves it over HTTP or FastCGI.
-For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`.
-For Python and Ruby SDKs exist that speak the worker protocol.
-Volucer can also run a FastCGI server — `gunicorn`, `flup`, a Rack adapter, or any other FastCGI-compatible backend.
-Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
+**Volucer** is a single binary that runs and serves applications on Linux, macOS, and Windows. It provides the HTTP listener, host- and path-based routing, static-file serving, TLS with automatic ACME certificates, and process supervision.
 
-It runs on Linux, macOS, and Windows. Windows does not provide `php-fpm`; Volucer can supervise `php-cgi` there.
+Use a worker SDK to keep a PHP, Python, or Ruby application running between requests. For applications that use FastCGI, Volucer can connect to an existing server such as `php-fpm` or start and supervise a compatible backend such as `php-cgi`, `gunicorn`, or a Rack server. It can also route requests to an HTTP server written in another language, such as Go or Node.js.
 
-## Two ways to run a request
+## How requests are handled
 
-|                  | Boots the application | State between requests     | Good for                         |
-| ---------------- | --------------------- | -------------------------- | -------------------------------- |
-| **Worker mode**  | Once, at startup      | Managed by the application | PHP, Python or Ruby applications |
-| **FastCGI mode** | On every request      | Reset by the backend       | Any FastCGI application          |
+Volucer supports two application backends. Both use the same listener and dispatcher, and
+you can select a different backend for each route in `volucer.toml`.
 
-Both modes use the same dispatcher. Routes can use different backends, configured in `volucer.toml`.
+| Mode        | Application lifetime           | Request state                            | Use it for                                                     |
+| ----------- | ------------------------------ | ---------------------------------------- | -------------------------------------------------------------- |
+| **Worker**  | Starts once and stays resident | The application resets its request state | Persistent PHP, Python, or Ruby apps, or any custom worker     |
+| **FastCGI** | Managed by the FastCGI backend | Reset by the backend                     | Existing FastCGI apps and apps that need per-request isolation |
 
-**Worker mode is language-agnostic.** It starts a process, performs a protocol handshake, and keeps it resident — the command is yours to choose, so it can be `php worker.php`, `python worker.py` or `bundle exec worker.rb` or any other command that runs a long-lived process.
+**Worker mode is language-agnostic.** Volucer starts a command, completes a protocol
+handshake, and keeps the process available for requests. The command can be
+`php worker.php`, `python worker.py`, `bundle exec worker.rb`, or any other long-running
+program that implements the worker protocol.
 
-**FastCGI mode is per-request.** A FastCGI-speaking WSGI, Rack or Go server is served exactly as `php-fpm` is. The backend either attaches to a pool somebody else runs (`external`), or Volucer starts and supervises the processes itself (`spawn_cgi`) — with `php-cgi` as one driver and any other FastCGI server as another:
+**FastCGI works with more than PHP.** Volucer can connect to an existing FastCGI pool with
+the `external` backend, or start and supervise a FastCGI server with `spawn_cgi`. This
+works with `php-fpm`, `php-cgi`, and other FastCGI-compatible servers, including WSGI,
+Rack, and Go applications:
 
 ```toml
 [backends.py]
 kind = "spawn_cgi"
-command = "gunicorn myapp.wsgi --bind {address}"
-workers = 4
-capacity = 4
+command = "gunicorn myapp.wsgi --threads {concurrency} --bind {address}"
+workers = 4        # four slots: the command is started four times, four addresses
+concurrency = 4    # requests one slot answers at once, i.e. Gunicorn's --threads above
 ```
 
-For PHP, Python and Ruby, worker mode is usually the better of the two, because it boots the application once instead of per request.
+The `command` runs once per slot with a different `{address}`, so a concurrency flag inside it
+describes **one** address. `workers × concurrency` is what the host runs. `{concurrency}` is
+substituted with that number, so the flag and the key cannot drift.
 
-Worker mode avoids repeated application boot. An attached worker and a preforked `php-cgi` pool can also share memory pages: benchmarks measured 4.5x lower PSS than one process per slot at 16 PHP processes and 9.5x lower at 64. See the [benchmarks](docs/12-BENCHMARKS.md) for the method and results.
+An attached worker and a preforked `php-cgi` pool can share memory pages. In
+benchmarks, this reduced proportional set size (PSS) by 4.5x at 16 PHP processes and
+9.5x at 64, compared with one process per slot. See the [benchmark results](docs/12-BENCHMARKS.md)
+for the method and measurements.
 
 ## Install
 
@@ -49,11 +57,10 @@ Worker mode avoids repeated application boot. An attached worker and a preforked
 curl -fsSL https://github.com/sailantis/volucer/releases/latest/download/install.sh | sh
 ```
 
-The binary lands in `~/.local/bin`, which the installer adds to your `PATH` if it is not
-already there. It writes to the file your shell actually reads — `~/.bashrc` (or `~/.profile`
-when you have none), `~/.zshrc`, or `~/.config/fish/config.fish` — and prints the file and the
-exact line it added, so you can take it back out. Set `VOLUCER_MODIFY_PATH=0` to install
-without touching a dotfile.
+The installer places the binary in `~/.local/bin` and adds that directory to your `PATH`
+if needed. It updates the startup file for your shell (`~/.bashrc`, `~/.profile`,
+`~/.zshrc`, or `~/.config/fish/config.fish`) and prints the exact change it made. Set
+`VOLUCER_MODIFY_PATH=0` to install without editing a shell startup file.
 
 ### Windows
 
@@ -61,17 +68,23 @@ without touching a dotfile.
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/sailantis/volucer/releases/latest/download/install.ps1 | iex"
 ```
 
-The binary lands in `%LOCALAPPDATA%\volucer\bin`, which the installer adds to your user `PATH`. Open a new shell afterwards for that to take effect. Pass `-ModifyPath 0` (or set `VOLUCER_MODIFY_PATH=0`) to leave the environment alone.
+The installer places the binary in `%LOCALAPPDATA%\volucer\bin` and adds it to your user
+`PATH`. Open a new shell for the change to take effect. Pass `-ModifyPath 0` (or set
+`VOLUCER_MODIFY_PATH=0`) to leave `PATH` unchanged.
 
 ### In a container
 
-`packaging/docker/Dockerfile` builds two images from one crate — a glibc image and a `scratch`-based musl image:
+`packaging/docker/Dockerfile` builds either a glibc-based image or a `scratch`-based musl
+image:
 
 ```console
 docker build --target musl -t volucer .
 ```
 
-The image declares a `HEALTHCHECK` that runs `volucer health`, which reads the probe address from `[status]` — the `scratch` target has no shell and no `curl`, so the check has to be the binary itself. See [Operations](docs/11-OPERATIONS.md#docker) for the `docker run` and Compose invocations, and for which of `/health` and `/ready` belongs in which place.
+The image uses `volucer health` for its Docker `HEALTHCHECK`. The command reads its probe
+address from `[status]`, so it also works in the `scratch` image, which has no shell or
+`curl`. See [Docker operations](docs/11-OPERATIONS.md#docker) for `docker run`, Compose,
+and guidance on when to use `/health` or `/ready`.
 
 ### Build from source
 
@@ -79,8 +92,10 @@ The image declares a `HEALTHCHECK` that runs `volucer health`, which reads the p
 cargo install --path crates/volucer
 ```
 
-Or take a prebuilt archive from the [releases page](https://github.com/sailantis/volucer/releases).
-Then write a `volucer.toml` and serve:
+You can also download a prebuilt archive from the
+[releases page](https://github.com/sailantis/volucer/releases).
+
+Create a `volucer.toml` to configure the listener, document root, and worker:
 
 ```toml
 [server]
@@ -100,12 +115,13 @@ volucer check      # validate the configuration before you start
 volucer serve
 ```
 
-`volucer check` reports configured listeners and backends, discovered PHP binaries, and
-configuration warnings.
+Before serving requests, run `volucer check` to validate the configuration. It reports
+the configured listeners and backends, discovered PHP binaries, and any configuration
+warnings.
 
-**A file is not required.** The same deployment can be stated on the command line, which is what
-a container `CMD` or a systemd `ExecStart` wants — `-o` takes any key in `dot.notation`, and
-`--listen` is shorthand for `server.http`:
+You can provide the same configuration on the command line instead of using a file. This
+is useful for a container `CMD` or systemd `ExecStart`. Use `-o` with any
+dot-notated configuration key; `--listen` is shorthand for `server.http`:
 
 ```sh
 volucer serve --listen 0.0.0.0:8080 \
@@ -116,17 +132,18 @@ volucer serve --listen 0.0.0.0:8080 \
     -o backends.app.workers=8
 ```
 
-Unknown keys are refused and the value is read as a TOML literal, so the strictness and the
-defaults are the file's own. See [Configuration](docs/01-CONFIGURATION.md#the-command-line-as-a-source)
-for the two limits (arrays of tables and maps stay file-only) and for how relative paths resolve
-when there is no file.
+Unknown keys are rejected, and values use TOML literal syntax. Command-line configuration
+uses the same validation and defaults as a configuration file, with two exceptions: arrays
+of tables and maps can only be set in a file. The
+[configuration guide](docs/01-CONFIGURATION.md#the-command-line-as-a-source) also explains
+how relative paths are resolved when no file is present.
 
 [**Getting started →**](docs/00-GETTING-STARTED.md)
 
 ## Documentation
 
-The full guide is in [`docs/`](docs/README.md). Start with
-[Getting Started](docs/00-GETTING-STARTED.md), then:
+The [documentation guide](docs/README.md) links to the full reference. Start with
+[Getting Started](docs/00-GETTING-STARTED.md), or browse the topics below:
 
 - [Backends](docs/02-BACKENDS.md) — the five backend types and when to use them
 - [Configuration](docs/01-CONFIGURATION.md) — every key, with its default
@@ -141,10 +158,10 @@ The full guide is in [`docs/`](docs/README.md). Start with
 - [Operations](docs/11-OPERATIONS.md) — reloads, containers, systemd, release process
 - [Benchmarks](docs/12-BENCHMARKS.md) — measured, with the method and the raw rows
 
-## Write a worker in any language
+## Worker SDKs
 
-The worker protocol is specified, and the implementations use the same wire format. If your
-language is not listed, use the [specification](docs/worker-protocol.md) to implement a worker.
+The worker protocol is language-independent. Use one of the SDKs below, or implement the
+[protocol](docs/worker-protocol.md) for another language.
 
 | Language | Package                                                                           | Install                                     |
 | -------- | --------------------------------------------------------------------------------- | ------------------------------------------- |
@@ -152,9 +169,10 @@ language is not listed, use the [specification](docs/worker-protocol.md) to impl
 | Python   | [`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk) | `pip install volucer-worker`                |
 | Ruby     | [`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk)     | `gem install volucer-worker`                |
 
-All three are transports, not frameworks: no router, no container, no middleware pipeline. The
-SDK is a codec and a channel, and adapting it to whatever your application already speaks is a
-few lines. A plain WSGI or Rack application needs no adapter at all.
+These SDKs provide the worker transport, not an application framework: they do not impose
+a router, dependency-injection container, or middleware pipeline. Connect your application
+to the worker channel with a small adapter; WSGI and Rack applications can use the
+provided handlers directly.
 
 ### PHP
 
@@ -180,9 +198,8 @@ from myapp import application
 Worker.connect().run(wsgi.call(application))
 ```
 
-Python 3.10 or newer, and nothing to install beyond the standard library. A worker SDK loads
-before an application's own environment is known to work, so a dependency here is a failure mode
-unrelated to the protocol.
+Requires Python 3.10 or newer. The SDK uses only the standard library, so the worker
+protocol does not add runtime dependencies to your application.
 
 ### Ruby
 
@@ -193,24 +210,24 @@ require 'my_app'
 Volucer::Worker.connect.run(&Volucer::Rack.handler(MyApp.new))
 ```
 
-Ruby 3.1 or newer, and no runtime dependencies beyond the standard library, for the same reason.
+Requires Ruby 3.1 or newer and has no runtime dependencies beyond the standard library.
 
-Each SDK calls `connect()`, which honours `VOLUCER_WORKER_SOCKET` and falls back to stdio. That
-is the call a worker file should make; `create()` is the explicit-streams form, used when you
-are binding streams yourself — including when the connection was opened by somebody else, which
-is what the `attach` backend needs.
+Each SDK's `connect()` method uses `VOLUCER_WORKER_SOCKET` when set and otherwise connects
+over standard input and output. Use it in a worker entry point. The `create()` method
+accepts explicit streams for cases where your application manages the connection itself,
+including the `attach` backend.
 
-**For a Django, Flask or Rails application, the `upstream` backend is the shorter path.** It
-supervises gunicorn or Puma over HTTP and needs no SDK at all. The `spawn_cgi` backend is the
-other one: it runs any FastCGI server, so a `flup` or a Rack adapter works with no SDK either.
-Use the SDK when the worker channel itself is what you want: the `kv`, `lock`, `jobs` and
-`metrics` services, recycling on RSS, and no HTTP framing on the hot path.
+For Django, Flask, or Rails, the `upstream` backend is often simpler: it can supervise
+Gunicorn or Puma over HTTP without a Volucer SDK. The `spawn_cgi` backend can likewise run
+a FastCGI server such as `flup` or a Rack adapter. Choose a worker SDK when you want the
+worker channel and its built-in `kv`, `lock`, `jobs`, and `metrics` services, worker
+recycling based on memory use, or to avoid HTTP framing between Volucer and the application.
 
 Framework bridges build on the PHP SDK — see [SDKs and Frameworks](docs/10-SDKS-AND-FRAMEWORKS.md).
 
 ## Contributing
 
-See the documentation under [`docs/`](docs/README.md) for design and implementation details.
+See the [documentation](docs/README.md) for design and implementation details.
 
 ```sh
 cargo test            # unit and integration tests, including live php-cgi

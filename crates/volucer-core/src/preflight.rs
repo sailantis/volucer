@@ -577,6 +577,26 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                                  \"gunicorn app.wsgi --bind {address}\"",
                             ));
                         }
+                        // `{concurrency}` with nothing to resolve it to is the one silent
+                        // failure the placeholder can cause: the command still binds, the pool
+                        // still connects, and the program is told to start one worker while the
+                        // pool holds two permits — so the second request waits in the socket
+                        // backlog. `Config::validate` cannot catch it because it is legal, so
+                        // it is a warning that spells out the number the program will get.
+                        if command.contains(crate::config::FCGI_CONCURRENCY_PLACEHOLDER)
+                            && cgi.concurrency == 0
+                        {
+                            warnings.push(Warning::with_hint(
+                                format!(
+                                    "backends.{name}: the command uses {{concurrency}} but no \
+                                     `concurrency` is set, so the program is told to start 1 worker \
+                                     and this slot admits 1 request at a time"
+                                ),
+                                "set `concurrency` to the worker count the program should start, \
+                                 and write {concurrency} where that number belongs in the \
+                                 command — the two then cannot disagree",
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -831,6 +851,68 @@ command = "{command}"
 "#
         );
         Config::from_toml(&text).expect("config parses")
+    }
+
+    /// `{concurrency}` with no `concurrency` key resolves to one, and that is worth saying.
+    ///
+    /// It is the one silent failure the placeholder can cause: the command binds, the pool
+    /// connects, and a program told `--workers 1` sits behind a slot the operator believes is
+    /// wider. `Config::validate` cannot refuse it because it is legal, so `check` says the number
+    /// out loud — and says nothing when the two agree, because a warning about a correct file is
+    /// the one that trains an operator to ignore the rest.
+    #[test]
+    fn a_concurrency_placeholder_with_no_key_is_reported() {
+        let exe = std::env::current_exe().expect("the test binary path");
+        let text = format!(
+            r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "{} --workers {{concurrency}} --bind {{address}}"
+"#,
+            exe.display().to_string().replace('\\', "\\\\")
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        let fixture = Fixture::bare("concurrency-placeholder");
+        let warnings = inspect(&config, fixture.path());
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.message.contains("{concurrency}")
+                    && warning.message.contains("no `concurrency` is set")
+            }),
+            "expected the placeholder warning, got {warnings:#?}"
+        );
+        drop(fixture);
+    }
+
+    /// The same file with `concurrency` set is quiet about the placeholder.
+    #[test]
+    fn a_resolved_concurrency_placeholder_is_not_reported() {
+        let exe = std::env::current_exe().expect("the test binary path");
+        let text = format!(
+            r#"
+[server]
+default_backend = "py"
+http = "127.0.0.1:8080"
+[backends.py]
+kind = "spawn_cgi"
+command = "{} --workers {{concurrency}} --bind {{address}}"
+concurrency = 4
+"#,
+            exe.display().to_string().replace('\\', "\\\\")
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        let fixture = Fixture::bare("concurrency-resolved");
+        let warnings = inspect(&config, fixture.path());
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.message.contains("{concurrency}")),
+            "a resolved placeholder must not be warned about: {warnings:#?}"
+        );
+        drop(fixture);
     }
 
     /// A directory that is removed when the test ends.

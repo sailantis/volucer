@@ -294,6 +294,43 @@ pub const FCGI_ADDRESS_ENV: &str = "VOLUCER_FCGI_ADDRESS";
 /// The placeholder a `spawn_cgi` `command` uses for the address its slot must bind.
 pub const FCGI_ADDRESS_PLACEHOLDER: &str = "{address}";
 
+/// The placeholder a `spawn_cgi` `command` uses for the number of requests its slot may serve at
+/// once — the resolved `concurrency`, which is the same number the pool hands that address as
+/// permits.
+///
+/// **Here because the same number otherwise has to be written twice.** A program that forks its
+/// own workers is told how many by the same `command` string that is told the address, so
+/// `command = "gunicorn app.wsgi --workers 4 --bind {address}"` beside `concurrency = 4` states
+/// one fact in two places with nothing checking that they agree. Raising `concurrency` to `8`
+/// and leaving the `--workers 4` behind is a pool that holds eight connections against a program
+/// with four workers, where the surplus waits in the socket backlog and nothing counts it. With
+/// `--workers {concurrency}` there is one statement and nothing to drift.
+///
+/// **Substituted with the resolved value, not the configured one**, because `concurrency = 0`
+/// means one: a program handed `0` where it expects a worker count is a program that starts
+/// nothing, and the pool would be admitting one request to it. The substituted number is
+/// [`crate::config::SpawnCgiConfig::slot_concurrency`], so it is by construction the number of
+/// permits the pool holds for that address.
+///
+/// **`{workers}` deliberately has no counterpart.** A slot's command is started once per slot
+/// with its own address, so "how many siblings do you have" is a fact about a different layer,
+/// and a program told it would be invited to divide work or ports the pool has already divided.
+/// It is refused by name rather than passed through as a literal, because a command line carrying
+/// the text `{workers}` fails inside the program with a message that names neither volucer nor
+/// the key.
+pub const FCGI_CONCURRENCY_PLACEHOLDER: &str = "{concurrency}";
+
+/// The placeholder that deliberately does **not** exist, named so it can be refused with an
+/// explanation instead of reaching the program.
+///
+/// A slot's command is started once per slot with its own address, so the number of slots is not
+/// a fact about that process — it is a fact about how many of it volucer starts. A program told
+/// `{workers}` would be invited to divide work, ports or a shared resource by a number the pool
+/// has already divided, which is the failure this placeholder's absence prevents. Left to the
+/// program, the text arrives as an argument, its argument parser rejects it (or reads it as a
+/// name), and the operator sees an error that names neither volucer nor `workers`.
+pub const WORKERS_PLACEHOLDER: &str = "{workers}";
+
 /// The call namespaces a worker backend may be granted, and the fixed half of the allow-list
 /// `WorkerConfig::services` is checked against.
 ///

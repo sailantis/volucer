@@ -9,16 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **`--root`, `--worker`, `--fcgi` and `--capacity` in the same quick-start shape.** `--root`
+- **`--root`, `--worker`, `--fcgi` and `--concurrency` in the same quick-start shape.** `--root`
   aliases `--document-root`, and `--php-cgi`, `--worker` and `--fcgi` each declare a default
   backend in one flag: `--php-cgi [PATH]` a `spawn_cgi` pool driven by `php-cgi`, `--worker
   COMMAND` a resident worker, and `--fcgi COMMAND` any FastCGI server with `{address}`. `--workers
-  <N>` sizes whichever was chosen and requires one of them; `--capacity <N>` is how many requests
-  one `--fcgi` slot serves at once, and is refused for the other two. Two backend flags at once is
-  a usage error. `--fcgi` also implies "only real files", because a WSGI or Rack program is not
-  `index.php`. `volucer check` accepts the same flags, and its preflight now takes the resolved
-  front controller rather than reading the table alone, so neither command warns about an
-  `index.php` the deployment is not using. Nothing is detected without a flag.
+  <N>` sizes whichever was chosen and requires one of them; `--concurrency <N>` is how many
+  requests one `--fcgi` slot serves at once, and is refused for the other two. Two backend flags
+  at once is a usage error. `--fcgi` also implies "only real files", because a WSGI or Rack
+  program is not `index.php`. `volucer check` accepts the same flags, and its preflight now takes
+  the resolved front controller rather than reading the table alone, so neither command warns
+  about an `index.php` the deployment is not using. Nothing is detected without a flag.
 - **A bare `spawn_cgi.binary` is resolved like a `command` program.** A value containing no path
   separator is looked up in the PHP search directories — `PATH` first, then the conventional
   install locations, with `PATHEXT` on Windows — so `binary = "php-cgi"` and
@@ -56,7 +56,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and failing probes.
 - **`.dockerignore`** excludes `.git/` and `target/` from Docker build contexts.
 - **Generic `spawn_cgi` commands** support an address placeholder or `VOLUCER_FCGI_ADDRESS`,
-  `capacity`, and TCP. They are mutually exclusive with `binary`; invalid commands fail at
+  `concurrency`, and TCP. They are mutually exclusive with `binary`; invalid commands fail at
   startup. Process supervision and recycling work with either driver.
 - **`spawn_cgi.working_dir`** sets the working directory for non-PHP applications.
 - **Changelog** documents releases; the operations guide links to it.
@@ -75,9 +75,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   symlink-safe; `VOLUCER_MODIFY_PATH=0` opts out.
 - **`install.ps1 -ModifyPath 0`** (or `VOLUCER_MODIFY_PATH=0`) opts out of PATH changes. Its
   self-tests verify default behavior and the opt-out without leaving stale entries.
+- **`spawn_cgi` commands can use `{concurrency}`.** A `command` is started once per slot with its
+  own `{address}`, so the worker count its program is told to fork belongs to one address — which
+  is exactly what `concurrency` means. Substituting it removes the second copy of that number:
+  `command = "gunicorn app.wsgi --workers {concurrency} --bind {address}"` beside
+  `concurrency = 4` cannot drift, where `--workers 4` beside `concurrency = 4` is two statements
+  with nothing checking that they agree — the case where raising `concurrency` leaves the surplus
+  waiting in the socket backlog, uncounted. The substitution is the **resolved** value, so
+  `concurrency = 0` gives the program `1` rather than a `0` it would read as "start no workers";
+  `volucer check` prints the resulting command line as `command resolves:`. `{workers}` is
+  deliberately not a placeholder and is refused by name, because a slot is started once per slot
+  with its own address and so has no sibling count to be told. Any other brace is left as written,
+  so `--define={a:1}` still works.
 
 ### Changed
 
+- **`volucer check` prints a `spawn_cgi` backend's process total.** `processes: 16 (workers 4 ×
+  concurrency 4)` for a `command` driver, `processes: 20 (workers 4 × (children 4+1))` for
+  `php-cgi`, with `workers = 0` resolved to the core count first. The multiplication used to live
+  only in prose, which made a `concurrency` misread as a backend-wide total invisible until the
+  host ran out of memory. The line replaces the `php-cgi`-only `prefork:` line, which stated the
+  same arithmetic for one driver.
+- **`spawn_cgi`'s `capacity` key is now `concurrency`.** The old name read like a total for the
+  backend, while the number is per slot: a `command` slot's width. The backend's total is
+  `workers × concurrency`. The CLI flag follows (`--concurrency`), with `--capacity` kept as an
+  alias. An existing file that still sets `capacity` fails at startup naming the key rather than
+  being silently ignored.
 - **The redirect is decided by the site, not by the listener.** `ListenerSettings::redirect_to_https`
   is gone: a listener now supplies only the port a redirect should name, and *whether* a request is
   redirected comes from the resolved site. A cleartext listener that no site redirects on no longer

@@ -177,6 +177,19 @@ the configuration is *internally consistent*, and a warning is a statement that 
 describe the deployment you meant. Exit code `0` with three warnings is a deployment that
 will start and misbehave.
 
+For a `spawn_cgi` backend, `check` also prints **`processes:`**, which is the multiplication
+the file makes you do yourself: `workers × concurrency` for a `command` driver, or
+`workers × (children + 1)` for `php-cgi`, whose children are spawned in addition to the
+master. A `workers = 0` (one per logical CPU) is resolved before the multiplication, so the
+line states what this host will actually run — which is the number to size memory,
+file descriptors or a container's `pids_limit` against.
+
+A `command` that uses `{concurrency}` also gets a **`command resolves:`** line, because the
+substitution is the one thing an operator cannot check by reading the file: `concurrency = 0`
+means one, so the program is told `1` rather than the `0` the key appears to say. `{address}` is
+left as written there — the pool decides one per slot, and printing an invented slot number would
+show an address `serve` never binds.
+
 `volucer check` needs a configuration file to check. If you do not have one yet, write
 the minimum below first.
 
@@ -255,7 +268,7 @@ Your application is now on <http://127.0.0.1:8080>.
 | `--worker <COMMAND>` | Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`. |
 | `--fcgi <COMMAND>` | Serve any FastCGI server as the default backend, e.g. `--fcgi "python fcgi_app.py --bind {address}"`. |
 | `--workers <N>` | How many slots the chosen backend starts. Requires one of the three flags above. |
-| `--capacity <N>` | How many requests one `--fcgi` slot serves at once. `--fcgi` only. |
+| `--concurrency <N>` | How many requests one `--fcgi` slot serves at once. `--fcgi` only. `--capacity` is the old spelling and still parses. |
 | `--max-connections <N>` | Maximum concurrent client connections. Defaults to `512`. |
 
 A flag always wins over the file. That is deliberate: a systemd unit or a container image
@@ -320,19 +333,21 @@ my-project/
 
 ```console
 volucer serve --listen 127.0.0.1:8080 --root public \
-    --fcgi "python fcgi_app.py --bind {address}" --workers=2 --capacity=4
+    --fcgi "python fcgi_app.py --bind {address}" --workers=2 --concurrency=4
 ```
 
 `{address}` is required: the pool owns one address per slot, so a program that binds one of its
 own is never reached, and `check` warns about it.
 
-`--workers` and `--capacity` are two different numbers, and the split is the point. `--workers` is
-how many **processes** the pool starts (`1` by default here), while `--capacity` is how many
-connections the pool keeps open to **each one** — so set it to the number of children your
-FastCGI server forks for itself, `gunicorn -w 4` or Puma's `threads 5`, and the pool can reach
-every child instead of queueing behind one. `--capacity` without `--fcgi` is an error, because a
-worker answers one request at a time by construction and a `php-cgi` pool spells the same number
-`children`.
+`--workers` and `--concurrency` are two different numbers, and the split is the point.
+`--workers` is how many **slots** the pool starts (`1` by default here), while
+`--concurrency` is how many requests **one slot** answers at once. Since the `--fcgi` command
+runs once per slot with its own `{address}`, `--concurrency` is the app server's own worker
+count for that one address: `--fcgi "gunicorn app.wsgi --workers 4 --bind {address}"` wants
+`--concurrency 4`, and `--workers 2` then runs two of those. `--concurrency` without `--fcgi` is
+an error, because a worker answers one request at a time by construction and a `php-cgi` pool
+spells the same number `children`. The flag was called `--capacity` before; the old spelling
+still parses.
 
 `--fcgi` also means **"serve only real files"** unless you say otherwise, because a WSGI or Rack
 program is not `index.php`: leaving the PHP-shaped default in place would answer 404 for every

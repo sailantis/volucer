@@ -271,9 +271,9 @@ if volucer dies.
 ```toml
 [backends.py]
 kind = "spawn_cgi"
-command = "gunicorn myapp.wsgi --bind {address}"
+command = "gunicorn myapp.wsgi --workers {concurrency} --bind {address}"
 workers = 4
-capacity = 4          # the app server's own worker count
+concurrency = 4        # substituted above: one slot is one address, and it serves four
 working_dir = "/srv/app"
 env = { APP_ENV = "production" }
 ```
@@ -292,11 +292,36 @@ waited for, health-checked by connecting, restarted if it exits, recycled on `ma
 and killed as a process group. Its stdout and stderr are drained into the log rather than
 discarded, which is where the traceback that explains a 502 actually is.
 
-**`capacity` instead of `children`.** `children` is `php-cgi`'s `PHP_FCGI_CHILDREN` — a
+**`concurrency` instead of `children`.** `children` is `php-cgi`'s `PHP_FCGI_CHILDREN` — a
 prefork count volucer dictates. An application server that forks its own children has
-already decided how many it runs, so `capacity` is how the pool learns that number: it is
-how many connections are held open to one slot, and setting it below what the server can
-answer only costs throughput. One of the two keys, never both.
+already decided how many it runs, so `concurrency` is how the pool learns that number: it is
+how many requests are in flight against one slot, and setting it below what the server can
+answer only costs throughput. One of the two keys, never both. It is **per slot**, not for the
+backend: the backend's ceiling is `workers × concurrency`, and writing that total here would
+hold every one of those connections open to a single address.
+
+**The command runs once per slot, with a different `{address}`.** Whatever that command is told
+to fork belongs to one address, and that is the number `concurrency` states — so Gunicorn's
+`--workers 4` is `concurrency = 4`, and `workers = 4` beside it starts four Gunicorn instances.
+Sixteen processes, four per address. A server that threads as well multiplies the two.
+`volucer check` prints the product as a `processes:` line, which is the number to size the
+machine against.
+
+**`{concurrency}` is that number, substituted, so it is written once.** The command is the second
+place a worker count would otherwise appear, and the two copies have nothing keeping them in
+step: raise `concurrency` and leave `--workers 4` behind and the pool holds more connections
+than the program has workers, where the surplus waits in the socket backlog and nothing counts
+it. `--workers {concurrency}` cannot drift. It is replaced with the **resolved** value, so
+`concurrency = 0` — the default, meaning one — gives the program `1` rather than a `0` it would
+read as "start no workers", and `volucer check` prints the resulting command line.
+
+`{workers}` is not a placeholder and is refused by name: a slot is started once per slot with its
+own address, so it has no sibling count to be told, and a program given one would be invited to
+divide work the pool has already divided. Any other brace is left as written, so an argument like
+`--define={a:1}` still works.
+
+Writing the number out instead stays legal — `--workers 4` beside `concurrency = 4` starts the
+same sixteen processes — it just leaves two copies to keep in step.
 
 The `binary`/`command` distinction matters in three places beyond the argv, and all three
 are properties of `php-cgi` rather than of the pool:
@@ -304,7 +329,7 @@ are properties of `php-cgi` rather than of the pool:
 | | `binary` | `command` |
 | --- | --- | --- |
 | how the address is given | `-b <address>` | `{address}` and `VOLUCER_FCGI_ADDRESS` |
-| concurrency inside a slot | `children` → `PHP_FCGI_CHILDREN` | `capacity` |
+| concurrency inside a slot | `children` → `PHP_FCGI_CHILDREN` | `concurrency` |
 | a unix socket on Windows | a named pipe | TCP only |
 
 A `command` that exits is reported once, not retried on the next port: the retry exists

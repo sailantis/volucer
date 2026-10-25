@@ -168,7 +168,7 @@ impl Config {
             }
             BackendConfig::SpawnCgi(c) => {
                 // One call, because the rules are about this table alone: which driver is in
-                // use, whether `children`/`capacity` describe the same number twice, and
+                // use, whether `children`/`concurrency` describe the same number twice, and
                 // whether a `socket` is a shape the driver can bind. Kept on the type rather
                 // than here so `spawn_cgi`'s rules are not split across two files.
                 c.validate(name).map_err(Error::Config)?;

@@ -18,7 +18,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
     SpawnCgiConfig {
         binary: Some(binary.to_path_buf()),
         command: None,
-        capacity: 0,
+        concurrency: 0,
         working_dir: None,
         workers,
         bind_host: "127.0.0.1".to_string(),
@@ -27,6 +27,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
         max_requests: None,
         children: 0,
         env: Default::default(),
+        legacy_capacity: None,
     }
 }
 
@@ -160,7 +161,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
     let config = SpawnCgiConfig {
         binary: Some(binary.clone()),
         command: None,
-        capacity: 0,
+        concurrency: 0,
         working_dir: None,
         workers: 2,
         bind_host: "127.0.0.1".to_string(),
@@ -169,6 +170,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
         max_requests: None,
         children: 0,
         env: Default::default(),
+        legacy_capacity: None,
     };
 
     let mut pool = CgiPool::start("unix-test", &config).expect("a unix-socket pool starts");
@@ -234,7 +236,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
     let config = SpawnCgiConfig {
         binary: Some(binary.clone()),
         command: None,
-        capacity: 0,
+        concurrency: 0,
         working_dir: None,
         workers: 2,
         bind_host: "127.0.0.1".to_string(),
@@ -243,6 +245,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
         max_requests: None,
         children: 0,
         env: Default::default(),
+        legacy_capacity: None,
     };
 
     let mut pool = CgiPool::start("pipe-test", &config).expect("a pipe pool starts");
@@ -289,7 +292,7 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
     let config = SpawnCgiConfig {
         binary: Some(binary.clone()),
         command: None,
-        capacity: 0,
+        concurrency: 0,
         working_dir: None,
         workers: 1,
         bind_host: "127.0.0.1".to_string(),
@@ -298,6 +301,7 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
         max_requests: None,
         children: 0,
         env: Default::default(),
+        legacy_capacity: None,
     };
 
     let mut pool = CgiPool::start("unix-restart", &config).expect("pool starts");
@@ -692,9 +696,10 @@ fn a_command_driver_serves_through_the_address_it_was_given() {
         children: 0,
         // One request per slot: a bare `php-cgi -b` does not prefork, so this is the honest
         // number for what a `command` slot can answer at once.
-        capacity: 1,
+        concurrency: 1,
         working_dir: None,
         env: Default::default(),
+        legacy_capacity: None,
     };
 
     let mut pool = CgiPool::start("command-test", &config).expect("a command pool starts");
@@ -743,9 +748,10 @@ fn a_command_with_no_address_placeholder_is_a_misconfiguration() {
         socket: None,
         max_requests: None,
         children: 0,
-        capacity: 0,
+        concurrency: 0,
         working_dir: None,
         env: Default::default(),
+        legacy_capacity: None,
     };
 
     let err = CgiPool::start("no-placeholder", &config).expect_err("must be refused");
@@ -784,9 +790,10 @@ fn a_command_that_exits_is_not_retried_across_ports() {
         socket: None,
         max_requests: None,
         children: 0,
-        capacity: 0,
+        concurrency: 0,
         working_dir: None,
         env: Default::default(),
+        legacy_capacity: None,
     };
 
     let started = std::time::Instant::now();

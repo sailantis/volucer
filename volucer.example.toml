@@ -741,7 +741,7 @@ base_port = 19001
 #
 # It was 0 for a long time because a slot that hides children cannot be counted,
 # recycled or killed as a unit. What changed is that the pool now declares the slot's
-# capacity and its address, so the children are no longer hidden from it. What has
+# concurrency and its address, so the children are no longer hidden from it. What has
 # not changed is that php-cgi cannot multiplex requests on one connection, so this is
 # the only way to get more than one concurrent request out of a slot.
 #
@@ -776,10 +776,22 @@ base_port = 19001
 # command using neither is refused at startup: it would bind somewhere the pool
 # cannot reach, and every request would be a 502 after the startup timeout.
 #
-# `capacity`, not `children`, is how many requests one slot answers at once: an
-# application server that forks its own children has already decided that number,
-# and the pool only needs to know it so it does not hold more connections open
-# than there are children to accept them. Setting both keys is refused.
+# `concurrency`, not `children`, is how many requests one slot answers at once --
+# per slot, not for the backend: the backend's ceiling is `workers` x `concurrency`.
+#
+# The command runs once per slot, each time with a different {address}, so whatever
+# the command is told to fork belongs to ONE address -- and that is this number.
+# `gunicorn --workers 4 ... {address}` is `concurrency = 4`; `workers = 4` beside it
+# starts that command four times: sixteen processes, four per address. A server that
+# also threads multiplies the two. Setting both keys is refused.
+#
+# `{concurrency}` is that number, substituted, so it is written once instead of
+# twice: `command = "gunicorn myapp.wsgi --workers {concurrency} --bind {address}"`
+# cannot drift from the key, where `--workers 4` beside `concurrency = 4` is two
+# copies to keep in step. It is replaced with the resolved value, so `concurrency`
+# omitted (0, meaning one) tells the program `1` and not a zero it would read as
+# "start no workers". `{workers}` is NOT a placeholder -- a slot has no sibling
+# count to be told -- and is refused by name.
 #
 # `working_dir` matters here in a way it does not for php-cgi: a Python
 # application finds its modules relative to the working directory, and a Ruby one
@@ -787,9 +799,9 @@ base_port = 19001
 # ---------------------------------------------------------------------------
 # [backends.py]
 # kind = "spawn_cgi"
-# command = "gunicorn myapp.wsgi --bind {address}"
+# command = "gunicorn myapp.wsgi --workers {concurrency} --bind {address}"
 # workers = 4
-# capacity = 4
+# concurrency = 4
 # working_dir = "/srv/app"
 # env = { APP_ENV = "production" }
 #
@@ -809,10 +821,22 @@ base_port = 19001
 # command using neither is refused at startup: it would bind somewhere the pool
 # cannot reach, and every request would be a 502 after the startup timeout.
 #
-# `capacity`, not `children`, is how many requests one slot answers at once: an
-# application server that forks its own children has already decided that number,
-# and the pool only needs to know it so it does not hold more connections open
-# than there are children to accept them. Setting both keys is refused.
+# `concurrency`, not `children`, is how many requests one slot answers at once --
+# per slot, not for the backend: the backend's ceiling is `workers` x `concurrency`.
+#
+# The command runs once per slot, each time with a different {address}, so whatever
+# the command is told to fork belongs to ONE address -- and that is this number.
+# `gunicorn --workers 4 ... {address}` is `concurrency = 4`; `workers = 4` beside it
+# starts that command four times: sixteen processes, four per address. A server that
+# also threads multiplies the two. Setting both keys is refused.
+#
+# `{concurrency}` is that number, substituted, so it is written once instead of
+# twice: `command = "gunicorn myapp.wsgi --workers {concurrency} --bind {address}"`
+# cannot drift from the key, where `--workers 4` beside `concurrency = 4` is two
+# copies to keep in step. It is replaced with the resolved value, so `concurrency`
+# omitted (0, meaning one) tells the program `1` and not a zero it would read as
+# "start no workers". `{workers}` is NOT a placeholder -- a slot has no sibling
+# count to be told -- and is refused by name.
 #
 # `working_dir` matters here in a way it does not for php-cgi: a Python
 # application finds its modules relative to the working directory, and a Ruby one
@@ -820,9 +844,9 @@ base_port = 19001
 # ---------------------------------------------------------------------------
 # [backends.py]
 # kind = "spawn_cgi"
-# command = "gunicorn myapp.wsgi --bind {address}"
+# command = "gunicorn myapp.wsgi --workers {concurrency} --bind {address}"
 # workers = 4
-# capacity = 4
+# concurrency = 4
 # working_dir = "/srv/app"
 # env = { APP_ENV = "production" }
 #

@@ -3,11 +3,11 @@
 //! This is the `spawn_cgi` backend, and it is the only way to get a per-request reset on
 //! Windows, where `php-fpm` does not exist. The shape is forced by the platform:
 //!
-//! - **A slot is an address with a capacity**, not a process. `children = 0` (or `capacity = 0`)
-//!   is one process per slot. `children = n` is a preforked master plus `n` children, all
-//!   sharing the one listening socket and the one OPcache segment; each child accepts its own
-//!   connections. `capacity = n` is the same number for a `command` slot, which does its own
-//!   forking and reports its width instead of having it dictated.
+//! - **A slot is an address with a concurrency**, not a process. `children = 0` (or
+//!   `concurrency = 0`) is one process per slot. `children = n` is a preforked master plus `n`
+//!   children, all sharing the one listening socket and the one OPcache segment; each child
+//!   accepts its own connections. `concurrency = n` is the same number for a `command` slot,
+//!   which does its own forking and reports its width instead of having it dictated.
 //! - **`PHP_FCGI_CHILDREN` works on both platforms**, by different mechanisms: `fork()` on
 //!   Unix (`cgi_main.c:1995`) and `CreateProcess` on Windows (`cgi_main.c:2083`). An earlier
 //!   version of this comment said the Linux path ignored
@@ -19,8 +19,8 @@
 //! - FastCGI request ids would allow multiplexing, but neither driver does `FCGI_MPXS_CONNS` —
 //!   `php-cgi` refuses it outright (`main/fastcgi.c:490`) and an application server behind
 //!   `command` is an ordinary CGI framework, so one request per connection either way. More
-//!   concurrency out of one slot means more processes, which is what `children` and `capacity`
-//!   are, and a demux table would buy nothing.
+//!   concurrency out of one slot means more processes, which is what `children` and
+//!   `concurrency` are, and a demux table would buy nothing.
 //!
 //! **Two drivers, one pool.** Everything above the spawn is shared: the addresses, the
 //! readiness probe, the restart on death, `max_requests`, and the per-slot admission. What
@@ -30,7 +30,7 @@
 //! The pool owns the processes, assigns the addresses, health-checks by connecting, restarts a
 //! slot that died, and lends a connection per request. Concurrency within a slot is admitted by
 //! [`SlotPermits`] rather than by the slot's lock, so a slot's lock is held only for
-//! bookkeeping — which is what lets a slot's whole capacity be in flight against one address at
+//! bookkeeping — which is what lets a slot's whole concurrency be in flight against one address at
 //! once.
 
 use std::collections::BTreeMap;
@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use volucer_core::config::{
     SpawnCgiConfig, SpawnDriver, FCGI_ADDRESS_ENV, FCGI_ADDRESS_PLACEHOLDER,
+    FCGI_CONCURRENCY_PLACEHOLDER,
 };
 use volucer_core::program::{resolve_program, split_command};
 use volucer_fcgi::{Client, Endpoint, Request, Response};
@@ -90,7 +91,7 @@ const SETTLE_AFTER_CONNECT: Duration = Duration::from_millis(10);
 
 /// One `php-cgi` listening socket, the process tree behind it, and its connections.
 ///
-/// **A slot is an address with a capacity, not a process.** With `children = 0` the two are
+/// **A slot is an address with a concurrency, not a process.** With `children = 0` the two are
 /// the same thing and this is what it always was — one process, one connection, the slot
 /// mutex serialising requests. With `children = n` the master has forked `n` children that
 /// share the listening socket, so it can answer `n` requests at once and needs `n`
@@ -110,7 +111,7 @@ struct Slot {
     /// outside, and the replacement unit is the group — which is the only thing `killpg` can
     /// express. So this counter measures what the pool can act on.
     served: u64,
-    /// Live connections, up to the slot's capacity.
+    /// Live connections, up to the slot's concurrency.
     ///
     /// A `Vec` rather than one `Option` because a preforked master can answer several
     /// requests at once, and one connection carries one request: `FCGI_MPXS_CONNS` is `0` and
@@ -250,8 +251,19 @@ enum SlotKind {
         /// The program, resolved through `PATH` once so a mistyped name is a startup error
         /// rather than a pool of 502s, and so `check` and `serve` agree about which file runs.
         binary: PathBuf,
-        /// The remaining tokens, still carrying `{address}` where the operator put it.
+        /// The remaining tokens, still carrying `{address}` (and `{concurrency}`) where the
+        /// operator put them.
         args: Vec<String>,
+        /// What `{concurrency}` becomes, resolved once here rather than read from the
+        /// configuration at each spawn.
+        ///
+        /// **Carried for the same reason `children` is.** A replacement slot has to be started
+        /// on the terms the pool was configured with, and `{concurrency}` is now one of those
+        /// terms — so a recycled slot must see the same number as the one it replaces, not
+        /// whatever the file says if it were re-read. Resolved through
+        /// [`SpawnCgiConfig::slot_concurrency`] so `concurrency = 0` becomes the `1` the pool
+        /// actually admits, never a `0` the program would read as "start nothing".
+        concurrency: usize,
     },
 }
 
@@ -345,7 +357,11 @@ impl SlotLaunch {
                         ),
                     });
                 }
-                SlotKind::Command { binary, args }
+                SlotKind::Command {
+                    binary,
+                    args,
+                    concurrency: config.slot_concurrency(),
+                }
             }
         };
 
@@ -391,15 +407,29 @@ impl SlotLaunch {
                     .envs(&self.env);
                 command
             }
-            SlotKind::Command { binary, args } => {
+            SlotKind::Command {
+                binary,
+                args,
+                concurrency,
+            } => {
                 let mut command = Command::new(binary);
                 // `replace` rather than a shell: the tokenizer has already made each token one
                 // argument, so a path with a space in it stays one argument, and an address can
-                // never become shell syntax. A token may carry the placeholder more than once
+                // never become shell syntax. A token may carry either placeholder more than once
                 // and any number of tokens may — `--bind {address} --pidfile {address}.pid` is
                 // an ordinary pairing.
+                //
+                // `{concurrency}` is replaced with the *resolved* number, so the value the
+                // program is told to fork equals the number of permits this pool holds for the
+                // same address. Writing the configured value instead would pass `0` for
+                // `concurrency = 0`, which means one, and a program told `--workers 0` starts
+                // nothing while the pool happily admits a request to it.
+                let concurrency = concurrency.to_string();
                 for arg in args {
-                    command.arg(arg.replace(FCGI_ADDRESS_PLACEHOLDER, address));
+                    let arg = arg
+                        .replace(FCGI_ADDRESS_PLACEHOLDER, address)
+                        .replace(FCGI_CONCURRENCY_PLACEHOLDER, &concurrency);
+                    command.arg(arg);
                 }
                 command.envs(&self.env);
                 command
@@ -547,17 +577,17 @@ fn slot_address_of(endpoint: &Endpoint) -> SlotAddress {
 pub struct CgiPool {
     name: String,
     /// Each slot behind its own lock, so the pool serves as many requests at once
-    /// as it has slots and their capacity allows.
+    /// as it has slots and their concurrency allows.
     ///
     /// The lock is per *slot*, not per process: with `children > 0` one slot is several
     /// processes behind one address, and the slot's [`SlotPermits`] is what bounds concurrent
     /// requests to that address. The lock is only held while a connection is taken or
     /// returned, never across a request — which is the difference between "one request per
-    /// slot" and "`children` requests per slot".
+    /// slot" and "`children` or `concurrency` requests per slot".
     slots: Vec<Mutex<Slot>>,
-    /// Admission per slot, so a slot's capacity is enforced without holding its lock.
+    /// Admission per slot, so a slot's concurrency is enforced without holding its lock.
     ///
-    /// Sized to the slot count and created from `config.slot_capacity()`, so a slot's permit
+    /// Sized to the slot count and created from `config.slot_concurrency()`, so a slot's permit
     /// count and the number of processes the driver was told to start are the same number read
     /// from the same place.
     permits: Vec<SlotPermits>,
@@ -566,8 +596,8 @@ pub struct CgiPool {
     /// How one slot's process is started, resolved once at construction.
     ///
     /// Held as a value rather than re-derived from the configuration, because a replacement slot
-    /// must be started on the terms the pool was configured with — the same rule `capacity` and
-    /// `env` follow.
+    /// must be started on the terms the pool was configured with — the same rule `concurrency`
+    /// and `env` follow.
     launch: SlotLaunch,
     /// Which driver built `launch`, for the three decisions that are not about argv: whether a
     /// Windows `socket` is a pipe, how a unix address is spelled, and whether a lost bind is
@@ -584,29 +614,30 @@ pub struct CgiPool {
 /// How many requests one slot may serve at once.
 ///
 /// A counter and a condvar, mirroring `backend::Limit` for an `external` backend's
-/// `max_connections`: the request path is synchronous, so a request over capacity has to
-/// *block*, and blocking is the feature — the alternative is opening a connection no child
+/// `max_connections`: the request path is synchronous, so a request over the slot's concurrency
+/// has to *block*, and blocking is the feature — the alternative is opening a connection no child
 /// is there to accept, which queues in the listen backlog where nothing counts it.
 ///
-/// The capacity is `children.max(1)`. With `children = 0` this is 1, so the observable
-/// behaviour of an existing configuration is exactly what it was.
+/// The concurrency is `children.max(1)` for `binary` and `concurrency.max(1)` for `command`.
+/// With `children = 0` it is 1, so the observable behaviour of an existing configuration is
+/// exactly what it was.
 #[derive(Debug)]
 struct SlotPermits {
     state: Mutex<usize>,
     released: Condvar,
-    capacity: usize,
+    concurrency: usize,
 }
 
 impl SlotPermits {
-    fn new(capacity: usize) -> Self {
+    fn new(concurrency: usize) -> Self {
         SlotPermits {
             state: Mutex::new(0),
             released: Condvar::new(),
-            capacity,
+            concurrency,
         }
     }
 
-    /// Wait until this slot is under capacity, then count the request.
+    /// Wait until the slot is below its concurrency, then count the request.
     ///
     /// A poisoned lock is recovered rather than propagated: a panic in one request must not
     /// wedge every later one behind a condvar nobody will signal again.
@@ -615,7 +646,7 @@ impl SlotPermits {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *in_flight >= self.capacity {
+        while *in_flight >= self.concurrency {
             in_flight = self
                 .released
                 .wait(in_flight)
@@ -651,11 +682,11 @@ impl CgiPool {
         })?;
 
         let count = worker_count(config.workers);
-        let capacity = config.slot_capacity();
+        let concurrency = config.slot_concurrency();
         let mut pool = CgiPool {
             name: name.to_string(),
             slots: Vec::with_capacity(count as usize),
-            permits: (0..count).map(|_| SlotPermits::new(capacity)).collect(),
+            permits: (0..count).map(|_| SlotPermits::new(concurrency)).collect(),
             cursor: AtomicUsize::new(0),
             launch,
             driver: config.driver(),
@@ -672,7 +703,7 @@ impl CgiPool {
             slots = pool.slots.len(),
             driver = pool.driver.as_str(),
             program = %pool.launch.binary().display(),
-            capacity = pool.permits.first().map_or(0, |permits| permits.capacity),
+            concurrency = pool.permits.first().map_or(0, |permits| permits.concurrency),
             "FastCGI pool started"
         );
         Ok(pool)
@@ -953,7 +984,7 @@ impl CgiPool {
 
         // Blocking rather than refusing: the front-end's own connection limit is where a
         // request is refused, and turning a full slot into an error here would make a pool
-        // that is merely busy into a source of 502s. With `children = 0` the capacity is one,
+        // that is merely busy into a source of 502s. With `children = 0` the concurrency is one,
         // so this is a mutex by another name — exactly what it replaces.
         permits.enter();
         // Given back on every path out, including the `?` below. A `Drop` guard is the only
@@ -980,7 +1011,7 @@ impl CgiPool {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // The connection goes back so the next request to this slot is warm. Retention is
-            // per slot and bounded by capacity, which *is* the number of processes behind the
+            // per slot and bounded by concurrency, which *is* the number of processes behind the
             // address — so a warm connection is one warm child and cannot starve a sibling.
             slot.clients.push(client);
             slot.served += 1;
@@ -1284,6 +1315,104 @@ mod tests {
         assert_eq!(worker_count(1), 1);
     }
 
+    /// `{concurrency}` becomes the *resolved* number in the argv the pool is about to spawn.
+    ///
+    /// Asserted on the `Command` the pool builds rather than on the configuration string, because
+    /// the substitution is the thing that can be wrong: a `replace` on the wrong token, or the
+    /// configured `0` instead of the resolved `1`, both leave a file that looks correct and a
+    /// program that starts no workers. `get_args` is the same argv `spawn_slot` hands the OS.
+    #[test]
+    fn a_command_substitutes_the_resolved_concurrency() {
+        let program = if cfg!(windows) { "cmd" } else { "true" };
+        let mut config = SpawnCgiConfig {
+            binary: None,
+            command: Some(format!(
+                "{program} --workers {{concurrency}} --bind {{address}}"
+            )),
+            workers: 2,
+            bind_host: "127.0.0.1".to_string(),
+            base_port: 19_001,
+            socket: None,
+            max_requests: None,
+            children: 0,
+            concurrency: 4,
+            working_dir: None,
+            env: Default::default(),
+            legacy_capacity: None,
+        };
+
+        let launch = SlotLaunch::from_config(&config, "test").expect("the slot resolves");
+        let args: Vec<String> = launch
+            .command("127.0.0.1:19001")
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--workers".to_string(),
+                "4".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:19001".to_string()
+            ],
+            "both placeholders are replaced, and neither survives into the argv"
+        );
+
+        // `concurrency = 0` means one. Passing the configured value through would hand the
+        // program `--workers 0`, which starts nothing, while the pool holds one permit for it.
+        config.concurrency = 0;
+        let launch = SlotLaunch::from_config(&config, "test").expect("the slot resolves");
+        let args: Vec<String> = launch
+            .command("127.0.0.1:19001")
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[1], "1",
+            "zero means one, so that is what the program is told: {args:?}"
+        );
+    }
+
+    /// A placeholder the pool does not substitute is left exactly as written.
+    ///
+    /// `-DKEY={value}` is a legal argument for a program that takes one, so the substitution must
+    /// not be a general "replace every brace" pass. Only the named tokens move; anything else
+    /// reaches the program intact, which is what makes adding a placeholder safe for the
+    /// deployments that already work.
+    #[test]
+    fn an_unknown_placeholder_is_left_alone() {
+        let program = if cfg!(windows) { "cmd" } else { "true" };
+        let config = SpawnCgiConfig {
+            binary: None,
+            command: Some(format!("{program} --define={{a:1}} --bind {{address}}")),
+            workers: 1,
+            bind_host: "127.0.0.1".to_string(),
+            base_port: 19_001,
+            socket: None,
+            max_requests: None,
+            children: 0,
+            concurrency: 2,
+            working_dir: None,
+            env: Default::default(),
+            legacy_capacity: None,
+        };
+
+        let launch = SlotLaunch::from_config(&config, "test").expect("the slot resolves");
+        let args: Vec<String> = launch
+            .command("127.0.0.1:19001")
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[0], "--define={a:1}",
+            "an unrelated brace pair is untouched: {args:?}"
+        );
+        assert_eq!(
+            args[2], "127.0.0.1:19001",
+            "the address is still substituted: {args:?}"
+        );
+    }
+
     #[test]
     fn a_slot_address_knows_how_to_bind_and_how_to_connect() {
         let port = SlotAddress::Port(19_001);
@@ -1499,10 +1628,11 @@ mod tests {
             base_port: 19_700,
             socket: None,
             children: 0,
-            capacity: 0,
+            concurrency: 0,
             max_requests: None,
             working_dir: None,
             env: Default::default(),
+            legacy_capacity: None,
         };
         let err = CgiPool::start("test", &config).unwrap_err();
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
