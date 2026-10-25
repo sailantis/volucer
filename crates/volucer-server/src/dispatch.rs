@@ -953,23 +953,28 @@ impl Dispatcher {
 
     /// Send a request to a named backend.
     pub fn dispatch_to(&self, name: &str, request: &Request) -> Result<Response> {
-        let backend = self
-            .backends
-            .get(name)
-            // A static-only configuration reaches here with no backends at all.
-            // Reported as `NoWorker` rather than as a misconfiguration, because by
-            // the time a request arrives the file is a decision rather than a
-            // mistake — the CLI already warned about it at startup.
-            .ok_or_else(|| ServerError::NoWorker {
-                backend: name.to_string(),
-            })?;
+        let backend = self.backends.get(name).ok_or_else(|| {
+            // Two different failures share this lookup, and which one it is decides the
+            // status a client reads. No backends at all is the static-only deployment: the
+            // configuration has no dispatch target and never will, so it is a 500 and the
+            // CLI has already warned about it. A name that does not resolve in a deployment
+            // that *has* backends is the pool being momentarily exhausted, which is a
+            // transient 503.
+            if self.backends.is_empty() {
+                ServerError::NoBackend
+            } else {
+                ServerError::NoWorker {
+                    backend: name.to_string(),
+                }
+            }
+        })?;
         backend.request(request)
     }
 
     /// Send a request to the default backend, ignoring the route table.
     ///
     /// An alias used by the listener, where "default" is the meaningful word.
-    /// Returns `NoWorker` for a static-only configuration, which is the one case
+    /// Returns `NoBackend` for a static-only configuration, which is the one case
     /// where a request can arrive with nowhere to go.
     pub fn dispatch_to_default(&self, request: &Request) -> Result<Response> {
         self.dispatch_to(&self.default, request)
@@ -1179,6 +1184,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ServerError::NoWorker { .. }), "{err}");
         assert!(err.to_string().contains("nope"), "{err}");
+        // A name that does not resolve in a deployment that *has* backends is a transient pool
+        // condition — the named backend exists and its slots are momentarily taken — so it stays
+        // a 503. Only a deployment with no backends at all is the 500.
+        assert!(err.is_busy(), "{err}");
+    }
+
+    /// The static-only deployment is `NoBackend`, not `NoWorker`: it is the difference between a
+    /// 500 and a 503, and the two must not be reached by the same lookup.
+    #[test]
+    fn a_dispatcher_with_no_backends_reports_no_backend_and_not_a_busy_pool() {
+        let config = config_with(&[], "");
+        let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
+
+        let err = dispatcher
+            .dispatch_to_default(&Request::default())
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NoBackend), "{err}");
+        assert!(
+            !err.is_busy(),
+            "a deployment with no backends must not claim to be at capacity: {err}"
+        );
+        assert!(
+            err.to_string().contains("no backend is configured"),
+            "{err}"
+        );
     }
 
     #[test]

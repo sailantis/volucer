@@ -68,6 +68,22 @@ pub fn inspect_with(
     document_root: &Path,
     config_path: Option<&Path>,
 ) -> Vec<Warning> {
+    inspect_with_front_controller(config, document_root, config_path, None)
+}
+
+/// [`inspect_with`], with the front controller the command line resolved.
+///
+/// **The flag has to be passed in rather than read from the config**, because `serve` and `check`
+/// resolve `--front-controller` (and the "only real files" value `--fcgi` implies) on top of the
+/// table — so a preflight that read `config.server` alone would warn about an `index.php` the
+/// deployment is not using, which is exactly the shape of the contradiction this file exists to
+/// avoid.
+pub fn inspect_with_front_controller(
+    config: &Config,
+    document_root: &Path,
+    config_path: Option<&Path>,
+    front_controller_flag: Option<&str>,
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
 
     if !document_root.exists() {
@@ -89,7 +105,10 @@ pub fn inspect_with(
     // unmatched path resolves to a script PHP will refuse to execute, and the
     // client sees a 404 that says nothing about the cause.
     if document_root.is_dir() {
-        if let Some(front) = config.server.resolve_front_controller(None) {
+        if let Some(front) = config
+            .server
+            .resolve_front_controller(front_controller_flag)
+        {
             let script = document_root.join(&front);
             if !script.is_file() {
                 warnings.push(Warning::with_hint(
@@ -132,7 +151,7 @@ pub fn inspect_with(
     // the request path would send the operator to check a setting that is not in force. What
     // it must never be is silent: a layer the file configured and the server is not running
     // has to be said out loud.
-    let sites = Sites::from_config_with(config, document_root, None);
+    let sites = Sites::from_config_with(config, document_root, front_controller_flag);
     let suppressed = sites.suppressed_static_layer();
     if !suppressed.is_empty() {
         let names: Vec<&str> = suppressed.iter().map(|site| site.name.as_str()).collect();
@@ -141,10 +160,22 @@ pub fn inspect_with(
         } else {
             format!("the document roots of {} hold", names.join(", "))
         };
+        // The **resolved** front controller, not the configured one: with
+        // `--front-controller ''` (which `--fcgi` implies) there is none, and the reason the
+        // layer is off is then simply that the root has no asset — the clause about a front
+        // controller would name something the deployment does not have.
+        let cause = if config
+            .server
+            .resolve_front_controller(front_controller_flag)
+            .is_some()
+        {
+            "server.static_files is on and a front controller is configured"
+        } else {
+            "server.static_files is on"
+        };
         warnings.push(Warning::plain(format!(
-            "server.static_files is on and a front controller is configured, but {subject} no \
-             asset a file could be served from, so the static layer is off for that site — it \
-             would answer the same requests, without a stat"
+            "{cause}, but {subject} no asset a file could be served from, so the static layer is \
+             off for that site — it would answer the same requests, without a stat"
         )));
     }
 
@@ -473,12 +504,36 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                 // rather than an error for the reason the document root is — an image that
                 // installs the runtime in a later layer is a normal thing to check.
                 match (&cgi.binary, &cgi.command) {
-                    (Some(binary), _) if !binary.is_file() => {
-                        warnings.push(Warning::with_hint(
-                            format!("backends.{name}: {} does not exist", binary.display()),
-                            "point `binary` at the php-cgi executable for this host — \
-                             `volucer check` lists every PHP binary it found above",
-                        ));
+                    (Some(configured), _) => {
+                        // Resolved the way the pool resolves it: a bare `php-cgi` is a lookup
+                        // in the PHP search directories, not a path relative to the working
+                        // directory. Checking the configured string instead was how `check`
+                        // reported a binary it had just found and then warned it was missing.
+                        let binary = crate::php::resolve_cgi_binary(configured);
+                        if !binary.is_file() {
+                            // The "from binary …" clause only when the name was resolved and
+                            // failed: with an explicit path there is nothing to add, and quoting
+                            // a `PathBuf` with `{:?}` doubled every backslash of a Windows path.
+                            let detail = if binary == *configured {
+                                String::new()
+                            } else {
+                                format!(" (from binary \"{}\")", configured.display())
+                            };
+                            let hint = if detail.is_empty() {
+                                "point `binary` at the php-cgi executable for this host — \
+                                 `volucer check` lists every PHP binary it found above"
+                            } else {
+                                "check the path, or put the directory holding php-cgi first on \
+                                 `PATH` — `check` resolved the name and found nothing there"
+                            };
+                            warnings.push(Warning::with_hint(
+                                format!(
+                                    "backends.{name}: {} does not exist{detail}",
+                                    binary.display()
+                                ),
+                                hint,
+                            ));
+                        }
                     }
                     (None, Some(command)) => {
                         // Resolved the way the pool resolves it, so what is checked is the file

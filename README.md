@@ -1,6 +1,6 @@
 ![Volucer](docs/images/volucer-logo-text.svg)
 
-<h3 align="center">A cross-platform high-performance application server built to speed up PHP, Python and Ruby</h3>
+<h3 align="center">A cross-platform application server built to speed up PHP, Python and Ruby</h3>
 
 <p align="center">
 Run PHP, Python and Ruby applications with one binary, using worker or FastCGI backends. Other languages can be served as well.
@@ -8,7 +8,11 @@ Run PHP, Python and Ruby applications with one binary, using worker or FastCGI b
 
 ---
 
-**Volucer** runs cross-platform applications. It starts the application, supervises it, and serves it over HTTP or FastCGI. For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`. For Python and Ruby SDKs exist that speak the worker protocol. Volucer can also run any FastCGI server — `gunicorn`, `flup`, a Rack adapter, or any other FastCGI-compatible backend. Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
+**Volucer** runs cross-platform applications. It starts the application, supervises it, and serves it over HTTP or FastCGI.
+For PHP it starts `php`, `php-cgi`, or connects to an existing `php-fpm` process, so applications keep their existing PHP version, extensions, and `php.ini`.
+For Python and Ruby SDKs exist that speak the worker protocol.
+Volucer can also run a FastCGI server — `gunicorn`, `flup`, a Rack adapter, or any other FastCGI-compatible backend.
+Volucer provides the listener, routing, static-file serving, TLS, and process supervision.
 
 It runs on Linux, macOS, and Windows. Windows does not provide `php-fpm`; Volucer can supervise `php-cgi` there.
 

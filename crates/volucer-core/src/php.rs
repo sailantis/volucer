@@ -213,6 +213,32 @@ pub fn default_search_dirs() -> Vec<PathBuf> {
     dedupe(dirs)
 }
 
+/// Resolve a `spawn_cgi` `binary` to the file that will actually be executed.
+///
+/// **A value with a separator is a path and is returned unchanged**, so an absolute
+/// `C:/php-8.3.31/php-cgi.exe`, a `./php-cgi` beside the working directory and every
+/// configuration written before this existed mean exactly what they meant before.
+///
+/// A bare name is looked up in the same directories [`discover`] searches — `PATH` first,
+/// then the conventional install locations — with `PATHEXT` on Windows. That is the point:
+/// before this, `binary = "php-cgi"` failed while `command = "php-cgi -b {address}"`
+/// succeeded on the same host, and `volucer check` listed the binary it had just found
+/// directly above a warning that it did not exist. One rule now answers both.
+///
+/// A name that is nowhere is returned as written, so the caller's "does not exist"
+/// message quotes what the operator typed rather than a path this function invented.
+pub fn resolve_cgi_binary(binary: &Path) -> PathBuf {
+    // A name with a separator is a path, not a lookup.
+    if binary.components().count() > 1 {
+        return binary.to_path_buf();
+    }
+    let Some(name) = binary.to_str() else {
+        return binary.to_path_buf();
+    };
+    crate::program::find_in_dirs(&default_search_dirs(), name)
+        .unwrap_or_else(|| binary.to_path_buf())
+}
+
 /// Remove duplicates while preserving order, so the first hit still wins.
 fn dedupe(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
@@ -342,6 +368,34 @@ mod tests {
             PathBuf::from("/a"),
         ];
         assert_eq!(dedupe(dirs), vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    /// A value with a separator is a path and must be returned untouched.
+    ///
+    /// This is what keeps every existing configuration meaning what it meant: an absolute
+    /// `C:/php-8.3.31/php-cgi.exe` and a `./php-cgi` beside the working directory are resolved
+    /// by nobody but the operator.
+    #[test]
+    fn a_binary_with_a_separator_is_not_looked_up() {
+        for written in [
+            "C:/php-8.3.31/php-cgi.exe",
+            "/usr/bin/php-cgi",
+            "./php-cgi",
+            "../bin/php-cgi",
+        ] {
+            let resolved = resolve_cgi_binary(Path::new(written));
+            assert_eq!(resolved, PathBuf::from(written), "{written}");
+        }
+    }
+
+    /// A bare name that is nowhere is handed back as written, so the error quotes the operator's
+    /// own typo instead of a path this function invented.
+    #[test]
+    fn an_unresolvable_bare_binary_is_reported_as_written() {
+        // Deliberately not a name any PHP installation uses, so the assertion holds on a host
+        // that does have PHP installed.
+        let resolved = resolve_cgi_binary(Path::new("php-cgi-definitely-not-installed"));
+        assert_eq!(resolved, PathBuf::from("php-cgi-definitely-not-installed"));
     }
 
     #[cfg(windows)]

@@ -9,6 +9,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--root`, `--worker`, `--fcgi` and `--capacity` in the same quick-start shape.** `--root`
+  aliases `--document-root`, and `--php-cgi`, `--worker` and `--fcgi` each declare a default
+  backend in one flag: `--php-cgi [PATH]` a `spawn_cgi` pool driven by `php-cgi`, `--worker
+  COMMAND` a resident worker, and `--fcgi COMMAND` any FastCGI server with `{address}`. `--workers
+  <N>` sizes whichever was chosen and requires one of them; `--capacity <N>` is how many requests
+  one `--fcgi` slot serves at once, and is refused for the other two. Two backend flags at once is
+  a usage error. `--fcgi` also implies "only real files", because a WSGI or Rack program is not
+  `index.php`. `volucer check` accepts the same flags, and its preflight now takes the resolved
+  front controller rather than reading the table alone, so neither command warns about an
+  `index.php` the deployment is not using. Nothing is detected without a flag.
+- **A bare `spawn_cgi.binary` is resolved like a `command` program.** A value containing no path
+  separator is looked up in the PHP search directories — `PATH` first, then the conventional
+  install locations, with `PATHEXT` on Windows — so `binary = "php-cgi"` and
+  `command = "php-cgi -b {address}"` find the same file, and `check` no longer lists a binary it
+  found directly above a warning that it does not exist. A value with a separator is still used
+  as a path, so every existing configuration is unchanged. `check` and the pool share one
+  resolver, and `check` prints the path that will actually run.
+
 - **`redirect_to_https` is configurable per site** and inherits `[server]` by default. Internal
   HTTP-only sites can disable redirects; enabling the setting when the site's protocols exclude
   `http` or `https` is rejected.

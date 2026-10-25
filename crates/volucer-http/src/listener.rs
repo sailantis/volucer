@@ -2123,8 +2123,14 @@ fn error_response(err: &HttpError) -> Response<ResponseBody> {
 /// 502, one that is reachable but silent is a 504, and one that has no capacity
 /// is a 503. Collapsing them into one status throws away the only information
 /// the operator gets.
+///
+/// A deployment with no backends at all is the exception, and it is checked first: it has no
+/// capacity *to be* exhausted, and answering 503 would tell a load balancer to take a healthy
+/// node out of rotation. It maps to a 500 through [`HttpError::NoBackend`].
 fn map_server_error(err: ServerError) -> HttpError {
-    if err.is_timeout() {
+    if matches!(err, ServerError::NoBackend) {
+        HttpError::NoBackend(err.to_string())
+    } else if err.is_timeout() {
         HttpError::GatewayTimeout(err.to_string())
     } else if err.is_busy() {
         HttpError::Overloaded
@@ -2529,6 +2535,26 @@ mod tests {
             backend: "app".to_string(),
         };
         assert_eq!(map_server_error(busy).status(), 503);
+    }
+
+    /// A deployment with no backends is not "busy": it has nothing to be busy with, and saying
+    /// 503 would take a healthy node out of a load balancer's rotation because of a
+    /// configuration that will not change until somebody edits it.
+    #[test]
+    fn a_static_only_deployment_is_a_500_and_not_the_503_a_full_pool_gets() {
+        let static_only = map_server_error(ServerError::NoBackend);
+        assert_eq!(static_only.status(), 500);
+        assert_eq!(static_only.reason(), "Internal Server Error");
+        // The page must name the real cause rather than borrowing "too many connections" from
+        // the capacity variant, which is what made this unreadable.
+        assert!(
+            static_only.to_string().contains("no backend is configured"),
+            "{static_only}"
+        );
+        assert!(
+            !static_only.to_string().contains("too many connections"),
+            "{static_only}"
+        );
     }
 
     #[test]

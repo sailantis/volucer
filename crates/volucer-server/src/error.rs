@@ -42,8 +42,20 @@ pub enum ServerError {
         hint: Hint,
     },
 
-    #[error("no worker is available for backend {backend:?}")]
+    #[error("no backend named {backend:?} is configured")]
     NoWorker { backend: String },
+
+    /// No backend is configured at all, so a request that names no file has nowhere to go.
+    ///
+    /// **Its own variant rather than [`ServerError::NoWorker`]**, and the distinction decides the
+    /// status the client reads. `NoWorker` is transient — the named pool exists and every slot in
+    /// it is momentarily taken — so a gateway answers *503 Service Unavailable* and invites a
+    /// retry. A static-only deployment is not transient: nothing will ever be started by waiting,
+    /// so a 503 would take a healthy node out of a load balancer's rotation over a configuration
+    /// decision. This is a 500, which is what the CLI warns about at startup, and the reason
+    /// phrase says so instead of claiming the server is overloaded.
+    #[error("no backend is configured: a path naming no file cannot be answered")]
+    NoBackend,
 
     #[error("all workers for backend {backend:?} are busy")]
     AllBusy { backend: String },
@@ -200,6 +212,11 @@ impl ServerError {
     ///
     /// Distinct from a backend that failed: nothing was attempted, so the honest
     /// answer is a 503 rather than a 502.
+    ///
+    /// [`ServerError::NoBackend`] is deliberately **not** here. A deployment with no
+    /// backends at all will not become able to answer by being retried, so it is a 500
+    /// rather than a 503 — see that variant for why the difference matters to a load
+    /// balancer.
     pub fn is_busy(&self) -> bool {
         matches!(
             self,

@@ -263,17 +263,29 @@ impl SlotLaunch {
     fn from_config(config: &SpawnCgiConfig, backend: &str) -> Result<Self> {
         let kind = match config.driver() {
             SpawnDriver::PhpCgi => {
-                let binary = config
-                    .binary
-                    .clone()
-                    .ok_or_else(|| ServerError::Misconfigured {
-                        backend: backend.to_string(),
-                        reason: "`binary` is required for the php-cgi driver".to_string(),
-                    })?;
+                let configured =
+                    config
+                        .binary
+                        .clone()
+                        .ok_or_else(|| ServerError::Misconfigured {
+                            backend: backend.to_string(),
+                            reason: "`binary` is required for the php-cgi driver".to_string(),
+                        })?;
+                // Resolved exactly as `check` resolves it, so a bare `php-cgi` means the same
+                // file to both commands. A value with a separator is returned unchanged.
+                let binary = volucer_core::php::resolve_cgi_binary(&configured);
                 if !binary.is_file() {
                     return Err(ServerError::Misconfigured {
                         backend: backend.to_string(),
-                        reason: format!("{} does not exist", binary.display()),
+                        reason: format!(
+                            "{} does not exist{}",
+                            binary.display(),
+                            if binary == configured {
+                                String::new()
+                            } else {
+                                format!(" (from binary \"{}\")", configured.display())
+                            }
+                        ),
                     });
                 }
                 SlotKind::PhpCgi {

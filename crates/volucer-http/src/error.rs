@@ -43,6 +43,16 @@ pub enum HttpError {
     #[error("too many connections")]
     Overloaded,
 
+    /// A request that names no file reached a deployment with no backend configured.
+    ///
+    /// Its own variant rather than reusing [`HttpError::Overloaded`], because that variant is how
+    /// the server says "this node is at capacity, try another or retry shortly" — a 503, which a
+    /// load balancer reads as unhealthy. A static-only deployment is not at capacity: nothing will
+    /// ever answer a non-file path with its current configuration, so this is a 500 and its page
+    /// says what is actually missing. See `ServerError::NoBackend`.
+    #[error("no backend is configured: {0}")]
+    NoBackend(String),
+
     /// Binding the listener failed.
     #[error("cannot bind {address}: {source}")]
     Bind {
@@ -137,6 +147,9 @@ impl HttpError {
             HttpError::BadGateway(_) => 502,
             HttpError::Overloaded => 503,
             HttpError::GatewayTimeout(_) => 504,
+            // A 500, not a 503: nothing about waiting makes a backend appear, and 500 is what the
+            // CLI warns about at startup.
+            HttpError::NoBackend(_) => 500,
             // **429, not 503**, and the distinction is the whole reason this variant exists: a
             // 503 takes the node out of a load balancer's rotation, which is an outage caused by
             // one client. "Too Many Requests" says exactly what happened and what to do.
@@ -189,6 +202,7 @@ mod tests {
         assert_eq!(HttpError::BadGateway("x".into()).status(), 502);
         assert_eq!(HttpError::Overloaded.status(), 503);
         assert_eq!(HttpError::GatewayTimeout("x".into()).status(), 504);
+        assert_eq!(HttpError::NoBackend("x".into()).status(), 500);
     }
 
     #[test]

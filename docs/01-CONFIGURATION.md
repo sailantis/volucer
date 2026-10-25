@@ -508,7 +508,7 @@ Exactly one of `binary` and `command`:
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `binary` | path | — | The `php-cgi` executable. The `PHP_FCGI_*` driver. |
+| `binary` | path | — | The `php-cgi` executable. The `PHP_FCGI_*` driver. A bare name is looked up in the PHP search directories (`PATH` first); a value containing a separator is used as a path. |
 | `command` | string | — | A command that starts **one slot**, with `{address}` where it must bind. |
 | `workers` | integer | `0` | How many slots. `0` means one per logical CPU. |
 | `children` | integer | `0` | `php-cgi` children behind each slot (`binary` only). `0` means no prefork. |

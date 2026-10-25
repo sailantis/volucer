@@ -38,6 +38,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the configured listeners and backends.
+    #[command(group(
+        clap::ArgGroup::new("backend")
+            .multiple(false)
+            .args(["php_cgi", "worker", "fcgi"])
+    ))]
     Serve {
         /// Path to `volucer.toml`.
         ///
@@ -77,7 +82,7 @@ enum Command {
         /// Document root that PHP scripts are resolved against.
         ///
         /// Overrides `server.document_root`; without either, `.`.
-        #[arg(long)]
+        #[arg(long, visible_alias = "root")]
         document_root: Option<PathBuf>,
 
         /// Front controller, relative to the document root.
@@ -88,12 +93,79 @@ enum Command {
         #[arg(long)]
         front_controller: Option<String>,
 
+        /// Serve a `php-cgi` pool as the default backend.
+        ///
+        /// The quick-start flag: `volucer serve --root public --php-cgi` is a complete
+        /// deployment, with no `volucer.toml` to write. It sets `backends.cgi.kind=spawn_cgi`,
+        /// `backends.cgi.binary`, and points `server.default_backend` at it — three statements
+        /// that this flag *makes* rather than infers, which is why nothing is detected without it.
+        ///
+        /// A bare `--php-cgi` uses `php-cgi`, resolved in the PHP search directories (`PATH`
+        /// first), so the name works wherever `volucer check` finds a binary. Give a value to
+        /// name one explicitly: `--php-cgi=C:/php-8.3.31/php-cgi.exe`.
+        #[arg(
+            long = "php-cgi",
+            value_name = "PATH",
+            num_args = 0..=1,
+            default_missing_value = "php-cgi"
+        )]
+        php_cgi: Option<String>,
+
+        /// Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`.
+        ///
+        /// Sets `backends.app.kind=worker`, its `command`, and `server.default_backend`.
+        /// `--workers` sizes the pool. The value is one command line, split without a shell —
+        /// the same tokenizer `[backends.app].command` uses — so quote it as a whole.
+        #[arg(long, value_name = "COMMAND")]
+        worker: Option<String>,
+
+        /// Serve any FastCGI server as the default backend, e.g.
+        /// `--fcgi "python fcgi_app.py --bind {address}"`.
+        ///
+        /// The non-PHP sibling of `--php-cgi`: it sets `backends.app.kind=spawn_cgi` with a
+        /// `command`, and `server.default_backend`. **`{address}` is required** — the pool owns
+        /// the address of every slot, so a program that binds one of its own is never reached.
+        ///
+        /// It also sets `front_controller` to `""` when you have not, because a WSGI or Rack
+        /// program is not `index.php`: without that, a path naming no file resolves to
+        /// `index.php` and answers 404. Set `--front-controller` yourself to choose one.
+        #[arg(long, value_name = "COMMAND")]
+        fcgi: Option<String>,
+
+        /// How many slots the `--php-cgi`, `--worker` or `--fcgi` backend starts.
+        ///
+        /// Shorthand for that backend's `workers`, and an error without one of those flags —
+        /// there would be no backend of that name to size. Omitted, a slot is started per
+        /// logical CPU, except for `--fcgi`, whose slots are `1` by default because the program
+        /// decides its own concurrency through `capacity`.
+        #[arg(long, value_name = "N", requires = "backend")]
+        workers: Option<u32>,
+
+        /// How many requests one `--fcgi` slot may serve at once.
+        ///
+        /// Shorthand for `backends.app.capacity`, and it means something different from
+        /// `--workers`: `--workers` is how many processes, `--capacity` is how many connections
+        /// the pool holds open to each one. Set it to the number of children your FastCGI server
+        /// forks for itself — `gunicorn -w 4`, Puma's `threads 5`, or a Rack server's own worker
+        /// count — so the pool does not queue a request behind a slot that could answer it.
+        ///
+        /// Only meaningful with `--fcgi`, because a `worker` decides its own concurrency one
+        /// request at a time and `php-cgi` expresses it as `children`; giving it to either is an
+        /// error naming that.
+        #[arg(long, value_name = "N")]
+        capacity: Option<u32>,
+
         /// Maximum concurrent client connections.
         #[arg(long, default_value_t = 512)]
         max_connections: usize,
     },
 
     /// Validate the configuration and report what was found on this host.
+    #[command(group(
+        clap::ArgGroup::new("backend")
+            .multiple(false)
+            .args(["php_cgi", "worker", "fcgi"])
+    ))]
     Check {
         /// Path to `volucer.toml`. Optional, with the same rule as `serve`.
         #[arg(short, long)]
@@ -116,8 +188,42 @@ enum Command {
         overrides: Vec<String>,
 
         /// Document root to check, overriding `server.document_root`.
-        #[arg(long)]
+        #[arg(long, visible_alias = "root")]
         document_root: Option<PathBuf>,
+
+        /// Check a `php-cgi` pool as the default backend.
+        ///
+        /// The same shorthand `serve` takes, so a one-line deployment can be rehearsed with
+        /// `check` before it is started. A bare `--php-cgi` names `php-cgi`, resolved in the PHP
+        /// search directories.
+        #[arg(
+            long = "php-cgi",
+            value_name = "PATH",
+            num_args = 0..=1,
+            default_missing_value = "php-cgi"
+        )]
+        php_cgi: Option<String>,
+
+        /// Check a resident worker as the default backend. See `serve --worker`.
+        #[arg(long, value_name = "COMMAND")]
+        worker: Option<String>,
+
+        /// Check a generic FastCGI server as the default backend. See `serve --fcgi`.
+        #[arg(long, value_name = "COMMAND")]
+        fcgi: Option<String>,
+
+        /// Front controller to check, overriding `server.front_controller`. See
+        /// `serve --front-controller`.
+        #[arg(long)]
+        front_controller: Option<String>,
+
+        /// How many slots the backend would start. See `serve --workers`.
+        #[arg(long, value_name = "N", requires = "backend")]
+        workers: Option<u32>,
+
+        /// How many requests one `--fcgi` slot may serve at once. See `serve --capacity`.
+        #[arg(long, value_name = "N")]
+        capacity: Option<u32>,
 
         /// Extra directories to search for PHP binaries.
         #[arg(long = "php-dir")]
@@ -187,25 +293,57 @@ fn main() -> ExitCode {
             overrides,
             document_root,
             front_controller,
+            php_cgi,
+            worker,
+            fcgi,
+            workers,
+            capacity,
             max_connections,
-        } => serve(
-            &Source::resolve(config, listen, fastcgi, overrides),
-            document_root.as_deref(),
-            front_controller.as_deref(),
-            max_connections,
-        ),
+        } => {
+            let backend = Backends::from_flags(php_cgi, worker, fcgi);
+            Sizing::from_flags(&backend, workers, capacity).and_then(|sizing| {
+                // An explicit `--front-controller` wins over what `--fcgi` implies; both end up on
+                // the one flag path, which is the only spelling the empty value has.
+                let front_controller = front_controller
+                    .or_else(|| implied_front_controller(&backend).map(str::to_string));
+                serve(
+                    &Source::resolve_with_backends(
+                        config, listen, fastcgi, overrides, backend, sizing,
+                    ),
+                    document_root.as_deref(),
+                    front_controller.as_deref(),
+                    max_connections,
+                )
+            })
+        }
         Command::Check {
             config,
             listen,
             fastcgi,
             overrides,
             document_root,
+            front_controller,
+            php_cgi,
+            worker,
+            fcgi,
+            workers,
+            capacity,
             php_dirs,
-        } => check(
-            &Source::resolve(config, listen, fastcgi, overrides),
-            document_root.as_deref(),
-            &php_dirs,
-        ),
+        } => {
+            let backend = Backends::from_flags(php_cgi, worker, fcgi);
+            Sizing::from_flags(&backend, workers, capacity).and_then(|sizing| {
+                let front_controller = front_controller
+                    .or_else(|| implied_front_controller(&backend).map(str::to_string));
+                check(
+                    &Source::resolve_with_backends(
+                        config, listen, fastcgi, overrides, backend, sizing,
+                    ),
+                    document_root.as_deref(),
+                    front_controller.as_deref(),
+                    &php_dirs,
+                )
+            })
+        }
         Command::Health {
             url,
             config,
@@ -725,31 +863,93 @@ struct Source {
 }
 
 impl Source {
-    /// Assemble the source from the parsed command line.
+    /// Assemble the source from the parsed command line, without the quick-start flags.
     ///
-    /// `--listen` and `--fastcgi` are converted into override pairs **here** rather than special-
-    /// cased at each use, so precedence is a property of one list: an explicit `-o server.http=…`
-    /// comes after the sugar and therefore wins, and the order does not depend on where the flags
-    /// appeared on the command line.
+    /// The flags without extra arguments, for a caller that has none.
+    /// [`Source::resolve_with_backends`] is the one the command line uses.
+    #[cfg(test)]
     fn resolve(
         config: Option<PathBuf>,
         listen: Option<String>,
         fastcgi: Option<String>,
         overrides: Vec<String>,
     ) -> Self {
+        Self::resolve_with_backends(
+            config,
+            listen,
+            fastcgi,
+            overrides,
+            Backends::None,
+            Sizing::default(),
+        )
+    }
+
+    /// [`Source::resolve`] with the quick-start backend flags.
+    ///
+    /// Six positional arguments is a lot for an in-process API, but this is the shape of the
+    /// command line and the whole point of the type: every one of these is a flag, and none of
+    /// them has a meaning apart from the others. Kept beside [`Source::resolve`] so the two
+    /// callers that pass none of them — every test, and any future subcommand — say what they
+    /// mean instead of spelling `None, None`.
+    fn resolve_with_backends(
+        config: Option<PathBuf>,
+        listen: Option<String>,
+        fastcgi: Option<String>,
+        overrides: Vec<String>,
+        backend: Backends,
+        sizing: Sizing,
+    ) -> Self {
         let mut pairs = Vec::with_capacity(overrides.len() + 2);
         for (key, address) in [("server.http", listen), ("server.fastcgi", fastcgi)] {
             if let Some(address) = address {
-                // Quoted as a TOML string rather than left to the literal reader below: a listener
-                // may be `unix:/run/app.sock`, which no TOML grammar accepts unquoted, and a bare
-                // `8080` would otherwise be read as a number and refused by the type check.
-                // `toml_edit`-free spelling, so a Windows path cannot be re-escaped by accident.
-                pairs.push(format!(
-                    "{key}=\"{}\"",
-                    address.replace('\\', "\\\\").replace('"', "\\\"")
-                ));
+                pairs.push(string_pair(key, &address));
             }
         }
+
+        // Every backend flag is the same *kind* of statement, made here rather than inferred
+        // anywhere else: a backend exists, of this kind, with these settings, and it is the
+        // default. A deployment that wants a route to reach it instead sets `default_backend`
+        // itself, which these pairs are written *before* so the file or an `-o` still wins.
+        match backend {
+            Backends::None => {}
+            Backends::PhpCgi(binary) => {
+                pairs.push(string_pair("server.default_backend", "cgi"));
+                pairs.push(string_pair("backends.cgi.kind", "spawn_cgi"));
+                pairs.push(string_pair("backends.cgi.binary", &binary));
+                if let Some(workers) = sizing.workers {
+                    pairs.push(count_pair("backends.cgi.workers", workers));
+                }
+            }
+            Backends::Worker(command) => {
+                pairs.push(string_pair("server.default_backend", "app"));
+                pairs.push(string_pair("backends.app.kind", "worker"));
+                pairs.push(string_pair("backends.app.command", &command));
+                if let Some(workers) = sizing.workers {
+                    pairs.push(count_pair("backends.app.workers", workers));
+                }
+            }
+            Backends::Fcgi(command) => {
+                pairs.push(string_pair("server.default_backend", "app"));
+                pairs.push(string_pair("backends.app.kind", "spawn_cgi"));
+                pairs.push(string_pair("backends.app.command", &command));
+                // `capacity` rather than `children` is how many requests one slot answers, and
+                // `workers` is how many slots there are. One slot by default, because a FastCGI
+                // application server usually forks for itself; `--capacity` says how wide that
+                // fork is, so the pool holds enough connections to reach every child instead of
+                // queueing behind one.
+                pairs.push(count_pair(
+                    "backends.app.workers",
+                    sizing.workers.unwrap_or(1),
+                ));
+                if let Some(capacity) = sizing.capacity {
+                    pairs.push(count_pair("backends.app.capacity", capacity));
+                }
+                // The front controller is *not* written here. "Only real files" is expressible
+                // only as a flag — `Config::validate` refuses an empty table key on purpose — so
+                // [`implied_front_controller`] supplies it through the flag instead.
+            }
+        }
+
         pairs.extend(overrides);
 
         // The default file is used only when it is *there*. A missing `volucer.toml` and no `-c`
@@ -908,6 +1108,109 @@ fn apply_override(table: &mut toml::Table, pair: &str) -> Result<(), ServerError
 /// error, and it reaches the operator through the same `configuration error: …` line as a bad file.
 fn invalid_override(reason: String) -> ServerError {
     ServerError::from(volucer_core::Error::Config(reason))
+}
+
+/// One `KEY=VALUE` pair whose value is forced to be a TOML **string**.
+///
+/// Quoted rather than passed to [`literal`]: a listener may be `unix:/run/app.sock`, which no TOML
+/// grammar accepts unquoted, and a bare `8080` would otherwise be read as a number and refused by
+/// the type check. A `default_missing_value = "8080"` on a string-typed key is exactly that trap.
+/// Backslashes and quotes are escaped, so a Windows path survives as one value.
+fn string_pair(key: &str, value: &str) -> String {
+    format!(
+        "{key}=\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+/// One `KEY=<N>` pair whose value is a TOML **integer**.
+///
+/// A number, not a string: [`literal`] reads it as TOML, which is what makes the type check accept
+/// it without a per-key rule.
+fn count_pair(key: &str, count: u32) -> String {
+    format!("{key}={count}")
+}
+
+/// Which backend a quick-start flag asked for.
+///
+/// One value rather than three `Option`s threaded separately, because the three flags are one
+/// choice — `clap`'s group already refuses them together — and the pairs each one writes are the
+/// same three statements with different values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Backends {
+    /// No backend flag: the file, the `-o` pairs, or nothing (a static-only deployment).
+    None,
+    /// `--php-cgi [PATH]`: a `spawn_cgi` pool driven by the `php-cgi` argv.
+    PhpCgi(String),
+    /// `--worker COMMAND`: a resident process speaking the worker protocol.
+    Worker(String),
+    /// `--fcgi COMMAND`: any FastCGI server with `{address}`.
+    Fcgi(String),
+}
+
+impl Backends {
+    /// Read the three flags as one choice. `clap`'s group makes at most one of them `Some`.
+    fn from_flags(php_cgi: Option<String>, worker: Option<String>, fcgi: Option<String>) -> Self {
+        match (php_cgi, worker, fcgi) {
+            (Some(binary), _, _) => Backends::PhpCgi(binary),
+            (_, Some(command), _) => Backends::Worker(command),
+            (_, _, Some(command)) => Backends::Fcgi(command),
+            _ => Backends::None,
+        }
+    }
+}
+
+/// The sizing a quick-start flag asked for: how many slots, and how wide each one is.
+///
+/// A struct rather than two more positional arguments, because the two mean different things and
+/// only one of them applies to each backend: `workers` is processes, `capacity` is connections per
+/// process. `clap` keeps `--workers` to any backend and `--capacity` to `--fcgi`, so a `Backends`
+/// plus this is a complete statement of what the command line asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Sizing {
+    workers: Option<u32>,
+    capacity: Option<u32>,
+}
+
+impl Sizing {
+    /// Read the two flags, refusing `--capacity` for a backend it cannot describe.
+    ///
+    /// **Checked here rather than by `requires = "fcgi"` on the argument**, because clap's
+    /// `requires` is satisfied by *presence*: `--php-cgi` takes an optional value, so clap reads it
+    /// as never missing, and `--php-cgi --capacity 4` would pass a `requires` check while meaning
+    /// nothing. `backends.cgi.capacity` is a configuration error for that driver anyway, so the
+    /// only honest thing to do is say so before the configuration is built.
+    fn from_flags(
+        backend: &Backends,
+        workers: Option<u32>,
+        capacity: Option<u32>,
+    ) -> Result<Self, ServerError> {
+        if capacity.is_some() && !matches!(backend, Backends::Fcgi(_)) {
+            return Err(invalid_override(
+                "--capacity sets how many requests one --fcgi slot serves at once, so it needs \
+                 --fcgi: a worker answers one request at a time by construction, and a php-cgi \
+                 pool expresses the same number as `children`"
+                    .to_string(),
+            ));
+        }
+        Ok(Self { workers, capacity })
+    }
+}
+
+/// The front controller `--fcgi` implies, when the operator named none.
+///
+/// A WSGI or Rack program is not `index.php`: leaving the PHP-shaped default in place means every
+/// path naming no file resolves to `index.php`, which does not exist, and answers 404. So `--fcgi`
+/// means "serve only real files" unless told otherwise — the same meaning `--front-controller ''`
+/// has.
+///
+/// **It is returned as a flag rather than written as a configuration key**, and that is not
+/// cosmetic: `Config::validate` refuses an empty `server.front_controller` in the table, because
+/// TOML cannot tell `front_controller = ""` from an absent key and the meaning is reserved for the
+/// flag. Returning it here puts it on the same path an explicit `--front-controller` takes, so the
+/// reserved spelling has exactly one implementation.
+fn implied_front_controller(backend: &Backends) -> Option<&'static str> {
+    matches!(backend, Backends::Fcgi(_)).then_some("")
 }
 
 /// Build the routing for a site from the site table.
@@ -1435,9 +1738,12 @@ fn serve(
     // front controller PHP will not run, and noticing it in the log is worth
     // more than the process refusing to start. Only in the log, so a deployment
     // that creates the root during startup still works.
-    for warning in
-        volucer_core::preflight::inspect_with(&config, &document_root, source.path.as_deref())
-    {
+    for warning in volucer_core::preflight::inspect_with_front_controller(
+        &config,
+        &document_root,
+        source.path.as_deref(),
+        front_controller_flag,
+    ) {
         tracing::warn!("{}", warning.message);
         if let Some(hint) = &warning.hint {
             tracing::warn!("  {hint}");
@@ -2701,6 +3007,7 @@ mod signals {
 fn check(
     source: &Source,
     document_root_flag: Option<&Path>,
+    front_controller_flag: Option<&str>,
     extra_php_dirs: &[PathBuf],
 ) -> Result<(), ServerError> {
     let config = source.load()?;
@@ -2708,7 +3015,9 @@ fn check(
     // The same resolution `serve` performs, so this reports the deployment that
     // would actually start rather than the one written in the file.
     let document_root = absolute_document_root(&resolve_document_root(document_root_flag, &config));
-    let front_controller = config.server.resolve_front_controller(None);
+    let front_controller = config
+        .server
+        .resolve_front_controller(front_controller_flag);
     // Where relative paths resolve: the file's directory, or the working directory for a fileless
     // deployment. Taken once, from the same helper `serve` uses, so the two cannot disagree about
     // which certificate `check` inspected.
@@ -3100,6 +3409,21 @@ fn check(
         if let volucer_core::config::BackendConfig::SpawnCgi(cgi) = backend {
             if cgi.is_php_cgi() {
                 println!("      driver:            php-cgi (binary)");
+                // The resolved path, not the configured string: with a bare `php-cgi` the two
+                // differ, and "which php-cgi will run" is the question this line answers — the
+                // same rule the `command` driver's `program` line follows.
+                if let Some(configured) = &cgi.binary {
+                    let resolved = volucer_core::php::resolve_cgi_binary(configured);
+                    if resolved == *configured {
+                        println!("      program:           {}", resolved.display());
+                    } else {
+                        println!(
+                            "      program:           {} (from binary {:?})",
+                            resolved.display(),
+                            configured
+                        );
+                    }
+                }
             } else {
                 println!("      driver:            command");
                 println!(
@@ -3530,8 +3854,12 @@ fn check(
     // Warnings, not errors: every one of these is a normal intermediate state on
     // the way to a working deployment, and refusing to report anything else
     // because the root is not there yet would be the wrong trade.
-    let warnings =
-        volucer_core::preflight::inspect_with(&config, &document_root, source.path.as_deref());
+    let warnings = volucer_core::preflight::inspect_with_front_controller(
+        &config,
+        &document_root,
+        source.path.as_deref(),
+        front_controller_flag,
+    );
     if !warnings.is_empty() {
         println!("  warnings:");
         for warning in &warnings {
@@ -3625,6 +3953,7 @@ fn print_advertised_capacity(external: &volucer_core::config::ExternalConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use volucer_core::config::BackendConfig;
 
     /// An override is typed by TOML, and a listener that is not TOML is still a string.
     ///
@@ -3734,6 +4063,311 @@ mod tests {
             Some("unix:/run/app.sock"),
             "the fastcgi sugar is untouched by the http override"
         );
+    }
+
+    /// The quick-start group is three statements plus a count, written before every `-o`.
+    ///
+    /// Asserted on the assembled pairs, like the `--listen` test: the ordering *is* the precedence
+    /// rule, and a process-based test would fail for a port reason and say nothing about it.
+    #[test]
+    fn the_php_cgi_sugar_names_a_default_backend_and_its_size() {
+        let source = Source::resolve_with_backends(
+            None,
+            Some("127.0.0.1:8080".to_string()),
+            None,
+            vec!["backends.cgi.workers=9".to_string()],
+            Backends::PhpCgi("C:/php-8.3.31/php-cgi.exe".to_string()),
+            Sizing {
+                workers: Some(5),
+                capacity: None,
+            },
+        );
+
+        assert_eq!(
+            source.pairs,
+            vec![
+                "server.http=\"127.0.0.1:8080\"".to_string(),
+                "server.default_backend=\"cgi\"".to_string(),
+                "backends.cgi.kind=\"spawn_cgi\"".to_string(),
+                "backends.cgi.binary=\"C:/php-8.3.31/php-cgi.exe\"".to_string(),
+                "backends.cgi.workers=5".to_string(),
+                "backends.cgi.workers=9".to_string(),
+            ],
+            "the sugar precedes the overrides, so an explicit -o wins"
+        );
+    }
+
+    /// The whole point of the short command: the pairs alone describe a deployment `serve` will
+    /// accept, with no file and no further flags.
+    #[test]
+    fn the_php_cgi_sugar_alone_is_a_valid_configuration() {
+        let source = Source::resolve_with_backends(
+            None,
+            Some("127.0.0.1:8080".to_string()),
+            None,
+            Vec::new(),
+            Backends::PhpCgi("php-cgi".to_string()),
+            Sizing {
+                workers: Some(5),
+                capacity: None,
+            },
+        );
+
+        let mut table = toml::Table::new();
+        for pair in &source.pairs {
+            apply_override(&mut table, pair).expect("each pair applies");
+        }
+        let config = Config::from_table(table).expect("the table deserializes");
+        config.validate().expect("and validates");
+
+        assert_eq!(config.server.default_backend.as_deref(), Some("cgi"));
+        match config.backends.get("cgi").expect("the backend exists") {
+            BackendConfig::SpawnCgi(cgi) => {
+                assert_eq!(cgi.binary.as_deref(), Some(Path::new("php-cgi")));
+                assert_eq!(cgi.workers, 5);
+                assert!(cgi.command.is_none(), "binary and command are exclusive");
+            }
+            other => panic!("expected a spawn_cgi backend, got {other:?}"),
+        }
+    }
+
+    /// Worker mode is the same three statements, with `worker` where `spawn_cgi` was.
+    #[test]
+    fn the_worker_sugar_produces_a_worker_backend_with_its_command() {
+        let source = Source::resolve_with_backends(
+            None,
+            Some("127.0.0.1:8080".to_string()),
+            None,
+            Vec::new(),
+            Backends::Worker("php worker.php".to_string()),
+            Sizing {
+                workers: Some(5),
+                capacity: None,
+            },
+        );
+
+        let mut table = toml::Table::new();
+        for pair in &source.pairs {
+            apply_override(&mut table, pair).expect("each pair applies");
+        }
+        let config = Config::from_table(table).expect("the table deserializes");
+        config.validate().expect("and validates");
+
+        assert_eq!(config.server.default_backend.as_deref(), Some("app"));
+        match config.backends.get("app").expect("the backend exists") {
+            BackendConfig::Worker(worker) => {
+                assert_eq!(worker.command, "php worker.php");
+                assert_eq!(worker.workers, 5);
+            }
+            other => panic!("expected a worker backend, got {other:?}"),
+        }
+    }
+
+    /// The non-PHP FastCGI flag: a `command` slot with `{address}`, and one slot by default —
+    /// plus the front controller it has to clear, because a WSGI program is not `index.php`.
+    #[test]
+    fn the_fcgi_sugar_sets_a_command_slot_and_clears_the_front_controller() {
+        let source = Source::resolve_with_backends(
+            None,
+            Some("127.0.0.1:8080".to_string()),
+            None,
+            Vec::new(),
+            Backends::Fcgi("python fcgi_app.py --bind {address}".to_string()),
+            Sizing::default(),
+        );
+
+        let mut table = toml::Table::new();
+        for pair in &source.pairs {
+            apply_override(&mut table, pair).expect("each pair applies");
+        }
+        let config = Config::from_table(table).expect("the table deserializes");
+        config.validate().expect("and validates");
+
+        assert_eq!(config.server.default_backend.as_deref(), Some("app"));
+        match config.backends.get("app").expect("the backend exists") {
+            BackendConfig::SpawnCgi(cgi) => {
+                assert_eq!(
+                    cgi.command.as_deref(),
+                    Some("python fcgi_app.py --bind {address}")
+                );
+                assert!(cgi.binary.is_none(), "binary and command are exclusive");
+                assert_eq!(cgi.workers, 1, "one slot until capacity is widened");
+            }
+            other => panic!("expected a spawn_cgi backend, got {other:?}"),
+        }
+        // The empty string is the documented spelling of "no front controller", and it is what
+        // keeps a WSGI deployment from resolving every unknown path to a missing `index.php`.
+        // It cannot live in the table — `Config::validate` refuses that — so it is supplied as a
+        // flag, which is the same path an explicit `--front-controller` takes.
+        assert_eq!(
+            implied_front_controller(&Backends::Fcgi(
+                "python fcgi_app.py --bind {address}".to_string()
+            )),
+            Some("")
+        );
+        assert_eq!(
+            implied_front_controller(&Backends::PhpCgi("php-cgi".to_string())),
+            None,
+            "a PHP deployment keeps index.php"
+        );
+        assert_eq!(implied_front_controller(&Backends::None), None);
+        assert_eq!(
+            config.server.resolve_front_controller(None).as_deref(),
+            Some("index.php")
+        );
+    }
+
+    /// `--capacity` widens a `--fcgi` slot without changing how many slots there are.
+    ///
+    /// The two are different numbers, and that is the whole reason the flag exists: `--workers` is
+    /// processes, `--capacity` is connections held open to each one. A FastCGI server that forks
+    /// four children behind one slot needs `capacity = 4` for the pool to reach all four.
+    #[test]
+    fn the_capacity_flag_widens_an_fcgi_slot() {
+        let source = Source::resolve_with_backends(
+            None,
+            Some("127.0.0.1:8080".to_string()),
+            None,
+            Vec::new(),
+            Backends::Fcgi("python fcgi_app.py --bind {address}".to_string()),
+            Sizing {
+                workers: Some(2),
+                capacity: Some(4),
+            },
+        );
+
+        let mut table = toml::Table::new();
+        for pair in &source.pairs {
+            apply_override(&mut table, pair).expect("each pair applies");
+        }
+        let config = Config::from_table(table).expect("the table deserializes");
+        config.validate().expect("and validates");
+
+        match config.backends.get("app").expect("the backend exists") {
+            BackendConfig::SpawnCgi(cgi) => {
+                assert_eq!(cgi.workers, 2, "two slots");
+                assert_eq!(cgi.capacity, 4, "four requests each");
+            }
+            other => panic!("expected a spawn_cgi backend, got {other:?}"),
+        }
+    }
+
+    /// `--capacity` describes a `spawn_cgi` slot, so it is refused for the other two backends.
+    ///
+    /// A `worker` answers one request at a time by construction and `php-cgi` spells the same
+    /// number `children`, so accepting the flag there would either do nothing or mean something
+    /// else — and `backends.cgi.capacity` beside `binary` is a configuration error anyway. The
+    /// refusal is ours rather than clap's, because `requires` is satisfied by *presence* and
+    /// `--php-cgi`'s optional value counts as present.
+    #[test]
+    fn capacity_without_fcgi_is_refused() {
+        for (backend, argv) in [
+            (
+                Backends::PhpCgi("php-cgi".to_string()),
+                vec!["volucer", "serve", "--php-cgi", "--capacity", "4"],
+            ),
+            (
+                Backends::Worker("php worker.php".to_string()),
+                vec![
+                    "volucer",
+                    "serve",
+                    "--worker",
+                    "php worker.php",
+                    "--capacity",
+                    "4",
+                ],
+            ),
+            (Backends::None, vec!["volucer", "serve", "--capacity", "4"]),
+        ] {
+            // Parsed, so the flag itself is accepted — the refusal is what the value *means*,
+            // which only the backend choice can answer.
+            let cli = Cli::try_parse_from(&argv).expect("--capacity parses on its own");
+            let Command::Serve {
+                workers, capacity, ..
+            } = cli.command
+            else {
+                panic!("expected serve for {argv:?}")
+            };
+            let err = Sizing::from_flags(&backend, workers, capacity)
+                .expect_err("capacity without --fcgi is refused");
+            assert!(err.to_string().contains("--capacity"), "{err}");
+            assert!(err.to_string().contains("--fcgi"), "{err}");
+        }
+
+        // And with `--fcgi` it is accepted.
+        assert!(Sizing::from_flags(
+            &Backends::Fcgi("python fcgi_app.py --bind {address}".to_string()),
+            None,
+            Some(4)
+        )
+        .is_ok());
+    }
+
+    /// The three backend flags are one choice, and clap refuses two at once rather than letting
+    /// one silently win over another.
+    #[test]
+    fn two_backend_flags_are_a_usage_error() {
+        for pair in [
+            vec!["--php-cgi", "--worker", "php worker.php"],
+            vec!["--php-cgi", "--fcgi", "flup-fcgi {address}"],
+            vec![
+                "--worker",
+                "php worker.php",
+                "--fcgi",
+                "flup-fcgi {address}",
+            ],
+        ] {
+            let mut argv = vec!["volucer", "serve", "--listen", "127.0.0.1:8080"];
+            argv.extend(pair.iter().copied());
+            let error = Cli::try_parse_from(&argv)
+                .expect_err("clap refuses two backends in one deployment");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{pair:?}"
+            );
+        }
+    }
+
+    /// `--workers` without any backend flag has nothing to size, and clap refuses it rather than
+    /// writing a pair for a backend nobody asked for.
+    #[test]
+    fn workers_without_a_backend_is_a_usage_error() {
+        let error = Cli::try_parse_from([
+            "volucer",
+            "serve",
+            "--listen",
+            "127.0.0.1:8080",
+            "--workers",
+            "5",
+        ])
+        .expect_err("clap refuses a dependent flag on its own");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    /// A bare `--php-cgi` means the name `php-cgi`, which the resolver then looks up; a value
+    /// means exactly that value. Both are the same flag, which is why `num_args = 0..=1` is
+    /// load-bearing.
+    #[test]
+    fn a_bare_php_cgi_flag_names_php_cgi_and_a_value_overrides_it() {
+        for (argv, expected) in [
+            (vec!["volucer", "serve", "--php-cgi"], "php-cgi"),
+            (
+                vec!["volucer", "serve", "--php-cgi=C:/php-8.3.31/php-cgi.exe"],
+                "C:/php-8.3.31/php-cgi.exe",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("parses");
+            match cli.command {
+                Command::Serve { php_cgi, .. } => {
+                    assert_eq!(php_cgi.as_deref(), Some(expected), "{argv:?}")
+                }
+                other => panic!("expected serve, got {other:?}"),
+            }
+        }
     }
 
     #[test]

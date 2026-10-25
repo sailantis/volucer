@@ -95,12 +95,27 @@ pub fn resolve_program(program: &str) -> PathBuf {
 
 /// Look a bare program name up on `PATH`.
 fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    find_in_dirs(&dirs, program)
+}
 
+/// Look a bare program name up in the given directories, most specific first.
+///
+/// Shared with [`crate::php::resolve_cgi_binary`], so a `spawn_cgi` `binary` and a
+/// `command`'s program are found by one rule. Without that, the same executable is
+/// resolvable from one key and not the other, and `volucer check` ends up listing a
+/// binary directly above a warning that it does not exist.
+///
+/// `is_file` rather than `exists`, for the reason [`resolve_program`] documents: a name
+/// that happens to match a directory would otherwise be "resolved" and fail only when
+/// something tried to execute it.
+pub fn find_in_dirs(dirs: &[PathBuf], program: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     let extensions = path_extensions();
 
-    for dir in std::env::split_paths(&path) {
+    for dir in dirs {
         let candidate = dir.join(program);
         if candidate.is_file() {
             return Some(candidate);

@@ -249,12 +249,96 @@ Your application is now on <http://127.0.0.1:8080>.
 | `-o`, `--override <KEY=VALUE>` | Set one key, in `dot.notation`. Repeatable. |
 | `--listen <ADDR>` | Shorthand for `-o server.http=<ADDR>`. |
 | `--fastcgi <ADDR>` | Shorthand for `-o server.fastcgi=<ADDR>`. |
-| `--document-root <PATH>` | Override `server.document_root`. |
+| `--document-root <PATH>`, `--root <PATH>` | Override `server.document_root`. |
 | `--front-controller <NAME>` | Override `server.front_controller`. Set it to an empty string to serve only real files. |
+| `--php-cgi [<PATH>]` | Serve a `php-cgi` pool as the default backend — see below. |
+| `--worker <COMMAND>` | Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`. |
+| `--fcgi <COMMAND>` | Serve any FastCGI server as the default backend, e.g. `--fcgi "python fcgi_app.py --bind {address}"`. |
+| `--workers <N>` | How many slots the chosen backend starts. Requires one of the three flags above. |
+| `--capacity <N>` | How many requests one `--fcgi` slot serves at once. `--fcgi` only. |
 | `--max-connections <N>` | Maximum concurrent client connections. Defaults to `512`. |
 
 A flag always wins over the file. That is deliberate: a systemd unit or a container image
 can describe its whole deployment in one file and not carry arguments.
+
+### The short command
+
+For a project you are developing, two flags are enough:
+
+```console
+volucer serve --listen 127.0.0.1:8080 --root public --php-cgi
+```
+
+No file, no `-o` pairs, and PHP is served. `--php-cgi` is **three statements at once** — a
+`spawn_cgi` backend named `cgi` exists, its `binary` is `php-cgi`, and
+`server.default_backend` points at it — and it is written only because the flag asked for it.
+Nothing is detected from the working directory: a deployment without one of these flags has no
+backend, and says so.
+
+A bare `--php-cgi` names `php-cgi`, looked up in the same directories `volucer check` searches
+— `PATH` first, then the conventional install locations, with `PATHEXT` on Windows. Name the
+executable to choose one:
+
+```console
+volucer serve --listen 127.0.0.1:8080 --root public \
+    --php-cgi=C:\php-8.3.31\php-cgi.exe --workers=5
+```
+
+`--workers` is that backend's `workers` key; omitted, one slot is started per logical CPU.
+`volucer check` accepts the same flags, so a one-line deployment can be rehearsed before
+it is started. The flags are written **before** every `-o`, so an explicit
+`-o backends.cgi.workers=9` still wins.
+
+### The other two modes
+
+The same shape works for the other backends. **Worker mode** — a persistent process that boots
+your application once:
+
+```console
+volucer serve --listen 127.0.0.1:8080 --root public --worker "php worker.php" --workers=5
+```
+
+That writes `backends.app.kind=worker`, its `command`, and `server.default_backend`. The worker
+needs the SDK — see [Worker Applications](07-WORKER-APPLICATIONS.md).
+
+**`--root` and the worker's `command` are two different places, and that is deliberate.** `--root
+public` is the document root: the directory static files are served from, and the directory a
+front controller is resolved inside. The worker's `command` resolves from the **working
+directory** — the folder you started `volucer serve` in — so `php worker.php` means a `worker.php`
+beside `public/`, not inside it. A worker is an application entry point, not a document to be
+served, so keeping it out of the document root is the normal layout:
+
+```text
+my-project/
+├── worker.php          ← --worker "php worker.php"
+└── public/             ← --root public
+    ├── index.php
+    └── style.css
+```
+
+**FastCGI mode for anything that is not PHP** — a WSGI, Rack or Go server:
+
+```console
+volucer serve --listen 127.0.0.1:8080 --root public \
+    --fcgi "python fcgi_app.py --bind {address}" --workers=2 --capacity=4
+```
+
+`{address}` is required: the pool owns one address per slot, so a program that binds one of its
+own is never reached, and `check` warns about it.
+
+`--workers` and `--capacity` are two different numbers, and the split is the point. `--workers` is
+how many **processes** the pool starts (`1` by default here), while `--capacity` is how many
+connections the pool keeps open to **each one** — so set it to the number of children your
+FastCGI server forks for itself, `gunicorn -w 4` or Puma's `threads 5`, and the pool can reach
+every child instead of queueing behind one. `--capacity` without `--fcgi` is an error, because a
+worker answers one request at a time by construction and a `php-cgi` pool spells the same number
+`children`.
+
+`--fcgi` also means **"serve only real files"** unless you say otherwise, because a WSGI or Rack
+program is not `index.php`: leaving the PHP-shaped default in place would answer 404 for every
+path that names no file. Pass `--front-controller app.py` to give it one instead.
+
+The three backend flags are one choice: two of them in one command is a usage error.
 
 ### Without a file at all
 
