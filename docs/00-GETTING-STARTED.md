@@ -1,37 +1,39 @@
 # Getting Started
 
-**Install volucer, serve an application, and move off `php-fpm`.**
+Install Volucer, connect it to an application, and serve requests over HTTP or FastCGI.
 
-## What volucer is
+## What Volucer does
 
-Volucer is a single binary that runs applications. It never embeds a runtime — `php`,
-`php-cgi` and `php-fpm` are started as ordinary external processes, the same way any
-other server would start them, and it runs any FastCGI server and speaks its own worker
-protocol besides.
+Volucer is a cross-platform application server distributed as one binary. It does not
+embed a language runtime: it starts and supervises application processes, connects to
+existing backends, and serves applications over HTTP or FastCGI.
 
-It offers two ways to run your application, and you pick per route:
+Choose a backend for each route:
 
-| | What happens per request | Use it when |
+| Backend | How it works | Use it when |
 |---|---|---|
-| **Worker mode** | The application boots once and stays resident. It clears its own request scope between requests. | You can restructure the app to reset its own state, and the boot cost matters. |
-| **FastCGI mode** | The backend resets everything, exactly as `php-fpm` does it. | You are migrating an existing app and cannot change how it handles state. |
+| **Worker** | The app starts once and stays resident. The app resets request-scoped state between requests. | You use a Volucer worker SDK or implement the worker protocol, and want to avoid repeated startup. |
+| **FastCGI** | A FastCGI backend handles requests and resets request state. | You want to keep an existing FastCGI application and its request lifecycle. |
+| **HTTP upstream** | Volucer routes requests to an HTTP server. | Your application already runs its own HTTP server. |
 
-Both are served by the same listener, so a single process can run a `/api` route in worker
-mode and a `/admin` route in FastCGI mode.
+All routes use the same listener. For example, one Volucer process can serve `/api` with
+a worker and `/admin` through FastCGI.
 
-**FastCGI is a protocol, not a PHP feature.** A FastCGI-speaking WSGI, Rack or Go server
-is served exactly as `php-fpm` is: `external` attaches to a pool somebody else runs, and
-`spawn_cgi` starts and supervises the processes itself — with `php-cgi` as one driver and
-any other FastCGI server as another.
+**FastCGI is a protocol, not a PHP feature.** Volucer can attach to an existing FastCGI
+pool with the `external` backend, or start and supervise a compatible server with
+`spawn_cgi`. This includes `php-fpm`, `php-cgi`, and FastCGI applications built with
+WSGI, Rack, or Go.
 
-It runs on Linux, macOS and Windows. On Windows it is the only way to get `php-fpm`-like
-behaviour, because Windows has no `php-fpm` at all.
+Volucer runs on Linux, macOS, and Windows. Windows does not provide `php-fpm`; use
+`php-cgi` there for a FastCGI-based PHP deployment. Worker SDKs are available for PHP,
+Python, and Ruby.
 
 ## Requirements
 
-- **PHP 8.2 or newer**, if your application is PHP. This is the floor for the PHP SDK.
-- An application. Any framework works, in any language the backend supports.
-- No Rust toolchain, no Composer package, no build step.
+- An application that uses one of Volucer's supported backends. Any framework can work;
+  the backend determines how Volucer communicates with it.
+- **PHP 8.2 or newer** if you plan to use the PHP worker SDK.
+- No Rust toolchain or build step is needed to install and run the prebuilt binary.
 
 ## Install
 
@@ -41,11 +43,10 @@ behaviour, because Windows has no `php-fpm` at all.
 curl -fsSL https://github.com/sailantis/volucer/releases/latest/download/install.sh | sh
 ```
 
-The binary lands in `~/.local/bin`, which the installer adds to your `PATH` if it is not
-already there. It writes to the file your shell actually reads — `~/.bashrc` (or `~/.profile`
-when you have none), `~/.zshrc`, or `~/.config/fish/config.fish` — and prints the file and the
-exact line it added, so you can take it back out. Set `VOLUCER_MODIFY_PATH=0` to install
-without touching a dotfile.
+The installer puts the binary in `~/.local/bin` and adds that directory to `PATH` if
+needed. It updates the startup file used by your shell (`~/.bashrc`, `~/.profile`,
+`~/.zshrc`, or `~/.config/fish/config.fish`) and prints the exact change it made. Set
+`VOLUCER_MODIFY_PATH=0` to install without editing a shell startup file.
 
 ### Windows
 
@@ -53,29 +54,28 @@ without touching a dotfile.
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/sailantis/volucer/releases/latest/download/install.ps1 | iex"
 ```
 
-The binary lands in `%LOCALAPPDATA%\volucer\bin`, which the installer adds to your user
-`PATH`. Open a new shell afterwards for that to take effect. Pass `-ModifyPath 0` (or set
-`VOLUCER_MODIFY_PATH=0`) to leave the environment alone.
+The installer puts the binary in `%LOCALAPPDATA%\volucer\bin` and adds it to your user
+`PATH`. Open a new shell for the change to take effect. Pass `-ModifyPath 0` (or set
+`VOLUCER_MODIFY_PATH=0`) to leave `PATH` unchanged.
 
-Both scripts resolve the newest release, download the archive for your platform, verify its
-SHA-256 **before** extracting anything, and only then put the binary in place. A failure at
-any step leaves your existing binary exactly as it was.
+Both installers find the latest release, download the archive for your platform, and
+verify its SHA-256 before extracting or installing anything. If a step fails, the
+existing binary is left in place.
 
-A SHA-256 fetched from the same server as the archive proves the archive was not corrupted in
-transit; it cannot prove the archive came from this repository, because whoever can replace one
-file can replace the other. Every release is therefore attested with
-`actions/attest-build-provenance`, and both installers check that attestation when they can —
-with `gh attestation verify`, against a signature GitHub's OIDC identity made and Sigstore's
-transparency log records, which a compromised or hostile download origin cannot forge.
+The SHA-256 file detects corruption in transit, but by itself does not prove who published
+the archive if both files come from the same server. Releases also include a provenance
+attestation created with `actions/attest-build-provenance`. When possible, the installers
+verify it with `gh attestation verify`, which checks the GitHub Actions identity and the
+Sigstore transparency log.
 
-That check needs the GitHub CLI and a GitHub login, which a `curl | sh` cannot assume, so it is
-best-effort by default and the installer says plainly which of the two guarantees you got. Set
-`VOLUCER_VERIFY=require` (or `-Verify require` on PowerShell) to make it mandatory: the install
-then refuses to proceed when the attestation cannot be checked. A *failed* verification is fatal
-in every mode except `off`.
+Attestation verification requires the GitHub CLI and a GitHub login, so it is best-effort
+by default. The installer reports whether verification succeeded. Set
+`VOLUCER_VERIFY=require` (or `-Verify require` in PowerShell) to refuse installation if
+verification cannot be completed. A failed verification is fatal unless verification is
+explicitly disabled with `off`.
 
-They read their settings from environment variables, because `curl | sh` and `irm | iex`
-cannot pass arguments. Both scripts read the same names:
+The installers read settings from environment variables, which work with both
+`curl | sh` and `irm | iex`. They support these settings:
 
 | Variable | Effect |
 |---|---|
@@ -87,48 +87,46 @@ cannot pass arguments. Both scripts read the same names:
 | `VOLUCER_API` | The release API root. |
 | `VOLUCER_VERIFY` | `auto` (default), `require` or `off` — whether to check the build provenance attestation. |
 
-`install.ps1` takes the same settings as parameters (`-Version`, `-InstallDir`, `-Force`,
-`-BaseUrl`, `-Verify`, `-ModifyPath`) and falls back to the environment variables, so a one-liner
-that can only set environment variables behaves the same as one that passes parameters.
+`install.ps1` also accepts parameters (`-Version`, `-InstallDir`, `-Force`, `-BaseUrl`,
+`-Verify`, and `-ModifyPath`). If a parameter is not supplied, it uses the corresponding
+environment variable.
 
-The shell script also honours `VOLUCER_LIBC` (`gnu` or `musl`) and `VOLUCER_ARCH`
-(`x86_64` or `aarch64`). `install.ps1` takes the same `VOLUCER_MODIFY_PATH` setting as
-`-ModifyPath`, and defaults to the same `1`: on Windows the user `PATH` is a single registry
-value, so the edit is one value to add and one to take back out rather than a line in a file
-whose name depends on the shell.
+On Linux and macOS, the shell installer also accepts `VOLUCER_LIBC` (`gnu` or `musl`)
+and `VOLUCER_ARCH` (`x86_64` or `aarch64`). On Windows, `-ModifyPath` (or
+`VOLUCER_MODIFY_PATH`) controls whether the installer edits the user `PATH`; it defaults
+to `1`.
 
 ### In a container
 
-`packaging/docker/Dockerfile` builds two images from one crate — a glibc image and a
-`scratch`-based musl image:
+`packaging/docker/Dockerfile` can build a glibc image or a `scratch`-based musl image.
+To build the musl image, run:
 
 ```console
 docker build --target musl -t volucer .
 ```
 
-The image declares a `HEALTHCHECK` that runs `volucer health`, which reads the probe address
-from `[status]` — the `scratch` target has no shell and no `curl`, so the check has to be the
-binary itself. See [Operations](11-OPERATIONS.md#docker) for the `docker run` and Compose
-invocations, and for which of `/health` and `/ready` belongs in which place.
+The image's Docker `HEALTHCHECK` runs `volucer health`. The command reads its probe
+address from `[status]`, so it also works in the `scratch` image, which contains no shell
+or `curl`. See [Docker operations](11-OPERATIONS.md#docker) for `docker run`, Compose,
+and guidance on when to use `/health` or `/ready`.
 
 ### Directly
 
 Download the archive for your platform from the
-[releases page](https://github.com/sailantis/volucer/releases), verify it against the
-`.sha256` file beside it, and put the binary on your `PATH`. That is the whole procedure.
+[releases page](https://github.com/sailantis/volucer/releases), verify it using the
+adjacent `.sha256` file, and put the binary on your `PATH`.
 
 ## Check your setup
 
-Before serving anything, ask volucer what it found on this host:
+Run `volucer check` before starting the server:
 
 ```console
 volucer check
 ```
 
-This parses your configuration, resolves the document root and front controller the way
-`serve` would, discovers the PHP binaries it can find, and reports which of them are
-executable. It is the fastest way to find out why a deployment is not doing what you
-expected.
+The command validates the configuration and reports the effective listeners, backends,
+resolved document root and front controller, and any PHP binaries it finds. Use it to
+catch configuration problems before serving traffic.
 
 ```
 configuration: volucer.toml
@@ -170,30 +168,29 @@ configuration: volucer.toml
 configuration OK
 ```
 
-Read the `warnings:` block if one appears — it is where a path that does not exist, a front
-controller the document root does not contain, or a worker `command` naming a program that
-is not on `PATH` is reported. A warning does not make `check` fail: `configuration OK` means
-the configuration is *internally consistent*, and a warning is a statement that it may not
-describe the deployment you meant. Exit code `0` with three warnings is a deployment that
-will start and misbehave.
+If a `warnings:` block appears, review it before deployment. It can identify a missing
+path, a front controller that is not under the document root, or a worker command whose
+program is not on `PATH`. Warnings do not make `check` fail: `configuration OK` means the
+configuration is internally consistent, not necessarily that it matches your intent. A
+zero exit code with warnings can still lead to a deployment that starts but behaves
+incorrectly.
 
-For a `spawn_cgi` backend, `check` also prints **`processes:`**, which is the multiplication
-the file makes you do yourself: `workers × concurrency` for a `command` driver, or
-`workers × (children + 1)` for `php-cgi`, whose children are spawned in addition to the
-master. A `workers = 0` (one per logical CPU) is resolved before the multiplication, so the
-line states what this host will actually run — which is the number to size memory,
-file descriptors or a container's `pids_limit` against.
+For `spawn_cgi`, `check` prints the total process count. For a `command` driver it is
+`workers × concurrency`; for `php-cgi` it is `workers × (children + 1)`, because each
+master also spawns its children. If `workers = 0`, Volucer first resolves it to the
+number of logical CPUs. Use the resulting count to plan memory, file descriptors, and a
+container's `pids_limit`.
 
-A `command` that uses `{concurrency}` also gets a **`command resolves:`** line, because the
-substitution is the one thing an operator cannot check by reading the file: `concurrency = 0`
-means one, so the program is told `1` rather than the `0` the key appears to say. `{address}` is
-left as written there — the pool decides one per slot, and printing an invented slot number would
-show an address `serve` never binds.
+For a `command` containing `{concurrency}`, `check` also prints the resolved command.
+This shows the value Volucer will pass to the program: `concurrency = 0` is treated as
+one, so the command receives `1`. `{address}` remains unchanged in this output because
+the pool assigns a separate address to each slot at runtime.
 
-`volucer check` needs a configuration file to check. If you do not have one yet, write
-the minimum below first.
+`volucer check` requires a configuration file. If you do not have one yet, create the
+minimal file shown below first.
 
-If volucer cannot find your PHP, point it at the directory:
+If Volucer cannot find your PHP installation, provide the directory containing its
+binaries:
 
 ```console
 volucer check --php-dir /usr/local/php/bin
@@ -201,8 +198,8 @@ volucer check --php-dir /usr/local/php/bin
 
 ## Write a configuration file
 
-Volucer reads a TOML file called `volucer.toml` by default. This is the smallest useful
-one:
+By default, Volucer reads `volucer.toml` from the working directory. This minimal
+configuration listens for HTTP requests and forwards them to an existing PHP-FPM socket:
 
 ```toml
 [server]
@@ -215,19 +212,19 @@ kind = "external"
 socket = "unix:/run/php/php8.3-fpm.sock"
 ```
 
-Three things are in there:
+The configuration has three important parts:
 
-- **`[server]`** — the listeners, where your application lives, and which backend answers a
-  request that matches no route.
-- **`[backends.app]`** — how the application gets run. This one attaches to a `php-fpm` that is
-  already running, so the behaviour is exactly what you have today.
-- **`default_backend`** — the backend used when a request matches no route. It is one of
-  `[server]`'s keys rather than a top-level one, because `[server]` **is** the unnamed site:
-  a `[sites.<name>]` table overrides it for one host, exactly as it overrides `document_root`.
+- **`[server]`** configures the listener, document root, and default backend.
+- **`[backends.app]`** defines how the application is reached. Here, `external` connects to
+  a PHP-FPM process that is already running.
+- **`default_backend`** selects the backend for requests that do not match a route. It
+  belongs under `[server]` because that table also represents the default, unnamed site.
+  A `[sites.<name>]` table can override it for a particular host, along with settings such
+  as `document_root`.
 
-That is a complete FastCGI deployment. It behaves like `nginx` in front of `php-fpm`,
-except there is no `nginx` to configure. Any FastCGI server is the same backend — a `socket`
-is a socket, and the protocol is FastCGI:
+This is a complete FastCGI setup: Volucer serves requests to PHP-FPM without requiring
+nginx in front. The same `external` backend can connect to any FastCGI server; change the
+socket to the one used by that application:
 
 ```toml
 [backends.app]
@@ -235,7 +232,7 @@ kind = "external"
 socket = "unix:/run/app/py.sock"
 ```
 
-To use volucer's own worker mode instead, replace the backend:
+To run a persistent worker instead, replace the backend configuration:
 
 ```toml
 [backends.app]
@@ -243,18 +240,19 @@ kind = "worker"
 command = "php worker.php"
 ```
 
-That needs a `worker.php` in your application — see
-[Worker Applications](07-WORKER-APPLICATIONS.md).
+The application needs a `worker.php` entry point and the worker SDK. See
+[Worker Applications](07-WORKER-APPLICATIONS.md) for implementation details.
 
-## Serve
+## Start the server
 
 ```console
 volucer serve
 ```
 
-Your application is now on <http://127.0.0.1:8080>.
+With the example configuration above, the application is available at
+<http://127.0.0.1:8080>.
 
-`volucer serve` accepts a few options:
+`volucer serve` accepts these options:
 
 | Option | Effect |
 |---|---|
@@ -271,55 +269,53 @@ Your application is now on <http://127.0.0.1:8080>.
 | `--concurrency <N>` | How many requests one `--fcgi` slot serves at once. `--fcgi` only. `--capacity` is the old spelling and still parses. |
 | `--max-connections <N>` | Maximum concurrent client connections. Defaults to `512`. |
 
-A flag always wins over the file. That is deliberate: a systemd unit or a container image
-can describe its whole deployment in one file and not carry arguments.
+Command-line options override values in the configuration file. Use them to supply
+deployment-specific settings without maintaining a separate file for each environment.
 
 ### The short command
 
-For a project you are developing, two flags are enough:
+For local development with PHP, these options are often enough:
 
 ```console
 volucer serve --listen 127.0.0.1:8080 --root public --php-cgi
 ```
 
-No file, no `-o` pairs, and PHP is served. `--php-cgi` is **three statements at once** — a
-`spawn_cgi` backend named `cgi` exists, its `binary` is `php-cgi`, and
-`server.default_backend` points at it — and it is written only because the flag asked for it.
-Nothing is detected from the working directory: a deployment without one of these flags has no
-backend, and says so.
+This starts Volucer without a configuration file or `-o` overrides. `--php-cgi` configures
+a `spawn_cgi` backend named `cgi`, sets its binary to `php-cgi`, and makes it the default
+backend. Volucer does not infer an application backend from the working directory; without
+a backend in the file or on the command line, it reports the missing configuration.
 
-A bare `--php-cgi` names `php-cgi`, looked up in the same directories `volucer check` searches
-— `PATH` first, then the conventional install locations, with `PATHEXT` on Windows. Name the
-executable to choose one:
+With no value, `--php-cgi` looks for `php-cgi` using the same search order as
+`volucer check`: `PATH` first, then conventional installation directories. On Windows,
+the search also uses `PATHEXT`. Pass a path to select a specific executable:
 
 ```console
 volucer serve --listen 127.0.0.1:8080 --root public \
     --php-cgi=C:\php-8.3.31\php-cgi.exe --workers=5
 ```
 
-`--workers` is that backend's `workers` key; omitted, one slot is started per logical CPU.
-`volucer check` accepts the same flags, so a one-line deployment can be rehearsed before
-it is started. The flags are written **before** every `-o`, so an explicit
-`-o backends.cgi.workers=9` still wins.
+`--workers` sets that backend's `workers` value. If omitted, Volucer starts one slot per
+logical CPU. `volucer check` accepts the same options, so you can validate a command before
+serving traffic. Volucer applies these flags before `-o` overrides, so
+`-o backends.cgi.workers=9` takes precedence over `--workers`.
 
 ### The other two modes
 
-The same shape works for the other backends. **Worker mode** — a persistent process that boots
-your application once:
+You can also select a worker or another FastCGI server from the command line.
+**Worker mode** starts a persistent process and boots the application once:
 
 ```console
 volucer serve --listen 127.0.0.1:8080 --root public --worker "php worker.php" --workers=5
 ```
 
-That writes `backends.app.kind=worker`, its `command`, and `server.default_backend`. The worker
-needs the SDK — see [Worker Applications](07-WORKER-APPLICATIONS.md).
+This sets `backends.app.kind=worker`, its `command`, and `server.default_backend`. The
+application needs a worker SDK; see [Worker Applications](07-WORKER-APPLICATIONS.md).
 
-**`--root` and the worker's `command` are two different places, and that is deliberate.** `--root
-public` is the document root: the directory static files are served from, and the directory a
-front controller is resolved inside. The worker's `command` resolves from the **working
-directory** — the folder you started `volucer serve` in — so `php worker.php` means a `worker.php`
-beside `public/`, not inside it. A worker is an application entry point, not a document to be
-served, so keeping it out of the document root is the normal layout:
+The document root and the worker command resolve from different directories.
+`--root public` sets the document root for static files and front-controller lookup. The worker's
+`command` runs from the **working directory** where you started `volucer serve`. In this
+example, `php worker.php` refers to the file beside `public/`, not inside it. Keeping the
+worker entry point outside the document root is a common layout:
 
 ```text
 my-project/
@@ -329,37 +325,39 @@ my-project/
     └── style.css
 ```
 
-**FastCGI mode for anything that is not PHP** — a WSGI, Rack or Go server:
+For a FastCGI application, such as a WSGI, Rack, or Go server, use `--fcgi`:
 
 ```console
 volucer serve --listen 127.0.0.1:8080 --root public \
     --fcgi "python fcgi_app.py --bind {address}" --workers=2 --concurrency=4
 ```
 
-`{address}` is required: the pool owns one address per slot, so a program that binds one of its
-own is never reached, and `check` warns about it.
+Include `{address}` in the command. Volucer allocates an address for each slot; if the
+program binds its own address instead, Volucer cannot reach it. `check` warns if the
+placeholder is missing.
 
-`--workers` and `--concurrency` are two different numbers, and the split is the point.
-`--workers` is how many **slots** the pool starts (`1` by default here), while
-`--concurrency` is how many requests **one slot** answers at once. Since the `--fcgi` command
-runs once per slot with its own `{address}`, `--concurrency` is the app server's own worker
-count for that one address: `--fcgi "gunicorn app.wsgi --workers 4 --bind {address}"` wants
-`--concurrency 4`, and `--workers 2` then runs two of those. `--concurrency` without `--fcgi` is
-an error, because a worker answers one request at a time by construction and a `php-cgi` pool
-spells the same number `children`. The flag was called `--capacity` before; the old spelling
-still parses.
+`--workers` and `--concurrency` control different levels of parallelism. `--workers`
+sets the number of FastCGI slots Volucer starts (one by default); `--concurrency` sets
+how many requests each slot can handle. Volucer runs the command once per slot and
+provides a separate `{address}`. For example,
+`--fcgi "gunicorn app.wsgi --workers 4 --bind {address}"` needs `--concurrency 4`.
+Setting `--workers 2` then starts two such slots. `--concurrency` requires `--fcgi`;
+worker mode handles one request at a time, while `php-cgi` uses `children` for the
+equivalent setting. The old option name `--capacity` is still accepted.
 
-`--fcgi` also means **"serve only real files"** unless you say otherwise, because a WSGI or Rack
-program is not `index.php`: leaving the PHP-shaped default in place would answer 404 for every
-path that names no file. Pass `--front-controller app.py` to give it one instead.
+By default, `--fcgi` serves only real files. A WSGI or Rack application is not an
+`index.php` front controller, so the PHP-style default would return 404 for paths that do
+not name a file. Pass `--front-controller app.py` if the application has a front
+controller.
 
-The three backend flags are one choice: two of them in one command is a usage error.
+The three backend options (`--php-cgi`, `--worker`, and `--fcgi`) are mutually exclusive.
 
-### Without a file at all
+### Run without a configuration file
 
-The file is one *source* of configuration and the command line is another. When neither `-c`
-nor a `volucer.toml` beside the working directory exists, everything comes from `-o` (and
-`--listen` / `--fastcgi`), which is the shape a container `CMD` or a systemd `ExecStart` wants:
+A configuration file and the command line are two ways to provide settings. If you do
+not pass `-c` and there is no `volucer.toml` in the working directory, configure the
+server with `-o`, `--listen`, and `--fastcgi`. This can be useful for a container command
+or systemd unit:
 
 ```console
 volucer serve \
@@ -379,33 +377,33 @@ ExecStart=/usr/local/bin/volucer serve --listen 0.0.0.0:8080 \
     -o backends.app.command="php /srv/public/worker.php"
 ```
 
-Three rules make the pair predictable:
+Keep these rules in mind when setting options on the command line:
 
-- **The value is a TOML literal.** `-o backends.app.workers=8` is a number;
-  `-o server.http=127.0.0.1:8080` is the string it looks like, because that is not valid TOML.
-  Quote it to force a string — `-o 'server.http="0.0.0.0:8080"'` — which is what a value that
-  happens to read as a number or a boolean needs.
-- **`--listen` and `--fastcgi` are applied before `-o`**, so `-o server.http=…` wins over
-  `--listen …` rather than depending on where the flags appeared.
-- **A key that does not exist is a startup error**, exactly as a typo in the file is. A
-  `-o server.htpp=…` stops the server and names the key; it does not quietly serve on a
-  default port.
+- **Values use TOML literal syntax.** For example, `-o backends.app.workers=8` sets a
+  number. `-o server.http=127.0.0.1:8080` is treated as a string because it is not a valid
+  TOML literal; quote the value explicitly with
+  `-o 'server.http="0.0.0.0:8080"'` when needed.
+- **`--listen` and `--fastcgi` are applied before `-o`.** An explicit `-o server.http=…`
+  therefore overrides `--listen …`, regardless of the order in which the options appear.
+- **Unknown keys are errors.** A typo such as `-o server.htpp=…` stops startup and names
+  the invalid key instead of silently using a default.
 
-Two limits are worth knowing. Arrays of tables (`[[server.routes]]`, a site's own `[sites.x]`)
-and `map` values have no `dot.notation` spelling and stay file-only; and `server.front_controller`
-is the one key whose empty value is reserved, so "serve only real files" is spelled
-`--front-controller ''` rather than `-o server.front_controller=`. With **no file**, relative
-paths — `server.tls.certificate`, `[server.acme].cache`, the access-log path — resolve against
-the **working directory**, because there is no file directory to resolve them against;
-`volucer check` prints the resolved value.
+Arrays of tables (such as `[[server.routes]]` or a site's `[sites.x]` table) and `map`
+values can only be set in a file; they have no `dot.notation` form. To serve only real
+files, use `--front-controller ''`. An empty `-o server.front_controller=` is not valid
+because the empty value is reserved for that option.
 
-An explicit `-c` naming a file that is not there remains an error: that is the difference
-between "I said nothing" and "I named a file that should be there".
+When there is **no configuration file**, relative paths such as
+`server.tls.certificate`, `[server.acme].cache`, and the access-log path resolve from the
+working directory. `volucer check` shows the resolved paths.
 
-`--front-controller ''` is worth knowing about. By default a path that names no file is
-handed to the front controller with `PATH_INFO` set, which is what keeps a framework
-working. Setting it empty turns that off and makes volucer behave like nginx's
-`location ~ \.php$` — a path naming no file is a 404.
+If you explicitly pass `-c` with a path to a missing file, startup fails. Omitting a
+configuration file is different from naming one that should exist.
+
+By default, a request for a path that does not name a file is passed to the front
+controller with `PATH_INFO` set. This is how many frameworks handle application routes.
+Setting the front controller to an empty string disables that behavior: a path that does
+not name a file returns 404, similar to nginx's `location ~ \.php$`.
 
 ## Check the version
 
@@ -413,7 +411,8 @@ working. Setting it empty turns that off and makes volucer behave like nginx's
 volucer version
 ```
 
-This prints the build's capabilities, which is a useful thing to have in a bug report:
+This prints the version and capabilities of your build. Include this output when
+reporting a problem:
 
 ```
 volucer 0.1.0
@@ -434,14 +433,14 @@ volucer health --config volucer.toml --ready  # /ready: should traffic be sent h
 volucer health --url http://127.0.0.1:2114/health
 ```
 
-It exits `0` or nonzero and says why on stderr, which is exactly what a `HEALTHCHECK` reads —
-and unlike `curl`, it exists inside a container image that has no shell. See
-[Operations](11-OPERATIONS.md#health-checks).
+The command exits with `0` when the check passes and a nonzero status when it fails; it
+prints failure details to stderr. This makes it suitable for a Docker `HEALTHCHECK`, even
+in images without a shell or `curl`. See [Health checks](11-OPERATIONS.md#health-checks)
+for details.
 
 ## What to read next
 
-- **[Configuration](01-CONFIGURATION.md)** — every key, with its default.
-- **[Backends](02-BACKENDS.md)** — choosing between the five ways to run PHP. This is
-  the decision that matters most.
-- **[Operations](11-OPERATIONS.md)** — running behind nginx, systemd, Docker, and
-  reloading without dropping connections.
+- **[Configuration](01-CONFIGURATION.md)** — all configuration keys and their defaults.
+- **[Backends](02-BACKENDS.md)** — the five backend types and how to choose between them.
+- **[Operations](11-OPERATIONS.md)** — deployment with nginx, systemd, or Docker, plus
+  reloads without dropping connections.

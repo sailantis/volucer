@@ -1,60 +1,58 @@
 # Configuration
 
-**Every key volucer accepts, with its default.**
+**Configuration options, types, and defaults for Volucer.**
 
-This is the reference. The other pages in this guide explain what the keys *do*; this one
-tells you what they are called and what happens if you leave them out.
+Use this page as a reference for configuration keys and their defaults. The other
+documentation pages explain how the features work.
 
 ## The file
 
-Volucer reads a TOML file, `volucer.toml` by default. Point it somewhere else with
-`volucer serve --config <path>`.
+Volucer reads TOML configuration from `volucer.toml` by default. Use
+`volucer serve --config <path>` to select another file.
 
-**The file is optional.** When neither `--config` nor a `volucer.toml` beside the working
-directory exists, the configuration comes from the command line alone — `-o key=value` (and
-`--listen` / `--fastcgi`) — and the two sources are the same table by the time anything reads
-them. See [Getting Started](00-GETTING-STARTED.md#without-a-file-at-all) for the flag rules and
-the limits.
+**A configuration file is optional.** If you do not pass `--config` and there is no
+`volucer.toml` in the working directory, configure the server with command-line overrides
+(`-o key=value`, `--listen`, and `--fastcgi`). These options produce the same configuration
+table as a file. See [Getting Started](00-GETTING-STARTED.md#run-without-a-configuration-file)
+for syntax and limitations.
 
-**Unknown keys are an error, not a warning.** The configuration is parsed strictly, so a
-typo stops the server at startup rather than silently doing nothing. This is deliberate: a
-key that parses and is ignored looks supported and cannot work.
+**Unknown keys are errors.** Volucer validates configuration strictly, so a typo stops
+startup instead of being silently ignored.
 
-The one exception is a `deny_unknown_fields`-free path in a few places noted below.
+Any exceptions to this rule are called out in the relevant sections below.
 
 ## The command line as a source
 
-`-o section.key=value` lays one value onto the table the file produced (or onto an empty one),
-**before** deserialization. Three consequences follow from that order, and they are the whole
-design:
+Each `-o section.key=value` override adds a value to the configuration table, whether it
+came from a file or started empty. Overrides are applied **before** deserialization. This
+determines how their values are interpreted:
 
 | Rule | Why |
 |---|---|
-| The value is read as a TOML literal. | `-o workers=8` is a number because TOML says so, not because a table of key types says so. `127.0.0.1:8080` is not valid TOML, so it stays the string it looks like. Quote it to force a string when a value would otherwise read as a number or a boolean. |
-| An unknown key is refused by name. | The same `deny_unknown_fields` that guards the file guards a flag, so `-o server.htpp=…` is a startup error rather than a setting that parses, is ignored, and looks supported. |
-| `${NAME}` is expanded first. | A pair goes through the same expansion as the file's text, so `-o 'server.http=${HOST:-127.0.0.1}:8080'` works. |
+| Values use TOML literal syntax. | `-o workers=8` sets a number. `127.0.0.1:8080` is not a valid TOML literal, so it is read as a string. Quote a value when it might otherwise be read as a number or boolean. |
+| Unknown keys are rejected. | Overrides use the same strict validation as files, so `-o server.htpp=…` fails at startup and identifies the invalid key. |
+| Environment variables are expanded first. | Overrides use the same expansion as the file, so `-o 'server.http=${HOST:-127.0.0.1}:8080'` works. |
 
-`--listen` and `--fastcgi` are sugar for `-o server.http=…` and `-o server.fastcgi=…`, applied
-**before** every `-o` pair — so an explicit `-o server.http=…` wins over `--listen …`.
+`--listen` and `--fastcgi` are shorthand for `-o server.http=…` and
+`-o server.fastcgi=…`. Volucer applies them **before** all `-o` pairs, so an explicit
+override such as `-o server.http=…` takes precedence over `--listen …`.
 
-Arrays of tables (`[[server.routes]]`, `[sites.<name>]`) and `map` values have no dotted
-spelling and stay file-only.
+Arrays of tables (such as `[[server.routes]]` and `[sites.<name>]`) and `map` values
+cannot be expressed with dotted keys, so they must be set in a file.
 
-**One key cannot be spelled as an override**: `server.front_controller`. Its empty string is
-reserved to mean "serve only real files", and TOML cannot tell an empty string from a missing
-key there — which is why `validate` refuses it. Use the flag for that one,
-`volucer serve --front-controller ''`, which is the documented spelling.
+**`server.front_controller` cannot be set with `-o`.** Its empty string means “serve only
+real files,” but TOML treats an empty string as a missing value for this key. Use
+`volucer serve --front-controller ''` instead.
 
-**Relative paths and the command line.** `server.tls.certificate`, `server.tls.key`,
-`[server.acme].cache`, a file KV store's `path` and `[server.access_log].path` resolve against
-the **config file's directory**. With no file, they resolve against the **working directory** —
-the only directory left once there is no file to be beside. `volucer check` prints the resolved
-value either way.
+**Relative paths.** `server.tls.certificate`, `server.tls.key`, `[server.acme].cache`,
+a file KV store's `path`, and `[server.access_log].path` resolve relative to the
+configuration file's directory. Without a file, they resolve relative to the working
+directory. `volucer check` prints each resolved path.
 
 ## Environment variables in the file
 
-`${NAME}` and `${NAME:-default}` are expanded from the server's own environment **before the
-file is parsed**, so they work in a string, a number, a port or a listener address:
+Volucer expands `${NAME}` and `${NAME:-default}` from its environment **before parsing the
+file**. Expansion works in strings, numbers, ports, and listener addresses:
 
 ```toml
 [server]
@@ -72,22 +70,21 @@ workers = ${WORKERS:-0}
 | `${NAME:-default}` | The value, or `default` when the variable is unset **or empty** — bash's `:-`. |
 | `$$` | One literal `$`, so `$${NAME}` is the text `${NAME}`. |
 
-**Only the braced form is expanded.** A bare `$NAME` is left alone, unlike RoadRunner: a
-password, a DSN or an access-log value may legitimately contain `$`, and a rule that expanded
-it would make the file mean something its author did not write.
+**Only braced variables are expanded.** A bare `$NAME` is left unchanged. This allows
+values such as passwords, DSNs, and log settings to contain `$` without accidental
+substitution.
 
-Three consequences worth knowing before writing one:
+Important behavior to keep in mind:
 
-- **A `${...}` in a comment is expanded too.** The substitution is textual and does not know a
-  comment from a value. This is the price of one rule rather than two.
-- **An unset variable without a default stops the server** rather than becoming an empty
-  string. An empty listener address is a server that binds nothing for a reason nothing logs.
-- **A value may not contain a line break or a NUL byte.** Because the substitution produces
-  TOML text, a newline inside a value could introduce a table header the file does not contain.
-  The expansion refuses it, naming the variable.
+- **Variables in comments are expanded too.** Expansion is textual and does not distinguish
+  comments from values.
+- **An unset variable without a default is an error.** It does not become an empty string.
+- **Values cannot contain a newline or NUL byte.** Expansion produces TOML text, so a
+  newline could add configuration that is not present in the file. Volucer rejects these
+  values and identifies the variable.
 
-`volucer check` reads the file through the same path, so it reports the deployment `serve`
-would actually start — including the expansion's own failures.
+`volucer check` uses the same configuration-loading path as `serve`, including variable
+expansion, so it reports the configuration Volucer would actually use.
 
 ## Top level
 
@@ -105,9 +102,8 @@ would actually start — including the expansion's own failures.
 
 ## Sections enabled by their presence
 
-Several features are turned on by the *existence* of a table, not by a flag inside it.
-There is no `enabled = true` to write for these, and a present-but-empty table is not the
-same as an absent one:
+Some features are enabled by the presence of their table. They do not need an
+`enabled = true` setting, and an empty table still enables the feature:
 
 | Section | What its presence turns on |
 |---|---|
@@ -122,9 +118,9 @@ same as an absent one:
 | `[jobs]` | Queues |
 | `[kv.<name>]` | That key-value storage |
 
-TLS and ACME are the reason this rule exists. A flag and a certificate are two statements
-about one thing, and two statements can disagree. Having the table means you have a
-certificate, or you have ACME configured to get one.
+This is especially important for TLS and ACME: the configuration table itself expresses
+that the feature is intended to be active, avoiding a separate flag that could contradict
+its certificate or ACME settings.
 
 ## `[server]`
 
@@ -153,19 +149,15 @@ certificate, or you have ACME configured to get one.
 
 ### `max_body_bytes`
 
-**Bytes, not megabytes.** The unit is in the name on purpose — RoadRunner spells this
-`http.max_request_size` and counts megabytes, so copying that spelling here is an error
-rather than a silently different unit.
+**The value is in bytes.** This differs from RoadRunner's `http.max_request_size`, which
+uses megabytes; do not copy that setting's unit.
 
-It bounds both listeners. The FastCGI front-end had no bound at all before this key
-existed, so a request forwarded by a proxy with no `client_max_body_size` of its own could
-make volucer buffer without limit.
+The limit applies to both HTTP and FastCGI front-ends. It does not apply to an
+`upstream` backend, where the request body streams to the origin. Set the body limit on
+the origin instead.
 
-It does **not** bound an `upstream` backend, whose body streams to the origin unread. The
-limit to configure for one of those is the origin's.
-
-Zero is refused rather than read as "unlimited" — a zero here refuses every request with a
-body, which is never what was meant.
+Zero is rejected rather than treated as “unlimited”; it would reject every request with a
+body.
 
 ### `serve_only`
 
@@ -177,8 +169,8 @@ body, which is never what was meant.
 
 ### `[server.env]`
 
-Environment variables that **every process this deployment starts** inherits: a worker pool, a
-job consumer, a `php-cgi` slot, and a supervised `upstream` origin.
+These variables are inherited by **every process started by this deployment**, including
+workers, job consumers, `php-cgi` slots, and supervised `upstream` origins.
 
 ```toml
 [server.env]
@@ -186,24 +178,25 @@ APP_ENV = "production"
 DATABASE_URL = "postgres://app@db/app"
 ```
 
-The order is `inherited environment → [server.env] → the backend's own env`. A backend's `env`
-wins, so the common case is written once and the exception — one consumer pointed at a different
-database — is still expressible on that table.
+Environment values are applied in this order:
+`inherited environment → [server.env] → backend-specific env`. A backend's `env` takes
+precedence, so shared settings can live in one place while a particular backend can
+override them.
 
-`attach` does not receive it: volucer starts those processes not at all.
+`attach` workers do not receive these settings because Volucer does not start their
+processes.
 
-Names are passed **exactly as written**, with no case folding (RoadRunner uppercases `server.env`
-keys; a server that silently renamed a variable would leave an application reading `app_env` from
-a file that says `APP_ENV`). A name containing `=` or a NUL byte is refused at startup, because
-`Command::env` would otherwise fail at spawn with an error naming no key.
+Variable names are passed **exactly as written**; Volucer does not change their case.
+Names containing `=` or a NUL byte are rejected at startup because they cannot be passed
+to the process environment.
 
-**Every value here is a secret as far as `config.describe` is concerned**: the call reports the
-variable names and elides the values, so `${DATABASE_PASSWORD}` supplied from the environment
-cannot reach a worker.
+**Values are treated as secrets by `config.describe`.** It reports variable names but
+omits values, including values supplied through expansion such as `${DATABASE_PASSWORD}`.
 
 ### The server's own variables
 
-Two variables are set **after** the configured `env`, so a table cannot shadow either:
+Volucer sets these variables **after** applying configured environment values, so they
+cannot be overridden:
 
 | Variable | Value |
 |---|---|
@@ -211,27 +204,27 @@ Two variables are set **after** the configured `env`, so a table cannot shadow e
 | `VOLUCER_WORKER_SOCKET` | Where a `socket`-transport worker connects back — see [Worker Applications](07-WORKER-APPLICATIONS.md). |
 | `VOLUCER_FCGI_ADDRESS` | The address a `spawn_cgi` slot must bind. Only read by a `command` deployment; `php-cgi` takes it as `-b`. |
 
-`VOLUCER_VERSION` exists because a `php-cgi` per-request process or a supervised origin has no
-channel to ask the server what it is. Nothing in the SDK reads it; a worker's handshake already
-reports its own version.
+`VOLUCER_VERSION` lets a `php-cgi` process or supervised origin identify the Volucer
+version that started it. Worker SDKs do not need this variable because the worker
+handshake reports the worker's version.
 
-`VOLUCER_FCGI_ADDRESS` and the `{address}` placeholder carry the same string, so a `spawn_cgi`
-`command` may take its bind address either way — as an argument or from the environment. Both
-are written *after* the backend's `env` table, so a configured variable cannot point the program
-at an address the pool is not connecting to.
+`VOLUCER_FCGI_ADDRESS` contains the same address as the `{address}` placeholder. A
+`spawn_cgi` command can use either the command-line argument or the environment variable
+to learn where to bind. Volucer sets this variable after backend-specific `env` values so
+the process cannot be directed to an address the pool does not use.
 
 ### `front_controller`
 
-The script a path that names no file is handed to, with `PATH_INFO` set. This is what
-keeps a framework working: `/users/42` reaches `index.php` rather than being a 404.
+Requests for paths that do not name a file are passed to this script with `PATH_INFO` set.
+For example, `/users/42` can be handled by `index.php` instead of returning 404.
 
-Set it to an empty string on the command line (`--front-controller ''`) to turn it off
-and serve only real files. An empty value cannot be written in the file, because TOML
-cannot tell an empty string from an absent key.
+Set it to an empty string with `--front-controller ''` to disable the front controller
+and serve only existing files. An empty value cannot be set in the TOML file because it
+is treated as though the key were absent.
 
 ## `[server.static_files]`
 
-Also settable as a plain `true` or `false`, which is shorthand for `enabled`.
+This section can also be set to a plain `true` or `false`, as shorthand for `enabled`.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -242,30 +235,29 @@ Also settable as a plain `true` or `false`, which is shorthand for `enabled`.
 | `cache_control` | string | `"public, max-age=3600"` | The `Cache-Control` header on served files. |
 | `max_multirange_bytes` | integer | `1048576` (1 MiB) | The largest total a multi-range request may ask for. |
 
-**The static layer is on by default.** You do not need to write this section to serve
-files.
+**Static-file serving is enabled by default.** You do not need to add this section to
+serve files.
 
-**But writing the table is not the same as leaving it out.** The table states overrides,
-and a table that does not say `enabled = true` does not turn the layer on — it leaves the
-inherited setting alone. So this turns it *off*:
+**A table only overrides the settings it contains.** If `enabled` is omitted, its
+inherited value remains unchanged. For example, this explicitly disables static files:
 
 ```toml
 [server.static_files]
 enabled = false
 ```
 
-And this says nothing about whether it runs, while still changing the other keys:
+This changes the cache header without changing whether static-file serving is enabled:
 
 ```toml
 [server.static_files]
 cache_control = "public, max-age=60"
 ```
 
-A bare `static_files = false` is the one-key opt-out. A bare `static_files = true` turns
-it on and leaves everything else inherited.
+Use `static_files = false` as a one-key opt-out, or `static_files = true` to enable
+serving while retaining the other inherited settings.
 
-`dotfiles = "deny"` answers **404**, not 403, matching how nginx treats a hidden file by
-default. Which files exist is not something a client needs to learn.
+With `dotfiles = "deny"`, requests for hidden files return **404**, not 403. This avoids
+revealing whether a hidden file exists.
 
 ## `[server.compression]`
 
@@ -286,12 +278,10 @@ default. Which files exist is not something a client needs to learn.
 | `alpn` | array of strings | `["h2", "http/1.1"]` | The protocols offered. |
 | `plain` | bool | `false` | Also accept cleartext on the TLS port. |
 
-A relative certificate or key path is resolved against the directory holding the
-configuration file, not the process's working directory. `volucer check` prints the path
-it resolved.
+Relative certificate and key paths are resolved from the configuration file's directory,
+not the process's working directory. `volucer check` prints the resolved paths.
 
-See [TLS and ACME](05-TLS-AND-ACME.md) for the three deployment shapes and what
-`plain` does.
+See [TLS and ACME](05-TLS-AND-ACME.md) for deployment examples and details about `plain`.
 
 ## `[server.acme]`
 
@@ -303,12 +293,11 @@ See [TLS and ACME](05-TLS-AND-ACME.md) for the three deployment shapes and what
 | `contact` | array of strings | absent | Addresses the CA warns about failing renewals. |
 | `cache` | path | `"acme-cache"` | Where issued certificates are kept, relative to the configuration file. |
 
-The staging authority is the default because a production authority has rate limits, and
-a first run against it can exhaust them. Switch to `production` once the configuration is
-known to be right.
+The default authority is `staging`. Production certificate authorities enforce rate
+limits, so validate the configuration with staging before switching to `production`.
 
-`enabled = false` keeps the table and its settings and issues nothing, which is how you
-stage a contact address or park an order without deleting anything.
+Setting `enabled = false` retains the ACME settings but disables certificate issuance.
+Use this to prepare contact details or pause an order without removing the configuration.
 
 ## `[server.access_log]`
 
@@ -318,10 +307,11 @@ stage a contact address or park an order without deleting anything.
 | `format` | string | `"combined"` | `"combined"` or `"json"`. |
 | `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from. |
 
-`combined` is nginx's shape with the request and origin timings appended. `json` is one
-object per line.
+The `combined` format follows nginx's log format and appends request and origin timings.
+The `json` format writes one JSON object per line.
 
-Set `request_id_header` to an empty string to always generate an id and never adopt one.
+Set `request_id_header` to an empty string to always generate a new request ID instead of
+adopting one from a request header.
 
 ## `[server.proxy]`
 
@@ -330,8 +320,9 @@ Set `request_id_header` to an empty string to always generate an id and never ad
 | `trusted_subnets` | array of strings | empty | The peers whose forwarded headers are believed. |
 | `trusted_headers` | array of strings | empty | The headers to read, in order. |
 
-Without this, every request appears to come from your reverse proxy, and a per-client rate
-limit throttles the proxy instead of the clients.
+Configure trusted proxies when Volucer runs behind a reverse proxy. Otherwise, requests
+appear to come from the proxy itself, so a per-client rate limit would apply to the proxy
+rather than to individual clients.
 
 ## `[server.rate_limit]`
 
@@ -344,22 +335,21 @@ limit throttles the proxy instead of the clients.
 | `burst` | integer | `rate` | How many may be spent at once. |
 | `max_entries` | integer | `10000` | Identities tracked before new ones are refused. |
 
-`key = "ip"` buckets by client address **as `[server.proxy]` resolves it**, so behind nginx
-you still get per-client limits.
+With `key = "ip"`, rate-limit buckets use the client address resolved by
+`[server.proxy]`. This preserves per-client limits behind nginx or another trusted proxy.
 
-`key = "header"` is **not** an authenticated identity. A client chooses that value, so a
-client that varies it gets a fresh bucket per request. Use a value the *proxy* sets — an
-API key it vouched for, a tenant it routed.
+`key = "header"` does **not** authenticate a client. Clients can choose their own header
+values and evade limits by changing them. Use a value set by a trusted proxy, such as a
+verified API key or tenant identifier.
 
-**Reloadable.** A `SIGHUP` replaces the policy in place, and every tracked caller's bucket is
-carried across whenever the *identity* is unchanged — that is, when `key` and `header` are the
-same. So tightening `rate` throttles a caller from where they already were rather than handing
-them a fresh burst, which is the difference between a limit and a limit that can be escaped by
-asking the operator to edit the file and signal.
+**Reloadable.** On `SIGHUP`, Volucer replaces the policy in place. It preserves each
+caller's bucket when the identity definition is unchanged—that is, when `key` and
+`header` stay the same. Tightening `rate` therefore applies to callers' existing usage
+rather than granting each a fresh burst.
 
-Changing `key` or `header` renames every bucket, and there is no honest way to map one caller's
-bucket onto another's: that reload starts over, and says so in the log. Adding or removing the
-whole table does the same, because there is no bucket to carry.
+Changing `key` or `header` changes the identity definition, so Volucer starts new buckets
+and reports this in the log. Adding or removing the entire table also starts with empty
+buckets.
 
 ## `[[server.routes]]`
 
@@ -371,19 +361,19 @@ whole table does the same, because there is no bucket to carry.
 | `policy` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
 | `backend` | string | absent | The backend for matched requests. Required unless `policy = "static"`. |
 
-Routes belong to the unnamed site, so they are written as `[[server.routes]]` next to
-`[server]`'s other keys. A `[sites.<name>]` table states its own `routes`, which **replaces**
-this list rather than adding to it.
+These routes belong to the unnamed site and are declared as `[[server.routes]]` alongside
+the other `[server]` settings. A `[sites.<name>]` table can define its own `routes`; that
+list **replaces** the global list rather than extending it.
 
-**Before 0.3.0 these were `[[routes]]` and `default_backend` at the top of the file.** Both
-moved into `[server]`; the old spelling is refused at startup with a message naming the new
-one, so an upgrade that misses it stops with a sentence rather than an unknown-field error.
+**Configuration changed in 0.3.0:** `[[routes]]` and the top-level `default_backend`
+moved under `[server]`. The old forms are rejected at startup, with an error that names
+the replacement setting.
 
 ## `[sites.<name>]`
 
-A site is one application, identified by the `Host` header. `hosts` and `document_root` are
-required; everything else is inherited from `[server]` when you leave it out — except
-`addresses`, which makes `hosts` optional.
+A site represents an application selected by the `Host` header. It normally requires
+`hosts` and `document_root`. Other settings inherit from `[server]` unless overridden.
+If you specify `addresses`, `hosts` becomes optional.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -403,15 +393,15 @@ required; everything else is inherited from `[server]` when you leave it out —
 
 ### `addresses` and `protocols`
 
-Both narrow a site to the connections it will serve, and both are decided **before** the
-`Host` header is consulted — see
-[Routing and Sites](03-ROUTING-AND-SITES.md#binding-a-site-to-addresses-and-protocols) for the
-matching order and the reasoning.
+Both settings restrict which connections a site can serve. Volucer checks them
+**before** consulting the `Host` header. See
+[Routing and Sites](03-ROUTING-AND-SITES.md#binding-a-site-to-addresses-and-protocols)
+for the matching order and rationale.
 
-`addresses` is the **local** address the socket accepted the connection on, not the client's:
-the `Host` header is written by the caller, so it cannot be the only thing selecting an
-internal site. Entries are addresses or CIDR ranges, with the same syntax as
-`[server.proxy].trusted_subnets`:
+`addresses` refers to the **local address** that accepted the connection, not the
+client's address. Because a caller controls the `Host` header, it should not be the only
+way to select an internal site. Values can be addresses or CIDR ranges, using the same
+syntax as `[server.proxy].trusted_subnets`:
 
 ```toml
 [sites.internal]
@@ -420,13 +410,14 @@ addresses = ["192.168.9.123", "10.0.0.0/8"]
 document_root = "/srv/internal"
 ```
 
-A site that states `addresses` and no `hosts` is a default for those addresses — nginx's
-`default_server` — and answers everything that reaches them, including an unclaimed name.
-`[server]` is the fallback for everything no site claims and cannot itself be bound.
+A site with `addresses` but no `hosts` acts as the default site for those addresses,
+similar to nginx's `default_server`. It handles all requests received on them, including
+requests with an otherwise unclaimed host name. `[server]` is the fallback for
+unmatched sites and cannot itself be bound to an address.
 
 ## `[backends.<name>]`
 
-A backend is one of five shapes, chosen by `kind`. See
+A backend is one of five types, selected with `kind`. See
 [Backends](02-BACKENDS.md) for what each one does.
 
 ```toml
@@ -453,24 +444,23 @@ command = "php worker.php"
 | `transport` | string | platform default | `"pipe"` or `"socket"`. |
 | `socket` | string | absent | Where the socket transport listens. |
 
-`workers = 0` means one worker per logical CPU.
+`workers = 0` starts one worker per logical CPU.
 
-`transport` defaults to `"socket"` on Windows and `"pipe"` everywhere else. On Windows,
-PHP's stream layer takes about 8 ms to return from a blocking read on a pipe and about
-0.09 ms on a socket, so the default is the one each platform is fast on. The choice is
-logged at startup, because the transport is invisible on the wire — a pool on the wrong one
-answers every request with a `200`, only slower.
+The default transport is `"socket"` on Windows and `"pipe"` on other platforms. This
+accounts for platform differences in PHP's stream handling: on Windows, a blocking pipe
+read can take about 8 ms to return, compared with about 0.09 ms for a socket. Volucer
+logs the selected transport at startup. A mismatched transport can still return
+successful responses, but more slowly.
 
-`socket` is a **prefix**, and `unix:` is required: each worker gets
-`<prefix>.<slot>.sock`. A bare path is relative, so a value copied from an `external`
-backend would bind a file named `unix:/run/php/php8.3-fpm.sock` in the working directory
-instead of failing. `socket` beside `transport = "pipe"` is refused rather than ignored,
-because a key that is read by nothing looks supported and is not.
+`socket` is a **prefix** and must start with `unix:`. Each worker listens on
+`<prefix>.<slot>.sock`. A bare path is relative and can produce an unexpected filename,
+so do not copy a socket address from an `external` backend. Volucer rejects `socket` when
+`transport = "pipe"` rather than silently ignoring the unused setting.
 
 ### `kind = "attach"`
 
-The same protocol as `worker`, but volucer dials a relay somebody else listens on
-instead of starting processes.
+This backend uses the same protocol as `worker`, but connects to an existing relay
+instead of starting worker processes.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -485,24 +475,25 @@ instead of starting processes.
 
 ### `kind = "external"`
 
-An already-running FastCGI server — `php-fpm`, or any other.
+Connect to an already-running FastCGI server, such as `php-fpm`.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `socket` | string | **required** | The FastCGI address, e.g. `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`. |
 | `max_connections` | integer | absent | How many connections to keep open to the pool. |
 
-`external` has no `workers` key, and that is the point: the pool is somebody else's. Its
-size lives in `pm.max_children` or `PHP_FCGI_CHILDREN`, in configuration volucer has no
-access to.
+There is no `workers` setting for `external`: the pool is managed separately. Configure
+its size where that server is configured, for example with `pm.max_children` or
+`PHP_FCGI_CHILDREN`.
 
-Nothing here is PHP-specific — it is a socket and a protocol, so a FastCGI-speaking WSGI,
-Rack or Go server is the same backend.
+This backend is not PHP-specific. Any FastCGI-speaking WSGI, Rack, or Go server can use
+it.
 
 ### `kind = "spawn_cgi"`
 
-FastCGI processes started by volucer — `php-cgi`, or any program that serves FastCGI. The
-only per-request-reset option on Windows.
+Use `spawn_cgi` to have Volucer start and supervise FastCGI processes. This includes
+`php-cgi` and other FastCGI servers. On Windows, it is the FastCGI option for
+per-request state reset.
 
 Exactly one of `binary` and `command`:
 
@@ -520,36 +511,33 @@ Exactly one of `binary` and `command`:
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
 | `env` | table | empty | Extra environment variables for every slot. |
 
-`children > 0` turns on prefork, and it is worth about 4.5× the memory for the same
-concurrency: forked children inherit both the listening socket and the OPcache segment, so
-the compiled scripts exist once. `children` counts children, **not** processes —
-`php-cgi` spawns them in addition to itself, so `workers × (children + 1)` is the process
-count on the host. `children = 1` is therefore mapped to `0` and stays a truthful alias
-for the default.
+Setting `children > 0` enables prefork. For the same concurrency, prefork uses about
+4.5× the memory: child processes inherit the listening socket and OPcache segment, so
+compiled scripts are shared. `children` counts child processes, not total processes;
+`php-cgi` also has a master process. The total is
+`workers × (children + 1)`. A value of `children = 1` is normalized to `0`, preserving
+the default no-prefork behavior.
 
-`command` is the non-PHP shape. `{address}` is replaced in every argument with the address
-that slot must bind, and the same string is exported as `VOLUCER_FCGI_ADDRESS`. A command
-using neither is refused at startup, because it would bind somewhere the pool cannot reach.
-`concurrency` — not `children` — says how many requests **one slot** answers at once. It is not
-the backend's total: that is `workers × concurrency`, and writing the total here would hold that
-many connections open to a single address.
+Use `command` for a non-PHP server. Volucer replaces `{address}` in each argument with
+the address the slot must bind and also sets `VOLUCER_FCGI_ADDRESS` to that value. Startup
+fails if the command uses neither, because the pool would have no address to connect to.
+`concurrency` sets how many requests **one slot** can handle. The total capacity is
+`workers × concurrency`; setting the total as `concurrency` would incorrectly assign that
+many connections to every address.
 
-**The command runs once per slot**, each time with a different `{address}`, so whatever that
-command is told to fork belongs to one address — that number is `concurrency`. Gunicorn's
-`--workers 4` in the command means `concurrency = 4`; the pool then starts that command
-`workers` times, so the host runs `workers × 4` Gunicorn processes. If the server also threads,
-multiply: four workers with four threads each is `concurrency = 16`. In the example below,
-`workers = 4` and `concurrency = 4` start four Gunicorn instances of four workers each — sixteen
-processes, four per address. `volucer check` prints exactly that product as its `processes:`
-line, so the total is visible at deploy time rather than derived by hand.
+**Volucer runs the command once per slot**, providing a different `{address}` each time.
+Any processes the command starts belong to that slot, so their request capacity is
+`concurrency`. For example, a Gunicorn command with `--workers 4` needs
+`concurrency = 4`. If the server also uses four threads per worker, set
+`concurrency = 16`. With `workers = 4` and `concurrency = 4`, Volucer starts four
+Gunicorn instances with four workers each: sixteen processes in total, four per address.
+`volucer check` reports the total in its `processes:` line.
 
-Setting both `children` and `concurrency` is refused. The key was called `capacity` before; that
-spelling is now refused with a message naming the replacement.
+Do not set both `children` and `concurrency`; Volucer rejects that combination. The old
+setting name `capacity` is also rejected, with an error naming its replacement.
 
-**Write the worker count once, as `{concurrency}`.** The command is the second place the same
-number has to appear — a program that forks its own workers is told how many by that command —
-so `concurrency = 4` beside `--workers 4` states one fact twice with nothing checking that the two
-agree. `--workers {concurrency}` removes the second statement:
+**Use `{concurrency}` in the command to keep the worker count in one place.** Without the
+placeholder, the command and the configuration repeat the same number, and can disagree:
 
 ```toml
 [backends.py]
@@ -560,29 +548,29 @@ concurrency = 4   # substituted above: each address serves four requests at once
 working_dir = "/srv/app"
 ```
 
-The substitution is the **resolved** number, so `concurrency = 0` (the default) gives the program
-`1` — the honest number for a slot the pool admits one request to — rather than a `0` it would read
-as "start no workers". `volucer check` prints the resolved command line as well as the product, so
-what the program will be told is visible before deploying.
+Volucer substitutes the **resolved** concurrency. The default `concurrency = 0` resolves
+to `1`, so the program receives the actual per-slot limit rather than a zero that could
+mean “start no workers.” `volucer check` prints both the resolved command and total
+process count.
 
-`{workers}` is deliberately **not** a placeholder and is refused by name. A slot's command is
-started once per slot with its own address, so the number of slots is not a fact about that
-process — it is a fact about how many copies volucer starts, and a program told it would be invited
-to divide work the pool has already divided. Any other braces are left exactly as written, so an
-argument like `--define={a:1}` still works.
+`{workers}` is **not** a supported placeholder and is rejected. The command runs once for
+each slot, so the worker count controls how many copies Volucer starts; it is not a
+setting for an individual process. Other brace expressions are left unchanged, so
+arguments such as `--define={a:1}` still work.
 
-Writing the number in the command instead is legal and unchanged —
-`command = "gunicorn myapp.wsgi --workers 4 --bind {address}"` beside `concurrency = 4` starts the
-same sixteen processes — it simply leaves the two copies for you to keep in step.
+You can still write the number directly in the command, for example
+`command = "gunicorn myapp.wsgi --workers 4 --bind {address}"` with `concurrency = 4`.
+That starts the same processes, but you must keep the two values in sync.
 
-`socket` is a prefix too, and it means a unix socket on Linux and macOS and a **named
-pipe** on Windows, because that is what `php-cgi -b` binds there. `\\.\pipe\volucer-cgi`
-gives slot 0 the pipe `\\.\pipe\volucer-cgi.0`. A `command` slot gets a `unix:` address and
-may not use a pipe.
+Here, `socket` is also a prefix. It creates Unix sockets on Linux and macOS and **named
+pipes** on Windows, which is what `php-cgi -b` binds there. For example,
+`\\.\pipe\volucer-cgi` gives slot 0 the pipe `\\.\pipe\volucer-cgi.0`. A `command` slot
+receives a `unix:` address and cannot use a named pipe.
 
 ### `kind = "upstream"`
 
-An HTTP origin that owns its own HTTP loop — Node, ASGI, Go, Python, Ruby.
+Route to an HTTP origin that runs its own HTTP server, such as Node, ASGI, Go, Python,
+or Ruby.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -597,10 +585,9 @@ An HTTP origin that owns its own HTTP loop — Node, ASGI, Go, Python, Ruby.
 | `restart_backoff_ms` | integer | `1000` | The delay between restarts. |
 | `ready_timeout_ms` | integer | `30000` | How long to wait for the origin to answer. |
 
-`restart = "on_failure"` is the default because a process that received `SIGTERM` and
-exited `0` has been shut down by somebody, and starting it again would fight the
-operator. A process that died on an uncaught exception exited non-zero, and that is what
-this is for.
+The default, `restart = "on_failure"`, restarts a process that exits with an error. A
+process that receives `SIGTERM` and exits successfully is treated as an intentional
+shutdown and is not restarted.
 
 `[backends.app.upstream.tls]`:
 
@@ -626,8 +613,8 @@ this is for.
 | `help` | string | **required** | The description, as Prometheus requires. |
 | `buckets` | array of numbers | empty | The bucket boundaries. Histograms only. |
 
-`buckets` on a counter or a gauge is refused. A setting that is read by nothing looks
-supported and cannot work.
+`buckets` is valid only for histograms. Volucer rejects it on counters and gauges rather
+than accepting an unused setting.
 
 ## `[status]`
 
@@ -637,23 +624,21 @@ supported and cannot work.
 | `unavailable_status_code` | integer | `503` | The code returned when the server is not ready. |
 | `allow_worker_reset` | bool | `false` | Expose the worker-control routes. |
 
-**`allow_worker_reset` has no authentication.** What protects those routes is that they do
-not exist until the flag is set — `404` on the path, not `403` — and that a wildcard
-`address` with the flag on is refused at startup. An unauthenticated `POST` that recycles
-workers, reachable from anywhere, is a remote kill switch. Put `[status]` on loopback or
-a private interface and reach it through your orchestrator's network, or leave the flag
-off.
+**`allow_worker_reset` does not enable authentication.** Worker-control routes do not
+exist unless this option is enabled, and requests to them otherwise return 404. Volucer
+also rejects this option when `address` is a wildcard. An unauthenticated request that
+recycles workers could otherwise act as a remote kill switch. Bind `[status]` to
+loopback or a private interface and expose it only to your orchestrator, or leave the
+option disabled.
 
-`allow_worker_reset` is **reloadable**, in both directions. Turning it off on a `SIGHUP` makes
-the routes stop existing on the next request — a `404`, the same answer a deployment that never
-asked for them gives — which is what lets an operator close an unauthenticated mutation surface
-without restarting a serving process. Turning it on is refused by validation when `address` is a
-wildcard, so the *open* direction is subject to the same rule through a reload as at startup.
-`[status]`'s `address` is not reloadable: the socket is already bound.
+`allow_worker_reset` can be changed in either direction with `SIGHUP`. Disabling it
+removes the routes on the next request, returning 404 without restarting the server.
+Enabling it during a reload is subject to the same wildcard-address validation as at
+startup. The `[status]` `address` cannot be reloaded because its socket is already bound.
 
-`volucer health` reads `address` from this table, so a probe does not have to repeat the port
-— including in a container, where a wildcard `address` is normal and is probed on loopback.
-See [Operations](11-OPERATIONS.md#health-checks).
+`volucer health` reads the probe address from this table, so you do not need to specify
+the port again. In a container, a wildcard listener is common; the health command probes
+it through loopback. See [Health checks](11-OPERATIONS.md#health-checks).
 
 ## `[telemetry]`
 
@@ -692,9 +677,8 @@ See [Operations](11-OPERATIONS.md#health-checks).
 | `url` | string | **required** |
 | `pool_size` | integer | `16` |
 
-Redis is only available in a build compiled with the `redis` feature. A build without it
-cannot instantiate a Redis storage, and says so rather than accepting the configuration
-and failing later.
+Redis support is available only when Volucer is built with the `redis` feature. Without
+that feature, Volucer rejects Redis configuration at startup.
 
 ## `[lock]`
 
@@ -702,7 +686,7 @@ and failing later.
 |---|---|---|---|
 | `driver` | string | **required** | `"memory"` or `"redis"`. |
 
-`driver = "redis"` also takes `url` (required), `pool_size` (default `16`) and
+With `driver = "redis"`, configure `url` (required), `pool_size` (default `16`), and
 `read_timeout_ms` (default `5000`).
 
 ## `[jobs]`
@@ -713,8 +697,9 @@ and failing later.
 | `pipelines` | table of tables | empty | The named pipelines. |
 | `pool` | table | absent | The consumer pool. Required when `consume` is not empty. |
 
-`[jobs.pipelines.<name>]` takes the same `driver` key as `[kv.<name>]`: `"memory"` or
-`"redis"`. The Redis variant also takes `url`, `pool_size` and `read_timeout_ms`.
+Each `[jobs.pipelines.<name>]` uses the same `driver` options as `[kv.<name>]`:
+`"memory"` or `"redis"`. Redis pipelines also accept `url`, `pool_size`, and
+`read_timeout_ms`.
 
 `[jobs.pool]`:
 
@@ -777,6 +762,10 @@ memory_limit_mb = 256
 max_requests = 1000
 services = ["kv", "lock", "jobs"]
 grpc_services = ["greeter.Greeter"]
+
+[backends.api]
+kind = "worker"
+command = "php api-worker.php"
 
 [[server.routes]]
 path_prefix = "/api"
