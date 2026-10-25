@@ -66,12 +66,37 @@ CMD ["serve", "--config", "/etc/volucer/volucer.toml"]
 # build. Two images from one crate rather than one image for each distribution.
 FROM rust:1.88-alpine AS build-musl
 
+# The triple is read from the platform rather than spelled out, because this stage is built once
+# per architecture: an arm64 builder that was told to produce `x86_64-unknown-linux-musl` would
+# either fail at the linker or, worse, cross-compile with a C toolchain that is not there and fail
+# somewhere inside `aws-lc-sys`. `TARGETARCH` is set by BuildKit from `--platform`, so a plain
+# `docker build` on either machine does the right thing and `--platform` overrides it.
+#
+# An unknown architecture is a refusal rather than a fallback: a guessed triple produces a
+# mislabelled image, which is discovered by whoever pulls it rather than by whoever built it.
+#
+# `triple` is assigned and read by the same shell, so the `case` and the build are one `RUN`; the
+# `cp` to a fixed path is there because `COPY --from` cannot interpolate it further down.
+ARG TARGETARCH
+
 RUN apk add --no-cache musl-dev cmake make perl bash nasm
 
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release --locked -p volucer --target x86_64-unknown-linux-musl
+# `TARGETARCH` is BuildKit's, derived from `--platform`. A build that went through the legacy
+# builder has it unset, so the builder's own architecture is the fallback rather than a hard
+# failure. `uname -m` spells the two the same way Docker does, hence both spellings in the cases.
+RUN set -eu; \
+    if [ -z "${TARGETARCH:-}" ]; then TARGETARCH="$(uname -m)"; fi; \
+    case "${TARGETARCH}" in \
+        amd64 | x86_64) triple=x86_64-unknown-linux-musl ;; \
+        arm64 | aarch64) triple=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "${triple}" >/dev/null; \
+    cargo build --release --locked -p volucer --target "${triple}"; \
+    cp "target/${triple}/release/volucer" /volucer
 
 
 FROM scratch AS musl
@@ -80,9 +105,7 @@ FROM scratch AS musl
 # package manager in a scratch image, so the bundle is copied in and named where the binary looks
 # for it (`SSL_CERT_FILE`), which is the one thing a scratch image must be told explicitly.
 COPY --from=build-musl /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build-musl \
-     /src/target/x86_64-unknown-linux-musl/release/volucer \
-     /usr/local/bin/volucer
+COPY --from=build-musl /volucer /usr/local/bin/volucer
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 

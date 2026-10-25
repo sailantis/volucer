@@ -244,8 +244,9 @@ jobs:
   # The last step, and the only one that changes what the outside world can see. It waits for
   # `install` rather than for `release`, because publishing is the moment the one-liner in the
   # README stops being a 404 - it should not start working before the assets behind it have been
-  # installed and compared. `docker` runs in parallel with this and depends on `build`, not on it:
-  # the images are built and discarded, so nothing they do can be invalidated by publishing.
+  # installed and compared. The two Docker jobs sit on either side of this: `docker` builds and
+  # tests each architecture in parallel with this one, and `docker-publish` waits for this job, so
+  # an image is not pullable by a tag until the release it belongs to is public.
   publish:
     name: Publish the release
     needs: [release, install]
@@ -261,85 +262,262 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash packaging/publish-release.sh
 
+  # Each architecture is built, smoke-tested and then *pushed by digest* — the `sha256:` value, not
+  # a tag. Nothing pullable references an image at this point, which is the property that matters:
+  # an architecture whose sibling fails leaves no half-published multi-arch tag behind. The
+  # `docker-publish` job below assembles the digests into the tags people actually pull.
   docker:
-    name: Docker (${{ matrix.image }})
+    name: Docker (${{ matrix.image }}, ${{ matrix.platform }})
     needs: build
-    runs-on: ubuntu-latest
+    # A real arm64 runner rather than QEMU on an amd64 one. The difference is not speed, it is that
+    # the smoke test below then executes the arm64 image natively instead of trusting an emulator
+    # to behave like the machine the image is for.
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
         image: [glibc, musl]
+        platform: [linux/amd64, linux/arm64]
     steps:
       - uses: actions/checkout@v7
+
+      # The image name is derived here rather than in a workflow-level `env`, because a registry
+      # path has to be lowercase and `github.repository` is not: an owner with a capital letter
+      # produces `ghcr.io/Owner/Repo`, which ghcr rejects at push time with a 403 that reads like a
+      # permission problem. `tr` is what makes a fork under such an owner work.
+      - name: Resolve the image name
+        run: |
+          set -eu
+          image="ghcr.io/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          printf 'IMAGE=%s\n' "$image" >>"${GITHUB_ENV}"
+          printf 'image: %s\n' "$image"
+
       - uses: docker/setup-buildx-action@v4
-      # Built and discarded rather than published. This repository has never pushed to a registry,
-      # and a workflow that starts pushing on its first run is not one to find that out with —
-      # adding `push: true` and a login is the only change needed.
-      - uses: docker/build-push-action@v7
+
+      # `GITHUB_TOKEN` rather than a personal access token or a Docker Hub secret: the package
+      # belongs to this repository, so there is nothing for an operator to paste into settings.
+      # `packages: write` above is the whole of the authorisation, and it is scoped to this job.
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: packaging/docker/Dockerfile
           target: ${{ matrix.image }}
-          push: false
-          load: true
-          tags: volucer:${{ matrix.image }}
+          platforms: ${{ matrix.platform }}
+          # `org.opencontainers.image.source` is not decoration: it is what links the package to this
+          # repository in GitHub's package settings, and a linked package inherits the repository's
+          # access rules. Without it, the first push creates an *unlinked* package that nobody but
+          # the account that pushed it can manage.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # No `tags:` on purpose. A tag here would be pullable before its sibling architecture had
+          # even been built; a digest is addressable and not yet referenced by anything.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
-      # The image is a hypothesis until the binary inside it runs. This is also the only step that
-      # would catch a `scratch` image missing its trust store, which is the one thing a static
-      # binary cannot be told about at build time.
-      - name: Smoke-test the image
-        run: docker run --rm volucer:${{ matrix.image }} version
-
-      # The health check is the one part of the image a `docker run version` cannot exercise: it
-      # needs a server that is actually serving, and a `scratch` image is exactly where a
-      # `HEALTHCHECK CMD curl` would fail invisibly. A container is started with a configuration
-      # whose `[status]` listener is reachable from inside it, and Docker's own health probe is
-      # given a short interval so this does not wait thirty seconds to find out.
-      - name: Smoke-test the health check
+      # The digest is a file rather than a step output because `docker` writes one artifact per
+      # matrix cell and `docker-publish` reads them all. An upload with no files is an error, so a
+      # build that produced nothing fails here instead of as an empty manifest list later.
+      - name: Export the digest
         run: |
           set -eu
-          work="$(mktemp -d)"
-          cat >"$work/volucer.toml" <<'EOF'
-          [server]
-          http = "0.0.0.0:8080"
-          document_root = "/"
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::the build produced no digest (got '$digest')" >&2; exit 1 ;;
+          esac
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
-          [status]
-          address = "0.0.0.0:9080"
-          EOF
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
-          docker run -d --name health \
-            -v "$work/volucer.toml:/etc/volucer/volucer.toml:ro" \
-            --health-interval=2s --health-timeout=2s --health-retries=10 \
-            --health-start-period=5s \
-            volucer:${{ matrix.image }}
+      # The image is a hypothesis until the binary inside it runs, and the `HEALTHCHECK` is the one
+      # part `version` cannot exercise: it needs a server that is actually serving, and a `scratch`
+      # image is exactly where a `HEALTHCHECK CMD curl` would fail invisibly. Both live in
+      # `packaging/docker/smoke-test.sh` rather than inline, so `ci.yml` can run the same script
+      # before a tag exists — the reason `packaging/release-selftest.sh` exists for the archives.
+      #
+      # The digest, not a tag: what is tested is byte-for-byte what will be published rather than a
+      # local rebuild of it.
+      - name: Smoke-test the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: bash packaging/docker/smoke-test.sh "${IMAGE}@${DIGEST}"
 
-          # Readiness is what proves the *listener* answered, which is what the check asserts.
-          # A poll rather than a sleep: the start period is a bound, not a duration.
-          for _ in $(seq 1 60); do
-            status="$(docker inspect --format '{{.State.Health.Status}}' health)"
-            [ "$status" = healthy ] && break
-            sleep 1
+  # The tags are created here and nowhere else, and only after every architecture of every image
+  # has been built, pushed and smoke-tested. A manifest list that names a digest nobody pushed, or
+  # a tag that appears while half its architectures are still compiling, is the failure this job
+  # exists to make impossible: until the `create manifest list` step runs, a pull of `latest`
+  # resolves to the previous release.
+  #
+  # `needs: [docker, publish]` and not just `docker`: publishing an image is a claim that the
+  # release is installable, and `publish` is what makes the archives and installers visible. Making
+  # the two happen together means nobody finds a tag for a release that failed its install test.
+  docker-publish:
+    name: Docker (publish)
+    needs: [docker, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      # `musl` first so the recommended image's tags exist before `glibc`'s. The two do not race -
+      # they carry different tags - but a failure in one should not read as "nothing was published".
+      matrix:
+        image: [musl, glibc]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      # The same derivation as the build job, and it has to be independent: this job downloads
+      # artifacts rather than checking out, so an `IMAGE` written to `GITHUB_ENV` by the build job
+      # is not visible here. A registry path has to be lowercase and `github.repository` is not.
+      - name: Resolve the image name
+        run: |
+          set -eu
+          image="ghcr.io/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          printf 'IMAGE=%s\n' "$image" >>"${GITHUB_ENV}"
+          printf 'image: %s\n' "$image"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `musl` is the recommended image — a `scratch` base, no libc, smaller — so it takes the
+      # unsuffixed tags and `glibc` is the one that carries a suffix. The other way round would make
+      # the default choice the one an operator has to know to avoid.
+      #
+      # The tags are derived here rather than by `docker/metadata-action`. That action would produce
+      # the same three names, but it does so through `flavor.suffix` plus `onlatest`, and a wrong
+      # `onlatest` publishes a suffixed `latest` beside an unsuffixed one that aliases the image
+      # nobody meant as the default — a mistake that is invisible until someone pulls `latest`.
+      # The rule is three lines, so it is spelled out:
+      #
+      #   v1.2.3  ->  1.2.3        1.2        latest
+      #   glibc   ->  1.2.3-glibc  1.2-glibc  latest-glibc
+      #
+      # A pre-release tag such as `v0.3.0-rc.1` deliberately does not move `latest`: `latest` is what
+      # a bare `docker pull` installs, and a release candidate is not that.
+      - name: Compute the tags
+        env:
+          SUFFIX: ${{ matrix.image == 'glibc' && '-glibc' || '' }}
+        run: |
+          set -eu
+          # `GITHUB_REF_NAME` is the tag that triggered this workflow, and this workflow only runs
+          # on `v*`. Dropping the `v` is what makes the image tag match every other release
+          # artifact, which the changelog and the docs quote without one.
+          version="${GITHUB_REF_NAME#v}"
+          core="${version%%[-+]*}"
+          # Exactly three numeric fields. Anything else - `v0.2`, a branch name, a hand-made tag -
+          # is a refusal rather than a tag nobody meant to publish.
+          old_ifs="${IFS}"
+          IFS=.
+          # shellcheck disable=SC2086
+          set -- ${core}
+          IFS="${old_ifs}"
+          [ "$#" -eq 3 ] || {
+            echo "::error::'${GITHUB_REF_NAME}' is not a version tag" >&2
+            exit 1
+          }
+          for field in "$@"; do
+            case "${field}" in
+              '' | *[!0-9]*)
+                echo "::error::'${GITHUB_REF_NAME}' is not a version tag" >&2
+                exit 1
+                ;;
+            esac
           done
+          # Anything after the three fields is a pre-release (`-rc.1`) or build metadata (`+abc`).
+          # Neither changes which release this is: the tag is cut from `core`, and only `latest`
+          # treats the two differently. A trailing `-` with nothing after it is not a tag either.
+          case "$version" in
+            *[-+] | *[-+][-+]*) echo "::error::'${GITHUB_REF_NAME}' is not a version tag" >&2; exit 1 ;;
+          esac
+          tags="${RUNNER_TEMP}/tags.txt"
+          printf '%s\n' "${IMAGE}:${core}${SUFFIX}" >"$tags"
+          printf '%s\n' "${IMAGE}:${core%.*}${SUFFIX}" >>"$tags"
+          case "$version" in
+            *-*) ;;
+            *) printf '%s\n' "${IMAGE}:latest${SUFFIX}" >>"$tags" ;;
+          esac
+          cat "$tags"
 
-          status="$(docker inspect --format '{{.State.Health.Status}}' health)"
-          if [ "$status" != healthy ]; then
-            echo "::error::the image's HEALTHCHECK reported '$status'"
-            docker inspect --format '{{json .State.Health}}' health
-            docker logs health
-            docker rm -f health
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -eu
+          # `-t` per tag and one digest per architecture is the whole of what a manifest list is.
+          # `name-canonical=true` above is what makes each digest fully qualified: a bare
+          # `sha256:...` is registry-ambiguous, and `imagetools` would look for it on Docker Hub.
+          args=""
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            args="${args} -t ${tag}"
+          done <"${{ runner.temp }}/tags.txt"
+          # The artifacts are files named for their hex, one per architecture, so a glob is the
+          # whole set. It is a glob rather than a count so that a third architecture later needs no
+          # change here - the check below is what enforces the two that exist today.
+          found=0
+          for file in *; do
+            [ -f "$file" ] || continue
+            found=$((found + 1))
+            args="${args} ${IMAGE}@sha256:${file}"
+          done
+          [ "$found" -gt 0 ] || { echo "::error::no digests to assemble" >&2; exit 1; }
+          # Word splitting is the point: one `-t`/image pair per argument.
+          # shellcheck disable=SC2086
+          docker buildx imagetools create ${args}
+
+      # A tag that resolves to one architecture, or to nothing, is the failure this asserts against
+      # - `imagetools create` is happy to build a list from a single digest. `inspect --raw` fetches
+      # the list from the registry rather than reading a local cache, so this is the registry's
+      # answer to "what did we just publish", not this runner's belief about it.
+      - name: Verify the published manifest list
+        run: |
+          set -eu
+          count="$(ls -1 "${{ runner.temp }}/digests" | wc -l | tr -d ' ')"
+          [ "$count" -eq 2 ] || {
+            echo "::error::expected a digest for each of linux/amd64 and linux/arm64, got ${count}" >&2
             exit 1
-          fi
-
-          # The check has to fail too, or it is a probe that always passes. Point it at a port
-          # nothing listens on, which is the shape of a container whose server died. The absolute
-          # path, because a `scratch` image has no `PATH` to search.
-          if docker exec -e VOLUCER_HEALTH_URL=http://127.0.0.1:1/health health \
-              /usr/local/bin/volucer health; then
-            echo "::error::the health check passed against a closed port"
-            docker rm -f health
-            exit 1
-          fi
-
-          docker rm -f health
-          echo "the image's health check answers both ways"
+          }
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            # `|| true` so a manifest the registry returns in an unexpected shape reaches the
+            # assertions below as "no platforms found" rather than as a bare `grep` failure, which
+            # would report `grep: no match` and nothing about the tag.
+            platforms="$(docker buildx imagetools inspect --raw "$tag" \
+              | tr -d ' \n' | grep -o '"architecture":"[a-z0-9]*"' | sort -u | tr '\n' ' ' || true)"
+            printf '%s -> %s\n' "$tag" "$platforms"
+            case "$platforms" in
+              *amd64*) ;;
+              *) echo "::error::${tag} has no linux/amd64 image" >&2; exit 1 ;;
+            esac
+            case "$platforms" in
+              *arm64*) ;;
+              *) echo "::error::${tag} has no linux/arm64 image" >&2; exit 1 ;;
+            esac
+          done <"${{ runner.temp }}/tags.txt"

@@ -210,6 +210,41 @@ jobs:
             exit 1
           fi
 
+  # `release.yml`'s Docker jobs build, push and smoke-test images on a `v*` tag, so without this job
+  # the first execution of any of that is release day. Two things are checked here that only a
+  # build can answer: that the Dockerfile still builds on both architectures, and that the
+  # `HEALTHCHECK` inside it still answers both ways. The tags are not published - a pull request
+  # from a fork has no `packages: write` and should not need one.
+  #
+  # amd64 only. The arm64 image is proven on the `docker` job's native arm64 runner at release time,
+  # where `ubuntu-24.04-arm` is free; adding QEMU here would emulate a compiler for half an hour to
+  # check a line the release build already checks natively.
+  docker:
+    name: Docker (${{ matrix.image }})
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [glibc, musl]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          target: ${{ matrix.image }}
+          load: true
+          push: false
+          tags: volucer:${{ matrix.image }}
+      # The same script `release.yml` runs against a pushed digest. Running the identical code here
+      # is the point: an inline copy would drift, and the copy that runs at release time is the one
+      # nobody can exercise beforehand.
+      - name: Smoke-test the image
+        shell: bash
+        run: bash packaging/docker/smoke-test.sh volucer:${{ matrix.image }}
+
   # A published crate cannot depend on a version that is not on crates.io yet, so the publish
   # order is forced and a mistake in it is invisible until release day.
   package:

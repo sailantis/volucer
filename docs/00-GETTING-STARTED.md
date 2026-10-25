@@ -98,11 +98,22 @@ to `1`.
 
 ### In a container
 
-`packaging/docker/Dockerfile` can build a glibc image or a `scratch`-based musl image.
-To build the musl image, run:
+Every release publishes `linux/amd64` and `linux/arm64` images to GitHub Container Registry:
 
 ```console
-docker build --target musl -t volucer .
+docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based: the recommended one
+docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you need a libc
+```
+
+The default image uses musl and is based on `scratch`; the glibc image always carries the
+`-glibc` suffix. For reproducible deployments, pin a version tag such as `0.2.0` instead of
+`latest`. The package has to be made public once after its first release; see
+[Publishing](11-OPERATIONS.md#publishing).
+
+To build either image from a checkout instead, use `packaging/docker/Dockerfile`:
+
+```console
+docker build -f packaging/docker/Dockerfile --target musl -t volucer .
 ```
 
 The image's Docker `HEALTHCHECK` runs `volucer health`. The command reads its probe

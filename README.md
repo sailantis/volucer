@@ -74,17 +74,27 @@ The installer places the binary in `%LOCALAPPDATA%\volucer\bin` and adds it to y
 
 ### In a container
 
-`packaging/docker/Dockerfile` builds either a glibc-based image or a `scratch`-based musl
-image:
+Each release publishes `linux/amd64` and `linux/arm64` images to GitHub Container
+Registry:
 
-```console
-docker build --target musl -t volucer .
+```sh
+docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based
+docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, glibc
 ```
 
-The image uses `volucer health` for its Docker `HEALTHCHECK`. The command reads its probe
-address from `[status]`, so it also works in the `scratch` image, which has no shell or
-`curl`. See [Docker operations](docs/11-OPERATIONS.md#docker) for `docker run`, Compose,
-and guidance on when to use `/health` or `/ready`.
+The default image uses musl and is based on `scratch`; the Debian-based glibc image uses the `-glibc` suffix. For reproducible deployments, pin a version tag such as `0.2.0` instead of using `latest`.
+
+After the package is public, you can pull it without `docker login`. See [Publishing](docs/11-OPERATIONS.md#publishing) for details.
+
+To build either image from a checkout, use `packaging/docker/Dockerfile`:
+
+```console
+docker build -f packaging/docker/Dockerfile --target musl -t volucer .
+```
+
+The Docker `HEALTHCHECK` runs `volucer health` and reads its probe address from
+`[status]`. This works in the `scratch` image, which does not include a shell or `curl`.
+See [Docker operations](docs/11-OPERATIONS.md#docker) for `docker run`, Compose, and guidance on choosing `/health` or `/ready`.
 
 ### Build from source
 

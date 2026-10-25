@@ -275,44 +275,89 @@ is no authentication on those routes.
 
 ## Docker
 
-`packaging/docker/Dockerfile` builds two images from the one crate — a glibc image and a
-`scratch`-based musl image:
+There are two ways to get an image: pull a published one, or build it from a checkout.
+
+### Pulling a published image
+
+Every release publishes both images to GitHub Container Registry, for `linux/amd64` and
+`linux/arm64`:
 
 ```console
-docker build --target musl -t volucer .
-docker build --target glibc -t volucer:glibc .
+docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based: the recommended one
+docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you need a libc
 ```
 
-The musl image is the smaller of the two and has no libc dependency, which matters for a
-`scratch` base. There is no archive to fetch and nothing to verify by hand, because the
-binary is built into the image. `.dockerignore` keeps `target/` and `.git/` out of the build
-context, which they would otherwise dominate: a checkout of this repository has a `target/`
-directory in the tens of gigabytes, and every byte of it would be uploaded and written into a
-layer before the compiler started.
+The `musl` image is the default — it has no libc dependency and is smaller, which is what a
+`scratch` base allows. **`glibc` always carries a suffix**, so a bare pull is never the base
+image by accident:
+
+| Tag | Image |
+|---|---|
+| `0.2.0`, `0.2`, `latest` | musl, `scratch` base |
+| `0.2.0-glibc`, `0.2-glibc`, `latest-glibc` | glibc, `debian:bookworm-slim` |
+
+`latest` moves only for a final release: a pre-release such as `v0.3.0-rc.1` publishes
+`0.3.0` and `0.3` and leaves `latest` where it is, because `latest` is what a bare
+`docker pull` installs. Pin `0.2.0` rather than `latest` in anything that must not change
+under it.
+
+The package has to be made public once, after the first release publishes it — see
+[Publishing](#publishing) — after which no `docker login` is needed to pull it.
+
+### Building it yourself
+
+`packaging/docker/Dockerfile` builds both images from the one crate, measured at about
+3m45s for `musl` and 1m40s for `glibc` on a 4-vCPU machine with a cold Cargo cache:
+
+```console
+docker build -f packaging/docker/Dockerfile --target musl -t volucer .           # the host's architecture
+docker build -f packaging/docker/Dockerfile --target glibc -t volucer:glibc .
+```
+
+`-f` is required: the Dockerfile is in `packaging/docker/`, not at the repository root, while the
+build context has to be the root because `COPY . .` copies the whole cargo workspace.
+
+`--target musl` resolves the Rust target from `--platform`, so
+`docker build -f packaging/docker/Dockerfile --platform linux/arm64 --target musl` produces an
+`aarch64` binary rather than a mislabelled `x86_64` one. An architecture with no musl target is a
+build failure, not a fallback.
+
+The two images are 23 MB (`musl`, `scratch`) and 149 MB (`glibc`, `debian:bookworm-slim`).
+
+There is no archive to fetch and nothing to verify by hand, because the binary is built into
+the image. `.dockerignore` keeps `target/` and `.git/` out of the build context, which they
+would otherwise dominate: a checkout of this repository has a `target/` directory in the tens of
+gigabytes, and every byte of it would be uploaded and written into a layer before the compiler
+started.
 
 ### Running it
 
-Both images have the same contract, so the same invocation works for either:
+Both images have the same contract, so the same invocation works for either — a published image
+name drops in for the local one:
 
 ```console
 docker run --rm \
     -p 8080:8080 -p 9080:9080 \
     -v "$PWD/volucer.toml:/etc/volucer/volucer.toml:ro" \
     -v "$PWD/public:/srv/public:ro" \
-    volucer
+    ghcr.io/sailantis/volucer:latest
 ```
 
 **The image can also be run with no configuration file at all**, which is the shape that needs
 nothing mounted and no entrypoint script to generate one:
 
 ```console
-docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" volucer \
+docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" \
+    ghcr.io/sailantis/volucer:latest \
     serve --listen 0.0.0.0:8080 --document-root /srv/public \
         -o server.front_controller=index.php \
         -o backends.app.kind=worker \
         -o "backends.app.command=php /srv/public/worker.php" \
         -o status.address=0.0.0.0:9080
 ```
+
+Note the subcommand: `ENTRYPOINT` is the binary, so arguments after the image name replace the
+default `serve --config /etc/volucer/volucer.toml` and `serve` has to be named explicitly.
 
 The `HEALTHCHECK` reads `[status]` from a file, so a fileless container needs the probe pointed
 at the URL instead: `HEALTHCHECK CMD ["/volucer", "health", "--url",
@@ -379,12 +424,12 @@ docker exec volucer volucer health --ready
 
 ### Compose
 
+Use the published image, or `build:` if you are working from a checkout:
+
 ```yaml
 services:
   app:
-    build:
-      context: .
-      target: musl
+    image: ghcr.io/sailantis/volucer:0.2.0      # or: build: {context: ., target: musl}
     ports:
       - "8080:8080"
       - "9080:9080"
@@ -420,10 +465,40 @@ for one job.
 
 ### Publishing
 
-The release workflow builds both images and **does not push them**: this repository has never
-published to a registry, and a workflow that starts pushing on its first run is not one to find
-that out with. `docker/build-push-action` is already wired with `push: false`, so publishing is
-a login (`.github/workflows/release.yml`) and `push: true`.
+The release workflow publishes both images to `ghcr.io/<repository>` on every `v*` tag, for
+`linux/amd64` and `linux/arm64`, as a multi-architecture manifest list. It is the last job in
+the pipeline and it depends on `publish`, so an image tag never exists for a release whose
+archives failed to install.
+
+Nothing is stored as a secret: the workflow authenticates to ghcr with its own `GITHUB_TOKEN`
+and the `packages: write` permission, because the package belongs to the repository that built
+it.
+
+**The first push creates the package as private, even for a public repository.** GHCR does not
+inherit repository visibility — access *rules* inherit, visibility does not — so one manual step
+is needed after the first release: the package's **Settings → Danger Zone → Change visibility**,
+or the API for an organization-owned package:
+
+```console
+gh api --method PATCH /orgs/sailantis/packages/container/volucer -f visibility=public
+```
+
+Until that is done, `docker pull` needs a login and the README's one-liner does not work. The
+build passes `org.opencontainers.image.source`, which is what links the package to this
+repository; an unlinked package cannot be managed from the repository's settings page at all.
+
+Two properties are deliberate and worth not undoing:
+
+- **A build never creates a tag.** Each `(image, architecture)` pair is pushed by digest — an
+  addressable but unreferenced `sha256:…` — and the tags are created in one separate job once
+  every architecture has been built and smoke-tested. A tag written during the build would be
+  pullable while its sibling architecture was still compiling.
+- **`glibc` always carries a suffix.** `latest` and `latest-glibc` are different images, so a bare
+  pull cannot resolve to the base image by accident.
+
+`.github/workflows/ci.yml` builds both images on every push to `main` and exercises
+`packaging/docker/smoke-test.sh` against them, which is the same script the release runs against
+the pushed digest. Without that job the first execution of the Dockerfile would be release day.
 
 ## The access log and logrotate
 

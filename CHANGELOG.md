@@ -9,6 +9,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Container images are published to `ghcr.io/<repository>`.** Every `v*` tag pushes a
+  multi-architecture manifest list (`linux/amd64` and `linux/arm64`) of both the `scratch`-based
+  musl image and the Debian-based glibc image, so `docker pull ghcr.io/sailantis/volucer:latest`
+  works without a checkout or a Rust toolchain. `musl` is the recommended image and takes the
+  unsuffixed tags (`0.2.0`, `0.2`, `latest`); `glibc` always carries a suffix (`0.2.0-glibc`,
+  `latest-glibc`), so a bare pull cannot resolve to the base image by accident. `latest`
+  deliberately does not move for a pre-release tag. The images are pushed by digest during the
+  build and tagged only in a final job that depends on the release being published, so a
+  half-built multi-architecture tag is impossible. The package is created private and has to be
+  made public once after the first release. See
+  [Docker operations](docs/11-OPERATIONS.md#pulling-a-published-image).
+- **The `musl` Docker stage builds for `arm64` as well as `amd64`.** The Rust target is derived
+  from `TARGETARCH`, so `docker build --platform linux/arm64 --target musl` produces an
+  `aarch64` binary; an unsupported architecture is a build failure rather than a mislabelled
+  image. `docker build --target musl` is unchanged on both architectures. Two corrections to
+  what the docs used to say came out of building both: the Dockerfile has to be named with
+  `-f packaging/docker/Dockerfile` (it is not at the context root), and a `scratch` image is
+  23 MB on amd64 and 21 MB on arm64.
+- **`packaging/docker/smoke-test.sh`** runs an image and checks both halves of what it claims:
+  that the binary runs, and that the `HEALTHCHECK` answers `healthy` for a serving container and
+  fails against a closed port. It takes a tag or a digest, so the release runs it against exactly
+  what it published. A new `docker` job in `ci.yml` runs it on both images for every push, so a
+  broken `HEALTHCHECK` no longer waits for release day to be discovered. It also works from Git
+  Bash on Windows, where `mktemp -d` and `docker exec /path` need translating - the script
+  converts the bind-mount path with `cygpath`, and refuses to let a path-mangled `exec` count as
+  the negative case passing.
 - **`--root`, `--worker`, `--fcgi` and `--concurrency` in the same quick-start shape.** `--root`
   aliases `--document-root`, and `--php-cgi`, `--worker` and `--fcgi` each declare a default
   backend in one flag: `--php-cgi [PATH]` a `spawn_cgi` pool driven by `php-cgi`, `--worker
