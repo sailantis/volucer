@@ -484,7 +484,10 @@ backend = "{pool}"
     // The reload, through the shared handle every front-end holds. The new table's site routes
     // `/probe.php` to the other pool, so a listener that kept a stale clone is visible in the
     // answer rather than only in the table.
-    let _replaced = reload.apply(Sites::from_config(&after, &roots.join("second")));
+    let _replaced = reload.apply(
+        Sites::from_config(&after, &roots.join("second")),
+        std::sync::Arc::new(volucer_watch::GrpcGrantsMap::new()),
+    );
 
     let second = request_on(&mut connection, 2, "any.test", "/probe.php");
     assert!(
@@ -894,7 +897,7 @@ document_root = {root:?}
     );
     let sites = SharedState::new(Sites::from_config(&config, &root));
     let registry = Arc::new(Registry::new(sites));
-    let limiter = Arc::new(
+    let limiter = Arc::new(volucer_watch::RateLimitCell::new(Some(
         volucer_core::RateLimitPolicy::new(
             volucer_core::KeyMode::Ip,
             None,
@@ -904,7 +907,7 @@ document_root = {root:?}
             None,
         )
         .expect("the policy is valid"),
-    );
+    )));
 
     let listener = FastCgiListener::bind_registered(
         "127.0.0.1:0",

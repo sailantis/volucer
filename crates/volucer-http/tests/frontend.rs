@@ -137,6 +137,9 @@ fn worker_config(workers: u32) -> Config {
                 checksum: Default::default(),
                 services: Vec::new(),
                 grpc_services: Vec::new(),
+                grpc_serve_any: false,
+                grpc_proto: Vec::new(),
+                grpc_proto_services: Vec::new(),
                 transport: Default::default(),
                 socket: None,
             }),
@@ -1294,7 +1297,10 @@ static_files = {{ enabled = true }}
     // Replace the site table. The listener keeps running: nothing is rebound, and the accept
     // loop is never told anything happened.
     let second = config_for(&after);
-    let replaced = server.reload.apply(Sites::from_config(&second, &after));
+    let replaced = server.reload.apply(
+        Sites::from_config(&second, &after),
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
+    );
 
     // The handle reports what it actually replaced, which is what lets a caller log a change
     // rather than only that a reload was attempted.
@@ -1345,12 +1351,17 @@ static_files = {{ enabled = true }}
     };
 
     let first = Arc::new(config_for("one"));
-    let state = volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(first, 8080));
+    let state = volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(
+        first,
+        8080,
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
+    ));
     // What a request does: take one snapshot and hold it.
     let in_flight = state.load();
     let previous = state.replace(volucer_http::Reloaded::from_sites(
         Arc::new(config_for("two")),
         8080,
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
     ));
 
     assert_eq!(
@@ -1496,7 +1507,10 @@ document_root = {app:?}
 
         // Let every reader get into its loop, then apply the reload between them.
         std::thread::sleep(Duration::from_millis(100));
-        let _replaced = reload.apply(Sites::from_config(&config_for(&second), &second));
+        let _replaced = reload.apply(
+            Sites::from_config(&config_for(&second), &second),
+            std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
+        );
         std::thread::sleep(Duration::from_millis(100));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     });
@@ -2454,6 +2468,114 @@ grpc_services = ["greeter.Greeter"]
     );
 }
 
+/// **A reload widens a gRPC grant, with no restart.**
+///
+/// The property the reloadable-grants change exists for, and the reason it is a socket test rather
+/// than a unit one: the grant was captured into a worker pool's spec at startup, so this is only
+/// demonstrable by showing that a *running* listener, on the *same* connection, admits a service it
+/// refused a moment earlier.
+///
+/// Driven through the real PHP fixture, which serves both protocols — so the second half of the
+/// assertion is that the call now *reaches the application*, not merely that the status changed. A
+/// grant that widened without the worker being asked would produce the same `UNIMPLEMENTED` from a
+/// different place, and only the message in the body tells them apart.
+#[test]
+fn a_reload_widens_a_grpc_grant_on_a_running_listener() {
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+
+    let script = example_worker();
+    let config_for = |services: &str| {
+        format!(
+            r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:0"
+[backends.app]
+kind = "worker"
+command = 'php "{}"'
+workers = 1
+grpc_services = [{services}]
+"#,
+            script.display()
+        )
+    };
+
+    let before = Config::from_toml(&config_for(r#""greeter.Greeter""#)).expect("the first file");
+    before.validate().expect("a legal service name validates");
+    let after = Config::from_toml(&config_for(r#""greeter.Greeter", "other.Service""#))
+        .expect("the second file");
+    after.validate().expect("a legal service name validates");
+
+    let routing = front_controller_routing();
+    let document_root = routing.document_root.clone();
+    let sites = Arc::new(sites_for(
+        &routing,
+        volucer_core::config::StaticConfig::default(),
+    ));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_grpc_grants(Arc::new(before.grpc_grants_all()));
+
+    let dispatcher = match Dispatcher::from_config(&before, routing.clone()) {
+        Ok(dispatcher) => dispatcher,
+        Err(err) => {
+            eprintln!("skipping: the worker pool could not start: {err}");
+            return;
+        }
+    };
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+    else {
+        panic!("the listener must start");
+    };
+    let address = server.address.clone();
+
+    // One call helper: `true` when the reply carries a message, which means a worker was asked.
+    let reached_a_worker = |path: &str| -> (String, bool) {
+        let body = b"\x00\x00\x00\x00\x05hello";
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: example.test\r\n\
+             Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body);
+        let answer = String::from_utf8_lossy(&exchange_raw(&address, &raw)).into_owned();
+        let asked = answer.contains("hello from volucer's gRPC handler");
+        (answer, asked)
+    };
+
+    let (answer, asked) = reached_a_worker("/other.Service/SayHello");
+    assert!(
+        !asked,
+        "the service is not granted yet, so no worker may be asked.\nGot: {answer}"
+    );
+    let (_, tail) = answer.split_once("\r\n0\r\n").unwrap_or((&answer, ""));
+    assert!(
+        tail.to_ascii_lowercase().contains("grpc-status: 12"),
+        "an ungranted service is UNIMPLEMENTED before the reload.\nGot: {answer}"
+    );
+
+    // The reload, through the same handle a `SIGHUP` reaches.
+    let _ = server.reload.apply(
+        Sites::from_config(&after, &document_root),
+        Arc::new(after.grpc_grants_all()),
+    );
+
+    let (answer, asked) = reached_a_worker("/other.Service/SayHello");
+    assert!(
+        asked,
+        "after the reload the call must reach the application, which answers it — this is the \
+         difference between a widened grant and a widened *refusal*.\nGot: {answer}"
+    );
+
+    drop(server);
+}
+
 /// Send a gRPC-shaped POST and return whatever came back, or nothing on the fixture's timeout.
 ///
 /// Deliberately not asserting on the answer: the fixture is not an HTTP/2 server, so a completed call
@@ -2618,7 +2740,7 @@ fn rate_limited_server(limit: volucer_core::RateLimitPolicy) -> Option<Server> {
     let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
         volucer_http::SharedState::new((*sites).clone()),
     )))
-    .with_rate_limit(Arc::new(limit));
+    .with_rate_limit(Arc::new(volucer_http::RateLimitCell::new(Some(limit))));
 
     Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
 }
@@ -2667,6 +2789,273 @@ fn a_request_over_the_rate_limit_is_a_429_with_a_retry_after() {
     );
 }
 
+/// **A `grpc_proto` grant is widened by re-reading the files, exactly as a written list is.**
+///
+/// The end-to-end half of the feature: `expand_grpc_proto` on the configuration, then the same
+/// `apply` a `SIGHUP` reaches. Asserted through the socket rather than on the `Config`, because the
+/// claim is that a *running listener* consults the grants its snapshot carries — a test that only
+/// checked the expanded list would pass on an implementation that read the files and installed
+/// nothing.
+///
+/// The `.proto` file is rewritten between the two halves, which is the whole point of the key: the
+/// set of services comes from the file, so a deploy that adds one is a reload rather than an edit to
+/// `volucer.toml`.
+#[test]
+fn a_reload_follows_a_proto_file_on_a_running_listener() {
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+
+    let fixture = proto_fixture("reload");
+    // One file, one package: `admin.proto` is a file a later deploy adds, and its service is granted
+    // only once the entry that reaches it exists.
+    fixture.write("greeter.proto", "package greeter;\nservice Greeter {}");
+
+    let script = example_worker();
+    let text_for = |entries: &str| {
+        format!(
+            r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:0"
+[backends.app]
+kind = "worker"
+command = 'php "{}"'
+workers = 1
+grpc_proto = [{entries}]
+"#,
+            script.display()
+        )
+    };
+
+    let mut before = Config::from_toml(&text_for(r#""greeter.proto""#)).expect("the first file");
+    before.validate().expect("a proto path validates");
+    before
+        .expand_grpc_proto(&fixture.0)
+        .expect("the first file resolves a service");
+
+    // The second generation names a file that did not exist when the server started. That is the
+    // shape this key is for: the grant comes out of the application's own `.proto` files rather
+    // than out of a list somebody maintains by hand in `volucer.toml`.
+    fixture.write("admin.proto", "package admin;\nservice Admin {}");
+    let mut after =
+        Config::from_toml(&text_for(r#""greeter.proto", "admin.proto""#)).expect("the second file");
+    after.validate().expect("two proto paths validate");
+    after
+        .expand_grpc_proto(&fixture.0)
+        .expect("both files resolve a service");
+
+    let routing = front_controller_routing();
+    let document_root = routing.document_root.clone();
+    let sites = Arc::new(sites_for(
+        &routing,
+        volucer_core::config::StaticConfig::default(),
+    ));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_grpc_grants(Arc::new(before.grpc_grants_all()));
+
+    let dispatcher = match Dispatcher::from_config(&before, routing.clone()) {
+        Ok(dispatcher) => dispatcher,
+        Err(err) => {
+            eprintln!("skipping: the worker pool could not start: {err}");
+            return;
+        }
+    };
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+    else {
+        panic!("the listener must start");
+    };
+    let address = server.address.clone();
+
+    let reached_a_worker = |path: &str| -> (String, bool) {
+        let body = b"\x00\x00\x00\x00\x05hello";
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: example.test\r\n\
+             Content-Type: application/grpc+proto\r\nTE: trailers\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body);
+        let answer = String::from_utf8_lossy(&exchange_raw(&address, &raw)).into_owned();
+        let asked = answer.contains("hello from volucer's gRPC handler");
+        (answer, asked)
+    };
+
+    // The service the first `.proto` declared: granted, and the application implements `SayHello`,
+    // so the reply carries its message. Asserted on the *method* the handler accepts, because that
+    // is the signal "a worker was asked": an ungranted service never reaches one at all.
+    let (answer, asked) = reached_a_worker("/greeter.Greeter/SayHello");
+    assert!(
+        asked,
+        "the service came from the .proto file and must be granted.\nGot: {answer}"
+    );
+
+    // The service the second `.proto` declares, before the reload.
+    let (answer, asked) = reached_a_worker("/admin.Admin/SayHello");
+    assert!(
+        !asked,
+        "the service is not granted yet, so no worker may be asked.\nGot: {answer}"
+    );
+    let (_, tail) = answer.split_once("\r\n0\r\n").unwrap_or((&answer, ""));
+    assert!(
+        tail.to_ascii_lowercase().contains("grpc-status: 12"),
+        "an ungranted service is UNIMPLEMENTED before the reload.\nGot: {answer}"
+    );
+
+    let _ = server.reload.apply(
+        Sites::from_config(&after, &document_root),
+        Arc::new(after.grpc_grants_all()),
+    );
+
+    let (answer, asked) = reached_a_worker("/admin.Admin/SayHello");
+    assert!(
+        asked,
+        "re-reading the .proto must widen the grant on the running listener.\nGot: {answer}"
+    );
+
+    drop(server);
+}
+
+/// A `grpc_proto` entry that resolves nothing refuses the reload, leaving the grants it had.
+///
+/// The counterpart, and the direction that matters: a reload that resolved nothing must not install
+/// an empty grant, because an empty grant is a worker that answers `UNIMPLEMENTED` to everything with
+/// no line saying why. `Registry::apply` is never reached here — the refusal happens while the
+/// configuration is loaded, which is what makes "the previous one is still serving" true.
+#[test]
+fn a_reload_that_resolves_no_service_keeps_the_grants_it_had() {
+    let fixture = proto_fixture("refuse");
+    fixture.write("greeter.proto", "package greeter;\nservice Greeter {}");
+
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_proto = ["greeter.proto"]
+"#;
+    let mut config = Config::from_toml(text).expect("the file parses");
+    config.validate().expect("a proto path validates");
+    config.expand_grpc_proto(&fixture.0).expect("expands");
+    let grants = Arc::new(config.grpc_grants_all());
+    assert!(grants["app"].granted("/greeter.Greeter/SayHello").is_some());
+
+    // The `.proto` now declares only a message, so there is nothing to grant.
+    fixture.write("greeter.proto", "package greeter;\nmessage OnlyA { }");
+    let mut next = Config::from_toml(text).expect("the file parses");
+    next.validate().expect("a proto path validates");
+    let err = next
+        .expand_grpc_proto(&fixture.0)
+        .expect_err("a set that resolves nothing must refuse");
+    assert!(
+        err.to_string().contains("resolved no gRPC service"),
+        "{err}"
+    );
+
+    // And the grant the running generation holds is untouched, because nothing replaced it.
+    assert!(
+        grants["app"].granted("/greeter.Greeter/SayHello").is_some(),
+        "a refused expansion must leave the installed grants alone"
+    );
+}
+
+/// A `.proto` fixture that removes itself, named after the test so two tests cannot collide.
+struct ProtoFixture(PathBuf);
+
+impl ProtoFixture {
+    fn write(&self, relative: &str, text: &str) {
+        let path = self.0.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create the parent");
+        }
+        std::fs::write(&path, text).expect("write the fixture");
+    }
+}
+
+impl Drop for ProtoFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn proto_fixture(name: &str) -> ProtoFixture {
+    let path =
+        std::env::temp_dir().join(format!("volucer-http-proto-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("create the fixture");
+    ProtoFixture(path)
+}
+
+/// **A reload replaces the limit, and a depleted caller stays depleted.**
+///
+/// The property that makes a reloadable limit a limit: a naive swap would hand every caller a fresh
+/// burst, which is a limit that can be escaped by asking the operator to edit the file and signal.
+/// The change here is only the interval, so the identity is unchanged and every bucket must survive.
+///
+/// Asserted through the socket, because the cell's own unit test cannot show that a *running listener*
+/// consults the replacement rather than a stale copy.
+#[test]
+fn a_reloaded_rate_limit_does_not_hand_out_a_fresh_allowance() {
+    let root = static_root("rate-limit-reload");
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let cell = Arc::new(volucer_http::RateLimitCell::new(Some(slow_limit(1))));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_rate_limit(Arc::clone(&cell));
+
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+    else {
+        panic!("the listener must start");
+    };
+
+    assert_eq!(get(&server.address, "/assets/app.css").status, 200);
+    assert_eq!(
+        get(&server.address, "/assets/app.css").status,
+        429,
+        "the single token is spent"
+    );
+
+    // The reload: same key mode, same header, a longer interval. Everything about the identity is
+    // unchanged, so the buckets must be carried.
+    assert!(
+        cell.replace(Some(
+            volucer_core::RateLimitPolicy::new(
+                volucer_core::KeyMode::Ip,
+                None,
+                1,
+                Duration::from_secs(7200),
+                Some(1),
+                None,
+            )
+            .expect("the test's policy is valid"),
+        )),
+        "a change of interval alone must carry every bucket"
+    );
+
+    let after = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        after.status, 429,
+        "a reload must not hand a depleted caller a fresh allowance: {after:?}"
+    );
+    // And the replacement is the one being consulted, which the *number* proves: a stale policy
+    // would still say 3600.
+    assert_eq!(after.header("retry-after"), Some("7200"), "{after:?}");
+}
+
 #[test]
 fn a_rate_limit_is_checked_before_the_static_layer_or_a_backend_does_any_work() {
     // The placement test, and the reason it is a separate assertion: a limiter that ran after
@@ -2712,7 +3101,7 @@ fn rate_limited_server_for_root(
     let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
         volucer_http::SharedState::new((*sites).clone()),
     )))
-    .with_rate_limit(Arc::new(limit));
+    .with_rate_limit(Arc::new(volucer_http::RateLimitCell::new(Some(limit))));
 
     Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
 }

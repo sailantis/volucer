@@ -806,7 +806,6 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
             socket: None,
         },
         checksum: Checksum::Optional,
-        grpc_services: Vec::new(),
     }
 }
 

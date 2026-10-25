@@ -46,6 +46,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Unset variables without defaults and values containing newlines or NUL bytes fail at load time.
 - **`[server.env]`** provides environment variables to spawned processes; backend values override
   it. Names are preserved, `attach` processes are unaffected, and invalid names fail at startup.
+- **Worker gRPC services can be discovered from `.proto` files or directories** with
+  `grpc_proto`; the resolved services are shown by `volucer check` and refreshed on `SIGHUP`.
 - **`spawn_cgi.env`** configures process variables without overriding pool-managed FastCGI values.
 - **`VOLUCER_VERSION`** is set for every process volucer starts and cannot be overridden.
 - **Installer provenance verification** supports `auto`, `require` and `off` through

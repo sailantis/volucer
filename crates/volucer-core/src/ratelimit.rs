@@ -53,7 +53,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -152,6 +152,33 @@ pub enum Verdict {
     },
 }
 
+/// The *shape* of a policy, without the buckets.
+///
+/// Separate from [`RateLimitPolicy`] because a reload has to answer one question about two
+/// policies: "would replacing this with that reset every caller's allowance?" If the shape is
+/// equal, the answer is no and the live policy is kept as-is; if it differs, the buckets can
+/// sometimes be carried across (see [`RateLimitPolicy::adopt_buckets`]) and sometimes cannot.
+///
+/// Integers rather than the derived `per_second`, so equality does not rest on comparing floats:
+/// `rate = 60, interval_ms = 60_000` and `rate = 1, interval_ms = 1_000` are the same limit and
+/// produce the same `f64`, but comparing the numbers an operator wrote is the comparison that can
+/// be explained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitShape {
+    /// Who a bucket belongs to.
+    pub key: KeyMode,
+    /// The canonical header name, when `key` is [`KeyMode::Header`].
+    pub header: Option<String>,
+    /// Requests allowed per `interval`.
+    pub rate: u32,
+    /// The interval, in milliseconds.
+    pub interval_ms: u64,
+    /// One bucket's capacity.
+    pub burst: u32,
+    /// The most identities tracked at once.
+    pub max_entries: usize,
+}
+
 /// One identity's bucket.
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -181,18 +208,20 @@ impl Bucket {
 /// configured allowance depending on which protocol received the request.
 #[derive(Debug)]
 pub struct RateLimitPolicy {
-    key: KeyMode,
-    /// The canonical header name, when `key` is [`KeyMode::Header`].
-    header: Option<String>,
+    /// The shape, and the one thing two policies are compared by.
+    shape: RateLimitShape,
     /// Tokens added per second. `rate / interval`, resolved once.
     per_second: f64,
     /// The capacity of one bucket, and the number of tokens a new one starts with.
     burst: f64,
-    max_entries: usize,
     /// The hasher for header-mode keys. One instance for the policy's life, because
     /// [`RandomState`] guarantees only that *the same instance* produces the same digests — a
     /// fresh one per request would give one client a new bucket every time.
-    hasher: RandomState,
+    ///
+    /// Behind an `Arc` rather than owned, so a reload that changes the rate but not the identity can
+    /// hand the *same instance* to the new policy and keep every caller in the bucket they were
+    /// already in. See [`RateLimitPolicy::adopt_buckets`].
+    hasher: Arc<RandomState>,
     buckets: Mutex<HashMap<Key, Bucket>>,
 }
 
@@ -288,24 +317,65 @@ impl RateLimitPolicy {
         };
 
         Ok(RateLimitPolicy {
-            key,
-            header,
             per_second: f64::from(rate) / interval.as_secs_f64(),
             burst: f64::from(burst),
-            max_entries,
-            hasher: RandomState::new(),
+            shape: RateLimitShape {
+                key,
+                header,
+                rate,
+                interval_ms: interval.as_millis().min(u128::from(u64::MAX)) as u64,
+                burst,
+                max_entries,
+            },
+            hasher: Arc::new(RandomState::new()),
             buckets: Mutex::new(HashMap::new()),
         })
     }
 
+    /// The shape of this policy, which is what a reload compares.
+    pub fn shape(&self) -> &RateLimitShape {
+        &self.shape
+    }
+
+    /// Take another policy's buckets **and its hasher**, so a reload that tightens or loosens the
+    /// limit does not hand every caller a fresh allowance.
+    ///
+    /// **Refused when the identity would change**, and only then. Buckets are keyed by [`Key`], and
+    /// for [`KeyMode::Header`] that is a digest of a caller-chosen string — so the map only means
+    /// the same identities under the *same* [`RandomState`]. Two independently built policies have
+    /// two of those, so carrying `buckets` without `hasher` would give every caller a new bucket
+    /// under a key nothing else shares: worse than the reset it looks like it avoids. Both move
+    /// together or neither does, which the `Arc` makes explicit rather than a comment.
+    ///
+    /// The rate and the burst may differ freely. A bucket's `tokens` is interpreted by whichever
+    /// policy owns it, and that is the right answer for a tightened limit: a caller who had five
+    /// tokens keeps five, and from then on they come back more slowly. A `max_entries` that shrank
+    /// leaves the map above its ceiling, which the ordinary sweep reclaims on the next new identity.
+    ///
+    /// Returns whether they were adopted, so a reload can report it rather than leaving an operator
+    /// to infer it from traffic.
+    pub fn adopt_buckets(&mut self, previous: &RateLimitPolicy) -> bool {
+        if previous.shape.key != self.shape.key || previous.shape.header != self.shape.header {
+            return false;
+        }
+        self.hasher = Arc::clone(&previous.hasher);
+        let buckets = previous
+            .buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self.buckets.lock().unwrap_or_else(|e| e.into_inner()) = buckets;
+        true
+    }
+
     /// The key mode, for reporting.
     pub fn key(&self) -> KeyMode {
-        self.key
+        self.shape.key
     }
 
     /// The header consulted in [`KeyMode::Header`], for reporting.
     pub fn header(&self) -> Option<&str> {
-        self.header.as_deref()
+        self.shape.header.as_deref()
     }
 
     /// Tokens per second, for reporting.
@@ -321,7 +391,7 @@ impl RateLimitPolicy {
 
     /// The most identities this process tracks, for reporting.
     pub fn max_entries(&self) -> usize {
-        self.max_entries
+        self.shape.max_entries
     }
 
     /// How many buckets are live, for tests and for a shutdown report.
@@ -386,7 +456,7 @@ impl RateLimitPolicy {
         }
 
         // A new identity, and no room for it.
-        if buckets.len() >= self.max_entries {
+        if buckets.len() >= self.shape.max_entries {
             // Reclaim the buckets that cost nothing to lose: a full bucket hands out `burst`
             // tokens from now whether it exists or not, so deleting it is indistinguishable from
             // never having created it. RoadRunner's timer-driven sweep uses exactly this test;
@@ -394,7 +464,7 @@ impl RateLimitPolicy {
             buckets.retain(|_, bucket| {
                 bucket.tokens_at(now, self.per_second, self.burst) < self.burst
             });
-            if buckets.len() >= self.max_entries {
+            if buckets.len() >= self.shape.max_entries {
                 // Everything left is depleted, so there is nothing lossless to evict and admitting
                 // this caller would mean handing it an allowance while the callers already tracked
                 // wait. Refusing is the truthful answer, and it is a 429 rather than a 503 because
@@ -811,6 +881,129 @@ mod tests {
             limiter.check(Identity::Global, now),
             Verdict::Limited { .. }
         ));
+    }
+
+    /// A reload that changes the rate keeps every caller where they were.
+    ///
+    /// The property a naive `Arc::replace` would destroy, and the reason `[server.rate_limit]` could
+    /// not simply be swapped: a limit that resets when the operator edits the file is a limit that
+    /// can be escaped by asking for a reload.
+    ///
+    /// Asserted from the *caller's* side rather than by inspecting buckets: a depleted caller must
+    /// still be depleted after the reload, which is the only thing an operator cares about.
+    #[test]
+    fn tightening_the_rate_keeps_a_depleted_bucket_depleted() {
+        let now = Instant::now();
+        let client = Identity::Address(ip("203.0.113.7"));
+
+        let previous = policy(1, 3600, Some(1));
+        assert_eq!(previous.check(client, now), Verdict::Allowed);
+        assert!(matches!(
+            previous.check(client, now),
+            Verdict::Limited { .. }
+        ));
+
+        // A tighter limit, built fresh — the shape a reload produces.
+        let mut next = policy(1, 7200, Some(1));
+        assert!(
+            next.adopt_buckets(&previous),
+            "same key mode and header, so the buckets must be carried"
+        );
+
+        assert!(
+            matches!(next.check(client, now), Verdict::Limited { .. }),
+            "a caller who had spent their allowance must not get a fresh one from the reload"
+        );
+        // The `previous` policy is untouched: it is still the one serving until the swap.
+        assert!(matches!(
+            previous.check(client, now),
+            Verdict::Limited { .. }
+        ));
+    }
+
+    /// A change of identity starts over, because there is no honest mapping.
+    ///
+    /// Switching from `ip` to `header` renames every bucket — the key space itself changes — so
+    /// carrying the map across would put one caller's bucket under a key nothing else shares. The
+    /// refusal is reported rather than silent, which is what lets a reload say so in its log.
+    #[test]
+    fn a_changed_identity_is_refused_rather_than_carried() {
+        let now = Instant::now();
+        let by_ip = policy(1, 3600, Some(1));
+        assert_eq!(
+            by_ip.check(Identity::Address(ip("203.0.113.7")), now),
+            Verdict::Allowed
+        );
+
+        let mut by_header = RateLimitPolicy::new(
+            KeyMode::Header,
+            Some("X-Client-Id"),
+            1,
+            Duration::from_secs(3600),
+            Some(1),
+            None,
+        )
+        .expect("valid");
+        assert!(
+            !by_header.adopt_buckets(&by_ip),
+            "a different key mode must refuse the carry, because the keys mean different things"
+        );
+        assert_eq!(
+            by_header.check(Identity::Header("anything"), now),
+            Verdict::Allowed,
+            "and the new policy therefore starts from a full bucket"
+        );
+
+        // A different *header name* is a different identity for the same reason, even though the key
+        // mode matches.
+        let mut other_header = RateLimitPolicy::new(
+            KeyMode::Header,
+            Some("X-Tenant"),
+            1,
+            Duration::from_secs(3600),
+            Some(1),
+            None,
+        )
+        .expect("valid");
+        assert!(!other_header.adopt_buckets(&by_header));
+    }
+
+    /// A header-keyed reload keeps its buckets *and* its digests, which is the subtle half.
+    ///
+    /// `Key::Header` is a digest produced by a `RandomState` instance, so the map only means the same
+    /// identities under the same hasher. Two independently built policies have two of them, which is
+    /// why `adopt_buckets` moves the hasher with the map — a carry that moved only the map would give
+    /// every caller a new bucket under a key nothing else shares.
+    #[test]
+    fn a_header_keyed_reload_carries_the_digests_with_the_buckets() {
+        let now = Instant::now();
+        let client = Identity::Header("tenant-7");
+
+        let previous = RateLimitPolicy::new(
+            KeyMode::Header,
+            Some("X-Client-Id"),
+            1,
+            Duration::from_secs(3600),
+            Some(1),
+            None,
+        )
+        .expect("valid");
+        assert_eq!(previous.check(client, now), Verdict::Allowed);
+
+        let mut next = RateLimitPolicy::new(
+            KeyMode::Header,
+            Some("X-Client-Id"),
+            1,
+            Duration::from_secs(3600),
+            Some(1),
+            None,
+        )
+        .expect("valid");
+        assert!(next.adopt_buckets(&previous));
+        assert!(
+            matches!(next.check(client, now), Verdict::Limited { .. }),
+            "the same header value must land in the same bucket after the reload"
+        );
     }
 
     #[test]

@@ -58,9 +58,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use volucer_core::config::StaticConfig;
+use volucer_core::config::{GrpcGrants, StaticConfig};
 use volucer_core::sites::{ResolvedSite, Sites};
 use volucer_fcgi::cgi::Routing;
+
+/// Which backend may be asked to serve which gRPC service, for one configuration generation.
+///
+/// Keyed by backend name, and only backends that can serve gRPC appear at all — a `worker` or an
+/// `attach`. An absent key is therefore "this backend cannot be a gRPC handler", and a present one
+/// with no names is "it can, and was granted nothing"; the second is the default and the safe
+/// answer, and the two are deliberately distinguishable because the listener's refusal names which
+/// of them applied.
+pub type GrpcGrantsMap = BTreeMap<String, GrpcGrants>;
 
 /// A value that can be replaced while readers are using it.
 ///
@@ -114,6 +123,75 @@ impl<T> Swappable<T> {
 impl<T: Default> Default for Swappable<T> {
     fn default() -> Self {
         Self::new(T::default())
+    }
+}
+
+/// The process's rate limit, in a form a reload can replace.
+///
+/// Lives here rather than beside either front-end because **both** consult it and a reload has to be
+/// able to replace it: `volucer-http` owns the HTTP listener and `volucer-server` the FastCGI one,
+/// and neither depends on the other. This crate is already the home of "what a reload replaces", so
+/// the rule travels with the cell rather than being re-derived per front-end.
+///
+/// A newtype rather than a bare [`Swappable`] because the *replacement rule* is the interesting part
+/// and it must not be written twice: a policy that changes only its rate keeps every caller's bucket
+/// (see [`volucer_core::RateLimitPolicy::adopt_buckets`]), and a policy that changes its *identity*
+/// cannot. Two reload paths that each wrote that match would be two chances to get it wrong, and the
+/// failure is silent — an allowance that resets is invisible in a log.
+#[derive(Debug)]
+pub struct RateLimitCell {
+    current: Swappable<Option<Arc<volucer_core::RateLimitPolicy>>>,
+}
+
+impl RateLimitCell {
+    /// A cell holding a policy, or `None` for a deployment with no `[server.rate_limit]`.
+    pub fn new(policy: Option<volucer_core::RateLimitPolicy>) -> Self {
+        RateLimitCell {
+            current: Swappable::new(policy.map(Arc::new)),
+        }
+    }
+
+    /// The policy to consult, or `None` to consult nothing.
+    ///
+    /// One pointer read, which is the cost the plain `Option` field had: a deployment with no limit
+    /// pays the same as before, and one with a limit pays an atomic load it already paid for the
+    /// site table.
+    pub fn load(&self) -> Arc<Option<Arc<volucer_core::RateLimitPolicy>>> {
+        self.current.load()
+    }
+
+    /// Whether a limit is configured at all, for `serve`'s own report.
+    pub fn is_some(&self) -> bool {
+        self.current.load().is_some()
+    }
+
+    /// Replace the policy, carrying the buckets across when the identity is unchanged.
+    ///
+    /// Returns `true` when every tracked caller kept its tokens — which is the answer for a change of
+    /// `rate`, `burst`, `interval_ms` or `max_entries`, and `false` for a change of `key` or `header`
+    /// (there is no honest way to map one caller's bucket onto another's) and for turning the limit
+    /// on or off.
+    ///
+    /// `false` is therefore an ordinary outcome and not a failure. The caller has already built and
+    /// validated the policy; a policy that cannot be built never reaches here, which is what keeps
+    /// the previous one in force.
+    #[must_use]
+    pub fn replace(&self, next: Option<volucer_core::RateLimitPolicy>) -> bool {
+        let previous = self.current.load();
+        match next {
+            Some(mut next) => {
+                let carried = match previous.as_ref() {
+                    Some(previous) => next.adopt_buckets(previous),
+                    None => false,
+                };
+                let _replaced = self.current.replace(Some(Arc::new(next)));
+                carried
+            }
+            None => {
+                let _replaced = self.current.replace(None);
+                false
+            }
+        }
     }
 }
 
@@ -236,6 +314,19 @@ pub struct Reloaded {
     /// other two: a request must be served under one generation, and a reload landing between
     /// "which site" and "how to compress" would apply half of a configuration.
     compression: BTreeMap<String, volucer_core::config::CompressionSetting>,
+    /// Which gRPC services each backend may be asked to serve, for this generation.
+    ///
+    /// **Here rather than on the pool, which is what makes it reloadable.** The grant used to be
+    /// captured into a worker pool's spec at startup, so widening it meant restarting the server —
+    /// for a list that never reaches a worker and is only ever a membership test on the request
+    /// path. Nothing about it is a property of a running process: the server refuses a call it was
+    /// not granted, before the body is read and before a worker is reached, which is a decision the
+    /// front-end makes alone.
+    ///
+    /// It travels in `Reloaded` for the reason everything else there does: a request must be
+    /// answered by one generation. A reload that changed a route *and* a grant moves both at once,
+    /// so a call cannot be routed by the new table and admitted by the old grant.
+    grpc_grants: Arc<GrpcGrantsMap>,
 }
 
 impl Reloaded {
@@ -247,7 +338,16 @@ impl Reloaded {
     ///
     /// `server_port` is the bound port, which the static layer stamps into generated
     /// redirects — a reload cannot change it, so it is passed in rather than stored.
-    pub fn from_sites(sites: Arc<Sites>, server_port: u16) -> Self {
+    ///
+    /// The gRPC grants are a *separate* argument rather than derived from the site table, because
+    /// they come from `[backends.*]` and a `Sites` is built from `[server]` and `[sites.*]`. The
+    /// caller that builds both has the whole configuration in hand; this pairs them into one
+    /// snapshot so a request cannot see one generation's grants and another's routes.
+    pub fn from_sites(
+        sites: Arc<Sites>,
+        server_port: u16,
+        grpc_grants: Arc<GrpcGrantsMap>,
+    ) -> Self {
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
         let mut compression = BTreeMap::new();
@@ -281,12 +381,40 @@ impl Reloaded {
             routings,
             statics,
             compression,
+            grpc_grants,
         }
     }
 
     /// The site table this snapshot was built from.
     pub fn sites(&self) -> &Sites {
         &self.sites
+    }
+
+    /// Which gRPC services each backend may be asked to serve, for *this* generation.
+    ///
+    /// The request-path answer, and the only one: asking the dispatcher or the pool would answer
+    /// with whatever the process started with, which is the restart-only behaviour this replaced.
+    pub fn grpc_grants(&self) -> &GrpcGrantsMap {
+        &self.grpc_grants
+    }
+
+    /// The gRPC call a `:path` addresses, when this generation grants the backend that service.
+    ///
+    /// `None` for three different refusals, which the caller reports apart rather than collapsing:
+    /// the backend cannot serve gRPC at all (an absent key), the path is not `/pkg.Service/Method`,
+    /// and the service is not in that backend's grant. All three become `UNIMPLEMENTED` — what gRPC
+    /// means by "this server does not implement that method" — but only the last one is something an
+    /// operator fixes by editing `grpc_services`.
+    ///
+    /// Returning the parsed call rather than just the verdict is deliberate: it is what a log line
+    /// and a test need, and re-parsing the path at either of those places would be a second
+    /// implementation of the rule.
+    pub fn granted_grpc_call<'a>(
+        &self,
+        backend: &str,
+        path: &'a str,
+    ) -> Option<volucer_core::config::GrpcPath<'a>> {
+        self.grpc_grants.get(backend)?.granted(path)
     }
 
     /// Resolve a host against *this* generation and return everything the request needs from it.
@@ -479,11 +607,16 @@ impl Registry {
         self.generations.load(Ordering::Acquire)
     }
 
-    /// Apply a new configuration's site table, whole, to every registered front-end.
+    /// Apply a new configuration's site table and gRPC grants, whole, to every registered front-end.
     ///
     /// Whole-or-nothing is the only safe direction and it is a property of this call rather than a
-    /// convention: the table is built by the caller *before* this is reached, so a configuration
+    /// convention: both values are built by the caller *before* this is reached, so a configuration
     /// that failed validation never gets here at all, and there is no partial path once it does.
+    ///
+    /// The two travel together on purpose. A grant is checked against the site's route selection —
+    /// a route names a backend, and the grant says whether that backend may serve the service — so a
+    /// reload that installed one without the other would admit a call through a route that no longer
+    /// selects it, or refuse one the new table just pointed at.
     ///
     /// This is the *applying* half; the trigger is `volucer serve`'s `signals` module. One apply path
     /// for the process is the point — a test and the process's own `SIGHUP` handler come through the
@@ -494,7 +627,7 @@ impl Registry {
     /// between two configurations, which is a question for the caller that has both of them — this
     /// only guarantees both are installed.
     #[must_use]
-    pub fn apply(&self, sites: Sites) -> Option<Arc<Reloaded>> {
+    pub fn apply(&self, sites: Sites, grpc_grants: Arc<GrpcGrantsMap>) -> Option<Arc<Reloaded>> {
         let _replaced = self.shared.replace(sites);
         // Read back through the handle rather than from the argument: `SharedState::replace`
         // returns the table it *replaced*, so rebuilding from its return value would build the
@@ -511,7 +644,8 @@ impl Registry {
         for front_end in front_ends.iter() {
             // The *front-end's own* port, not the one in the shared table: a redirect has to name
             // the port the client actually reached, and two listeners on two ports share one table.
-            let next = Reloaded::from_sites(Arc::clone(&live), front_end.port);
+            let next =
+                Reloaded::from_sites(Arc::clone(&live), front_end.port, Arc::clone(&grpc_grants));
             let replaced = front_end.state.replace(next);
             previous = previous.or(Some(replaced));
         }
@@ -711,6 +845,7 @@ mod tests {
         let state = Swappable::new(Reloaded::from_sites(
             Arc::new(named_sites("/srv/first")),
             8080,
+            Arc::new(GrpcGrantsMap::new()),
         ));
 
         let stop = AtomicBool::new(false);
@@ -740,7 +875,11 @@ mod tests {
                 } else {
                     "/srv/second"
                 };
-                let _ = state.replace(Reloaded::from_sites(Arc::new(named_sites(root)), 8080));
+                let _ = state.replace(Reloaded::from_sites(
+                    Arc::new(named_sites(root)),
+                    8080,
+                    Arc::new(GrpcGrantsMap::new()),
+                ));
             }
             stop.store(true, Ordering::Relaxed);
             seen = reader.join().expect("the reader thread panicked");
@@ -755,5 +894,130 @@ mod tests {
                 .all(|root| root == Path::new("/srv/first") || root == Path::new("/srv/second")),
             "a sample resolved to a root no generation named"
         );
+    }
+
+    /// A gRPC grant is per **generation**, so a reload can widen it without a restart.
+    ///
+    /// The property the whole change exists for. It is asserted on `Reloaded` rather than on a pool
+    /// because that is where the answer now lives: a grant that had stayed on the pool would be
+    /// pinned to the process, and this test would be unable to move it.
+    #[test]
+    fn a_generation_carries_its_own_grpc_grants() {
+        let mut before = GrpcGrantsMap::new();
+        before.insert(
+            "app".to_string(),
+            GrpcGrants::from_config(&["greeter.Greeter".to_string()], false),
+        );
+        let mut after = GrpcGrantsMap::new();
+        after.insert(
+            "app".to_string(),
+            GrpcGrants::from_config(
+                &["greeter.Greeter".to_string(), "other.Service".to_string()],
+                false,
+            ),
+        );
+
+        let first =
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), 8080, Arc::new(before));
+        let second =
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), 8080, Arc::new(after));
+
+        assert!(first
+            .granted_grpc_call("app", "/greeter.Greeter/SayHello")
+            .is_some());
+        assert!(
+            first
+                .granted_grpc_call("app", "/other.Service/SayHello")
+                .is_none(),
+            "the first generation must not admit a service it never listed"
+        );
+        assert!(
+            second
+                .granted_grpc_call("app", "/other.Service/SayHello")
+                .is_some(),
+            "the second generation must admit what it added, with no restart"
+        );
+
+        // A backend with no entry at all is a kind that cannot serve gRPC, and is refused no matter
+        // what the path names.
+        assert!(second
+            .granted_grpc_call("nope", "/greeter.Greeter/SayHello")
+            .is_none());
+        // The shape rule is unchanged: a URL is not a method name.
+        assert!(second
+            .granted_grpc_call("app", "/greeter.Greeter")
+            .is_none());
+    }
+
+    /// `grpc_serve_any` grants every well-formed service, still refusing every other path shape.
+    #[test]
+    fn a_generation_may_grant_every_service_but_not_every_path() {
+        let mut grants = GrpcGrantsMap::new();
+        grants.insert("app".to_string(), GrpcGrants::any());
+        let state =
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), 8080, Arc::new(grants));
+
+        assert!(state
+            .granted_grpc_call("app", "/never.Listed/Method")
+            .is_some());
+        for refused in ["/a.B/M/extra", "/a.B", "/", "/a.B/M?x=1"] {
+            assert!(
+                state.granted_grpc_call("app", refused).is_none(),
+                "{refused:?} is not a method path and must be refused even under grpc_serve_any"
+            );
+        }
+    }
+
+    /// A rate-limit replacement keeps the buckets when the identity is unchanged.
+    ///
+    /// The property that makes a reloadable limit a limit rather than a reset button. Asserted from
+    /// the caller's side: a depleted caller must still be depleted after the swap.
+    #[test]
+    fn replacing_a_rate_limit_keeps_buckets_when_only_the_rate_changed() {
+        fn policy(interval_secs: u64) -> volucer_core::RateLimitPolicy {
+            volucer_core::RateLimitPolicy::new(
+                volucer_core::KeyMode::Ip,
+                None,
+                1,
+                std::time::Duration::from_secs(interval_secs),
+                Some(1),
+                None,
+            )
+            .expect("valid")
+        }
+
+        let cell = RateLimitCell::new(Some(policy(3600)));
+        let client = volucer_core::Identity::Address("203.0.113.7".parse().expect("an address"));
+        let now = std::time::Instant::now();
+
+        {
+            let held = cell.load();
+            let limit = held.as_ref().as_ref().expect("a policy is configured");
+            assert_eq!(limit.check(client, now), volucer_core::Verdict::Allowed);
+            assert!(matches!(
+                limit.check(client, now),
+                volucer_core::Verdict::Limited { .. }
+            ));
+        }
+
+        assert!(
+            cell.replace(Some(policy(7200))),
+            "a change of interval alone must carry the buckets"
+        );
+        {
+            let held = cell.load();
+            let limit = held.as_ref().as_ref().expect("a policy is configured");
+            assert!(
+                matches!(
+                    limit.check(client, now),
+                    volucer_core::Verdict::Limited { .. }
+                ),
+                "a reload must not hand a depleted caller a fresh allowance"
+            );
+        }
+
+        // Turning the limit off is not a carry: there is no bucket to keep.
+        assert!(!cell.replace(None));
+        assert!(cell.load().is_none());
     }
 }

@@ -127,6 +127,24 @@ pub struct AttachConfig {
     /// The same allow-list and the same reasoning as [`WorkerConfig::grpc_services`].
     #[serde(default)]
     pub grpc_services: Vec<String>,
+
+    /// Serve any gRPC service the attached workers are sent.
+    ///
+    /// The same opt-out as [`WorkerConfig::grpc_serve_any`], with the same rule that it is refused
+    /// beside a non-empty [`Self::grpc_services`].
+    #[serde(default)]
+    pub grpc_serve_any: bool,
+
+    /// Read the gRPC services from `.proto` files instead of naming them.
+    ///
+    /// The same key and the same reasoning as [`WorkerConfig::grpc_proto`], including the rule that
+    /// it is refused beside both [`Self::grpc_services`] and [`Self::grpc_serve_any`].
+    #[serde(default)]
+    pub grpc_proto: Vec<PathBuf>,
+
+    /// The names [`Self::grpc_proto`] resolved. See [`WorkerConfig::grpc_proto_services`].
+    #[serde(skip)]
+    pub grpc_proto_services: Vec<String>,
 }
 
 impl AttachConfig {
@@ -187,6 +205,62 @@ impl AttachConfig {
             .relay()
             .map_err(|reason| format!("backends.{backend}: {reason}"))?;
         parse_listener(relay.as_ref()).map_err(|err| format!("backends.{backend}.relay: {err}"))?;
+
+        // The same two checks a `worker` backend's grants get, and duplicated here rather than
+        // shared because an `attach` table has no `WorkerConfig` to borrow: a name that is not a
+        // protobuf service is a grant that can admit nothing, and `grpc_serve_any` beside a list is
+        // two statements about one thing.
+        let mut seen = std::collections::BTreeSet::new();
+        for service in &self.grpc_services {
+            if !is_valid_grpc_service(service) {
+                return Err(format!(
+                    "backends.{backend}.grpc_services contains {service:?}, which is not a \
+                     protobuf service name; a service is identifiers joined by dots, e.g. \
+                     \"greeter.Greeter\" — check the name in the application's `.proto`, with its \
+                     package"
+                ));
+            }
+            if !seen.insert(service) {
+                return Err(format!(
+                    "backends.{backend}.grpc_services names {service:?} twice"
+                ));
+            }
+        }
+        if self.grpc_serve_any && !self.grpc_services.is_empty() {
+            return Err(format!(
+                "backends.{backend}.grpc_serve_any is set beside a non-empty grpc_services; they \
+                 are two statements about what this backend may be asked to serve. Remove the \
+                 list, or remove grpc_serve_any to keep the allow-list"
+            ));
+        }
+        // The third statement about the same set, refused beside both of the others for the reason
+        // the `worker` table refuses it: only one of the three can be the answer.
+        if !self.grpc_proto.is_empty() {
+            if !self.grpc_services.is_empty() {
+                return Err(format!(
+                    "backends.{backend}.grpc_proto is set beside a non-empty grpc_services; both \
+                     name the services this backend may be asked to serve, and only one of them \
+                     can be the answer. Remove grpc_services to let the `.proto` files decide, or \
+                     remove grpc_proto to keep the list"
+                ));
+            }
+            if self.grpc_serve_any {
+                return Err(format!(
+                    "backends.{backend}.grpc_proto is set beside grpc_serve_any; serving every \
+                     service makes reading the `.proto` files pointless. Remove one of them"
+                ));
+            }
+            if let Some(empty) = self
+                .grpc_proto
+                .iter()
+                .find(|path| path.as_os_str().is_empty())
+            {
+                return Err(format!(
+                    "backends.{backend}.grpc_proto contains {empty:?}, which names no file; give a \
+                     `.proto` path or a directory, relative to the configuration file"
+                ));
+            }
+        }
         Ok(())
     }
 }

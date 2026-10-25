@@ -6,6 +6,7 @@ mod access_log;
 mod acme;
 mod endpoints;
 mod grpc;
+mod grpc_proto;
 mod metrics;
 mod parse;
 mod relay;

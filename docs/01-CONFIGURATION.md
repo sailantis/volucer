@@ -351,6 +351,16 @@ you still get per-client limits.
 client that varies it gets a fresh bucket per request. Use a value the *proxy* sets — an
 API key it vouched for, a tenant it routed.
 
+**Reloadable.** A `SIGHUP` replaces the policy in place, and every tracked caller's bucket is
+carried across whenever the *identity* is unchanged — that is, when `key` and `header` are the
+same. So tightening `rate` throttles a caller from where they already were rather than handing
+them a fresh burst, which is the difference between a limit and a limit that can be escaped by
+asking the operator to edit the file and signal.
+
+Changing `key` or `header` renames every bucket, and there is no honest way to map one caller's
+bucket onto another's: that reload starts over, and says so in the log. Adding or removing the
+whole table does the same, because there is no bucket to carry.
+
 ## `[[server.routes]]`
 
 | Key | Type | Default | What it does |
@@ -437,6 +447,8 @@ command = "php worker.php"
 | `env` | table | empty | Extra environment variables for the worker, merged over `[server.env]`. |
 | `services` | array of strings | empty | The services this backend's workers may call. |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
+| `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
+| `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
 | `transport` | string | platform default | `"pipe"` or `"socket"`. |
 | `socket` | string | absent | Where the socket transport listens. |
@@ -468,6 +480,8 @@ instead of starting processes.
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
 | `services` | array of strings | empty | The services this backend's workers may call. |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
+| `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
+| `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
 
 ### `kind = "external"`
 
@@ -596,6 +610,13 @@ not exist until the flag is set — `404` on the path, not `403` — and that a 
 workers, reachable from anywhere, is a remote kill switch. Put `[status]` on loopback or
 a private interface and reach it through your orchestrator's network, or leave the flag
 off.
+
+`allow_worker_reset` is **reloadable**, in both directions. Turning it off on a `SIGHUP` makes
+the routes stop existing on the next request — a `404`, the same answer a deployment that never
+asked for them gives — which is what lets an operator close an unauthenticated mutation surface
+without restarting a serving process. Turning it on is refused by validation when `address` is a
+wildcard, so the *open* direction is subject to the same rule through a reload as at startup.
+`[status]`'s `address` is not reloadable: the socket is already bound.
 
 `volucer health` reads `address` from this table, so a probe does not have to repeat the port
 — including in a container, where a wildcard `address` is normal and is probed on loopback.

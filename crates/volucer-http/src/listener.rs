@@ -266,7 +266,11 @@ struct FrontEnd {
     /// a client twice the configured allowance depending on which protocol took the request. It is
     /// `None` — not a policy that allows everything — when no `[server.rate_limit]` table exists, so
     /// the request path does one `Option` check and touches no map, no clock and no lock.
-    rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
+    ///
+    /// An [`RateLimitCell`] rather than a plain `Option<Arc<…>>` because the limit is **reloadable**
+    /// — see [`ReloadHandles::rate_limit`]. The load is one pointer read, which is the same cost the
+    /// `None` check had.
+    rate_limit: Arc<RateLimitCell>,
 }
 
 impl FrontEnd {
@@ -285,7 +289,7 @@ impl FrontEnd {
 /// `Reloaded`, `Resolved` and the site table's derived maps live in `volucer-watch`, because both
 /// front-ends build them and a reload has to be able to. Re-exported here because this is where a
 /// reader looks for them.
-pub use volucer_watch::{Reloaded, Resolved};
+pub use volucer_watch::{RateLimitCell, Reloaded, Resolved};
 
 /// What one front-end needs in hand to serve a request.
 ///
@@ -305,6 +309,16 @@ pub struct ReloadHandles {
     /// is what moves. It is `None` on a deployment with no `[server.tls]`, and a plaintext
     /// listener therefore carries no TLS state at all.
     pub tls: Option<Arc<crate::tls::SniResolver>>,
+    /// The gRPC grants every backend starts with, as the configuration gave them.
+    ///
+    /// On the handles rather than derived from the site table, because grants come from
+    /// `[backends.*]` and a [`Sites`] is built from `[server]` and `[sites.*]`. A listener builds its
+    /// first [`Reloaded`] from this, and a reload replaces it — both through
+    /// [`Reloaded::from_sites`], so there is one constructor and no way for the two paths to pair
+    /// grants with a table from different generations.
+    ///
+    /// Defaults to empty, so a caller that never speaks gRPC keeps costing nothing.
+    pub grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
     /// Request identity and the access log, shared by **every** front-end.
     ///
     /// Here rather than on the listener, and here rather than as another argument, because this
@@ -330,11 +344,19 @@ pub struct ReloadHandles {
     /// The rate limit, when the deployment asked for one.
     ///
     /// Here for the same reason `client_ip` is: it is a process-wide decision both front-ends must
-    /// share. **Not reloadable**, and that is forced rather than chosen — the buckets are live
-    /// state, so replacing the policy would silently reset every caller's allowance on a `SIGHUP`,
-    /// which is a limit that can be escaped by asking the operator to reload. `restart_only` names
-    /// it.
-    pub rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
+    /// share, so that one client's allowance does not depend on which protocol received its request.
+    ///
+    /// **Reloadable**, unlike `client_ip`, and the buckets are why it took work rather than a swap:
+    /// replacing the policy naively would hand every caller a fresh allowance, which is a limit that
+    /// can be escaped by asking the operator to reload. [`volucer_core::RateLimitPolicy::adopt_buckets`]
+    /// is the answer — a reload that changes the rate keeps every bucket and its token count, and
+    /// only a change of *identity* (the key mode or the header name) starts over, because there is
+    /// no honest way to map one caller's bucket onto another's.
+    ///
+    /// A cell rather than a plain `Option` so the one instance `serve` builds is the one a reload
+    /// writes into: the FastCGI listener holds a clone of this `Arc`, not a copy of the policy, so
+    /// replacing it moves both front-ends. See [`RateLimitCell`].
+    pub rate_limit: Arc<RateLimitCell>,
 }
 
 impl ReloadHandles {
@@ -346,8 +368,19 @@ impl ReloadHandles {
             tls: None,
             observe: Arc::new(volucer_observe::Observability::disabled()),
             client_ip: Arc::new(volucer_core::ClientIpPolicy::off()),
-            rate_limit: None,
+            rate_limit: Arc::new(RateLimitCell::new(None)),
+            grpc_grants: Arc::new(volucer_watch::GrpcGrantsMap::new()),
         }
+    }
+
+    /// The same, with the gRPC grants the configuration gave.
+    ///
+    /// A builder beside the others, so every existing caller keeps working with no grants — which
+    /// is also the correct default: a backend that named no service is granted none.
+    #[must_use]
+    pub fn with_grpc_grants(mut self, grants: Arc<volucer_watch::GrpcGrantsMap>) -> Self {
+        self.grpc_grants = grants;
+        self
     }
 
     /// The same, with request identity and an access log.
@@ -368,13 +401,15 @@ impl ReloadHandles {
         self
     }
 
-    /// The same, with a rate limit both front-ends share.
+    /// The same, around a rate-limit cell `serve` already built.
     ///
-    /// A builder beside [`ReloadHandles::with_client_ip`] for the same reason: every existing caller
-    /// constructs these handles without a limiter and must keep costing nothing.
+    /// The two-front-end case: the cell is created once and handed to both, so replacing it moves
+    /// both. There is deliberately no builder that takes a bare policy: a caller that built its own
+    /// cell would give the FastCGI listener a *second* one, and two cells are two allowances for one
+    /// client.
     #[must_use]
-    pub fn with_rate_limit(mut self, rate_limit: Arc<volucer_core::RateLimitPolicy>) -> Self {
-        self.rate_limit = Some(rate_limit);
+    pub fn with_rate_limit(mut self, rate_limit: Arc<RateLimitCell>) -> Self {
+        self.rate_limit = rate_limit;
         self
     }
 
@@ -390,7 +425,7 @@ impl std::fmt::Debug for ReloadHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReloadHandles")
             .field("tls", &self.tls.is_some())
-            .field("rate_limit", &self.rate_limit.is_some())
+            .field("grpc_grants", &self.grpc_grants.len())
             .finish_non_exhaustive()
     }
 }
@@ -418,6 +453,14 @@ pub struct ReloadHandle {
     /// Independent of the registry, so a reload that changes sites and certificates applies both
     /// and a reload that changes neither installs nothing.
     tls: Option<Arc<crate::tls::SniResolver>>,
+    /// The rate-limit cell both front-ends consult, so a reload can replace the policy too.
+    ///
+    /// Independent of the registry for the reason `tls` is: the FastCGI front-end is not a registry
+    /// client, and the limit is not derived from the site table. Both holders share one [`Arc`], so
+    /// replacing through this moves the HTTP and the FastCGI listener together — which is the whole
+    /// reason there is one policy rather than one per front-end.
+    /// Held so a reload can swap it. See [`RateLimitCell`].
+    rate_limit: Arc<RateLimitCell>,
 }
 
 impl ReloadHandle {
@@ -448,11 +491,15 @@ impl ReloadHandle {
         self.tls.as_ref()
     }
 
-    /// Replace the shared site table, rebuilding every front-end's derived maps from it.
+    /// Replace the shared site table and the gRPC grants, rebuilding every front-end's derived maps.
     ///
-    /// The table is replaced through the [`Registry`], so **every** front-end moves at once. This
+    /// Both are replaced through the [`Registry`], so **every** front-end moves at once. This
     /// listener's own state is the one the registry rebuilt for it, rather than a second rebuild
     /// here — two rebuilds of one table is how the two front-ends would come to disagree.
+    ///
+    /// The grants travel with the table rather than as a second call, because a route names a
+    /// backend and a grant says whether that backend may serve a service: a reload that installed
+    /// one without the other would admit a call through a route that no longer selects it.
     ///
     /// Returns the state that was replaced, so a caller can report what changed rather than
     /// only that something did — the difference between "site `api` document_root changed"
@@ -461,13 +508,28 @@ impl ReloadHandle {
     /// In-flight requests are unaffected: each holds a snapshot of the state it started
     /// under, which is what makes this safe to call while the listener is serving.
     #[must_use]
-    pub fn apply(&self, sites: Sites) -> Arc<Reloaded> {
-        self.registry.apply(sites).unwrap_or_else(|| {
+    pub fn apply(
+        &self,
+        sites: Sites,
+        grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
+    ) -> Arc<Reloaded> {
+        self.registry.apply(sites, grpc_grants).unwrap_or_else(|| {
             // Unreachable while `bind` registers this listener before handing out a handle, and
             // expressed as a fresh snapshot rather than a panic so removing that could never
             // become a crash in a signal handler.
             self.state.load()
         })
+    }
+
+    /// Replace the rate limit both front-ends consult.
+    ///
+    /// Delegates to [`RateLimitCell::replace`], which owns the rule about carrying buckets across;
+    /// this exists so a reload does not have to reach into the listener's fields to find the cell.
+    ///
+    /// Returns `true` when every caller's bucket survived.
+    #[must_use]
+    pub fn replace_rate_limit(&self, next: Option<volucer_core::RateLimitPolicy>) -> bool {
+        self.rate_limit.replace(next)
     }
 }
 
@@ -825,9 +887,20 @@ impl HttpListener {
         // makes a reload reach a listener at all: a snapshot-holder nobody registered is a
         // front-end the process's own reload path cannot see, which is how a reload comes to take
         // effect on one protocol and not another.
+        // The grants a listener starts with, in order of what the caller actually said: the handles'
+        // own value when it was set, and otherwise the dispatcher's — which is the configuration the
+        // deployment was built from. The fallback matters because a listener built round a dispatcher
+        // (every test, and the shorthand binders) must not silently serve nothing, which is
+        // indistinguishable from a backend whose `grpc_services` is empty.
+        let grpc_grants = if handles.grpc_grants.is_empty() {
+            dispatcher.grpc_grants()
+        } else {
+            Arc::clone(&handles.grpc_grants)
+        };
         let state = Arc::new(Swappable::new(Reloaded::from_sites(
             handles.shared.sites(),
             port,
+            grpc_grants,
         )));
         handles
             .registry
@@ -847,7 +920,7 @@ impl HttpListener {
                 https_port: Some(https_port),
                 observe: Arc::clone(&handles.observe),
                 client_ip: Arc::clone(&handles.client_ip),
-                rate_limit: handles.rate_limit.clone(),
+                rate_limit: Arc::clone(&handles.rate_limit),
             }),
             tls: acceptor,
             accept_plain,
@@ -863,6 +936,7 @@ impl HttpListener {
             state: Arc::clone(&self.front_end.state),
             registry: Arc::clone(&self.front_end.registry),
             tls: self.front_end.tls.clone(),
+            rate_limit: Arc::clone(&self.front_end.rate_limit),
         }
     }
 
@@ -1346,7 +1420,7 @@ async fn prepare(
     // `resolved_peer` and not `remote_addr`: the identity is the address `[server.proxy]`
     // resolved, which is why that table was built before this one. A limit keyed on the socket peer
     // behind nginx would throttle the proxy and could not tell two clients apart.
-    if let Some(limit) = &front_end.rate_limit {
+    if let Some(limit) = front_end.rate_limit.load().as_ref() {
         let identity = match limit.key() {
             volucer_core::KeyMode::Global => volucer_core::Identity::Global,
             volucer_core::KeyMode::Ip => volucer_core::Identity::Address(resolved_peer),
@@ -1521,6 +1595,11 @@ async fn prepare(
     // serving an internal tool are different trust boundaries. Checking after dispatch would mean
     // the boundary was advisory.
     //
+    // *From this request's own snapshot*: the grants are part of the configuration generation, so a
+    // reload that widens one is visible to the next request and a call in flight keeps the grant it
+    // started under. Asking the dispatcher or the pool would answer with whatever the process
+    // started with — the restart-only behaviour this replaced.
+    //
     // *`UNIMPLEMENTED`, not a 404 or a 501*: gRPC's own code for "this server does not implement that
     // service", and the code a client already handles for every other non-reflective server. It is
     // also not transient, so a client does not retry a call that will never be served.
@@ -1530,8 +1609,7 @@ async fn prepare(
     // asked directly rather than through the grant check so that "not a method path" and "the wrong
     // service" are told apart in the sentence rather than both reading as a refusal.
     if is_grpc
-        && front_end
-            .dispatcher
+        && state
             .granted_grpc_call(&backend, parts.uri.path())
             .is_none()
     {
@@ -1540,6 +1618,10 @@ async fn prepare(
             None => format!(
                 "{path:?} is not a gRPC method path; a call addresses its service as \
                  `/pkg.Service/Method`"
+            ),
+            Some(_) if !front_end.dispatcher.accepts_grpc(&backend) => format!(
+                "backend {backend:?} is not a kind that can serve gRPC; only a worker backend \
+                 (including an attach) is handed method bytes"
             ),
             Some(call) => format!(
                 "backend {backend:?} does not list the service {:?} in its grpc_services, so this \

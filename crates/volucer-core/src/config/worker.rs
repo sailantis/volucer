@@ -70,11 +70,11 @@ pub struct WorkerConfig {
     /// answer for a worker that was never meant to speak gRPC at all — including a plain PHP
     /// application that a misconfigured client happens to send `content-type: application/grpc` to.
     ///
-    /// Only a `worker` backend has the key. A `worker` has a channel the server agreed to install a
-    /// handler on and a process that outlives a request; `external` and `spawn_cgi` reset per request
-    /// and have no such contract, and an `upstream` speaks gRPC itself and needs no permission from
-    /// here — the gRPC tiers are: the `upstream` backend relays to an origin that already speaks
-    /// gRPC, and the `worker` backend is the application serving the service itself.
+    /// Only a `worker` or an `attach` backend has the key. Both have a channel the server agreed to
+    /// install a handler on and a process that outlives a request; `external` and `spawn_cgi` reset
+    /// per request and have no such contract, and an `upstream` speaks gRPC itself and needs no
+    /// permission from here — the gRPC tiers are: the `upstream` backend relays to an origin that
+    /// already speaks gRPC, and the `worker` backend is the application serving the service itself.
     ///
     /// **Service names, not paths and not methods.** `"greeter.Greeter"` is a service; a method
     /// underneath it (`SayHello`) is the application's business, because a method the application
@@ -83,6 +83,68 @@ pub struct WorkerConfig {
     /// coupling the whole design exists to avoid.
     #[serde(default)]
     pub grpc_services: Vec<String>,
+
+    /// Serve **any** gRPC service this backend's workers are sent, without naming them.
+    ///
+    /// The opt-out from [`WorkerConfig::grpc_services`], and it is a *deliberate* one rather than
+    /// the lack of a list: absent `grpc_services` grants nothing, which is the safe default, so
+    /// "serve whatever arrives" has to be something an operator wrote down.
+    ///
+    /// **This gives up the boundary the list exists for.** `grpc_services` is checked before the
+    /// request body is read, so a caller cannot spend a body copy or a worker slot on a service the
+    /// deployment does not serve; with this set, every well-formed `/pkg.Service/Method` is delivered
+    /// and the application answers `UNIMPLEMENTED` itself after decoding. It is right for a backend
+    /// whose service set is genuinely dynamic — one that is discovered at runtime rather than
+    /// written down — and [`Self::grpc_proto`] is the answer for the much more common case of a set
+    /// that is large or churning but *declared* somewhere.
+    ///
+    /// It is legal **only on a `worker` or `attach` backend**, and only when [`Self::grpc_services`]
+    /// and [`Self::grpc_proto`] are both empty: two statements about one thing that can disagree is
+    /// refused everywhere else in this file. A startup warning names the backend, so a
+    /// public-facing worker granted everything says so in the log rather than only in the file.
+    #[serde(default)]
+    pub grpc_serve_any: bool,
+
+    /// Read the gRPC services from `.proto` files instead of naming them.
+    ///
+    /// **The same grant as [`Self::grpc_services`], from the source that cannot go stale.** A
+    /// deployment whose application already has `.proto` files has exactly one reliable statement of
+    /// which services exist, and a hand-maintained copy of it in this file is a second one that will
+    /// eventually disagree — in the silent direction, because a service that was added and not
+    /// listed is answered `UNIMPLEMENTED` with no log line saying why.
+    ///
+    /// Each entry is a `.proto` file or a directory that is searched recursively, resolved against
+    /// the directory holding this configuration file (the rule `[server.tls] certificate` and
+    /// [`Config::kv`]'s paths already follow). Only the `package` and the top-level `service`
+    /// declarations are read: an `import` is not followed, because a service's name depends on
+    /// nothing an import resolves.
+    ///
+    /// **Read when the configuration is loaded**, which is what makes it reloadable: the resolved
+    /// names become [`Self::grpc_services`] before anything is served, so a `SIGHUP` re-reads the
+    /// files and a changed set takes effect on the next request with no restart. A file that cannot
+    /// be read, or a set that resolves to no service at all, refuses the load — the same
+    /// whole-or-nothing rule the rest of the file follows, because a backend silently granted
+    /// nothing is the failure this key exists to remove.
+    ///
+    /// It is **mutually exclusive** with [`Self::grpc_services`] and with
+    /// [`Self::grpc_serve_any`]: they are three statements about one set, and every way of resolving
+    /// them silently ignores one. `volucer check` prints the files and the names they produced, so a
+    /// directory that brings in more services than intended is visible rather than inferred.
+    #[serde(default)]
+    pub grpc_proto: Vec<PathBuf>,
+
+    /// The names [`Self::grpc_proto`] resolved, or empty.
+    ///
+    /// **Not a statement in the file, and deliberately not deserializable**: `skip` means a file that
+    /// names this key is refused as an unknown field, so the three ways to say which services this
+    /// backend serves stay three. This is the *result* of one of them.
+    ///
+    /// It is a separate field rather than writing the resolved names back into
+    /// [`Self::grpc_services`] because those two keys are mutually exclusive: an expansion that
+    /// filled the list would produce a configuration its own validator refuses, which is a trap
+    /// whose only symptom would be a `check` on an already-loaded file.
+    #[serde(skip)]
+    pub grpc_proto_services: Vec<String>,
 
     /// Whether the per-frame `crc32c` is verified.
     ///

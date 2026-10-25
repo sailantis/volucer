@@ -122,10 +122,11 @@ pub struct FastCgiListener {
     observe: Arc<volucer_observe::Observability>,
     /// The rate limit, when the deployment asked for one.
     ///
-    /// The **same `Arc` the HTTP front-end holds**, so a client's allowance does not depend on which
-    /// protocol received its request. `None` when no `[server.rate_limit]` table exists, so an
-    /// unconfigured deployment's request path does one `Option` check.
-    rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
+    /// The **same cell the HTTP front-end holds**, so a client's allowance does not depend on which
+    /// protocol received its request *and* a reload that replaces the policy moves both. `None` when
+    /// no `[server.rate_limit]` table exists, so an unconfigured deployment's request path does one
+    /// pointer read and no work.
+    rate_limit: Option<Arc<volucer_watch::RateLimitCell>>,
 }
 
 impl FastCgiListener {
@@ -204,7 +205,7 @@ impl FastCgiListener {
     /// the `Arc` the HTTP listener was given rather than building one: two policies would be two
     /// allowances for one client.
     #[must_use]
-    pub fn with_rate_limit(mut self, rate_limit: Arc<volucer_core::RateLimitPolicy>) -> Self {
+    pub fn with_rate_limit(mut self, rate_limit: Arc<volucer_watch::RateLimitCell>) -> Self {
         self.rate_limit = Some(rate_limit);
         self
     }
@@ -453,7 +454,7 @@ fn serve_connection(
     stream: std::net::TcpStream,
     shared: Shared,
     limits: Limits,
-    rate_limit: Option<Arc<volucer_core::RateLimitPolicy>>,
+    rate_limit: Option<Arc<volucer_watch::RateLimitCell>>,
 ) -> Result<()> {
     let Shared {
         dispatcher,
@@ -614,10 +615,14 @@ fn serve_connection(
         // A request with no `REMOTE_ADDR` at all (a front-end that forwards raw FastCGI without
         // setting it) resolves to `None`, and gets no bucket rather than a shared one: bucketing
         // every such request together would make the limit a global one that reads as per-caller.
-        if let Some(limit) = &rate_limit {
+        if let Some(cell) = &rate_limit {
+            // Loaded once per request, from the shared cell, so a reload that replaces the policy is
+            // visible to the next request and never to one in flight.
+            let policy = cell.load();
+            let policy = policy.as_ref().as_ref();
             let address = param(request.params.as_slice(), b"REMOTE_ADDR")
                 .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok());
-            let identity = match limit.key() {
+            let identity = policy.and_then(|limit| match limit.key() {
                 volucer_core::KeyMode::Global => Some(volucer_core::Identity::Global),
                 volucer_core::KeyMode::Ip => address.map(volucer_core::Identity::Address),
                 volucer_core::KeyMode::Header => {
@@ -633,8 +638,8 @@ fn serve_connection(
                     param(request.params.as_slice(), format!("HTTP_{name}").as_bytes())
                         .map(volucer_core::Identity::Header)
                 }
-            };
-            if let Some(identity) = identity {
+            });
+            if let (Some(limit), Some(identity)) = (policy, identity) {
                 if let volucer_core::Verdict::Limited { retry_after, .. } =
                     limit.check(identity, Instant::now())
                 {

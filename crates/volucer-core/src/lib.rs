@@ -8,6 +8,7 @@ pub mod hostmap;
 pub mod php;
 pub mod preflight;
 pub mod program;
+pub mod proto;
 pub mod ratelimit;
 pub mod script;
 pub mod sites;

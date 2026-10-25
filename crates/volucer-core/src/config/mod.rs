@@ -20,6 +20,7 @@ use crate::ratelimit::KeyMode;
 mod attach;
 mod backend;
 mod grpc;
+mod grpc_proto;
 mod listener;
 mod metrics;
 mod paths;

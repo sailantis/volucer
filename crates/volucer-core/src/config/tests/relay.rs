@@ -158,6 +158,9 @@ fn attach_with_relay(relay: Option<&str>) -> AttachConfig {
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
     }
 }
 

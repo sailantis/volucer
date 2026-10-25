@@ -67,18 +67,6 @@ pub(super) struct Spec {
     /// and then respawned a worker under `required` would have one worker verifying and the rest
     /// not, which is a difference nothing would report.
     pub(super) checksum: Checksum,
-    /// The gRPC services this pool's workers were granted, captured from the configuration.
-    ///
-    /// **Captured rather than read from the configuration per request**, for the reason the
-    /// registry is built per backend and not per process: the list is a decision made once, at
-    /// startup, about what this pool may be asked to do. Reaching into a live configuration would
-    /// also make the answer depend on a reload landing mid-request, which is the ordering hazard
-    /// the listener's snapshot exists to prevent.
-    ///
-    /// Beside `checksum` because it is the same *kind* of fact — a handshake-time property of
-    /// this pool — and because a replaced worker must be granted what the worker it replaces was
-    /// granted, which is what putting it on the spec gives for free.
-    pub(super) grpc_services: Vec<String>,
 }
 
 impl Spec {
@@ -124,7 +112,6 @@ impl Spec {
                 socket: config.socket.clone(),
             },
             checksum: checksum_of(config.checksum),
-            grpc_services: config.grpc_services.clone(),
         })
     }
 
@@ -147,6 +134,9 @@ impl Spec {
                 env: config.env.clone(),
                 services: Vec::new(),
                 grpc_services: Vec::new(),
+                grpc_serve_any: false,
+                grpc_proto: Vec::new(),
+                grpc_proto_services: Vec::new(),
                 checksum: config.checksum,
                 transport: config.transport,
                 socket: config.socket.clone(),
@@ -181,7 +171,6 @@ impl Spec {
                 workers: config.workers,
             }),
             checksum: checksum_of(config.checksum),
-            grpc_services: config.grpc_services.clone(),
         })
     }
 
@@ -283,6 +272,9 @@ mod tests {
             checksum: Default::default(),
             services: Vec::new(),
             grpc_services: Vec::new(),
+            grpc_serve_any: false,
+            grpc_proto: Vec::new(),
+            grpc_proto_services: Vec::new(),
             transport: Default::default(),
             socket: Default::default(),
         }
@@ -296,6 +288,9 @@ mod tests {
             checksum: Default::default(),
             services: Vec::new(),
             grpc_services: Vec::new(),
+            grpc_serve_any: false,
+            grpc_proto: Vec::new(),
+            grpc_proto_services: Vec::new(),
         }
     }
 

@@ -768,6 +768,19 @@ impl Source {
     }
 
     /// Read, merge and validate. The only way `serve`, `check` and a reload build a `Config`.
+    ///
+    /// **`grpc_proto` is expanded here**, between validating and returning, and that placement is
+    /// the whole of how the key stays honest. It cannot happen in `Config::validate`, which is a
+    /// pure function of the file — every one of its rules is checkable without a disk, and `check`
+    /// depends on that to report a file it would not start from. It must not happen later either: a
+    /// backend whose grants were still unresolved when the dispatcher was built would answer
+    /// `UNIMPLEMENTED` to everything until the next reload. So the read goes where the file's
+    /// directory is already known, and what comes out is written back into `grpc_services`, which
+    /// every consumer already reads.
+    ///
+    /// The two refusals are `serve`'s and the reload's alike: a `.proto` that cannot be read, and a
+    /// set that resolves to nothing. Both leave the running configuration untouched on a reload,
+    /// which is the same whole-or-nothing rule the rest of them follow.
     fn load(&self) -> Result<Config, ServerError> {
         let mut table = match &self.path {
             Some(path) => Config::table_from_path(path)?,
@@ -776,8 +789,9 @@ impl Source {
         for pair in &self.pairs {
             apply_override(&mut table, pair)?;
         }
-        let config = Config::from_table(table)?;
+        let mut config = Config::from_table(table)?;
         config.validate()?;
+        config.expand_grpc_proto(&self.dir())?;
         tracing::info!(source = %self.describe(), "configuration loaded");
         Ok(config)
     }
@@ -1360,6 +1374,22 @@ fn serve(
     }
     let dispatcher = Arc::new(dispatcher);
 
+    // **A backend that serves any gRPC service says so at warning level.** The default grants
+    // nothing, so this can only be a decision somebody wrote down — but it is a decision that gives
+    // up the pre-body refusal, and a worker facing the public that opted out should be visible in
+    // the log rather than only in the file. Reported here, once, rather than per reload: the flag
+    // itself is restart-only, and a warning repeated on every `SIGHUP` is a warning people filter.
+    for (name, grants) in config.grpc_grants_all() {
+        if grants.is_any() {
+            tracing::warn!(
+                backend = %name,
+                "grpc_serve_any is set, so every well-formed gRPC method path is delivered to this \
+                 backend's workers; the application answers UNIMPLEMENTED for services it does not \
+                 implement, and an unknown service therefore costs a worker slot"
+            );
+        }
+    }
+
     println!("volucer");
     println!("  document root:    {}", document_root.display());
     println!(
@@ -1453,13 +1483,19 @@ fn serve(
     // The rate limit, when the deployment asked for one. Built here — before either front-end —
     // because one instance has to reach **both**. Two would give a client twice the configured
     // allowance depending on which protocol received its request, which no single-front-end test can
-    // see. Restart-only, and the buckets are why: replacing the policy on a `SIGHUP` would reset every
-    // caller's allowance, which is a limit that can be escaped by asking the operator to reload.
-    let rate_limit = config
-        .server
-        .rate_limiter()
-        .map_err(|reason| ServerError::Listener { reason })?
-        .map(Arc::new);
+    // see.
+    //
+    // **Reloadable**, as of the `RateLimitCell` work: the cell is built once and cloned into both
+    // front-ends and into the reloader, so a `SIGHUP` replaces the policy both of them consult. The
+    // buckets survive a change of rate (`RateLimitPolicy::adopt_buckets`) and are replaced only when
+    // the *identity* changes — which is the honest answer, because there is no way to map one
+    // caller's bucket onto another's.
+    let rate_limit = Arc::new(volucer_http::RateLimitCell::new(
+        config
+            .server
+            .rate_limiter()
+            .map_err(|reason| ServerError::Listener { reason })?,
+    ));
 
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
@@ -1475,11 +1511,8 @@ fn serve(
                     max_body_bytes: config.server.max_body_bytes(),
                 },
             )?
-            .with_observability(Arc::clone(&observe));
-            let listener = match rate_limit.as_ref() {
-                Some(limit) => listener.with_rate_limit(Arc::clone(limit)),
-                None => listener,
-            };
+            .with_observability(Arc::clone(&observe))
+            .with_rate_limit(Arc::clone(&rate_limit));
             println!("  fastcgi:          {}", listener.local_addr()?);
             Some(listener)
         }
@@ -1720,11 +1753,8 @@ fn serve(
     let handles_for = |speaks_tls: bool| {
         let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry))
             .with_observability(Arc::clone(&observe))
-            .with_client_ip(Arc::clone(&client_ip));
-        let handles = match rate_limit.as_ref() {
-            Some(limit) => handles.with_rate_limit(Arc::clone(limit)),
-            None => handles,
-        };
+            .with_client_ip(Arc::clone(&client_ip))
+            .with_rate_limit(Arc::clone(&rate_limit));
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
             _ => handles,
@@ -1738,7 +1768,19 @@ fn serve(
     // It is not one of the `http`/`https` listeners and deliberately shares none of their settings:
     // those face the public and may be TLS-only, while this one is meant to be reachable by a
     // scraper and an orchestrator and by nothing else.
-    let status = start_status(&config, &dispatcher)?;
+    // **One gate for the process**, built before the status listener so the listener and the reloader
+    // hold the same cell. Opening and shutting it on a reload is what makes
+    // `[status] allow_worker_reset` changeable without restarting: the routes stop existing while it
+    // is shut, which is the same answer a deployment that never asked for them gives.
+    let reset_gate = Arc::new(
+        if config.status.as_ref().is_some_and(|s| s.allow_worker_reset) {
+            volucer_http::WorkerResetGate::open()
+        } else {
+            volucer_http::WorkerResetGate::closed()
+        },
+    );
+
+    let status = start_status(&config, &dispatcher, &reset_gate)?;
 
     // The consumer side of the queues, when the deployment consumes anything. **Started before the
     // listeners**, so a consumer pool that cannot boot its processes is a startup failure rather than a
@@ -1852,12 +1894,16 @@ fn serve(
 
     install_shutdown_handler(
         fastcgi.as_ref().map(|l| l.shutdown_handle()),
-        Arc::clone(&registry),
-        tls_state.clone(),
-        Arc::clone(&observe),
-        source,
-        document_root_flag.map(Path::to_path_buf),
-        front_controller_flag.map(str::to_string),
+        Reloader {
+            source: source.clone(),
+            document_root_flag: document_root_flag.map(Path::to_path_buf),
+            front_controller_flag: front_controller_flag.map(str::to_string),
+            registry,
+            tls: tls_state.clone(),
+            observe,
+            rate_limit,
+            reset_gate,
+        },
     );
 
     // The poller, on its own thread: the pool is synchronous by construction, and the shutdown flag this
@@ -2099,6 +2145,7 @@ fn describe_collected(metrics: &volucer_core::config::MetricsConfig) {
 fn build_status(
     config: &Config,
     dispatcher: &Arc<Dispatcher>,
+    reset_gate: &Arc<volucer_http::WorkerResetGate>,
 ) -> Result<Option<RunningStatus>, ServerError> {
     if config.metrics.is_none() && config.status.is_none() {
         return Ok(None);
@@ -2155,7 +2202,14 @@ fn build_status(
         // The worker routes exist only when the deployment asked, and the implementation is the
         // dispatcher's own pool directory — the same one `workers.list` reads, so a `GET /workers`
         // and a worker's own `workers.list` cannot disagree about what a worker is.
-        workers: workers_control(config, dispatcher),
+        //
+        // The gate is a second question and deliberately separate: `workers` says whether there is a
+        // pool to control, the gate says whether a caller may reach it *now*. Splitting them is what
+        // lets `[status] allow_worker_reset` be turned off by a reload without dropping the pool
+        // handle — and closed routes are 404s rather than 403s, which is the property that stops an
+        // attacker enumerating them.
+        workers: workers_control(dispatcher),
+        reset_gate: Some(Arc::clone(reset_gate)),
     };
 
     RunningStatus::start(&address, services)
@@ -2165,23 +2219,17 @@ fn build_status(
         })
 }
 
-/// The worker-control routes, when `[status] allow_worker_reset` asks for them.
+/// The worker-control routes' implementation, when this deployment has a worker pool at all.
 ///
-/// `None` in two cases, and they are the same answer for different reasons: the deployment did not
-/// ask, or it asked and configured no worker pool at all — in which case there is nothing to list and
-/// `/workers` would be an empty array that looks like a pool with no workers. A static-only or
-/// upstream-only deployment gets no route rather than a misleading one.
-fn workers_control(
-    config: &Config,
-    dispatcher: &Arc<Dispatcher>,
-) -> Option<Arc<dyn volucer_http::WorkerControl>> {
-    if !config
-        .status
-        .as_ref()
-        .is_some_and(|status| status.allow_worker_reset)
-    {
-        return None;
-    }
+/// **No longer gated on `allow_worker_reset`**, and that is the change a reloadable gate forces: the
+/// pool handle has to be there *before* the flag can be turned on, because a reload must not have to
+/// rebuild a listener to start answering `/workers`. Whether a caller may reach the routes is
+/// [`WorkerResetGate`](volucer_http::WorkerResetGate)'s answer, asked per request.
+///
+/// `None` for a deployment with no worker pool: there is nothing to list, and `/workers` would be an
+/// empty array that looks like a pool with no workers. A static-only or upstream-only deployment gets
+/// no route rather than a misleading one, whatever the gate says.
+fn workers_control(dispatcher: &Arc<Dispatcher>) -> Option<Arc<dyn volucer_http::WorkerControl>> {
     let pools = dispatcher.pools()?;
     Some(Arc::new(PoolControl { pools }))
 }
@@ -2215,8 +2263,9 @@ impl volucer_http::WorkerControl for PoolControl {
 fn start_status(
     config: &Config,
     dispatcher: &Arc<Dispatcher>,
+    reset_gate: &Arc<volucer_http::WorkerResetGate>,
 ) -> Result<Option<RunningStatus>, ServerError> {
-    let running = build_status(config, dispatcher)?;
+    let running = build_status(config, dispatcher, reset_gate)?;
     if let Some(listener) = &running {
         println!("  metrics:          {}", listener.local_addr());
     }
@@ -2331,6 +2380,27 @@ struct Reloader {
     /// one `logrotate`'s default `postrotate` script sends. See
     /// [`volucer_observe::access_log::AccessLog::reopen`].
     observe: Arc<volucer_observe::Observability>,
+    /// The rate-limit cell both front-ends consult, so a `SIGHUP` can change the limit.
+    ///
+    /// **Held as the same `Arc` both front-ends carry**, which is what makes the replacement visible
+    /// to them: the policy lives behind an [`Swappable`](volucer_watch::Swappable) inside this value,
+    /// so replacing it moves the limit every front-end consults rather than installing a second one
+    /// they do not read.
+    ///
+    /// The buckets are carried across by
+    /// [`volucer_core::RateLimitPolicy::adopt_buckets`], so a reload that tightens the rate throttles
+    /// a caller from where they already were. That is the difference between a limit and a limit that
+    /// can be escaped by asking the operator to reload.
+    rate_limit: Arc<volucer_http::RateLimitCell>,
+    /// The worker-control gate, so `[status] allow_worker_reset` can be turned off — or on — by a
+    /// reload.
+    ///
+    /// The **same cell the status listener reads**, which is what makes the change visible: the
+    /// listener consults it per request, so a shut gate makes `/workers` a 404 and a `POST` a 405 on
+    /// the very next request rather than at the next restart. Validation has already refused a
+    /// wildcard `[status] address` beside the flag, so the *open* direction is as safe through a
+    /// reload as it was at startup.
+    reset_gate: Arc<volucer_http::WorkerResetGate>,
 }
 
 impl Reloader {
@@ -2399,7 +2469,11 @@ impl Reloader {
         let sites = Sites::from_config_with(&config, &document_root, front_controller.as_deref());
 
         let generation = self.registry.generation() + 1;
-        let _previous = self.registry.apply(sites);
+        // The gRPC grants are rebuilt from the same file and installed in the same swap as the site
+        // table: a route names a backend and a grant says whether that backend may serve a service,
+        // so a reload that installed one without the other would be half-applied by definition.
+        let grpc_grants = Arc::new(config.grpc_grants_all());
+        let _previous = self.registry.apply(sites, grpc_grants);
         tracing::info!(
             generation,
             source = %self.source.describe(),
@@ -2407,6 +2481,29 @@ impl Reloader {
             sites = config.sites.len(),
             "configuration reloaded"
         );
+
+        // The rate limit, third and independent of both tables above — the same ordering rule the
+        // certificates get, and for the same reason: a limit that cannot be built must not take the
+        // sites with it, and it is reported rather than silently kept.
+        match config.server.rate_limiter() {
+            Ok(policy) => {
+                let carried = self.rate_limit.replace(policy);
+                if carried {
+                    tracing::info!(
+                        "the rate limit was replaced; every tracked caller keeps the tokens it had"
+                    );
+                } else {
+                    tracing::info!(
+                        "the rate limit was replaced and starts from empty buckets — the key mode or \
+                         the header changed, so no existing caller's bucket could be carried over"
+                    );
+                }
+            }
+            Err(reason) => tracing::error!(
+                %reason,
+                "the rate limit was not replaced; the previous one is still limiting"
+            ),
+        }
 
         // Certificates are a second, independent table. Refreshed after the sites so that a
         // certificate that cannot be read leaves the *sites* reloaded and the certificates as they
@@ -2426,6 +2523,27 @@ impl Reloader {
                     tracing::error!(%err, "the certificate table was not replaced; the previous one is still serving")
                 }
             }
+        }
+
+        // The worker-control gate, fourth and independent of the three above. A shut gate makes the
+        // routes 404 on the next request; an open one makes them answer. The validation that refuses a
+        // wildcard `[status] address` beside the flag ran when the file was read, so this cannot open a
+        // mutation surface at an address the deployment would not have been allowed to start with.
+        //
+        // A **removed** `[status]` table closes the gate, because the flag it carried is gone — the
+        // routes are the flag's, and the flag is the table's. `address` is restart-only, which is why
+        // the listener itself survives; only the surface it used to expose does not.
+        let allow_reset = config
+            .status
+            .as_ref()
+            .is_some_and(|status| status.allow_worker_reset);
+        let was_allowed = self.reset_gate.set(allow_reset);
+        if was_allowed != allow_reset {
+            tracing::info!(
+                allow_worker_reset = allow_reset,
+                "the worker-control routes were {} by this reload",
+                if allow_reset { "opened" } else { "closed" }
+            );
         }
 
         for line in restart_only() {
@@ -2449,9 +2567,8 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: [server.env] and a backend's env (the processes are already running with the old values, so a reload would leave a replacement worker on the new ones and its siblings on the old)",
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
-        "a reload does not change: [server.rate_limit] (the buckets are live state, so replacing the policy would reset every caller's allowance)",
         "a reload does not change: [server.access_log] path, format and request_id_header (SIGHUP closes and reopens the log a rotation moved, but the destination is chosen at startup)",
-        "a reload does not change: [status] address and allow_worker_reset (the listener is bound, and a route that mutates must not appear because a file was edited)",
+        "a reload does not change: [status] address (the listener is bound, so a new address is a new socket)",
     ]
 }
 
@@ -2479,15 +2596,7 @@ pub fn restart_only() -> Vec<&'static str> {
 /// HTTP listener runs on another thread and is stopped by *dropping* its handle,
 /// which is what `serve` does after this — so the only thing this handler has to
 /// do for it is set the static flag that `wait_for_shutdown` polls.
-fn install_shutdown_handler(
-    shutdown: Option<volucer_server::ShutdownHandle>,
-    registry: Arc<volucer_http::Registry>,
-    tls: Option<Arc<volucer_http::SniResolver>>,
-    observe: Arc<volucer_observe::Observability>,
-    source: &Source,
-    document_root_flag: Option<PathBuf>,
-    front_controller_flag: Option<String>,
-) {
+fn install_shutdown_handler(shutdown: Option<volucer_server::ShutdownHandle>, reloader: Reloader) {
     let forced = Arc::new(AtomicBool::new(false));
     let stop = {
         let forced = Arc::clone(&forced);
@@ -2509,15 +2618,6 @@ fn install_shutdown_handler(
                 shutdown.shutdown();
             }
         }
-    };
-
-    let reloader = Reloader {
-        source: source.clone(),
-        document_root_flag,
-        front_controller_flag,
-        registry,
-        tls,
-        observe,
     };
 
     if let Err(err) = signals::install(stop, reloader) {
@@ -3049,6 +3149,32 @@ fn check(
                 "      env:               {} (values not printed)",
                 names.join(", ")
             );
+        }
+        // The gRPC grants, so the one setting that decides whether a call reaches a worker at all is
+        // visible without reading the file. `any` is spelled out rather than shown as an empty list,
+        // because the two are very different answers that would otherwise look identical here.
+        if let Some(grants) = config.grpc_grants(name) {
+            if grants.is_any() {
+                println!("      grpc:              any service (grpc_serve_any)");
+            } else if !grants.is_empty() {
+                println!("      grpc:              {}", grants.names().join(", "));
+                // Where the names came from, when they were not written in this file. A directory
+                // is the one entry that can grant services nobody meant to grant — a vendored SDK
+                // or another team's `.proto` sharing the tree — so the count is printed beside the
+                // source and an operator can compare it against what they expect to implement.
+                let entries = config.grpc_proto(name);
+                if !entries.is_empty() {
+                    println!(
+                        "      grpc from:         {} service(s) from grpc_proto: {}",
+                        grants.names().len(),
+                        entries
+                            .iter()
+                            .map(|entry| entry.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
         }
     }
 
@@ -3828,8 +3954,8 @@ document_root = "/from/file"
             "server.env",
             "min_version",
             "server.proxy",
-            "server.rate_limit",
             "server.access_log",
+            "status] address",
         ] {
             assert!(
                 joined.contains(required),
@@ -3838,13 +3964,22 @@ document_root = "/from/file"
             );
         }
 
-        // The two an earlier draft got wrong, in the code's favour. Both are read per request out
-        // of the swapped table, so telling an operator they are restart-only is telling them to
-        // restart for nothing.
-        for wrong in ["routes", "statics", "static_files"] {
+        // The ones an earlier draft got wrong, in the code's favour. Each is now read per request
+        // out of swapped state — `routes` and `static_files` from the site snapshot,
+        // `server.rate_limit` from the shared `RateLimitCell`, `allow_worker_reset` from the
+        // `WorkerResetGate`, and a backend's `grpc_services` from `Reloaded::grpc_grants` — so
+        // telling an operator they are restart-only is telling them to restart for nothing.
+        for wrong in [
+            "routes",
+            "statics",
+            "static_files",
+            "server.rate_limit",
+            "allow_worker_reset",
+            "grpc_services",
+        ] {
             assert!(
                 !joined.contains(wrong),
-                "{wrong:?} is read per request out of the swapped table and is therefore \
+                "{wrong:?} is read per request out of swapped state and is therefore \
                  reloadable; listing it as restart-only is the half-reload claim in reverse: \
                  {joined}"
             );

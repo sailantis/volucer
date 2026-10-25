@@ -1228,7 +1228,10 @@ static_files = {{ enabled = true }}
     );
 
     let second = config_for(&after);
-    let _ = reload.apply(Sites::from_config(&second, &after));
+    let _ = reload.apply(
+        Sites::from_config(&second, &after),
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
+    );
     assert_eq!(
         reload
             .current()

@@ -51,10 +51,12 @@ pub use listener::{
 };
 pub use status::{
     AlwaysReady, MetricsSource, Readiness, RunningStatus, StatusServices, StatusShutdown,
-    WorkerControl,
+    WorkerControl, WorkerResetGate,
 };
 pub use tls::{
     CertificateSet, Certs, ServerCertificate, SiteCertificate, SiteCertificatePair, SniResolver,
     TlsError,
 };
-pub use volucer_watch::{Registry, SharedState, Swappable, DEFAULT_SITE_KEY};
+pub use volucer_watch::{
+    GrpcGrantsMap, RateLimitCell, Registry, SharedState, Swappable, DEFAULT_SITE_KEY,
+};

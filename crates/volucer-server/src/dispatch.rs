@@ -34,6 +34,14 @@ pub struct Dispatcher {
     /// backend is chosen, which is what lets the FastCGI and HTTP front-ends
     /// behave identically for the same request.
     routes: Vec<RouteConfig>,
+    /// The gRPC grants the configuration gave, as this dispatcher's **first generation**.
+    ///
+    /// Here rather than only in the front-end, because a listener built round a dispatcher has to
+    /// start with the deployment's answer — otherwise a caller that did not separately hand over
+    /// grants would silently serve none, which is indistinguishable from a backend that listed
+    /// nothing. A reload replaces the front-end's copy; this one is never changed, so a
+    /// diagnostic can always say what the process started with.
+    grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
     /// What a `worker.reset` call needs in order to find a pool.
     ///
     /// **Weak handles to the pools, and the weakness is the point.** The handler for `worker.reset`
@@ -690,6 +698,7 @@ impl Dispatcher {
             default,
             routing,
             routes: config.server.routes.clone(),
+            grpc_grants: Arc::new(config.grpc_grants_all()),
             directory,
             queues: jobs,
         })
@@ -908,18 +917,28 @@ impl Dispatcher {
         self.dispatch_to(name, request)
     }
 
-    /// The gRPC call a path addresses, when the backend its route selects was granted that service.
+    /// The gRPC grants this dispatcher was built with, as its first generation.
     ///
-    /// `None` for every case that is not "a worker this deployment agreed may serve this service":
-    /// a non-`worker` backend, a path that is not a gRPC path, and a service absent from that
-    /// backend's own list. The caller turns all of them into the same `UNIMPLEMENTED`, which is what
-    /// gRPC means by "this server does not implement that method".
-    pub fn granted_grpc_call<'a>(
-        &self,
-        backend: &str,
-        path: &'a str,
-    ) -> Option<volucer_core::config::GrpcPath<'a>> {
-        self.backends.get(backend)?.granted_grpc_call(path)
+    /// The answer a listener must *start* with. A reload replaces the front-end's own copy — see
+    /// `volucer_watch::Reloaded::grpc_grants` — so this is read once at bind time and never again.
+    pub fn grpc_grants(&self) -> Arc<volucer_watch::GrpcGrantsMap> {
+        Arc::clone(&self.grpc_grants)
+    }
+
+    /// Whether the named backend is one a gRPC call can be delivered to at all.
+    ///
+    /// An unknown name is `false`, which is the same answer as a kind that cannot serve gRPC — from
+    /// the caller's side both mean "this deployment is not going to serve that call", and
+    /// `Config::validate` has already refused a route naming a backend that does not exist.
+    ///
+    /// The *service* half of the question is deliberately not here: the grants are reloadable state
+    /// carried by the configuration generation a request is served under
+    /// (`volucer_watch::Reloaded::grpc_grants`), so asking the backend would answer with whatever
+    /// the process started with.
+    pub fn accepts_grpc(&self, backend: &str) -> bool {
+        self.backends
+            .get(backend)
+            .is_some_and(Backend::accepts_grpc)
     }
 
     /// Send a request to the backend its route selects.

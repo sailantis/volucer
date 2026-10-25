@@ -422,8 +422,13 @@ fastcgi = "127.0.0.1:9080"
 # cause an outage. A gRPC call is refused as `RESOURCE_EXHAUSTED` in the trailers,
 # because a gRPC client cannot read a `429` at all.
 #
-# Restart-only: the buckets are live state, so swapping the policy on a `SIGHUP`
-# would reset every caller's allowance. A limit a reload clears is not a limit.
+# Restart-only was the previous rule, and it changed: the buckets are carried
+# across a reload whenever `key` and `header` are unchanged, so a tightened
+# `rate` throttles a caller from where they already were rather than handing them
+# a fresh burst. A limit a reload clears is not a limit, and this is how the
+# reloadable version avoids that. Changing `key` or `header` renames every
+# bucket, and there is no honest mapping between two identities, so that reload
+# starts over and says so in the log.
 # ---------------------------------------------------------------------------
 # [server.rate_limit]
 # key = "ip"
@@ -492,12 +497,58 @@ working_dir = "."
                           # names -- a method the application does not implement is one it
                           # answers UNIMPLEMENTED to itself, which keeps the application's
                           # interface out of this file. A call naming anything else never
-                          # reaches a worker: the server answers UNIMPLEMENTED itself.
+                          # reaches a worker: the server answers UNIMPLEMENTED itself, before
+                          # the body is read.
+                          #
+                          # RELOADABLE. A SIGHUP that widens this list takes effect on the next
+                          # call, on the same connection, with no restart and no pool rebuild:
+                          # the grant is a membership test the front-end makes alone, so nothing
+                          # about it is a property of a running process.
                           #
                           # The server never parses a message; a handler is handed the framed
                           # bytes and the method path (`$request->grpcMethod()`) and states its
                           # outcome with `Volucer\GrpcResponse`, whose status the server moves
                           # into the trailer section where gRPC clients read it.
+#
+# grpc_serve_any = true
+                          # The opt-out from the list above: serve EVERY well-formed gRPC method
+                          # path and let the application answer UNIMPLEMENTED for what it does
+                          # not implement. Refused beside a non-empty `grpc_services`, because
+                          # two statements about one thing can disagree. Legal only on `worker`
+                          # and `attach`.
+                          #
+                          # This gives up the boundary the list exists for: an unknown service
+                          # now reaches a worker and spends a slot before it is refused. Startup
+                          # logs a warning naming the backend, so an opted-out worker facing the
+                          # public is visible in the log rather than only in the file. The path
+                          # *shape* rule is not relaxed -- `/pkg.Service/Method` is still the
+                          # only accepted form.
+#
+# grpc_proto = ["proto/"]  # Read the services from the application's own `.proto` files
+                          # instead of naming them above. The third statement about the same
+                          # set, so refused beside both `grpc_services` and `grpc_serve_any`:
+                          # only one of the three can be the answer.
+                          #
+                          # A deployment with `.proto` files already has exactly one reliable
+                          # statement of which services exist, and a hand-maintained copy of it
+                          # in this file is a second one that eventually disagrees -- in the
+                          # silent direction, because a service added and not listed is answered
+                          # UNIMPLEMENTED with no log line saying why.
+                          #
+                          # Each entry is a file or a directory searched recursively, resolved
+                          # against this file's own directory. Only `package` and top-level
+                          # `service` declarations are read: an `import` is not followed, because
+                          # a service's name depends on nothing an import resolves.
+                          #
+                          # RELOADABLE, like the list: the files are read when the configuration
+                          # is loaded, so a SIGHUP re-reads them and a changed set takes effect on
+                          # the next call. Two refusals, both whole-or-nothing: a `.proto` that
+                          # cannot be read, and a set that resolves to no service at all -- a
+                          # backend granted nothing is the failure this key exists to remove.
+                          #
+                          # `volucer check` prints the entries beside the resolved names, so a
+                          # directory that pulls in more than intended (a vendored SDK, another
+                          # team's tree) is visible rather than inferred.
 # transport = "pipe"      # Defaults to "socket" on Windows and "pipe" elsewhere,
                           # which is the measured winner on each: PHP's stream layer
                           # reads a Windows pipe ~100x slower than a socket, and that
@@ -890,6 +941,15 @@ base_port = 19001
 #
 # Refused rather than warned about on a wildcard address: a POST that recycles a
 # worker, reachable from anywhere, is a remote kill switch with no login.
+#
+# RELOADABLE, in both directions. A SIGHUP that turns it off makes the routes
+# stop existing on the next request -- a 404, the same answer a deployment that
+# never asked for them gives -- so an unauthenticated mutation surface can be
+# closed without restarting a serving process. Turning it ON is subject to the
+# same wildcard-address refusal through a reload as at startup, because that
+# check runs when the file is read.
+#
+# `address` is not reloadable: the socket is already bound.
 # allow_worker_reset = true
 
 # ---------------------------------------------------------------------------

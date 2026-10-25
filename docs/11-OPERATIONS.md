@@ -32,6 +32,14 @@ per signal, so a `kill -HUP` can never take the server down by accident.
   `serve_only`, `default_backend` and `routes`
 - `[server.static_files]`, including turning the layer on or off
 - `redirect_to_https`
+- A backend's `grpc_services` and `grpc_serve_any` — a widened grant admits the next call,
+  on the same connection
+- A backend's `grpc_proto`, which is re-read: the `.proto` files are parsed again, so a `service`
+  added to one of them is granted on the next call. The files are **not watched** — the change
+  takes effect when you signal, which is also what makes a half-written file harmless
+- `[server.rate_limit]`, with every tracked caller's bucket carried across when the `key` and
+  `header` are unchanged
+- `[status] allow_worker_reset`, in both directions
 
 **Restart-only, and reported on every reload** rather than left to be discovered — a setting
 the implementation cannot honour should be *stated*, or the operator finds out from
@@ -44,15 +52,19 @@ behaviour:
 | `[server.env]` and a backend's `env` | They are the environment of processes already running; a replacement worker would get the new value and its siblings would not |
 | `[server.tls]` `min_version` and `alpn` | They are baked into the `rustls` server config the acceptor holds |
 | `[server.proxy]` | Whose forwarded headers are believed is a statement about this deployment's topology |
-| `[server.rate_limit]` | The token buckets are live state, so swapping the policy would reset every caller's allowance |
 | `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless** |
-| `[status]` address and `allow_worker_reset` | The listener is bound, and a route that recycles workers must not appear because somebody edited a file |
+| `[status]` address | The listener is bound |
 
 ### A reload is whole-or-nothing
 
 A file that does not parse, or does not validate, is refused with a logged reason and the
 previous configuration keeps serving. There is no way to apply half of one — including when
 the bad file names settings the server *can* apply.
+
+**A `.proto` file that `grpc_proto` names is part of that same "whole"**, even though it is not
+`volucer.toml`. It is read while the configuration is loaded, so an unreadable `.proto`, or one
+whose set resolves to no service at all, refuses the reload entirely rather than installing a
+backend granted nothing.
 
 There are two tables — the sites and the certificates — and each is whole-or-nothing **on its
 own**, applied site table first and certificates after. That ordering is deliberate: a

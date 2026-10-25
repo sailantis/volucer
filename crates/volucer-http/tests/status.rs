@@ -440,6 +440,68 @@ fn worker_services(control: Arc<FakeControl>) -> StatusServices {
     }
 }
 
+/// **A shut gate makes the routes stop existing, and an open one brings them back.**
+///
+/// The reloadable half of `[status] allow_worker_reset`. Both directions are asserted, and the
+/// *closed* answer is a 404/405 rather than a 403 — the property that stops an attacker enumerating
+/// the surface — so a test that only checked "not 200" would pass against a 403.
+#[test]
+fn a_shut_gate_removes_the_worker_routes_entirely() {
+    let control = Arc::new(FakeControl::with(2, Ok(())));
+    let gate = Arc::new(volucer_http::WorkerResetGate::open());
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            workers: Some(Arc::clone(&control) as Arc<dyn volucer_http::WorkerControl>),
+            reset_gate: Some(Arc::clone(&gate)),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+
+    // Open: the routes answer.
+    let (head, _) = get(running.local_addr(), "/workers");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    // Shut, exactly as a reload that turned the flag off would.
+    assert!(gate.set(false));
+    let (head, _) = get(running.local_addr(), "/workers");
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "a closed gate must make the route a 404, not a 403 — an endpoint that exists and refuses \
+         is an endpoint an attacker can enumerate:\n{head}"
+    );
+    let (head, _) = request(running.local_addr(), "POST", "/workers/1/reset");
+    assert!(
+        head.starts_with("HTTP/1.1 405") || head.starts_with("HTTP/1.1 404"),
+        "and a POST to it must not reach the pool:\n{head}"
+    );
+    assert!(
+        control.asked.lock().expect("not poisoned").is_empty(),
+        "no reset may have been attempted while the gate was shut"
+    );
+
+    // Opened again, as a reload in the other direction would.
+    assert!(!gate.set(true));
+    let (head, _) = get(running.local_addr(), "/workers");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "opening the gate must bring the routes back with no restart:\n{head}"
+    );
+    running.stop();
+}
+
+/// With no gate at all, the routes answer — a listener built before the gate existed must not
+/// silently lose its worker-control surface.
+#[test]
+fn an_absent_gate_leaves_the_routes_open() {
+    let control = Arc::new(FakeControl::with(1, Ok(())));
+    let running = RunningStatus::start("127.0.0.1:0", worker_services(control)).expect("start");
+    let (head, _) = get(running.local_addr(), "/workers");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    running.stop();
+}
+
 /// `GET /workers` renders the list the pool gave, and it is the same JSON `workers.list` answers.
 #[test]
 fn the_worker_list_is_served_as_json() {

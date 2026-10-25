@@ -43,6 +43,7 @@ use hyper_util::rt::TokioIo;
 use volucer_metrics::Registry;
 
 use crate::error::{HttpError, Result};
+use volucer_watch::Swappable;
 /// What the worker-control routes can do, without the listener knowing what a worker pool is.
 ///
 /// The three things the routes need are the three things `workers.list` and `worker.reset` already
@@ -202,7 +203,18 @@ pub struct StatusServices {
     /// `None` for a deployment that did not set `[status] allow_worker_reset`, which is every
     /// deployment until one asks. The routes then do not exist: `/workers` is the same 404 as any
     /// other unserved path, and a `POST` anywhere is a 405.
+    ///
+    /// **`None` is also what a deployment with no worker pool gets**, and the gate is what makes the
+    /// two distinguishable: see [`StatusServices::reset_gate`]. This field answers "is there a pool to
+    /// control", the gate answers "may a caller reach it right now".
     pub workers: Option<Arc<dyn WorkerControl>>,
+    /// Whether the worker-control routes answer at all.
+    ///
+    /// Separated from [`StatusServices::workers`] so `[status] allow_worker_reset` can be turned off
+    /// by a reload without dropping the pool handle — and turned on only for a deployment that has a
+    /// pool, which `workers` already encodes. `None` means the gate is permanently shut, which is what
+    /// a listener built by a caller that never mentioned it gets.
+    pub reset_gate: Option<Arc<WorkerResetGate>>,
 }
 
 impl Default for StatusServices {
@@ -215,6 +227,7 @@ impl Default for StatusServices {
             readiness: None,
             unavailable_status: 503,
             workers: None,
+            reset_gate: None,
         }
     }
 }
@@ -229,15 +242,61 @@ impl std::fmt::Debug for StatusServices {
             .field("readiness", &self.readiness.is_some())
             .field("unavailable_status", &self.unavailable_status)
             .field("workers", &self.workers.is_some())
+            .field(
+                "reset_gate",
+                &self.reset_gate.as_ref().map(|gate| gate.is_open()),
+            )
             .finish()
     }
 }
 
-/// A running metrics and status listener.
+/// Whether the worker-control routes answer at all.
 ///
-/// The same shape as [`crate::RunningHttp`], deliberately: a runtime on its own thread, a shutdown
-/// flag, and a `stop` that joins. Two listeners that stopped differently would be two shutdown
-/// paths to get right, and this process already has one.
+/// **A live gate rather than a construction-time `Option`**, so `[status] allow_worker_reset` can be
+/// turned on and off by a reload. The safety property is unchanged and still the point: while the
+/// gate is shut the routes *do not exist* — `/workers` is a 404 and a `POST` anywhere is a 405, not a
+/// 403 — so an endpoint never appears just because somebody edited a file and signalled. What the
+/// gate adds is the other direction: an operator who turned it on and then wants it gone no longer
+/// has to restart a serving process to close an unauthenticated mutation surface.
+///
+/// Deliberately **not** a field of [`StatusServices::workers`]: that is `None` when the deployment
+/// configured no worker pool at all, which is a different answer and must stay a different answer —
+/// a gate cannot conjure a pool. The two are asked in that order, pool first.
+#[derive(Debug)]
+pub struct WorkerResetGate {
+    open: Swappable<bool>,
+}
+
+impl WorkerResetGate {
+    /// A gate that is open — the deployment asked for the routes at startup.
+    pub fn open() -> Self {
+        WorkerResetGate {
+            open: Swappable::new(true),
+        }
+    }
+
+    /// A gate that is shut, which is every deployment until one asks.
+    pub fn closed() -> Self {
+        WorkerResetGate {
+            open: Swappable::new(false),
+        }
+    }
+
+    /// Whether the routes answer right now.
+    pub fn is_open(&self) -> bool {
+        *self.open.load()
+    }
+
+    /// Open or shut the gate, returning what it was.
+    ///
+    /// Whole-or-nothing, and the caller has already validated the configuration it came from — which
+    /// includes the refusal of a wildcard `[status] address` beside this flag. That refusal is what
+    /// makes the *open* direction safe to reach through a reload.
+    #[must_use]
+    pub fn set(&self, open: bool) -> bool {
+        *self.open.replace(open)
+    }
+}
 pub struct RunningStatus {
     shutdown: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -401,9 +460,19 @@ async fn answer(
     // they were configured. Order rather than precedence: the three sets of paths do not overlap, but
     // a `POST` has to reach the router at all, and the read-only routes below would answer a `POST` to
     // `/metrics` with the exposition — a body nobody asked for and a status code that says it worked.
+    //
+    // The gate is consulted per request rather than baked into `workers`, so `[status]
+    // allow_worker_reset` can be shut — or opened — by a reload. While it is shut the routes do not
+    // exist, which is the same answer a deployment that never asked for them gives.
     if let Some(workers) = &services.workers {
-        if let Some(response) = worker_route(request.method(), path, workers, services).await {
-            return response;
+        if services
+            .reset_gate
+            .as_ref()
+            .is_none_or(|gate| gate.is_open())
+        {
+            if let Some(response) = worker_route(request.method(), path, workers, services).await {
+                return response;
+            }
         }
     }
 

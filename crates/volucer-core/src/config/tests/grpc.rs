@@ -252,6 +252,147 @@ grpc_services = ["{service}"]
     }
 }
 
+/// `grpc_serve_any` admits every well-formed method path, and nothing else.
+///
+/// The opt-out from the allow-list, and the two halves of it are what make it safe rather than
+/// merely permissive: the *shape* check still applies (a URL is not a method name), and the flag is
+/// something an operator wrote down rather than the absence of a list — which is why deleting
+/// `grpc_services` still grants nothing.
+///
+/// The `attach` half is asserted too, because the two tables carry the same key and a reader will
+/// assume they agree; if they did not, one of them would be a silently ignored setting.
+#[test]
+fn grpc_serve_any_admits_every_service_but_no_other_path() {
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_serve_any = true
+"#;
+    let config = Config::from_toml(text).expect("the file parses");
+    config.validate().expect("the flag alone validates");
+
+    assert!(config.serves_grpc("app", "/greeter.Greeter/SayHello"));
+    // A service nobody listed, which is the whole point.
+    assert!(config.serves_grpc("app", "/never.Listed/Anything"));
+    // Case still matters: these are different services, and "any" is not "any spelling".
+    assert!(config.serves_grpc("app", "/greeter.greeter/SayHello"));
+    assert!(config.serves_grpc("app", "/a.B/M"));
+
+    // The shape rule is *not* relaxed, and this is the half that stops an arbitrary URL becoming a
+    // method name a worker reads.
+    for refused in [
+        "/greeter.Greeter",
+        "/a.B/M/extra",
+        "/a.B/M?x=1",
+        "/",
+        "//",
+        "/a.B/",
+        "/greeter.Greeter/Say-Hello",
+    ] {
+        assert!(
+            !config.serves_grpc("app", refused),
+            "{refused:?} is not a gRPC method path and must be refused even under grpc_serve_any"
+        );
+    }
+
+    // The `attach` table answers the same way.
+    let attach = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "attach"
+workers = 1
+relay = "unix:/run/app/workers.sock"
+grpc_serve_any = true
+"#;
+    let config = Config::from_toml(attach).expect("the file parses");
+    config.validate().expect("the flag alone validates");
+    assert!(config.serves_grpc("app", "/never.Listed/Anything"));
+}
+
+/// `grpc_serve_any` beside a non-empty `grpc_services` is refused, on both tables.
+///
+/// Two statements about one thing, and every resolution of them is wrong: honouring the list
+/// silently ignores the opt-out, honouring the opt-out silently ignores a list an operator wrote for
+/// a reason. The same shape as `header` beside a key mode that does not read one.
+#[test]
+fn grpc_serve_any_beside_a_list_is_refused() {
+    let worker = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_services = ["a.B"]
+grpc_serve_any = true
+"#;
+    let err = Config::from_toml(worker)
+        .expect("the file parses; the pair is what is wrong")
+        .validate()
+        .expect_err("must not validate");
+    assert!(
+        err.to_string().contains("grpc_serve_any"),
+        "the error has to name the key to remove: {err}"
+    );
+
+    let attach = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "attach"
+workers = 1
+relay = "unix:/run/app/workers.sock"
+grpc_services = ["a.B"]
+grpc_serve_any = true
+"#;
+    let err = Config::from_toml(attach)
+        .expect("the file parses; the pair is what is wrong")
+        .validate()
+        .expect_err("must not validate");
+    assert!(
+        err.to_string().contains("grpc_serve_any"),
+        "the error has to name the key to remove: {err}"
+    );
+}
+
+/// An `attach` backend's service names are checked where the file is read, as a `worker`'s are.
+///
+/// The same silent failure: a `grpc_services` entry that is not a legal protobuf name admits nothing
+/// on an attached pool, so every call to the service it was meant to grant is answered
+/// `UNIMPLEMENTED` and no line says why. Worth its own test because the two tables validate through
+/// different functions, and only one of them had this check until it was written.
+///
+/// The value is a *path*, not a package-less name: `"Greeter"` is a legal protobuf service name
+/// (protobuf does not require a package), so it is accepted and grants only `/Greeter/Method`.
+#[test]
+fn an_attach_backends_grpc_service_name_is_checked() {
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "attach"
+workers = 1
+relay = "unix:/run/app/workers.sock"
+grpc_services = ["greeter.Greeter/SayHello"]
+"#;
+    let err = Config::from_toml(text)
+        .expect("the file parses; the value is what is wrong")
+        .validate()
+        .expect_err("must not validate");
+    assert!(
+        err.to_string().contains("protobuf service name"),
+        "the error has to say what a service name looks like: {err}"
+    );
+}
+
 /// A service listed twice in `grpc_services` is refused, for `services`' own reason.
 #[test]
 fn a_grpc_service_listed_twice_is_refused() {

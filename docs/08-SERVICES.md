@@ -208,7 +208,7 @@ that a consumer which died does not leave work stuck for an hour.
 
 ## gRPC
 
-A worker backend can serve gRPC. The service must be named on the backend:
+A worker backend can serve gRPC. List the services it may serve in the backend configuration:
 
 ```toml
 [backends.app]
@@ -217,8 +217,84 @@ command = "php worker.php"
 grpc_services = ["greeter.Greeter"]
 ```
 
-A call naming a service that is not listed is answered `UNIMPLEMENTED` without reaching a
-worker at all.
+A call for an unlisted service receives `UNIMPLEMENTED` before the request body is read or a
+worker is assigned.
+
+Changes to `grpc_services` take effect on the next request after `SIGHUP`, including requests on
+existing connections. The list is part of the same configuration generation as the site table,
+so route and service-list changes are applied together.
+
+### Serving any service instead of naming them
+
+To deliver all well-formed gRPC method paths to the worker, leave `grpc_services` unset and set
+`grpc_serve_any`:
+
+```toml
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_serve_any = true
+```
+
+Every well-formed `/pkg.Service/Method` is delivered to the application, which returns
+`UNIMPLEMENTED` for methods it does not implement. For services declared in `.proto` files,
+`grpc_proto` can be used to build the service list instead.
+
+Configuration rules, checked when the file is read:
+
+- `grpc_serve_any` cannot be combined with a non-empty `grpc_services`.
+- The request path must still match `/pkg.Service/Method`.
+
+Startup logs a warning for each backend using `grpc_serve_any`.
+
+`grpc_services` is also available on an `attach` backend, with the same rules.
+
+### Reading the services from `.proto` files
+
+Use `grpc_proto` to derive the service list from `.proto` files:
+
+```toml
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+grpc_proto = ["proto/greeter.proto"]
+```
+
+An entry is a file or a directory, and a directory is searched recursively for `*.proto`:
+
+```toml
+grpc_proto = ["proto/"]     # everything under proto/, at any depth
+```
+
+Paths are resolved relative to the directory containing `volucer.toml`.
+
+The parser reads the file-scope `package` and top-level `service` declarations. It does not follow
+`import` statements or treat text in comments, strings, or message bodies as declarations. Files
+without a `package` declare bare service names. A file with a malformed `package` contributes no
+services.
+
+`grpc_proto`, `grpc_services`, and `grpc_serve_any = true` are mutually exclusive. Combining
+them causes a configuration error.
+
+The configuration is rejected if:
+
+- an entry cannot be read or is neither a file nor a directory;
+- the entries resolve to no services.
+
+The files are read when configuration is loaded by `serve`, `check`, or `SIGHUP`. Changes take
+effect after reloading, not when files are saved. If a reload resolves no services, it is rejected
+and the previous configuration remains active.
+
+`volucer check` displays the entries and the services they resolve to:
+
+```
+    app: worker, php worker.php
+      grpc:              greeter.Greeter, greeter.Admin
+      grpc from:         2 service(s) from grpc_proto: proto/
+```
+
+The output includes the service count for each entry, which can be compared with the services
+implemented by the application.
 
 ### Handling a call
 

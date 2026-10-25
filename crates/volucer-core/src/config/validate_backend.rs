@@ -89,6 +89,52 @@ impl Config {
                     }
                 }
 
+                // `grpc_serve_any` beside a list is two statements about one thing, and each of the
+                // two readings is wrong: honouring the list silently ignores the opt-out, and
+                // honouring the opt-out silently ignores the list an operator wrote for a reason.
+                // The same shape as `header` beside a key mode that does not read one.
+                if w.grpc_serve_any && !w.grpc_services.is_empty() {
+                    return bad(
+                        "grpc_serve_any is set beside a non-empty grpc_services; they are two \
+                         statements about what this backend may be asked to serve. Remove the \
+                         list, or remove grpc_serve_any to keep the allow-list"
+                            .to_string(),
+                    );
+                }
+
+                // `grpc_proto` is the third statement about the same set, so it is refused beside
+                // each of the other two for their reason: whatever the resolution order, one of the
+                // three would be ignored, and an operator who wrote two of them wrote one for
+                // nothing. This is the *only* rule about `grpc_proto` that can be checked without a
+                // disk; what the files contain is read by `expand_grpc_proto`, when the
+                // configuration is loaded.
+                if !w.grpc_proto.is_empty() {
+                    if !w.grpc_services.is_empty() {
+                        return bad(
+                            "grpc_proto is set beside a non-empty grpc_services; both name the \
+                             services this backend may be asked to serve, and only one of them can \
+                             be the answer. Remove grpc_services to let the `.proto` files decide, \
+                             or remove grpc_proto to keep the list"
+                                .to_string(),
+                        );
+                    }
+                    if w.grpc_serve_any {
+                        return bad(
+                            "grpc_proto is set beside grpc_serve_any; serving every service makes \
+                             reading the `.proto` files pointless. Remove one of them"
+                                .to_string(),
+                        );
+                    }
+                    if let Some(empty) =
+                        w.grpc_proto.iter().find(|path| path.as_os_str().is_empty())
+                    {
+                        return bad(format!(
+                            "grpc_proto contains {empty:?}, which names no file; give a `.proto` \
+                             path or a directory, relative to the configuration file"
+                        ));
+                    }
+                }
+
                 // Where the server listens, when it is not a pipe. Checked here rather than
                 // discovered at bind time for the reason every other address is: a typo is a
                 // startup message naming the key, not a bind error after the pool half exists.

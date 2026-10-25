@@ -135,6 +135,9 @@ fn config(workers: u32) -> WorkerConfig {
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
     }
@@ -742,6 +745,9 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
     };
@@ -856,6 +862,9 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
     };
@@ -1023,6 +1032,9 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
     };
@@ -1148,6 +1160,9 @@ fn slow_pool(tag: &str, workers: u32, micros: u64, max_wait: Option<Duration>) -
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
     };
@@ -2645,6 +2660,9 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
         checksum: Default::default(),
         services: Vec::new(),
         grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
     };
