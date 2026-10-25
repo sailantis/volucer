@@ -75,15 +75,41 @@ fn find_php() -> Option<PathBuf> {
 }
 
 /// A run of consecutive free ports, since the pool increments from `base_port`.
+///
+/// **Not `bind(0)`.** A `bind(0)` hands back a port the kernel has just released, and on
+/// `macos-latest` it hands back the *most recently* released one first. That turns "probe a port,
+/// release it, bind it a moment later" into a repeatable collision rather than a rare one: the
+/// next reservation in this binary is offered the very port that was just given up. The loser is
+/// the back-end, because the caller tells the front-end to listen on the first port of the run and
+/// the pool starts on the second — so a stolen pool port is a slot whose address answers with
+/// somebody else's HTTP listener, and a FastCGI client is handed an HTTP `200` ("unsupported
+/// FastCGI version 72", where 72 is `H`).
+///
+/// So the scan starts at a per-process offset and *holds* every port of the run before releasing
+/// it, which is the same question `bind(0)` was being asked, minus the recycling. The reservation
+/// is still only a hint — see [`start_server_on_a_free_port`] for the retry that covers the gap
+/// to the real bind — but no two reservations in this binary are offered the same ports in the
+/// same order.
 fn free_port_run(count: usize) -> Option<u16> {
-    for _ in 0..64 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-        let base = probe.local_addr().ok()?.port();
-        drop(probe);
+    // Any port the OS will hand out is fine here, and the exact range must not be assumed: macOS
+    // keeps its ephemeral ports up to 65535, Windows reserves swathes of 49xxx-65xxx for Hyper-V,
+    // and Linux starts at 32768. Only "consecutive and currently free" matters.
+    const FIRST: u16 = 20_000;
+    const LAST: u16 = 60_000;
+
+    // A per-call offset, not just a per-process one: every test in this binary runs as a thread of
+    // the same process, so a `pid`-derived start alone would have them all walking the same ports
+    // in the same order — which is the collision this replaces, one layer up.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let span = u32::from(LAST - FIRST - count as u16);
+    let start = (std::process::id().wrapping_mul(2654435761) ^ call.wrapping_mul(40503)) % span;
+    for attempt in 0..64u32 {
+        let base = FIRST + ((start + attempt * 97) % span) as u16;
         let mut held = Vec::with_capacity(count);
         for offset in 0..count {
-            let port = base.checked_add(offset as u16)?;
-            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            match std::net::TcpListener::bind(("127.0.0.1", base + offset as u16)) {
                 Ok(listener) => held.push(listener),
                 Err(_) => break,
             }
