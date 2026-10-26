@@ -431,9 +431,16 @@ runs after the archive publishing job succeeds.
 The workflow authenticates to GHCR using its `GITHUB_TOKEN` and `packages: write`
 permission; no separate secret is required.
 
-The first push creates the package as private, even when the repository is public. After
-the first release, change the package visibility to public in its settings or use the
-GitHub API for an organization-owned package:
+The first push creates the package as private, even when the repository is public.
+
+**The organization may have to allow public packages first.** An organization can forbid
+its members from publishing public packages, and the package settings page then greys out
+the *Public* option with "Setting is disabled by organization administrators". The REST
+API does not say so: `PATCH /orgs/{org}/packages/container/{name}` answers `404 Not Found`
+rather than `403`, which reads like a wrong URL or a missing token scope and is neither —
+`GET` on the same URL returns `200` throughout. An organization owner lifts it in
+**Organization settings → Packages → Package creation** by allowing *Public*, after which
+the per-package setting can be changed in its own settings or with:
 
 ```sh
 gh api --method PATCH /orgs/sailantis/packages/container/volucer -f visibility=public
