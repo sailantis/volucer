@@ -35,8 +35,21 @@ by their resource name, so there is only one `lock` grant.
 
 The same list applies to every backend kind. A `worker` and an `attach` reach these services
 over their channel; an `external`, `spawn_cgi` or `upstream` backend reaches them through
-`[rpc]`, if one is configured. `config` and `workers` are meaningful only on a channel, so a
-FastCGI application that names them gets a namespace whose calls can never succeed.
+`[rpc]`, if one is configured. A backend whose list is empty is granted nothing, and a
+backend that grants nothing is handed no address to dial.
+
+### Read, and read-write
+
+A namespace is one capability, so granting one grants every method in it. `workers` is the
+pair to know: `workers.list` is an answer, and `workers.reset` kills worker *N* and waits for
+the replacement to finish its handshake. Both arrive together, which is why an application
+that only wants to display a pool should not be granted `workers` at all.
+
+The same split runs through the others. `kv` reads with `get`, `has`, `ttl` and `getMultiple`,
+and writes with `set`, `setIfAbsent`, `delete`, `clear` and `setMultiple` — `clear` wiping the
+storage. `lock` answers with `exists` and `holders`, and mutates with `acquire`, `release`,
+`release_all` and `steal`. `jobs` reads with `size` and `pipelines`, and writes with `push` and
+`push_batch`.
 
 ## The call plane
 

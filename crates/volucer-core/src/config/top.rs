@@ -109,7 +109,7 @@ pub struct Config {
     ///
     /// **A third listener beside `[metrics]` and `[status]`, deliberately not a route on
     /// `[server]`.** What travels here mutates: `kv.set`, `lock.release`, `jobs.push`,
-    /// `worker.reset`. The public listener may be TLS-only, may redirect to HTTPS, and faces the
+    /// `workers.reset`. The public listener may be TLS-only, may redirect to HTTPS, and faces the
     /// internet, so a mutation surface on it would be one misconfiguration away from being public —
     /// which is exactly the argument `[metrics]` already makes for its own address, with a stronger
     /// conclusion.

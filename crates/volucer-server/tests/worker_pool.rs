@@ -1609,7 +1609,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     assert_eq!(
         answer["backends"], "app",
         "and the entries name the backend the dispatcher filed the pool under, which is what a \
-         worker.reset index has to be resolved against: {answer}"
+         workers.reset index has to be resolved against: {answer}"
     );
     assert!(
         answer["described_command"]

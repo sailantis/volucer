@@ -46,7 +46,7 @@ use crate::error::{HttpError, Result};
 use volucer_watch::Swappable;
 /// What the worker-control routes can do, without the listener knowing what a worker pool is.
 ///
-/// The three things the routes need are the three things `workers.list` and `worker.reset` already
+/// The three things the routes need are the three things `workers.list` and `workers.reset` already
 /// need, which is why there is no new machinery behind this: `crate::PoolLookup` is the same
 /// implementation the call plane uses, so the HTTP route and a worker's own call are one answer with
 /// two callers rather than two implementations of "which pool is worker 3 in".

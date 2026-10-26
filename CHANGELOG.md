@@ -9,6 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`workers.reset` was unreachable from a call, and had been since it was written.** The `workers`
+  namespace is registered under that name, and `MethodRegistry::serve` routes on the text before the
+  *first* dot — so the method, spelled `worker.reset` (singular), resolved to a `worker` namespace no
+  registry contains. The lookup refused it before the arm that serves it could run, on the worker
+  channel and over `[rpc]` alike; `POST /workers/{index}/reset` worked only because it calls
+  `WorkerControl::restart` directly and never passes through a registry. The method is now
+  `workers.reset`, matching its namespace and the HTTP route. Three tests assert that a reset reaches
+  the pool *through a registry* rather than on the namespace alone, which is the layer that would
+  have caught this: a test calling `WorkersNamespace::serve("worker.reset")` passes against the broken
+  registration too.
 - **A route tie went to the later entry, not the earlier one.** `select_route` used
   `Iterator::max_by_key`, which returns the *last* maximum, while the table's own documentation —
   and `Config::route_backend`'s — says ties are settled by declaration order so the earlier entry

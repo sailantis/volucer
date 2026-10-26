@@ -347,7 +347,7 @@ pub const WORKERS_PLACEHOLDER: &str = "{workers}";
 /// in the same file, by [`Config::is_a_call_service`]. Adding a fixed service means adding a name
 /// here, which is the one place a reviewer has to look to see the whole surface a worker can reach.
 pub const CALL_NAMESPACES: &[&str] = &[
-    // The deployment's own description, redacted. The pools: `workers.list` and `worker.reset`.
+    // The deployment's own description, redacted. The pools: `workers.list` and `workers.reset`.
     "config", "workers",
 ];
 

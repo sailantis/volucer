@@ -283,7 +283,7 @@ pub enum Backend {
     /// The application boots once and stays resident, so PHP does *not* reset
     /// state between requests — the application clears its own request scope.
     ///
-    /// Behind an `Arc` because the call plane needs to *find* this pool later: `worker.reset` is answered
+    /// Behind an `Arc` because the call plane needs to *find* this pool later: `workers.reset` is answered
     /// by the very pool whose workers are asking, and the dispatcher keeps a [`Weak`](std::sync::Weak)
     /// handle to it rather than a strong one. The `Arc` is not about sharing — nothing else holds it —
     /// and everything above this line would work with the pool inline.
@@ -650,7 +650,7 @@ impl Backend {
             Backend::SpawnCgi { pool, .. } => pool.shutdown(),
             Backend::Worker { pool, .. } => {
                 // `get_mut` because the pool is now behind an `Arc`: the dispatcher keeps a *weak*
-                // handle to it so that `worker.reset` can find it, and `get_mut` fails only if
+                // handle to it so that `workers.reset` can find it, and `get_mut` fails only if
                 // something holds a strong one — which nothing but this enum does. A failure here
                 // would be a leaked graceful stop rather than a leaked process, since `Drop` still
                 // terminates every worker; it is logged rather than ignored so that a future clone

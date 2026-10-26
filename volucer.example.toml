@@ -503,7 +503,7 @@ working_dir = "."
 # services = ["config"]   # Namespaces this backend's workers may CALL, mid-request. Absent
                           # means none, which is the safe default: the worker channel is a
                           # remote-execution surface and this key is the only thing limiting
-                          # it. "workers" also allows worker.reset, so grant it only to an
+                          # it. "workers" also allows workers.reset, so grant it only to an
                           # operator's worker, never to one facing the public.
 #
 # grpc_services = ["greeter.Greeter"]

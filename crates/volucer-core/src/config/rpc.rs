@@ -17,7 +17,7 @@
 //!
 //! The same argument [`MetricsConfig`](super::MetricsConfig) makes, only more so. `[server]`'s
 //! listener may be TLS-only, may redirect to HTTPS, and faces the public. What travels on this one is
-//! a **mutation** surface — `kv.set`, `lock.release`, `jobs.push`, `worker.reset` — so it is a
+//! a **mutation** surface — `kv.set`, `lock.release`, `jobs.push`, `workers.reset` — so it is a
 //! separate address, `unix:` by default, and a TCP address has to be loopback.
 //!
 //! # Enabling it

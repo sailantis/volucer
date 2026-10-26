@@ -4219,7 +4219,7 @@ static_files = false
 /// Two pools, a list, and a reset of the index the list gave.
 ///
 /// **This is the test the index arithmetic needed.** `workers.list` reported each slot's *own*
-/// index, while `worker.reset` counted slots across every pool — so with one backend the two agreed
+/// index, while `workers.reset` counted slots across every pool — so with one backend the two agreed
 /// and with two they did not, which is the arithmetic a single-pool test cannot see. Two is not an
 /// exotic deployment: it is a web backend and a jobs backend, which is what the queue
 /// design recommends.

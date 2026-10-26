@@ -463,7 +463,7 @@ pub struct WorkerPool {
     ///
     /// **Held by the pool and not by the caller**, because a worker is replaced many times over a
     /// deployment's life — on `max_requests`, on a memory threshold, on a failed request, on an
-    /// operator's `worker.reset` — and every one of those goes through the same `boot`. A registry that
+    /// operator's `workers.reset` — and every one of those goes through the same `boot`. A registry that
     /// had to be handed in again at each replacement is a registry that would eventually be forgotten at
     /// one of them, and the symptom would be one recycled worker in a pool that silently cannot call
     /// anything while its siblings can.
@@ -1366,7 +1366,7 @@ impl WorkerPool {
     ///
     /// # This can be reached from a call, and it blocks for as long as a worker takes to boot
     ///
-    /// `worker.reset` is a call, so this runs **on the exchange thread** of whichever worker asked —
+    /// `workers.reset` is a call, so this runs **on the exchange thread** of whichever worker asked —
     /// while that worker's request is in flight, and while its slot lock is held. `respawn` boots a PHP
     /// process and waits for its handshake, bounded by `HANDSHAKE_TIMEOUT` and in practice the
     /// application's boot time. So a worker that resets a sibling stalls its *own* request for that long,

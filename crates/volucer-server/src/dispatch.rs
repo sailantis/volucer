@@ -43,9 +43,9 @@ pub struct Dispatcher {
     /// nothing. A reload replaces the front-end's copy; this one is never changed, so a
     /// diagnostic can always say what the process started with.
     grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
-    /// What a `worker.reset` call needs in order to find a pool.
+    /// What a `workers.reset` call needs in order to find a pool.
     ///
-    /// **Weak handles to the pools, and the weakness is the point.** The handler for `worker.reset`
+    /// **Weak handles to the pools, and the weakness is the point.** The handler for `workers.reset`
     /// lives inside each worker's channel, which is owned by that worker's pool — so a strong handle
     /// here would be the cycle pool → registry → directory → pool. The cycle would be invisible in every
     /// test, and what it costs is that the pools never drop, so [`WorkerPool::shutdown`] never runs and
@@ -93,11 +93,11 @@ pub struct Dispatcher {
     rpc_address: String,
 }
 
-/// What `worker.reset` reaches the pools through, without holding one alive.
+/// What `workers.reset` reaches the pools through, without holding one alive.
 ///
 /// # Why weak, and why the list is filled in last
 ///
-/// The handler for `worker.reset` lives inside each worker's channel, which is owned by that worker's
+/// The handler for `workers.reset` lives inside each worker's channel, which is owned by that worker's
 /// pool — so a strong handle from here back to a pool would be the cycle
 /// pool → registry → directory → pool. The cycle would be invisible in every test, and what it costs is
 /// that the pools never drop, so [`WorkerPool::shutdown`] never runs and every worker process is leaked
@@ -137,7 +137,7 @@ impl Default for PoolDirectory {
 
 /// The one place that knows how `workers.list` enumerates pools.
 ///
-/// **The order is the backend map's, and it must not change.** `worker.reset` takes an index into this
+/// **The order is the backend map's, and it must not change.** `workers.reset` takes an index into this
 /// list, so an enumeration that reordered itself between two calls would make "restart worker 2" mean
 /// two different workers depending on when it was sent. The `BTreeMap` the backends live in gives that
 /// for free, which is the same reason [`MethodRegistry`]'s namespaces are one.
@@ -549,7 +549,7 @@ impl PoolLookup for PoolDirectory {
     fn workers(&self) -> Vec<WorkerStatus> {
         // **One running index across every pool, and it is the same one `restart` counts.** A slot's
         // own `index` is local to its pool, so returning it unmodified made `workers.list` and
-        // `worker.reset` disagree the moment a deployment configured two backends: the list said
+        // `workers.reset` disagree the moment a deployment configured two backends: the list said
         // worker 1 twice and reset indexed 0..n globally, so "list, then reset what you saw" — the
         // round trip both methods document — reset somebody else. Two pools is not an exotic
         // deployment; it is a web backend and a jobs backend.
@@ -823,7 +823,7 @@ impl Dispatcher {
     /// exists because the dispatcher itself has to answer a call: `volucer workers` and `volucer reset`
     /// on the command line are clients of this same machinery, and a CLI
     /// that re-derived "which pool is worker 3 in" would be a second implementation of the one rule
-    /// `worker.reset` exists to get right.
+    /// `workers.reset` exists to get right.
     pub fn pools(&self) -> Option<Arc<PoolDirectory>> {
         self.backends.values().find_map(|backend| match backend {
             Backend::Worker { .. } => Some(Arc::clone(&self.directory)),

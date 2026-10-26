@@ -8,13 +8,13 @@
 //! can serve it.
 //!
 //! It lives in `volucer-server` because that is what owns the things a call reaches — the worker pool
-//! for `workers.list` and `worker.reset`, the configuration for `config.describe` — and because the
+//! for `workers.list` and `workers.reset`, the configuration for `config.describe` — and because the
 //! front-ends already depend on it. A registry in the CLI would be unreachable from the pool that has to
 //! install the handler on each worker's channel.
 //!
 //! # The three control methods need no service at all
 //!
-//! `workers.list`, `worker.reset` and `config.describe` read machinery that already exists, so a control
+//! `workers.list`, `workers.reset` and `config.describe` read machinery that already exists, so a control
 //! plane is available from the first commit that installs a handler rather than after KV is written.
 //! That was the argument for making the call path the foundation of the control plane, and this is
 //! where it pays.
@@ -2673,7 +2673,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// # Why this needs no new machinery
 ///
 /// Every method here reads something that already exists. `workers.list` reads the pools the dispatcher
-/// holds; `worker.reset` calls [`crate::WorkerPool::restart`], which the pool already had for its own
+/// holds; `workers.reset` calls [`crate::WorkerPool::restart`], which the pool already had for its own
 /// tests and for an operator. This is the payoff of making the call path the foundation: a control plane
 /// is available from the first commit rather than after KV is written.
 ///
@@ -2707,7 +2707,7 @@ pub trait PoolLookup: Send + Sync {
     fn restart(&self, index: usize) -> std::result::Result<(), ResetRefusal>;
 }
 
-/// Why a `worker.reset` did not happen.
+/// Why a `workers.reset` did not happen.
 ///
 /// Three variants and no catch-all, because the three have three different callers' answers: an index
 /// that does not exist is the *caller's* mistake and retrying it changes nothing, a slot that is
@@ -2749,7 +2749,7 @@ impl ResetRefusal {
     /// A pool is asked about `index - offset` and answers about that number, so every refusal has to
     /// travel back through the same subtraction. Applied here rather than at the call site because
     /// `dispatch.rs` is the only place that knows an offset exists, and a caller that had to remember
-    /// would eventually be a second implementation of the one rule `worker.reset` exists to get right.
+    /// would eventually be a second implementation of the one rule `workers.reset` exists to get right.
     #[must_use]
     pub fn rebased(self, offset: usize) -> Self {
         match self {
@@ -2773,7 +2773,7 @@ impl ResetRefusal {
 pub struct WorkerStatus {
     /// The backend the pool belongs to, e.g. `app`.
     pub backend: String,
-    /// The worker's index **across every pool**, which is what `worker.reset` takes.
+    /// The worker's index **across every pool**, which is what `workers.reset` takes.
     pub index: usize,
     /// The worker's index **within its own pool**, which is what its supervisor calls it.
     ///
@@ -2815,14 +2815,21 @@ impl Namespace for WorkersNamespace {
                     }
                 }
             }
-            "worker.reset" => {
+            // Plural, because `MethodRegistry::serve` routes on the text before the **first** dot and
+            // this namespace is registered as `"workers"`. The singular name this arm used to match
+            // resolved to a `"worker"` namespace that no registry contains, so the lookup refused the
+            // call before this arm was ever reached — the method was unreachable from a call from the
+            // day it was written, on the worker channel as well as over `[rpc]`. Nothing caught it
+            // because the `[status]` route of the same name calls `WorkerControl::restart` directly and
+            // never comes through a registry.
+            "workers.reset" => {
                 // The index is taken from the params rather than from a name, because a name would have to
                 // be unique across every pool and a slot's pid changes when it is replaced. The index is
                 // what `workers.list` gives out, so the round trip is "list, then reset what you saw".
                 let Some(index) = call.params.get("index").and_then(serde_json::Value::as_u64)
                 else {
                     return Return::refused(
-                        "worker.reset needs an integer \"index\"; take it from workers.list",
+                        "workers.reset needs an integer \"index\"; take it from workers.list",
                     );
                 };
                 let Ok(index) = usize::try_from(index) else {
@@ -2840,5 +2847,118 @@ impl Namespace for WorkersNamespace {
             }
             other => Return::refused(format!("the workers namespace does not serve {other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_reset_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `PoolLookup` that records what it was asked, so a test can assert that a call *arrived*
+    /// rather than only that it was answered.
+    struct Recording {
+        restarts: AtomicUsize,
+        last_index: AtomicUsize,
+    }
+
+    impl Recording {
+        fn new() -> Self {
+            Recording {
+                restarts: AtomicUsize::new(0),
+                last_index: AtomicUsize::new(usize::MAX),
+            }
+        }
+    }
+
+    impl PoolLookup for Recording {
+        fn workers(&self) -> Vec<WorkerStatus> {
+            Vec::new()
+        }
+
+        fn restart(&self, index: usize) -> std::result::Result<(), ResetRefusal> {
+            self.restarts.fetch_add(1, Ordering::Relaxed);
+            self.last_index.store(index, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn reset_call(name: &str, index: u64) -> Call {
+        Call {
+            name: name.to_string(),
+            params: serde_json::json!({ "index": index }),
+            traceparent: None,
+            token: None,
+        }
+    }
+
+    /// **The bug this test exists for**: the namespace is registered as `"workers"` and
+    /// `MethodRegistry::serve` routes on the text before the first dot, so a method named
+    /// `"worker.reset"` resolved to a `"worker"` namespace that no registry contains and was refused
+    /// by the *lookup*, never reaching the arm that serves it. The method was unreachable from a call
+    /// for its whole life, and no test noticed because nothing asserted that a reset *arrived*.
+    ///
+    /// Asserted through a registry rather than on the namespace directly, because that is the layer
+    /// the name has to agree with. A test that called `WorkersNamespace::serve` with the plural name
+    /// would pass against the broken registration too.
+    #[test]
+    fn a_reset_reaches_the_pool_through_the_registry() {
+        let pools = Arc::new(Recording::new());
+        let registry = MethodRegistry::new().with(WorkersNamespace::new(
+            Arc::clone(&pools) as Arc<dyn PoolLookup>
+        ));
+
+        let answer = registry.serve(&reset_call("workers.reset", 7));
+        assert!(answer.ok, "the reset was served: {answer:?}");
+        assert_eq!(
+            pools.restarts.load(Ordering::Relaxed),
+            1,
+            "the call reached the pool rather than being refused by the registry"
+        );
+        assert_eq!(
+            pools.last_index.load(Ordering::Relaxed),
+            7,
+            "and with the index the caller named"
+        );
+    }
+
+    /// The refusal the old name produced, pinned so it cannot come back silently. The message is the
+    /// registry's — "no worker namespace is configured" — which is exactly what made the defect look
+    /// like a deployment mistake rather than a typo.
+    #[test]
+    fn the_singular_name_is_refused_by_the_registry_and_not_by_the_namespace() {
+        let pools = Arc::new(Recording::new());
+        let registry = MethodRegistry::new().with(WorkersNamespace::new(
+            Arc::clone(&pools) as Arc<dyn PoolLookup>
+        ));
+
+        let answer = registry.serve(&reset_call("worker.reset", 0));
+        assert!(!answer.ok, "the old name is not a method: {answer:?}");
+        assert_eq!(
+            pools.restarts.load(Ordering::Relaxed),
+            0,
+            "and it never reaches the pool"
+        );
+        assert!(
+            answer
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no worker namespace")),
+            "refused by the lookup, naming the namespace: {answer:?}"
+        );
+    }
+
+    /// `workers.list` and `workers.reset` are two methods of one namespace, so both have to route —
+    /// the list was the only one that ever did.
+    #[test]
+    fn both_methods_of_the_namespace_route() {
+        let pools = Arc::new(Recording::new());
+        let registry = MethodRegistry::new().with(WorkersNamespace::new(
+            Arc::clone(&pools) as Arc<dyn PoolLookup>
+        ));
+
+        assert!(registry.serve(&reset_call("workers.list", 0)).ok);
+        assert!(registry.serve(&reset_call("workers.reset", 0)).ok);
+        assert_eq!(pools.restarts.load(Ordering::Relaxed), 1);
     }
 }
