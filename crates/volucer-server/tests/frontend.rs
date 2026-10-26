@@ -967,3 +967,244 @@ document_root = {root:?}
     let _ = handle.join();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ------------------------------------------------------------ trace propagation
+//
+// The FastCGI front-end is the one behind nginx, and that is exactly why it needs its own test:
+// nginx has *already* put a `HTTP_TRACEPARENT` in the params by the time a request arrives here, so
+// a front-end that relayed them verbatim would hand the backend nginx's span while exporting its
+// own — two hops, two spans, and a waterfall that splits at the hop this server just added. The
+// assertion is made against what PHP actually sees, because that is the only place the answer
+// matters.
+
+/// A `traceparent` whose fields are recognisable: trace `aaaa…`, span `1111…`.
+const CLIENT_TRACE: &str = "00-aaaaaaaabbbbbbbbccccccccdddddddd-1111111111111111-01";
+
+/// A script that prints one CGI variable, as PHP sees it.
+fn echo_param_script(root: &Path, name: &str) -> std::path::PathBuf {
+    write_script(
+        root,
+        "echo.php",
+        &format!(
+            "<?php header('Content-Type: text/plain'); \
+             echo $_SERVER[{name:?}] ?? '-';"
+        ),
+    )
+}
+
+/// Run one request through a real listener and return the body PHP produced.
+///
+/// `traceparent` is what nginx would have put in `HTTP_TRACEPARENT`, or `None` to send none — which
+/// is the shape a deployment whose *nginx* does the extracting and a request that had no inbound
+/// header both produce.
+fn fastcgi_round_trip_with_trace(
+    propagate: volucer_observe::TracePropagation,
+    traceparent: Option<&str>,
+) -> Option<String> {
+    let Some(php) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return None;
+    };
+    let root = std::env::temp_dir().join(format!(
+        "volucer-fcgi-trace-{}-{:?}",
+        std::process::id(),
+        propagate
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let script = echo_param_script(&root, "HTTP_TRACEPARENT");
+
+    let config = Config {
+        server: ServerConfig {
+            fastcgi: Some("127.0.0.1:0".to_string()),
+            document_root: Some(root.clone()),
+            default_backend: Some("cgi".to_string()),
+            ..Default::default()
+        },
+        backends: [(
+            "cgi".to_string(),
+            BackendConfig::SpawnCgi(SpawnCgiConfig {
+                binary: Some(php.clone()),
+                command: None,
+                workers: 1,
+                bind_host: "127.0.0.1".to_string(),
+                base_port: free_port_run(1).expect("a free port for the pool"),
+                socket: None,
+                max_requests: None,
+                children: 0,
+                concurrency: 0,
+                working_dir: None,
+                env: Default::default(),
+                legacy_capacity: None,
+            }),
+        )]
+        .into_iter()
+        .collect(),
+        ..volucer_core::config::Config::default()
+    };
+    config.validate().expect("config validates");
+    let sites = SharedState::new(Sites::from_config(&config, &root));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let listener = FastCgiListener::bind_registered(
+        "127.0.0.1:0",
+        Arc::clone(&dispatcher),
+        Arc::new(Registry::new(sites)),
+        Limits::default(),
+    )
+    .expect("bind the fastcgi listener")
+    .with_observability(Arc::new(
+        volucer_observe::Observability::disabled().with_propagation(propagate),
+    ));
+    let address = listener.local_addr().expect("bound address");
+    let shutdown = listener.shutdown_handle();
+    let handle = std::thread::spawn(move || listener.run());
+    std::thread::sleep(Duration::from_millis(150));
+
+    let mut params: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (b"REQUEST_METHOD".to_vec(), b"GET".to_vec()),
+        (b"REQUEST_URI".to_vec(), b"/echo.php".to_vec()),
+        (
+            b"SCRIPT_FILENAME".to_vec(),
+            script.to_string_lossy().as_bytes().to_vec(),
+        ),
+        (b"SERVER_PROTOCOL".to_vec(), b"HTTP/1.1".to_vec()),
+        (b"SERVER_NAME".to_vec(), b"example.test".to_vec()),
+        (b"HTTP_HOST".to_vec(), b"example.test".to_vec()),
+        (b"REMOTE_ADDR".to_vec(), b"127.0.0.1".to_vec()),
+    ];
+    if let Some(traceparent) = traceparent {
+        params.push((
+            b"HTTP_TRACEPARENT".to_vec(),
+            traceparent.as_bytes().to_vec(),
+        ));
+    }
+
+    let mut wire = Vec::new();
+    record::Header::new(RecordType::BeginRequest, 1, 8)
+        .write(&mut wire)
+        .expect("write BEGIN_REQUEST");
+    wire.write_all(&BeginRequest::responder(false).encode())
+        .expect("write begin body");
+    let payload = nvpair::encode_pairs(
+        params
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    );
+    record::write_records(&mut wire, RecordType::Params, 1, &payload, true).expect("write params");
+    record::write_records(&mut wire, RecordType::Stdin, 1, b"", true).expect("write stdin");
+
+    let mut connection = fastcgi_connection(address);
+    connection
+        .get_mut()
+        .write_all(&wire)
+        .expect("send the request");
+    connection.get_mut().flush().expect("flush");
+
+    let mut out = Vec::new();
+    loop {
+        match record::read_record(&mut connection) {
+            Ok(Some(record)) => {
+                let end = record.record_type() == RecordType::EndRequest;
+                out.extend_from_slice(&record.content);
+                if end {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) => panic!("the front-end sent a malformed record: {err}"),
+        }
+    }
+    shutdown.shutdown();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let (_, _, body) = volucer_fcgi::client::parse_response(&out);
+    // `trim_end_matches('\0')` because the front-end pads its records to a word boundary, and the
+    // padding lands in the body this accumulates. Trimming whitespace instead would strip a
+    // legitimate `-` answer's meaning only by accident, so the trim is for the padding alone.
+    Some(
+        String::from_utf8_lossy(body)
+            .trim_end_matches('\0')
+            .trim()
+            .to_string(),
+    )
+}
+
+#[test]
+fn the_fastcgi_front_end_hands_php_its_own_span_under_propagate() {
+    let _serial = serial();
+    // **The measurement this feature exists for.** nginx's span (`1111…`) is what arrived in the
+    // params; PHP must be handed a different one, in the same trace, because the span this process
+    // exports has to be the one PHP's spans name as their parent.
+    let Some(seen) = fastcgi_round_trip_with_trace(
+        volucer_observe::TracePropagation::Propagate,
+        Some(CLIENT_TRACE),
+    ) else {
+        return;
+    };
+    assert_eq!(seen.len(), 55, "not a traceparent: {seen:?}");
+    assert_eq!(
+        &seen[3..35],
+        "aaaaaaaabbbbbbbbccccccccdddddddd",
+        "the trace must be continued across this hop: {seen}"
+    );
+    assert_ne!(
+        &seen[36..52],
+        "1111111111111111",
+        "PHP was handed nginx's span id, so its spans would be siblings of ours: {seen}"
+    );
+}
+
+#[test]
+fn the_fastcgi_front_end_leaves_nginxs_header_alone_under_extract() {
+    let _serial = serial();
+    // The default, and what this front-end did before the key existed. It has to stay reachable
+    // unchanged: a deployment where nginx already propagates correctly must not have its chain
+    // rewritten by an upgrade.
+    let Some(seen) = fastcgi_round_trip_with_trace(
+        volucer_observe::TracePropagation::Extract,
+        Some(CLIENT_TRACE),
+    ) else {
+        return;
+    };
+    assert_eq!(seen, CLIENT_TRACE, "the client's header was not relayed");
+}
+
+#[test]
+fn the_fastcgi_front_end_writes_a_traceparent_when_nginx_sent_none() {
+    let _serial = serial();
+    // The half that matters when nginx is *not* the one tracing: a request that arrived with no
+    // context still gets one, so PHP's spans join a trace instead of starting an unlinked one.
+    let Some(seen) =
+        fastcgi_round_trip_with_trace(volucer_observe::TracePropagation::Propagate, None)
+    else {
+        return;
+    };
+    assert_eq!(seen.len(), 55, "no traceparent was written: {seen:?}");
+    assert!(seen.starts_with("00-"), "{seen:?}");
+    // A request that arrived with no `traceparent` is a **root**, which the default sampler
+    // records — so the flag must say `-01`, and this is the assertion that catches a PHP side told
+    // to drop a trace whose parent span was exported anyway.
+    assert!(
+        seen.ends_with("-01"),
+        "a root must be recorded, so the header must say so: {seen:?}"
+    );
+}
+
+#[test]
+fn the_fastcgi_front_end_does_not_strip_the_header_under_ignore() {
+    let _serial = serial();
+    // `ignore` means this server does not *participate*: it does not read the trace and does not
+    // write one. It is not a strip list — nginx put that param there and this front-end relays the
+    // environment it was handed, which is what every other param in it gets. Deleting one header
+    // because of a tracing setting would be the relay inventing a rule about somebody else's
+    // request.
+    let Some(seen) = fastcgi_round_trip_with_trace(
+        volucer_observe::TracePropagation::Ignore,
+        Some(CLIENT_TRACE),
+    ) else {
+        return;
+    };
+    assert_eq!(seen, CLIENT_TRACE, "`ignore` must not rewrite the relay");
+}

@@ -65,6 +65,21 @@ pub struct Record<'a> {
     pub origin_seconds: Option<f64>,
     /// Bytes of response body sent.
     pub bytes_sent: u64,
+    /// The trace id, as lowercase hex, when this request belongs to a trace.
+    ///
+    /// **The one field that is not read off the request or its answer**, and the reason it is here:
+    /// a log line is where an operator starts, and a trace view is where they end up. Without this
+    /// column the two are joined by hand, by copying a timestamp into a query. nginx spells the same
+    /// value `$otel_trace_id`, and the 32 characters are the ones a collector shows, so a value
+    /// copied out of the log can be pasted into a trace query unchanged.
+    ///
+    /// `None` renders as `-` in the text format and `null` in the JSON one — the same distinction
+    /// [`Record::origin_seconds`] makes, and for the same reason: "there is no trace" and "the trace
+    /// id is empty" are different facts, and only one of them is possible here.
+    ///
+    /// It is filled from the request's own context, so it is the trace id the span carries — not a
+    /// second one minted for the log.
+    pub trace_id: Option<&'a str>,
 }
 
 impl Record<'_> {
@@ -393,6 +408,14 @@ fn combined(record: &Record<'_>) -> String {
     // The two additions, last so the positions above are nginx's.
     let _ = write!(out, " {:.3}", record.total_seconds);
     let _ = write!(out, " {}", record.origin_seconds());
+    // The trace id before the request id, and both after the timings: `$otel_trace_id` and
+    // `$request_id` are the two identifiers an operator copies out, so they sit together at the end
+    // where an `awk` field number is stable for everything nginx-shaped before them.
+    out.push(' ');
+    match record.trace_id {
+        Some(trace_id) => escape_into(&mut out, trace_id),
+        None => out.push('-'),
+    }
     let _ = write!(out, " {id}", id = record.id);
     out.push('\n');
     out
@@ -436,6 +459,15 @@ fn json(record: &Record<'_>) -> String {
         // `null`, not `-`: a machine reading this field must be able to tell "no origin" from
         // "an origin that took no time", which is the distinction the `-` in the text format makes.
         None => out.push_str(",\"origin_time\":null"),
+    }
+    // The same rule for the trace id: a field that is always a string would make an untraced
+    // request look like a traced one with an odd id.
+    match record.trace_id {
+        Some(trace_id) => {
+            out.push_str(",\"trace_id\":");
+            escape_json_into(&mut out, trace_id);
+        }
+        None => out.push_str(",\"trace_id\":null"),
     }
     out.push_str("}\n");
     out
@@ -571,6 +603,7 @@ mod tests {
             total_seconds: 0.012,
             origin_seconds: Some(0.004),
             bytes_sent: 1234,
+            trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736"),
         }
     }
 
@@ -605,8 +638,12 @@ mod tests {
         // Then, and only then, the additions — so every index above is nginx's.
         assert_eq!(fields[12], "0.012", "the whole request");
         assert_eq!(fields[13], "0.004", "to the origin's first byte");
-        assert_eq!(fields[14], "00112233445566778899aabbccddeeff", "the id");
-        assert_eq!(fields.len(), 15, "nothing else: {fields:?}");
+        assert_eq!(
+            fields[14], "4bf92f3577b34da6a3ce929d0e0e4736",
+            "the trace id, nginx's `$otel_trace_id`"
+        );
+        assert_eq!(fields[15], "00112233445566778899aabbccddeeff", "the id");
+        assert_eq!(fields.len(), 16, "nothing else: {fields:?}");
         assert!(line.ends_with('\n'), "a record is one line");
         assert_eq!(line.matches('\n').count(), 1);
     }
@@ -622,7 +659,7 @@ mod tests {
         let fields: Vec<&str> = line.trim_end().split(' ').collect();
         assert_eq!(fields[12], "0.012", "the total is unaffected");
         assert_eq!(fields[13], "-", "no origin, not zero seconds");
-        assert_eq!(fields[14], "00112233445566778899aabbccddeeff", "the id");
+        assert_eq!(fields[15], "00112233445566778899aabbccddeeff", "the id");
         let rendered = json(&plain);
         assert!(rendered.contains("\"origin_time\":null"), "{rendered}");
         // And the JSON form uses a number, not a string, when there is one — a reader must not have
@@ -631,6 +668,28 @@ mod tests {
         assert!(
             with_origin.contains("\"origin_time\":0.004"),
             "{with_origin}"
+        );
+    }
+
+    #[test]
+    fn a_untraced_request_logs_a_dash_and_a_null_rather_than_an_empty_id() {
+        // The same distinction `origin_time` makes, in the same place: `-` is "there is no trace",
+        // where an empty string would be "the trace id is empty" — a value that no reader can act on
+        // and that a `grep ' - '` would miss.
+        let mut untraced = record();
+        untraced.trace_id = None;
+        let line = combined(&untraced);
+        let fields: Vec<&str> = line.trim_end().split(' ').collect();
+        assert_eq!(fields[14], "-", "no trace, not an empty id");
+        assert_eq!(fields[15], "00112233445566778899aabbccddeeff", "the id");
+        assert_eq!(fields.len(), 16, "the field is still there: {fields:?}");
+
+        let rendered = json(&untraced);
+        assert!(rendered.contains("\"trace_id\":null"), "{rendered}");
+        assert!(
+            json(&record()).contains("\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\""),
+            "{}",
+            json(&record())
         );
     }
 
@@ -661,7 +720,7 @@ mod tests {
         // quotes and newlines but not spaces produced 31 fields here, because the hostile
         // `User-Agent` split into seven tokens and its own `200` landed where our status belongs.
         // Only a field count catches that: every positional assertion above still passed.
-        assert_eq!(fields.len(), 15, "no field was gained: {fields:?}");
+        assert_eq!(fields.len(), 16, "no field was gained: {fields:?}");
     }
 
     #[test]
@@ -684,6 +743,7 @@ mod tests {
             "status",
             "bytes_sent",
             "request_time",
+            "trace_id",
         ] {
             assert!(
                 line.contains(&format!("\"{name}\":")),

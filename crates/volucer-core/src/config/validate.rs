@@ -214,6 +214,46 @@ impl Config {
                     )));
                 }
             }
+            // The two sampling keys are one statement, so a disagreement between them is a mistake
+            // rather than a preference. `sample_ratio` beside a mode that does not read it is the
+            // "setting read by nothing" this file already refuses for `[metrics.collect].buckets`,
+            // and for the same reason: the operator who wrote it believes it does something.
+            match (telemetry.sample, telemetry.sample_ratio) {
+                (SampleMode::Ratio, None) => {
+                    return Err(Error::Config(
+                        "telemetry.sample is \"ratio\", which needs telemetry.sample_ratio — the \
+                         fraction of traces to export, e.g. 0.1 for one in ten"
+                            .to_string(),
+                    ));
+                }
+                (SampleMode::Ratio, Some(ratio)) => {
+                    // The bounds are the W3C consistent-probability range, which is 56 bits of
+                    // randomness and therefore cannot express a smaller probability. Refused
+                    // rather than clamped: a value outside it is an arithmetic error, and quietly
+                    // reading `1.5` as "everything" is how a tracing bill gets decided by a typo.
+                    if !ratio.is_finite() || ratio < 0.0 || ratio > 1.0 {
+                        return Err(Error::Config(format!(
+                            "telemetry.sample_ratio is {ratio}, which is not a proportion. Give a \
+                             number from 0 to 1, where 0.1 is one trace in ten"
+                        )));
+                    }
+                    if ratio > 0.0 && ratio < MIN_SAMPLE_RATIO {
+                        return Err(Error::Config(format!(
+                            "telemetry.sample_ratio is {ratio}, which is below the smallest \
+                             probability a trace id can express (2^-56, about \
+                             1.39e-17). Use 0.0 for no traces, or a larger fraction"
+                        )));
+                    }
+                }
+                (mode, Some(_)) => {
+                    return Err(Error::Config(format!(
+                        "telemetry.sample_ratio is set but telemetry.sample is \"{}\", which does \
+                         not read it. Remove the ratio, or set sample = \"ratio\"",
+                        mode.as_str()
+                    )));
+                }
+                (_, None) => {}
+            }
         }
 
         // The KV storages, checked here for the same reason the listeners above are: an empty name or

@@ -237,6 +237,29 @@ pub struct ServerConfig {
     /// two clients apart at all. See [`Self::rate_limiter`].
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+
+    /// What happens to the W3C `traceparent` on the way to a backend. Defaults to `extract`.
+    ///
+    /// # Why this is here rather than in `[telemetry]`
+    ///
+    /// It decides **what a backend receives**, which is a fact about the request path; `[telemetry]`
+    /// is where finished spans *go*, and it requires an `endpoint` because an exporter with nowhere
+    /// to send is not a feature. The two are therefore independent, and the shape that needs this
+    /// key most is the one that configures no `[telemetry]` at all: nginx in front doing the
+    /// exporting, and the application's own collector behind it. A key that existed only inside
+    /// `[telemetry]` could not be written in that deployment.
+    ///
+    /// # The four values, and why `extract` is the default
+    ///
+    /// `ignore`, `extract`, `inject` and `propagate` are nginx's `otel_trace_context`, spelled the
+    /// same and meaning the same — see [`PropagationMode`] for the table. `extract` is the default
+    /// because it is what this server has always done: a client's `traceparent` reaches the backend
+    /// untouched, and Volucer still continues the trace it was given. `propagate` **changes what a
+    /// backend receives** — the client's header is replaced with one naming this server's span —
+    /// so it is a deployment's statement rather than an upgrade's, which is the same rule
+    /// `redirect_to_https` and `hsts` follow.
+    #[serde(default)]
+    pub trace_context: PropagationMode,
 }
 
 /// One rate-limit policy, applied by every front-end.

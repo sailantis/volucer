@@ -1225,6 +1225,10 @@ async fn handle(
         local,
         cleartext,
         &mut hsts,
+        // The request's identity, taken in `handle` before anything could fail. Passed rather than
+        // recomputed: a second `begin` would mint a second span id, and the header a backend
+        // received would then name a span no exported span carries.
+        &context,
     )
     .await
     {
@@ -1304,6 +1308,9 @@ async fn handle(
         let bytes_sent = response.body().size_hint().exact().unwrap_or(0);
         let id = context.id.as_str();
         if front_end.observe.is_enabled() {
+            // Rendered inside the guard: the hex form is an allocation, and a deployment with
+            // tracing but no access log must not pay for one it discards.
+            let trace_id = context.trace.trace_id_hex();
             front_end
                 .observe
                 .access_log()
@@ -1320,6 +1327,7 @@ async fn handle(
                     total_seconds: started.elapsed().as_secs_f64(),
                     origin_seconds: None,
                     bytes_sent,
+                    trace_id: Some(&trace_id),
                 });
         }
     }
@@ -1332,6 +1340,29 @@ async fn handle(
 /// request id or a trace context, so `None` is the honest answer.
 fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Set one CGI parameter on a request that is about to be dispatched, replacing any entry of the
+/// same name.
+///
+/// **Replacing rather than appending is the whole point.** `build_params` has already turned the
+/// client's `traceparent` header into `HTTP_TRACEPARENT`, and a second entry of the same name would
+/// leave the backend's parent decided by whichever the application reads first — an ambiguity that
+/// would show up as a trace that is sometimes joined correctly and sometimes not.
+///
+/// Written as bytes rather than through a `String` round trip because the value is a rendered
+/// header, not text a caller assembled, and the parameter block is bytes on the wire.
+fn set_cgi_param(request: &mut volucer_fcgi::Request, name: &str, value: &str) {
+    let key = name.as_bytes();
+    let value = value.as_bytes();
+    match request
+        .params
+        .iter_mut()
+        .find(|(existing, _)| existing.as_slice() == key)
+    {
+        Some(pair) => pair.1 = value.to_vec(),
+        None => request.params.push((key.to_vec(), value.to_vec())),
+    }
 }
 
 /// The HTTP side of [`volucer_core::HeaderLookup`].
@@ -1399,6 +1430,7 @@ impl From<HttpError> for BackendFailure {
 }
 
 /// Read the body, build the CGI environment, dispatch, and translate the answer.
+#[allow(clippy::too_many_arguments)]
 async fn prepare(
     request: Request<Incoming>,
     front_end: &Arc<FrontEnd>,
@@ -1407,6 +1439,7 @@ async fn prepare(
     local: Option<std::net::IpAddr>,
     cleartext: bool,
     hsts: &mut Option<volucer_core::config::HstsPolicy>,
+    context: &volucer_observe::RequestContext,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
 
@@ -1571,6 +1604,12 @@ async fn prepare(
     // decided here rather than at each of them.
     let is_grpc = volucer_upstream::is_grpc(&parts.headers);
 
+    // The header this server wants the backend to treat as its parent, or `None` when
+    // `[server].trace_context` says not to write one. Computed here — before either request path
+    // starts — and from the same `context` the span and the log use, so the exported span id and
+    // the id a backend was told are necessarily the same string.
+    let outbound_traceparent = front_end.observe.outbound_traceparent(context);
+
     // The one branch between the two request paths, and it is here rather than inside the
     // dispatcher on purpose: every other backend is a blocking process on a pipe, so making the
     // dispatcher's *type* async to accommodate the one that is not would drag `spawn_blocking`
@@ -1580,7 +1619,16 @@ async fn prepare(
     // has to be a `Vec` because the environment carries its length, and an origin's must not be
     // touched at all.
     if front_end.dispatcher.is_upstream(&backend) {
-        return upstream(front_end, &backend, parts, body, &remote_addr, cleartext).await;
+        return upstream(
+            front_end,
+            &backend,
+            parts,
+            body,
+            &remote_addr,
+            cleartext,
+            outbound_traceparent,
+        )
+        .await;
     }
 
     // **A gRPC call this backend was not granted is refused here**, and every part of that sentence
@@ -1661,11 +1709,17 @@ async fn prepare(
     let routes = site.routes.clone();
     let blocking =
         tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
-            let cgi_request = if skips_stat {
+            let mut cgi_request = if skips_stat {
                 to_cgi_routed(&parts, body, &routing, front_end.server_port, &remote_addr)?
             } else {
                 to_cgi(&parts, body, &routing, front_end.server_port, &remote_addr)?
             };
+            // Replaces whatever `HTTP_TRACEPARENT` the client's own header produced, rather than
+            // being added beside it: two `HTTP_TRACEPARENT` entries in one `PARAMS` block is a
+            // request whose parent is chosen by whichever entry a backend happens to read first.
+            if let Some(traceparent) = &outbound_traceparent {
+                set_cgi_param(&mut cgi_request, "HTTP_TRACEPARENT", traceparent);
+            }
             // The site's own table, so the routing decision above and the dispatch agree.
             //
             // Mapped rather than mapped to an HTTP status here, because *which* mapping applies depends
@@ -1728,6 +1782,7 @@ async fn upstream(
     body: Incoming,
     remote_addr: &str,
     cleartext: bool,
+    outbound_traceparent: Option<String>,
 ) -> Result<Response<ResponseBody>> {
     let uri = parts
         .uri
@@ -1739,8 +1794,19 @@ async fn upstream(
     // The listener carries the peer's *address* — `remote_addr` is an IP with no port, and the
     // port of an incoming connection is not part of what this header carries anyway.
     let peer = remote_addr.parse::<std::net::IpAddr>().ok();
+    // **The header is set before `prepare_request` filters the map**, so the injection goes through
+    // the same never-forwarded rule as everything else rather than around it: `traceparent` is not
+    // on that list, and a value this server assembled cannot be one a client chose. Replacing rather
+    // than appending is the same rule the CGI path follows — two `traceparent` entries would make an
+    // origin's parent depend on which one it reads first.
+    let mut request_headers = parts.headers;
+    if let Some(traceparent) = &outbound_traceparent {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(traceparent) {
+            request_headers.insert(volucer_observe::TRACEPARENT_HEADER, value);
+        }
+    }
     let request = volucer_upstream::prepare_request(
-        parts.headers,
+        request_headers,
         parts.method,
         uri,
         parts.version,

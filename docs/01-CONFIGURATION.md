@@ -158,6 +158,28 @@ its certificate or ACME settings.
 | `access_log` | table | absent | The access log. Presence enables it. |
 | `proxy` | table | absent | Which peers may assert a client address. |
 | `rate_limit` | table | absent | The rate limiter. Presence enables it. |
+| `trace_context` | string | `"extract"` | How the client's trace context is handled when setting a backend's `traceparent`: `"ignore"`, `"extract"`, `"inject"` or `"propagate"`. See [Observability](06-OBSERVABILITY.md#trace-context). |
+
+### `trace_context`
+
+These values correspond to nginx's `otel_trace_context` setting:
+
+| Value | Reads the client's `traceparent` | Sends Volucer's context to the backend |
+|---|---|---|
+| `"ignore"` | no | no |
+| `"extract"` | yes | no — the default |
+| `"inject"` | no | yes |
+| `"propagate"` | yes | yes |
+
+With `"extract"`, the client header reaches the backend unchanged; this is the default and
+matches the server's previous behavior. `"inject"` sends Volucer's context without reading
+the client's header. `"propagate"` reads the client context, then replaces the header sent
+to the backend with Volucer's own context. The backend's spans are therefore children of
+Volucer's span, rather than siblings. Because it changes the context the backend receives,
+`"propagate"` is opt-in.
+
+This key does not need a `[telemetry]` table. It is about what a *backend* is told, which
+matters most in the deployment that exports nothing from here.
 
 ### `max_body_bytes`
 
@@ -662,6 +684,16 @@ it through loopback. See [Health checks](11-OPERATIONS.md#health-checks).
 | `timeout_ms` | integer | `10000` | Per export request. |
 | `batch_size` | integer | `512` | Spans per batch. |
 | `interval_ms` | integer | `5000` | How long a partly-filled batch waits. |
+| `sample` | string | `"parent_based"` | Which traces are exported: `"parent_based"`, `"always"` or `"ratio"`. See [Sampling](06-OBSERVABILITY.md#sampling). |
+| `sample_ratio` | number | absent | The fraction for `sample = "ratio"`, from `2^-56` to `1`. Refused for the other two modes. |
+
+What a backend receives is **not** configured here. `[server].trace_context` decides that,
+because it is a fact about the request path rather than about where spans go — see
+[Observability](06-OBSERVABILITY.md#trace-context).
+
+`sample` decides what *leaves the process*, which is a different question: a deployment may
+propagate a trace to its backend and still decline to export its own span. See
+[Sampling](06-OBSERVABILITY.md#sampling).
 
 ## `[kv.<name>]`
 

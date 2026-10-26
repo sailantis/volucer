@@ -415,6 +415,12 @@ fn record_fastcgi(
     // with `[telemetry]` and no `[server.access_log]` must get spans and no log file, and
     // `AccessLog::record` on a disabled log is a lock and a match for nothing.
     if observe.is_enabled() {
+        // Rendered inside the guard, and from this hop's context rather than from the
+        // `HTTP_TRACEPARENT` param: behind nginx that param is *nginx's*, where the span this record
+        // describes is this hop's. Reading the param would log a trace this server's span does not
+        // belong to whenever the two differ — which is exactly the deployment
+        // `trace_context = "propagate"` exists for.
+        let trace_id = context.trace.trace_id_hex();
         observe.access_log().record(&Record {
             id: &id,
             method: param(params, b"REQUEST_METHOD").unwrap_or("-"),
@@ -430,6 +436,7 @@ fn record_fastcgi(
             // duration arrives in the worker protocol's `END` frame rather than as a header here.
             origin_seconds: None,
             bytes_sent,
+            trace_id: Some(&trace_id),
         });
     }
 }
@@ -668,6 +675,26 @@ fn serve_connection(
                     }
                     continue;
                 }
+            }
+        }
+
+        // **The context this front-end minted is what a backend must be told about**, when
+        // propagation is on. Behind nginx the params carry whatever *nginx* put in
+        // `HTTP_TRACEPARENT`, and relaying it verbatim would make this hop's span a sibling of the
+        // backend's rather than its parent — the exact breakage `propagate` exists to prevent, one
+        // hop further down. `begin` above has already decided whether the caller's header was read
+        // at all, so this cannot disagree with it.
+        let mut request = request;
+        if let Some(traceparent) = observe.outbound_traceparent(&context) {
+            match request
+                .params
+                .iter_mut()
+                .find(|(key, _)| key.as_slice() == b"HTTP_TRACEPARENT")
+            {
+                Some(pair) => pair.1 = traceparent.into_bytes(),
+                None => request
+                    .params
+                    .push((b"HTTP_TRACEPARENT".to_vec(), traceparent.into_bytes())),
             }
         }
 

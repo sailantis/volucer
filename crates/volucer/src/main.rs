@@ -476,6 +476,20 @@ fn build_observability_with_exporter(
         // supported shape, and this is where that is expressed.
         None => volucer_observe::Observability::disabled(),
     };
+    // Set before the exporter is attached, because they are independent and the *earlier* one is
+    // the one a deployment without `[telemetry]` still needs: `propagate` writes the header a
+    // backend's spans hang from, and that is a request-path fact whether or not this process
+    // exports anything.
+    observe = observe.with_propagation(propagation_of(config.server.trace_context));
+    // And the sampler, for the same reason and with the same "earlier one matters" argument: under
+    // `propagate` the `sampled` flag on the header a backend receives *is* this decision, so a
+    // deployment that exports nothing here but asks for `always` still has to write `-01`.
+    observe = observe.with_sampling(
+        config
+            .telemetry
+            .as_ref()
+            .map_or_else(volucer_observe::Sampler::default, sampler_of),
+    );
 
     let Some(telemetry) = &config.telemetry else {
         return (observe, Telemetry { exporter: None });
@@ -484,11 +498,15 @@ fn build_observability_with_exporter(
     match volucer_otlp::Exporter::start(telemetry) {
         Ok(exporter) => {
             let exporter = std::sync::Arc::new(exporter);
+            // Attached *before* the exporter so the sampler is in place even if the exporter
+            // fails, which is the same argument as above: the flag on the outbound header is a
+            // request-path fact and does not depend on whether an export can be delivered.
             tracing::info!(
                 endpoint = exporter.endpoint(),
                 service = %telemetry.service_name,
                 batch_size = telemetry.batch_size,
                 interval_ms = telemetry.interval_ms,
+                sample = telemetry.sample.as_str(),
                 "trace export enabled"
             );
             observe = observe.with_spans(exporter.recorder());
@@ -515,6 +533,46 @@ fn build_observability_with_exporter(
             );
             (observe, Telemetry { exporter: None })
         }
+    }
+}
+
+/// The configuration enum as the behaviour enum.
+///
+/// **The one conversion**, called from the one place the process builds its `Observability`. A
+/// second conversion would be a second answer to "what does `propagate` mean", which is exactly the
+/// drift the mirror type exists to make impossible: `volucer-core` is a leaf and cannot depend on
+/// `volucer-observe`, so the two enums are separate and this is the seam between them.
+fn propagation_of(
+    mode: volucer_core::config::PropagationMode,
+) -> volucer_observe::TracePropagation {
+    use volucer_core::config::PropagationMode as From;
+    use volucer_observe::TracePropagation as To;
+    match mode {
+        From::Ignore => To::Ignore,
+        From::Extract => To::Extract,
+        From::Inject => To::Inject,
+        From::Propagate => To::Propagate,
+    }
+}
+
+/// The configuration's sampling policy as the behaviour type.
+///
+/// The second seam between `volucer-core` and `volucer-observe`, and the second reason the config
+/// model carries a mirror enum. The ratio is taken from the table rather than the enum because it
+/// is a value the configuration validates on its own — `sample_ratio` beside `sample = "ratio"` — so
+/// the conversion can never see a `Ratio` without one. The `unwrap_or_default` is therefore not a
+/// fallback for a missing key: validation has already refused that shape, and a reload cannot reach
+/// here with one. It is `parent_based` if it ever did, which is the safe direction — exporting less
+/// rather than more.
+fn sampler_of(telemetry: &volucer_core::config::TelemetryConfig) -> volucer_observe::Sampler {
+    use volucer_core::config::SampleMode;
+    match telemetry.sample {
+        SampleMode::ParentBased => volucer_observe::Sampler::ParentBased,
+        SampleMode::Always => volucer_observe::Sampler::Always,
+        SampleMode::Ratio => telemetry
+            .sample_ratio
+            .and_then(volucer_observe::Sampler::ratio)
+            .unwrap_or_default(),
     }
 }
 
@@ -4059,12 +4117,26 @@ fn check(
         }
         None => println!("  access log: none (server.access_log is unset)"),
     }
-    // Trace propagation has no config key of its own and needs none: an inbound `traceparent` is
-    // always parsed and continued with a fresh span, and a missing or malformed one starts a new
-    // unsampled trace rather than failing. It is also always forwarded — `to_cgi` maps it to
-    // `HTTP_TRACEPARENT` and no strip list contains it — so PHP sees it without any key to set.
-    // Printed so an operator can confirm that without reading the source.
-    println!("  trace context: W3C traceparent is read, continued, and forwarded to backends");
+    // Trace propagation, printed from the configured value rather than from a constant, so an
+    // operator can confirm the decision without reading the source. `extract` and `propagate` both
+    // read an inbound `traceparent` and continue it; `inject` and `propagate` both replace what the
+    // backend receives with this server's context. A missing or malformed inbound header starts a
+    // new unsampled trace rather than failing the request, under every value.
+    println!(
+        "  trace context: {} (inbound {})",
+        config.server.trace_context.as_str(),
+        match config.server.trace_context.extracts() {
+            true => "traceparent is read and continued",
+            false => "traceparent is ignored",
+        }
+    );
+    println!(
+        "    backend:     {}",
+        match config.server.trace_context.injects() {
+            true => "receives this server's traceparent, so its spans are children of its span",
+            false => "receives the client's traceparent unchanged, so its spans are siblings",
+        }
+    );
     // The exporter, and the endpoint as written, which is the key a misconfiguration hides in — the
     // silent-reader rule again. Note it is reported even when the endpoint cannot be dialled:
     // `check` reports what was configured, and `serve` reports whether the exporter started.
@@ -4076,6 +4148,19 @@ fn check(
             println!(
                 "    batching:     {} span(s), or every {} ms",
                 telemetry.batch_size, telemetry.interval_ms
+            );
+            // Printed from the configured value rather than from a constant, so an operator can
+            // confirm the decision without reading the source. Sampling is the key that decides
+            // *what leaves this process*, and a deployment that thinks it is tracing everything
+            // while exporting a tenth of it is the mistake this line exists to prevent.
+            println!(
+                "    sampling:     {} — exports {}",
+                telemetry.sample.as_str(),
+                match (telemetry.sample, telemetry.sample_ratio) {
+                    (volucer_core::config::SampleMode::Ratio, Some(ratio)) =>
+                        format!("{ratio} of traces, chosen by the trace id"),
+                    _ => sampler_of(telemetry).describe(),
+                }
             );
             println!("    timeout:      {} ms per export", telemetry.timeout_ms);
             if !telemetry.headers.is_empty() {

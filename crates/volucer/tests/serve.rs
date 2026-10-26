@@ -4034,7 +4034,7 @@ format = "combined"
         // nginx's field order, so a script written for nginx reads this. The timestamp is two
         // tokens because `$time_local` includes the `+0000` offset, exactly as nginx's does.
         let fields: Vec<&str> = line.split(' ').collect();
-        assert_eq!(fields.len(), 15, "field count of {line:?}");
+        assert_eq!(fields.len(), 16, "field count of {line:?}");
         assert_eq!(fields[0], "127.0.0.1", "the peer: {line:?}");
         assert_eq!(fields[5], "\"GET", "the request begins: {line:?}");
         assert_eq!(fields[6], target, "the target: {line:?}");
@@ -4044,6 +4044,19 @@ format = "combined"
         assert_eq!(
             fields[13], "-",
             "no origin, so a dash and not zero: {line:?}"
+        );
+        // The trace id, then the request id — the two identifiers an operator copies out, in the
+        // order the document gives them. A request with no inbound `traceparent` still belongs to a
+        // trace this server started, so the field is 32 hex characters here rather than a dash; the
+        // dash case is covered beside the renderer, where it can be constructed directly.
+        assert_eq!(
+            fields[14].len(),
+            32,
+            "the trace id, nginx's $otel_trace_id: {line:?}"
+        );
+        assert!(
+            fields[14].bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "the trace id is hex: {line:?}"
         );
     }
 

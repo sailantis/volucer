@@ -62,6 +62,8 @@ pub struct Observability {
     access_log: access_log::AccessLog,
     /// The header to adopt and echo, or `None` to always mint our own.
     id_header: Option<String>,
+    /// Whether an inbound `traceparent` is read, and whether ours is written for the backend.
+    propagation: TracePropagation,
     /// Where finished spans go, or `None` when no `[telemetry]` table asked for them.
     ///
     /// An `Option` rather than an always-present no-op recorder, and the reason is the same one that
@@ -69,6 +71,248 @@ pub struct Observability {
     /// on the request path, and a `None` check is one predictable branch while a trait object call
     /// is not.
     spans: Option<Arc<dyn span::SpanRecorder>>,
+    /// Which traces are exported, out of the ones this server sees.
+    sampling: Sampler,
+}
+
+/// What this server does with the W3C trace context on the way through.
+///
+/// The four values are nginx's `otel_trace_context`, spelled the same way and meaning the same
+/// thing, because an operator who has written one already knows what these do — and because the
+/// four are genuinely the four combinations of two independent decisions rather than a menu:
+///
+/// | Value | Reads the client's `traceparent` | Writes ours for the backend |
+/// | --- | --- | --- |
+/// | `ignore` | no | no |
+/// | `extract` | yes | no |
+/// | `inject` | no | yes |
+/// | `propagate` | yes | yes |
+///
+/// # Why `extract` is the default
+///
+/// It is what this server did before the key existed, and it is the least surprising half of the
+/// pair: a client's header still reaches the backend untouched, and Volucer still continues the
+/// trace it was given. Turning on `propagate` *changes what a backend receives* — its own header is
+/// replaced by one naming this server's span — so it is a statement a deployment makes rather than
+/// one an upgrade makes for it.
+///
+/// The difference matters: with `extract`, a backend's spans are **siblings** of Volucer's span,
+/// because both name the caller as their parent. With `propagate`, the backend's spans are
+/// **children**, which is what makes a waterfall diagram show the request instead of two unrelated
+/// branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TracePropagation {
+    /// Neither read nor write: every request starts a fresh trace at this hop.
+    Ignore,
+    /// Read the client's context and continue it. What the header does by default.
+    #[default]
+    Extract,
+    /// Start a fresh trace here and hand it to the backend.
+    Inject,
+    /// Read the client's context, continue it, and hand *ours* to the backend.
+    Propagate,
+}
+
+impl TracePropagation {
+    /// Whether an inbound `traceparent` is read.
+    #[must_use]
+    pub fn extracts(self) -> bool {
+        matches!(self, Self::Extract | Self::Propagate)
+    }
+
+    /// Whether the header a backend receives is replaced with this hop's context.
+    #[must_use]
+    pub fn injects(self) -> bool {
+        matches!(self, Self::Inject | Self::Propagate)
+    }
+
+    /// The value as it is written in configuration and printed by `volucer check`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Extract => "extract",
+            Self::Inject => "inject",
+            Self::Propagate => "propagate",
+        }
+    }
+}
+
+/// Which traces are exported, out of the ones this server sees.
+///
+/// A **decision**, not a mechanism, and that distinction is the whole reason it is a small value
+/// type here rather than a callback the exporter holds: the answer has to be the same on the
+/// request path, where the span is built, and in `volucer check`, where an operator reads what
+/// their configuration will do. A decision spread across two places is how a server ends up
+/// exporting a trace it told the backend it had dropped.
+///
+/// # The three answers, and the one that is missing
+///
+/// - [`Sampler::ParentBased`] (the default) — export the traces an upstream service already
+///   decided to record, and export a request that arrived with no `traceparent` at all. OTel calls
+///   this `ParentBased(root=AlwaysOn)` and names it the default sampler.
+/// - [`Sampler::Always`] — export everything, whatever the inbound flag said. This is the same
+///   answer for every request, so it differs from the default only for traffic that arrives with a
+///   parent explicitly marked `-00`, which is a caller saying "do not record this".
+/// - [`Sampler::Ratio`] — export a deterministic fraction of traces, chosen by the trace id.
+///
+/// There is deliberately no `Never`. A deployment that wants no traces expresses that by not
+/// writing a `[telemetry]` table, and a second way to say it would be a way for the two to
+/// disagree — the same rule that makes `[telemetry]`'s presence its enable switch. (`Ratio(0.0)` is
+/// reachable and is the one exception, because it is the useful way to keep a table's endpoint and
+/// headers while exporting nothing.)
+///
+/// # Why `parent_based` rather than "always export"
+///
+/// Because it is what makes a trace *one trace*. Under [`TracePropagation::Propagate`] the backend
+/// is handed this server's context, so if this hop exported a trace the caller had marked `-00`
+/// while the backend honoured the flag, the trace view would show Volucer's span as a single
+/// orphaned node with no children — worse than no span at all, because it looks like a backend
+/// that stopped sending spans. nginx spells the same policy `otel_trace $otel_parent_sampled`, and
+/// the reasoning is identical: a proxy is not the party that should decide to spend somebody
+/// else's tracing budget.
+///
+/// # Why a root is sampled rather than dropped
+///
+/// The other half, and the one an "honour the parent" rule gets wrong if it is read literally: a
+/// request that arrived with **no** `traceparent` has no parent to honour. Treating its absent flag
+/// as `-00` would mean a deployment with nothing in front of it — the ordinary single-service
+/// shape — exports nothing at all while believing tracing is on. The specification calls this
+/// `root=AlwaysOn` for exactly that reason.
+///
+/// # What a ratio means, precisely
+///
+/// The decision is a function of the trace id alone and of nothing else — no clock, no counter, no
+/// per-process state — so every hop that applies the same ratio agrees, and a trace is either
+/// sampled at every hop or at none. The arithmetic follows the W3C Trace Context level 2
+/// consistent-probability rule that OpenTelemetry's `ProbabilitySampler` also uses: the randomness
+/// is the **seven rightmost bytes** of the trace id, and a trace is kept when that value is at or
+/// above a threshold derived from the ratio. Lowering the ratio therefore only ever *removes*
+/// traces, which is the monotonicity the specification requires so that a backend can sample more
+/// generously than the front-end without losing anything the front-end kept.
+///
+/// `0.0` and `1.0` are exact rather than approximate — every trace and no trace — because an
+/// operator writing either means it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Sampler {
+    /// Export the traces an upstream service already decided to record, and record a request that
+    /// arrived with no trace at all. The default.
+    #[default]
+    ParentBased,
+    /// Export every trace, whatever the inbound flag said.
+    Always,
+    /// Export this fraction of traces, decided by the trace id.
+    Ratio(f64),
+}
+
+impl Sampler {
+    /// The smallest ratio `[telemetry].sample_ratio` accepts.
+    ///
+    /// `2^-56` is the smallest probability the W3C consistent-probability scheme can express,
+    /// because the randomness it samples from is 56 bits. A smaller value would round to "never",
+    /// which [`Sampler::Ratio`] already spells exactly as `0.0` — so accepting it would be
+    /// pretending to a precision that does not exist.
+    pub const MIN_RATIO: f64 = 1.0 / (1u64 << 56) as f64;
+
+    /// Build a ratio sampler, or `None` for a value outside the representable range.
+    ///
+    /// Refused rather than clamped: `sample_ratio = 1.5` is an operator arithmetic error, and
+    /// silently reading it as "all traces" is how a deployment discovers its tracing bill was
+    /// decided by a typo. `0.0` is accepted and means none, which is a legitimate way to turn
+    /// tracing off without removing the table.
+    #[must_use]
+    pub fn ratio(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        if value == 0.0 {
+            return Some(Self::Ratio(0.0));
+        }
+        if (Self::MIN_RATIO..=1.0).contains(&value) {
+            return Some(Self::Ratio(value));
+        }
+        None
+    }
+
+    /// Whether a trace with this id is recorded — by this server, and therefore by anything it
+    /// tells. **The one place the decision is made.**
+    ///
+    /// `parent` is the caller's flag when the request carried a usable `traceparent`, and `None`
+    /// when it carried none at all. **The two are different answers**, and conflating them is the
+    /// mistake this signature exists to prevent: a request with no parent is a *root*, and
+    /// [`Sampler::ParentBased`] samples a root rather than dropping it. Otherwise a standalone
+    /// deployment — no proxy in front, no inbound tracing — would export nothing at all, which is
+    /// the opposite of what turning tracing on means.
+    ///
+    /// This is OTel's `ParentBased(root=AlwaysOn)`, which the specification names as the default
+    /// sampler, and the two halves are worth stating separately because only one of them is
+    /// obvious: a child follows its parent's decision, and a root is recorded.
+    ///
+    /// Takes the trace id and the parent rather than a `RequestContext`, because those are the only
+    /// two things it reads — and the narrow signature says so. Sampling cannot depend on the path,
+    /// the client or the clock, or two hops applying the same ratio would disagree about the same
+    /// trace.
+    ///
+    /// The answer is used twice and must not be computed twice: it becomes the flag on the
+    /// `traceparent` a backend receives, and it decides whether this server's own span is
+    /// exported. One answer, so a backend can never be told `-01` by a server that then drops the
+    /// span — the mismatch this key exists to remove.
+    #[must_use]
+    pub fn samples(self, trace_id: [u8; 16], parent: Option<bool>) -> bool {
+        match self {
+            Self::ParentBased => parent.unwrap_or(true),
+            Self::Always => true,
+            Self::Ratio(ratio) => ratio_keeps(trace_id, ratio),
+        }
+    }
+
+    /// The value as it is written in configuration.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentBased => "parent_based",
+            Self::Always => "always",
+            Self::Ratio(_) => "ratio",
+        }
+    }
+
+    /// The one-line description `volucer check` prints.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::ParentBased => {
+                "the traces an upstream service recorded, and every trace it did not see at all"
+                    .to_string()
+            }
+            Self::Always => "every trace, whatever the caller asked for".to_string(),
+            Self::Ratio(ratio) => format!("{ratio} of traces, decided by the trace id"),
+        }
+    }
+}
+
+/// Whether the W3C consistent-probability rule keeps a trace with this id at this ratio.
+///
+/// The randomness is the seven rightmost bytes of the trace id — 56 bits, which is what the
+/// specification defines and what makes the decision interoperable with any other hop applying the
+/// same ratio. The threshold is `(1 - ratio) * 2^56` and the trace is kept when the randomness is
+/// at or above it, so `1.0` gives a zero threshold (everything) and `0.0` gives `2^56` (nothing,
+/// since the largest 56-bit value is `2^56 - 1`).
+fn ratio_keeps(trace_id: [u8; 16], ratio: f64) -> bool {
+    // The rightmost seven bytes, right-aligned in a `u64` so the comparison is on the value the
+    // specification describes rather than on a shifted one.
+    let mut randomness = [0u8; 8];
+    randomness[1..].copy_from_slice(&trace_id[9..16]);
+    let randomness = u64::from_be_bytes(randomness);
+    let threshold = (1.0 - ratio) * (1u64 << 56) as f64;
+    // Saturating rather than unchecked: a ratio of `0.0` produces exactly `2^56`, which is a
+    // representable `u64`, and one of `1.0` produces `0.0`, which truncates to `0`. Neither can
+    // overflow, but the cast is written to say what happens if a future caller widens the range.
+    let threshold = if threshold >= (1u64 << 56) as f64 {
+        1u64 << 56
+    } else {
+        threshold as u64
+    };
+    randomness >= threshold
 }
 
 impl Observability {
@@ -78,7 +322,9 @@ impl Observability {
         Self {
             access_log,
             id_header,
+            propagation: TracePropagation::default(),
             spans: None,
+            sampling: Sampler::default(),
         }
     }
 
@@ -91,6 +337,48 @@ impl Observability {
     pub fn with_spans(mut self, recorder: Arc<dyn span::SpanRecorder>) -> Self {
         self.spans = Some(recorder);
         self
+    }
+
+    /// Choose what happens to the W3C trace context on the way through.
+    ///
+    /// Separate from [`Observability::with_spans`] because they are independent in the same way:
+    /// `propagate` with no `[telemetry]` is a supported shape — an nginx in front, and a collector
+    /// behind the application rather than behind this server — and the header still has to be
+    /// written for the backend's spans to join the caller's trace.
+    #[must_use]
+    pub fn with_propagation(mut self, propagation: TracePropagation) -> Self {
+        self.propagation = propagation;
+        self
+    }
+
+    /// Choose which traces are exported.
+    ///
+    /// A third independent decision, and it is deliberately *not* folded into
+    /// [`Observability::with_spans`]: which traces to keep is a policy about cost, while where to
+    /// send them is a policy about plumbing. The default, [`Sampler::default`], is `parent_based`,
+    /// which exports exactly the traces somebody upstream already decided to record.
+    ///
+    /// Note what sampling does **not** touch: the access log, and the trace id this server logs and
+    /// propagates. A dropped trace is still logged with the same correlation id, so "the trace is
+    /// missing, find the request in the log by its trace id" stays the answer to a question about a
+    /// span that is not there. That is why the decision is applied at the recording site rather
+    /// than by not minting an id.
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: Sampler) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// Which traces are exported.
+    #[must_use]
+    pub fn sampling(&self) -> Sampler {
+        self.sampling
+    }
+
+    /// What this server does with the trace context.
+    #[must_use]
+    pub fn propagation(&self) -> TracePropagation {
+        self.propagation
     }
 
     /// Whether spans are being exported.
@@ -107,7 +395,12 @@ impl Observability {
             // No header means no adoption *and* no echo: a deployment that has not asked for an id
             // should not have one appear on its responses, because a client may act on it.
             id_header: None,
+            // `extract`, which is the documented default and what this server has always done: a
+            // client's header is relayed to the backend untouched. `propagate` is a deployment's
+            // decision, so it is never a side effect of building the handle.
+            propagation: TracePropagation::default(),
             spans: None,
+            sampling: Sampler::default(),
         }
     }
 
@@ -134,6 +427,25 @@ impl Observability {
     /// Returns whether a file is open afterwards.
     pub fn reopen_access_log(&self) -> bool {
         self.access_log.reopen()
+    }
+
+    /// The `traceparent` a backend should receive, or `None` when this server is not injecting.
+    ///
+    /// **The one place "which header does the backend see" is decided**, exactly as [`Self::begin`]
+    /// is for "which id is this request". A front-end that asked `propagation()` and then built the
+    /// header itself would be a second implementation of the rule, and the two would drift the
+    /// first time one of them was changed.
+    ///
+    /// It returns the *rendered* value rather than the [`TraceContext`] because the three call sites
+    /// want different shapes — a `(name, value)` pair for the CGI environment, a `HeaderMap` entry
+    /// for an origin — and converting at each of them is how one of them ends up formatting it
+    /// differently.
+    #[must_use]
+    pub fn outbound_traceparent(&self, context: &RequestContext) -> Option<String> {
+        match self.propagation.injects() {
+            true => Some(context.trace.header()),
+            false => None,
+        }
     }
 
     /// Whether anything will be recorded.
@@ -181,19 +493,30 @@ impl Observability {
         // the *caller's* span id, which is the parent this hop hangs from. Keeping only the trace
         // would discard the parent — and an exported span would then claim to be a root, breaking
         // the trace at the very hop it exists to show.
-        let client_trace = client_traceparent.and_then(TraceContext::parse);
-        let trace = match client_trace {
-            // The client's trace, our own span — see `TraceContext::continuing`. Its sampling
-            // decision is respected rather than overridden: whether to record a trace is the
-            // originating service's call, and a proxy that flipped the bit would make every span
-            // downstream appear regardless of what the caller asked for.
-            Some(client) => TraceContext::continuing(client.trace_id(), client.sampled()),
-            // A new trace starts **unsampled**. This server's own log is written regardless of the
-            // flag — the two are independent, and tying our access log to a tracing concept would
-            // make it disappear when a sampler said so. Starting at `00` leaves the decision to the
-            // first service that actually collects spans, which is the only party that knows what
-            // it costs.
-            None => TraceContext::new(false),
+        //
+        // `extracts()` is asked here rather than at the call site, so `ignore` cannot be half
+        // implemented: one front-end forgetting the check would make the key mean two things.
+        let client_trace = match self.propagation.extracts() {
+            true => client_traceparent.and_then(TraceContext::parse),
+            false => None,
+        };
+        let trace = {
+            // The trace id comes first, because a ratio sampler's decision is a function of it.
+            // `parent` is `None` for a request that carried no `traceparent`, which is a *root*
+            // and not the same thing as an unsampled parent — see `Sampler::samples`.
+            let (trace_id, parent) = match &client_trace {
+                Some(client) => (client.trace_id(), Some(client.sampled())),
+                None => (TraceContext::new(false).trace_id(), None),
+            };
+            // **One decision, two readers.** The flag goes into the `traceparent` a backend is
+            // handed and decides whether this server's own span is exported — so a backend can
+            // never be told `-01` by a server that then dropped the span, which is the mismatch
+            // that makes a trace view show a parent with children it does not admit to.
+            let sampled = self.sampling.samples(trace_id, parent);
+            // The client's trace, our own span — see `TraceContext::continuing`. Whether to record
+            // is decided above rather than assumed, so a request whose trace nobody asked to
+            // record still gets a *consistent* answer: `00` on the header, and no exported span.
+            TraceContext::continuing(trace_id, sampled)
         };
         // `None` when there was no usable inbound traceparent, which is exactly OTLP's "this is a
         // root span".
@@ -232,6 +555,15 @@ impl Observability {
         let Some(recorder) = &self.spans else {
             return;
         };
+        // The sampling decision, asked at the recording site rather than at the exporter's queue:
+        // a trace this deployment is not recording should cost nothing here either, and the queue
+        // is the one place where a dropped trace would still occupy a slot before being discarded.
+        //
+        // The flag is the *same* one `begin` put in the `traceparent` the backend was handed, so
+        // "recorded here" and "the backend was told to record" cannot disagree.
+        if !context.trace.sampled() {
+            return;
+        }
         let mut pairs: Vec<(&'static str, span::Attribute)> =
             Vec::with_capacity(4 + attributes.extra.len());
         pairs.push(("http.request.method", attributes.method.into()));
@@ -260,6 +592,8 @@ impl Observability {
             attributes: pairs,
             status: span::SpanStatus::from_http_status(attributes.status),
             status_message: attributes.status_message.map(str::to_string),
+            // The same bit the `traceparent` carried, from the same decision `begin` made.
+            flags: span::Span::flags_for(context.trace.sampled()),
         });
     }
 }
@@ -994,11 +1328,12 @@ mod tests {
     }
 
     #[test]
-    fn an_inbound_trace_is_continued_and_a_missing_one_starts_unsampled() {
-        // **Two decisions in one place, and both matter.** An inbound trace keeps its trace id and
-        // takes a new span id — a proxy that kept the span id too would make two hops claim to be
-        // one. And a request with no trace starts **unsampled**, so accepting a `traceparent` is
-        // not the same as being asked to record a trace.
+    fn an_inbound_trace_is_continued_and_a_missing_one_is_a_sampled_root() {
+        // **Two decisions in one place, and the second one changed.** An inbound trace keeps its
+        // trace id and takes a new span id — a proxy that kept the span id too would make two hops
+        // claim to be one. And a request with no trace is a **root**, which the default sampler
+        // records: reporting it unsampled was the bug that made a standalone deployment believe
+        // tracing was on while exporting nothing.
         let observing = observing(None);
         let client = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let continued = observing.begin(None, Some(client));
@@ -1014,15 +1349,34 @@ mod tests {
 
         let fresh = observing.begin(None, None);
         assert!(
-            !fresh.trace.sampled(),
-            "a new trace must not claim to be recorded"
+            fresh.trace.sampled(),
+            "a root must be recorded, or a deployment with nothing in front of it exports nothing"
         );
         assert_ne!(fresh.trace.trace_id(), [0u8; 16]);
 
-        // A broken traceparent starts a fresh trace rather than failing — the same rule as the id.
+        // A broken traceparent starts a fresh trace rather than failing — the same rule as the id,
+        // and it is a root like an absent one.
         let broken = observing.begin(None, Some("not-a-traceparent"));
-        assert!(!broken.trace.sampled());
         assert_ne!(broken.trace.trace_id(), [0u8; 16]);
+    }
+
+    #[test]
+    fn a_caller_that_says_do_not_record_is_obeyed_and_one_that_says_nothing_is_not() {
+        // **The distinction the whole sampler rests on.** `-00` is a caller asking not to be
+        // recorded and must be obeyed; an absent header is a caller with no opinion, which is a
+        // *root* and is recorded. A `parent_based` that read the two the same way would pass one
+        // half of this test whichever way it read them.
+        let observing = observing(None);
+        let unsampled = observing.begin(None, Some(UNSAMPLED_CLIENT_TRACE));
+        assert!(
+            !unsampled.trace.sampled(),
+            "an explicit -00 must be honoured, or a proxy spends somebody else's budget"
+        );
+        assert!(observing.begin(None, None).trace.sampled(), "a root");
+        assert!(
+            observing.begin(None, Some(CLIENT_TRACE)).trace.sampled(),
+            "an explicit -01 is a caller asking to be recorded"
+        );
     }
 
     #[test]
@@ -1037,5 +1391,358 @@ mod tests {
             "{}",
             context.elapsed_seconds()
         );
+    }
+
+    /// The caller's example from the W3C specification, used by the propagation tests.
+    const CLIENT_TRACE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    /// The same trace, with the caller's `sampled` flag **clear**: "do not record this".
+    const UNSAMPLED_CLIENT_TRACE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+
+    #[test]
+    fn ignore_reads_nothing_and_writes_nothing() {
+        // The value that has to be visibly different from `extract`, which is otherwise its
+        // neighbour: reading the header and merely not writing it would be indistinguishable from
+        // `extract` from the caller's side, and from the backend's.
+        let observing = observing(None).with_propagation(TracePropagation::Ignore);
+        let context = observing.begin(None, Some(CLIENT_TRACE));
+        assert_ne!(
+            context.trace.trace_id_hex(),
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "an ignored header was read"
+        );
+        assert!(
+            context.parent_span_id.is_none(),
+            "an ignored header became a parent"
+        );
+        assert_eq!(observing.outbound_traceparent(&context), None);
+    }
+
+    #[test]
+    fn extract_continues_the_trace_and_leaves_the_header_alone() {
+        // Today's behaviour, and the default. The client's header is what a backend receives —
+        // Volucer writes nothing — so a backend's spans are siblings of this server's span.
+        let observing = observing(None).with_propagation(TracePropagation::Extract);
+        let context = observing.begin(None, Some(CLIENT_TRACE));
+        assert_eq!(
+            context.trace.trace_id_hex(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(
+            context.parent_span_id.map(hex16).as_deref(),
+            Some("00f067aa0ba902b7")
+        );
+        assert_eq!(observing.outbound_traceparent(&context), None);
+    }
+
+    #[test]
+    fn inject_starts_a_trace_here_and_writes_it() {
+        // The half that does not read: a client's trace is deliberately *not* joined, and the
+        // header a backend gets is this server's own.
+        let observing = observing(None).with_propagation(TracePropagation::Inject);
+        let context = observing.begin(None, Some(CLIENT_TRACE));
+        assert_ne!(
+            context.trace.trace_id_hex(),
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "an injected trace joined the caller's"
+        );
+
+        let header = observing
+            .outbound_traceparent(&context)
+            .expect("inject must write a header");
+        // The rendered header is the context the span will be exported with, which is the whole
+        // point: a backend's child must name the span id this process reports.
+        assert_eq!(header, context.trace.header());
+        assert_eq!(&header[3..35], context.trace.trace_id_hex());
+        assert_eq!(&header[36..52], context.trace.span_id_hex());
+    }
+
+    #[test]
+    fn propagate_continues_the_callers_trace_and_writes_our_span() {
+        // The value this whole key exists for. The trace id stays the caller's, the span id is
+        // ours, and the backend is told ours — so its spans are children rather than siblings.
+        let observing = observing(None).with_propagation(TracePropagation::Propagate);
+        let context = observing.begin(None, Some(CLIENT_TRACE));
+        assert_eq!(
+            context.trace.trace_id_hex(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+
+        let header = observing
+            .outbound_traceparent(&context)
+            .expect("propagate must write a header");
+        assert_eq!(&header[3..35], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_ne!(
+            &header[36..52],
+            "00f067aa0ba902b7",
+            "the backend was handed the caller's span id, so its spans would be siblings"
+        );
+        assert_eq!(&header[36..52], context.trace.span_id_hex());
+        // And the caller's span is still recorded as this span's parent, so the export is not a
+        // root that dropped its link.
+        assert_eq!(
+            context.parent_span_id.map(hex16).as_deref(),
+            Some("00f067aa0ba902b7")
+        );
+    }
+
+    #[test]
+    fn a_malformed_inbound_header_under_propagate_starts_a_fresh_trace_and_still_writes() {
+        // The failure mode that would be worst: a broken client header must not leave a backend
+        // with no context at all, because then `propagate` would silently stop working for exactly
+        // the requests that already had a problem.
+        let observing = observing(None).with_propagation(TracePropagation::Propagate);
+        let context = observing.begin(None, Some("00-not-a-trace-x-01"));
+        assert!(context.parent_span_id.is_none());
+        let header = observing
+            .outbound_traceparent(&context)
+            .expect("still writes");
+        assert_eq!(header.len(), 55);
+        assert_eq!(&header[36..52], context.trace.span_id_hex());
+    }
+
+    /// The lowercase hex of a span id, for assertions.
+    fn hex16(id: [u8; 8]) -> String {
+        let mut out = String::with_capacity(16);
+        push_hex(&mut out, &id);
+        out
+    }
+
+    // ------------------------------------------------------------------ sampling
+    //
+    // The key that decides what *leaves* the process, as distinct from `trace_context`, which
+    // decides what a backend is handed. The two interact in exactly one place — the `sampled` bit —
+    // and that interaction is what most of these tests are about.
+
+    /// A trace id whose rightmost seven bytes are a chosen value, for the ratio tests.
+    ///
+    /// Built from the value rather than written as a constant so a test can say "just below the
+    /// threshold" and mean it: the sampler reads the low 56 bits, so those are the bits this sets.
+    fn id_with_randomness(value: u64) -> [u8; 16] {
+        let mut id = [0xaau8; 16];
+        id[9..].copy_from_slice(&value.to_be_bytes()[1..]);
+        id
+    }
+
+    #[test]
+    fn the_default_sampler_records_a_root_and_obeys_a_parent() {
+        // OTel's `ParentBased(root=AlwaysOn)`, and both halves matter. The root half is what makes
+        // a single-service deployment export anything at all; the parent half is what stops a
+        // proxy spending a tracing budget somebody else set.
+        let sampler = Sampler::default();
+        assert!(sampler.samples(id_with_randomness(1), None), "a root");
+        assert!(
+            sampler.samples(id_with_randomness(1), Some(true)),
+            "a parent that asked to be recorded"
+        );
+        assert!(
+            !sampler.samples(id_with_randomness(1), Some(false)),
+            "a parent that asked not to be, which is the half nginx's $otel_parent_sampled covers"
+        );
+    }
+
+    #[test]
+    fn always_records_what_a_parent_asked_to_drop() {
+        // The one thing `always` changes, stated as an assertion rather than as documentation: it
+        // overrides an explicit `-00` and does nothing else that differs from the default.
+        let sampler = Sampler::Always;
+        assert!(sampler.samples(id_with_randomness(1), Some(false)));
+        assert!(sampler.samples(id_with_randomness(1), None));
+        assert!(sampler.samples(id_with_randomness(1), Some(true)));
+    }
+
+    #[test]
+    fn a_ratio_is_exact_at_both_ends() {
+        // `0.0` and `1.0` are the values an operator writes to mean "none" and "all", so they must
+        // not be `~all` and `~none` — a rounding error at either end is a deployment exporting
+        // nothing or everything while believing the opposite.
+        let none = Sampler::ratio(0.0).expect("zero is a legal ratio");
+        let all = Sampler::ratio(1.0).expect("one is a legal ratio");
+        for value in [0u64, 1, (1 << 55), (1 << 56) - 1] {
+            let id = id_with_randomness(value);
+            assert!(!none.samples(id, None), "0.0 kept {value}");
+            assert!(all.samples(id, None), "1.0 dropped {value}");
+        }
+    }
+
+    #[test]
+    fn a_ratio_keeps_the_same_half_of_the_space_that_a_higher_one_would() {
+        // **The monotonicity the specification requires**, and the property that makes a ratio
+        // usable across hops: a backend sampling more generously than the front-end must keep
+        // everything the front-end kept, or traces appear to fork. Asserted over a spread of trace
+        // ids rather than one, because a sampler that read the wrong byte would still be monotone
+        // at a single point.
+        let sparse = Sampler::ratio(0.1).expect("a ratio");
+        let dense = Sampler::ratio(0.5).expect("a ratio");
+        let mut kept_sparse = 0;
+        let mut kept_dense = 0;
+        for step in 0..256u64 {
+            // Spread across the whole 56-bit space rather than clustered low, so this is a sample
+            // of the space and not of one corner of it.
+            let id = id_with_randomness(step * ((1 << 56) / 256));
+            let (a, b) = (sparse.samples(id, None), dense.samples(id, None));
+            assert!(!a || b, "a trace kept at 0.1 was dropped at 0.5");
+            kept_sparse += u64::from(a);
+            kept_dense += u64::from(b);
+        }
+        // Roughly a tenth and a half of 256, with a wide band because this is a deterministic hash
+        // and not a random draw — the assertion is that the mechanism discriminates at all, which a
+        // sampler returning a constant would fail.
+        assert!(
+            (5..=60).contains(&kept_sparse),
+            "0.1 kept {kept_sparse} of 256"
+        );
+        assert!(
+            kept_dense > kept_sparse,
+            "0.5 ({kept_dense}) kept no more than 0.1 ({kept_sparse})"
+        );
+    }
+
+    #[test]
+    fn a_ratio_is_a_function_of_the_trace_id_alone() {
+        // The property that makes the decision reproducible at another hop: same id, same answer,
+        // with no clock and no per-process state involved. Two fresh values of the type, built
+        // independently, must agree — which a sampler seeded from a counter would not.
+        let id = id_with_randomness(0x0123_4567_89ab);
+        let first = Sampler::ratio(0.25).expect("a ratio");
+        let second = Sampler::ratio(0.25).expect("a ratio");
+        assert_eq!(first.samples(id, None), second.samples(id, None));
+        assert_eq!(
+            first.samples(id, Some(true)),
+            second.samples(id, Some(true))
+        );
+        // And the ratio ignores the parent entirely: it is not a parent-based sampler.
+        assert_eq!(first.samples(id, None), first.samples(id, Some(false)));
+    }
+
+    #[test]
+    fn a_ratio_outside_the_representable_range_is_refused_rather_than_clamped() {
+        // `1.5` is an arithmetic error, and reading it as "all traces" is how a bill gets decided
+        // by a typo. `2^-56` is the floor because 56 bits of trace id is the whole sampling space;
+        // anything below it rounds to "never", which `0.0` already says exactly.
+        for bad in [f64::NAN, f64::INFINITY, -0.0 - 0.1, 1.5, 2.0, 1e-30] {
+            assert!(
+                Sampler::ratio(bad).is_none(),
+                "{bad} was accepted as a ratio"
+            );
+        }
+        assert!(Sampler::ratio(Sampler::MIN_RATIO).is_some());
+        assert_eq!(
+            Sampler::MIN_RATIO,
+            crate_min_ratio(),
+            "the behaviour floor and the configuration's must be one number"
+        );
+    }
+
+    /// The configuration crate's floor, reached through the constant rather than restated.
+    ///
+    /// A literal here would be a second copy of the number, and the copy would keep passing after
+    /// the real one was changed — which is the hazard the `propagate` mirror already guards against
+    /// in the other direction.
+    fn crate_min_ratio() -> f64 {
+        1.0 / (1u64 << 56) as f64
+    }
+
+    #[test]
+    fn the_sampling_decision_reaches_the_exported_span_as_the_flag_the_backend_was_given() {
+        // **The mismatch this whole change removes.** An inbound `-00` used to be propagated as
+        // `00` while the exporter wrote `"flags":1`, so the backend was told the trace was not
+        // recorded and the collector was told it was. Asserted through `outbound_traceparent` and
+        // the recorded span together, because it is the *agreement* between the two that matters.
+        let recording = std::sync::Arc::new(Recording::default());
+        let observing = observing(None)
+            .with_propagation(TracePropagation::Propagate)
+            .with_sampling(Sampler::ParentBased)
+            .with_spans(recording.clone());
+
+        let dropped = observing.begin(None, Some(UNSAMPLED_CLIENT_TRACE));
+        assert!(
+            observing
+                .outbound_traceparent(&dropped)
+                .expect("still writes")
+                .ends_with("-00"),
+            "the caller asked not to be recorded"
+        );
+        observing.record_server_span(
+            &dropped,
+            dropped.started_at,
+            dropped.started_at,
+            empty_span(),
+        );
+        assert_eq!(
+            recording.spans(),
+            0,
+            "a trace the caller dropped was exported anyway, so flags and traceparent disagree"
+        );
+
+        let kept = observing.begin(None, Some(CLIENT_TRACE));
+        assert!(observing
+            .outbound_traceparent(&kept)
+            .expect("still writes")
+            .ends_with("-01"));
+        observing.record_server_span(&kept, kept.started_at, kept.started_at, empty_span());
+        assert_eq!(recording.spans(), 1);
+        assert_eq!(
+            recording.flags(),
+            vec![span::TRACE_FLAG_SAMPLED],
+            "the exported flag must be the one the backend was told"
+        );
+    }
+
+    #[test]
+    fn an_always_sampler_writes_the_flag_it_exports() {
+        // The other direction: `always` overrides a `-00` caller, and the header must then say
+        // `-01` — otherwise the backend would honour the caller's flag, decline to record, and the
+        // parent span this server exports would hang over children that do not exist.
+        let observing = observing(None)
+            .with_propagation(TracePropagation::Propagate)
+            .with_sampling(Sampler::Always);
+        let context = observing.begin(None, Some(UNSAMPLED_CLIENT_TRACE));
+        assert_eq!(
+            observing
+                .outbound_traceparent(&context)
+                .map(|h| h[52..].to_string()),
+            Some("-01".to_string())
+        );
+    }
+
+    /// A recorder that keeps what it was given, for the two assertions above.
+    #[derive(Default)]
+    struct Recording {
+        spans: std::sync::Mutex<Vec<span::Span>>,
+    }
+
+    impl Recording {
+        fn spans(&self) -> usize {
+            self.spans.lock().expect("not poisoned").len()
+        }
+
+        fn flags(&self) -> Vec<u8> {
+            self.spans
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .map(|span| span.flags)
+                .collect()
+        }
+    }
+
+    impl span::SpanRecorder for Recording {
+        fn record(&self, span: span::Span) {
+            self.spans.lock().expect("not poisoned").push(span);
+        }
+    }
+
+    /// The smallest `ServerSpanAttributes` that satisfies the type.
+    fn empty_span() -> ServerSpanAttributes<'static> {
+        ServerSpanAttributes {
+            method: "GET",
+            path: "/",
+            host: None,
+            status: 200,
+            name: "http.request",
+            status_message: None,
+            extra: &[],
+        }
     }
 }

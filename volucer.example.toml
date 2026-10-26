@@ -61,6 +61,24 @@ fastcgi = "127.0.0.1:9080"
 # Zero is refused rather than read as "unlimited" -- a zero here refuses every
 # request with a body, which is never what was meant.
 # max_body_bytes = 33554432     # 32 MiB
+# What a backend is handed as its `traceparent`. The four values are nginx's
+# `otel_trace_context`, with the same meaning:
+#
+#   "ignore"     reads nothing, writes nothing
+#   "extract"    reads the client's trace and continues it; the client's header
+#                still reaches the backend unchanged  <- the default
+#   "inject"     starts a trace here and hands it to the backend
+#   "propagate"  reads the client's trace, and hands the backend *our* span id
+#
+# `extract` is the default because it is what this server has always done: the
+# client's header is relayed, so a backend's spans are *siblings* of this
+# server's span. `propagate` replaces it, so they become *children* -- which is
+# what makes a waterfall diagram show one request rather than two branches.
+#
+# It works without a `[telemetry]` table, and that is the point: the deployment
+# that needs it most exports nothing from here (nginx in front, a collector
+# behind the application) and still has to give the backend a context to join.
+# trace_context = "propagate"
 
 # ---------------------------------------------------------------------------
 # The environment every process this deployment starts inherits: a worker pool,
@@ -986,18 +1004,44 @@ base_port = 19001
 # path is the protocol's, not yours, and is appended. Write it with no path, or
 # paste a full URL including `/v1/traces`: both are accepted.
 #
-# The `traceparent` this exports is the one this server already sends to PHP
-# (and to any `upstream` origin), so a backend's spans and this server's span
-# are one trace rather than two. Nothing in a backend has to change.
+# The `traceparent` this server hands a backend is decided by
+# `[server] trace_context`, not here -- see the `[server]` section above. Under
+# the default, `extract`, the client's header is relayed untouched and a
+# backend's spans are *siblings* of this server's span. `propagate` replaces it
+# with this server's own context, which is what makes them children of one
+# request in a trace view.
 #
 # A batch fills up and is sent, or waits `interval_ms` and is sent anyway --
 # which is what makes a service handling one request a minute still produce
 # traces. A collector that is down costs dropped batches and one warning, never
 # a failed request: the same rule the access log follows for a full disk.
+#
+# `sample` decides which traces leave this process. It is not the same question
+# as `[server] trace_context`: that says what a *backend* is handed and works
+# with no [telemetry] table at all, while this says what is sent to the
+# collector. The default, `parent_based`, records a caller that asked to be
+# recorded and also a request that arrived with no traceparent at all -- a
+# *root*, which is what a deployment with nothing in front of it produces. That
+# second half is why the default is not "export nothing until told": a caller
+# that explicitly says `-00` is obeyed, and a caller that says nothing is not.
+# nginx spells the same rule `otel_trace $otel_parent_sampled`.
+#
+# `ratio` exports a deterministic fraction of traces, chosen from the trace id,
+# so every hop applying the same fraction agrees about the same trace. Lowering
+# it only ever removes traces, which lets a backend sample more generously than
+# this front-end without losing anything this one kept. `0` and `1` are exact,
+# and the smallest non-zero value is 2^-56 -- the resolution of the 56 bits of
+# trace id the decision reads. `sample_ratio` on any other mode is refused
+# rather than ignored, the same rule [metrics.collect].buckets follows.
+#
+# Sampling never touches the access log and never changes the trace id: a
+# dropped trace is still logged with the id to search for.
 # ---------------------------------------------------------------------------
 # [telemetry]
 # endpoint = "http://127.0.0.1:4318"
 # service_name = "volucer"
+# sample = "parent_based"   # "parent_based", "always" or "ratio"
+# sample_ratio = 0.1        # only with sample = "ratio"
 # timeout_ms = 10000        # per export request, not a total budget
 # batch_size = 512
 # interval_ms = 5000        # send a partly-filled batch after this long

@@ -24,6 +24,13 @@
 
 use std::time::SystemTime;
 
+/// W3C's `sampled` trace flag: bit 0 of the flags byte in a `traceparent` and in OTLP's `flags`.
+///
+/// A named constant rather than a bare `1` at each site, because it is bit 0 of a byte whose other
+/// seven bits are reserved — a `|= 1` somewhere and a `0x01` somewhere else is how a shift ends up
+/// on the wrong bit.
+pub const TRACE_FLAG_SAMPLED: u8 = 0x01;
+
 /// How a span relates to the work around it.
 ///
 /// The numbers are OTLP's own `SpanKind`, written down here rather than left to a mapping in the
@@ -134,6 +141,32 @@ pub struct Span {
     pub status: SpanStatus,
     /// The human-readable reason, for a failure.
     pub status_message: Option<String>,
+    /// W3C trace flags, as they will be written in the OTLP `flags` field.
+    ///
+    /// Bit 0 is `sampled`, and it is **carried rather than assumed**. A span that reaches this
+    /// crate was sampled by definition — but the field also describes the *trace*, and a collector
+    /// uses it to decide whether the trace is complete. Writing `1` unconditionally, which an
+    /// earlier version did, would claim a trace was recorded when the flag a backend was handed
+    /// said otherwise.
+    pub flags: u8,
+}
+
+impl Span {
+    /// The W3C trace flags for a request context.
+    ///
+    /// The one conversion from "this server's sampling decision" to "the bit the protocol carries",
+    /// so the value written into a span and the value written into a `traceparent` cannot be
+    /// spelled differently. Reserved bits are not set: this crate does not know what a future
+    /// revision means by them, which is the same rule [`crate::TraceContext::parse`] follows when
+    /// it reads one.
+    #[must_use]
+    pub const fn flags_for(sampled: bool) -> u8 {
+        if sampled {
+            TRACE_FLAG_SAMPLED
+        } else {
+            0
+        }
+    }
 }
 
 impl Span {
@@ -272,6 +305,7 @@ mod tests {
             attributes: Vec::new(),
             status: SpanStatus::Unset,
             status_message: None,
+            flags: TRACE_FLAG_SAMPLED,
         };
         assert_eq!(span.duration_nanos(), 0);
     }
@@ -289,6 +323,7 @@ mod tests {
             attributes: Vec::new(),
             status: SpanStatus::Unset,
             status_message: None,
+            flags: TRACE_FLAG_SAMPLED,
         };
         assert_eq!(span.duration_nanos(), 1_500_000);
     }

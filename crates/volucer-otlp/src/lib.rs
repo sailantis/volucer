@@ -500,6 +500,8 @@ mod tests {
             timeout_ms: 1_000,
             batch_size: 8,
             interval_ms: 50,
+            sample: volucer_core::config::SampleMode::ParentBased,
+            sample_ratio: None,
         }
     }
 
@@ -515,6 +517,7 @@ mod tests {
             attributes: Vec::new(),
             status: volucer_observe::span::SpanStatus::Unset,
             status_message: None,
+            flags: volucer_observe::span::TRACE_FLAG_SAMPLED,
         }
     }
 

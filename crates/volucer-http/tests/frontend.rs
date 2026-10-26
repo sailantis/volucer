@@ -1574,6 +1574,10 @@ enum OriginBehaviour {
     TwoChunks { pause_ms: u64 },
     /// Read the whole request body and answer with its length. Proves the body was not truncated.
     EchoLength,
+    /// Answer with the `traceparent` the request carried, or `-` when it carried none. The one
+    /// fixture that can tell "the proxy forwarded the client's header" from "the proxy wrote its
+    /// own", which is the whole of `[server].trace_context`.
+    EchoTraceparent,
 }
 
 /// A test origin: a stdlib listener that answers every request the same way.
@@ -1675,6 +1679,26 @@ fn serve_origin(mut stream: TcpStream, behaviour: OriginBehaviour, seen: &Arc<At
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
                 body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+        OriginBehaviour::EchoTraceparent => {
+            let raw = read_request(&mut stream, false);
+            let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+            // The *last* `traceparent` line, not the first: a proxy that appended beside the
+            // client's header would put its own after it, and reading the first would then report
+            // the client's while the origin actually saw both. Asserting on the last is stricter
+            // and is what the replacement rule promises.
+            let traceparent = head
+                .lines()
+                .filter_map(|line| line.strip_prefix("traceparent:"))
+                .map(|value| value.trim().to_string())
+                .next_back()
+                .unwrap_or_else(|| "-".to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{traceparent}",
+                traceparent.len()
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
@@ -3132,4 +3156,292 @@ fn a_rate_limited_grpc_call_is_resource_exhausted_rather_than_a_429() {
         !limited.contains("429"),
         "a gRPC failure must not use an HTTP error status: {limited}"
     );
+}
+
+// ------------------------------------------------------------ trace propagation
+//
+// `[server].trace_context` decides one thing: **what the backend receives.** These tests are about
+// that, through a real origin, because the header is written by the listener and a unit test of
+// `Observability` cannot show that the value it renders is the value that goes out. The
+// configuration file is parsed rather than the enum being called directly, so the key's spelling is
+// exercised too.
+
+/// A `traceparent` whose fields are recognisable: trace `aaaa…`, span `1111…`.
+const CLIENT_TRACE: &str = "00-aaaaaaaabbbbbbbbccccccccdddddddd-1111111111111111-01";
+
+/// A listener whose only backend is an origin that echoes the `traceparent` it received.
+///
+/// The `Origin` is returned beside the server because dropping it stops its thread, and a stopped
+/// origin answers nothing — which would make every assertion below pass by comparing against a
+/// connection error rather than against a header.
+fn trace_server(trace_context: &str) -> Option<(Server, Origin)> {
+    trace_server_with(trace_context, volucer_observe::Sampler::default())
+}
+
+/// The same listener, with an explicit sampling policy.
+///
+/// A second builder rather than a third argument on the first, because almost every test above
+/// wants the default and a call site that passes it every time is noise that hides the two tests
+/// which actually vary it.
+fn trace_server_with(
+    trace_context: &str,
+    sampler: volucer_observe::Sampler,
+) -> Option<(Server, Origin)> {
+    let origin = Origin::start(OriginBehaviour::EchoTraceparent);
+    let text = format!(
+        r#"
+[server]
+default_backend = "origin"
+http = "127.0.0.1:0"
+trace_context = "{trace_context}"
+
+[backends.origin]
+kind = "upstream"
+origin = "http://{}"
+"#,
+        origin.address
+    );
+    let config = Config::from_toml(&text).expect("the test's configuration parses");
+    config
+        .validate()
+        .expect("a legal trace_context value validates");
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&config, routing.clone())
+        .expect("an upstream backend starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_observability(std::sync::Arc::new(
+        volucer_observe::Observability::disabled()
+            .with_propagation(propagation_of(config.server.trace_context))
+            .with_sampling(sampler),
+    ));
+    let server = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)?;
+    Some((server, origin))
+}
+
+/// The configuration value as the behaviour enum, mirroring `volucer`'s own conversion.
+///
+/// Duplicated here deliberately: the conversion in `main` is private to the binary, and a test that
+/// reached into it would be testing the binary's plumbing rather than the front-end's behaviour.
+/// The mirror is exhaustive, so a new variant fails to compile here rather than being silently
+/// mapped to a default.
+fn propagation_of(
+    mode: volucer_core::config::PropagationMode,
+) -> volucer_observe::TracePropagation {
+    use volucer_core::config::PropagationMode as From;
+    use volucer_observe::TracePropagation as To;
+    match mode {
+        From::Ignore => To::Ignore,
+        From::Extract => To::Extract,
+        From::Inject => To::Inject,
+        From::Propagate => To::Propagate,
+    }
+}
+
+/// One `GET` carrying a `traceparent`, answered by an origin that echoes what it received.
+fn get_with_trace(address: &str, traceparent: &str) -> String {
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: example.test\r\ntraceparent: {traceparent}\r\nConnection: close\r\n\r\n"
+    );
+    let answer = exchange(address, request.as_bytes());
+    assert_eq!(answer.status, 200, "{answer:?}");
+    answer.text().trim().to_string()
+}
+
+#[test]
+fn extract_relays_the_clients_header_untouched() {
+    // The default, and the behaviour that predates the key: our client's header is what the origin
+    // sees. Asserted as *equality with the client's value*, which is what makes a sibling span
+    // rather than a child, and is why `propagate` has to be opt-in.
+    let Some((server, _origin)) = trace_server("extract") else {
+        return;
+    };
+    assert_eq!(get_with_trace(&server.address, CLIENT_TRACE), CLIENT_TRACE);
+}
+
+#[test]
+fn propagate_replaces_the_header_with_this_servers_span() {
+    // **The whole point of the key.** The trace id is the caller's, the span id is not — a
+    // replacement that kept both would make two hops claim to be one span, and one that changed
+    // both would break the trace across this hop.
+    let Some((server, _origin)) = trace_server("propagate") else {
+        return;
+    };
+    let seen = get_with_trace(&server.address, CLIENT_TRACE);
+    assert_eq!(
+        &seen[3..35],
+        "aaaaaaaabbbbbbbbccccccccdddddddd",
+        "the caller's trace must be continued: {seen}"
+    );
+    assert_ne!(
+        &seen[36..52],
+        "1111111111111111",
+        "the origin was handed the caller's span id, so its spans would be siblings: {seen}"
+    );
+    assert_eq!(
+        seen.len(),
+        55,
+        "the value must be a valid traceparent: {seen}"
+    );
+    assert!(
+        seen.ends_with("-01"),
+        "the caller's sampling decision must be respected: {seen}"
+    );
+}
+
+#[test]
+fn inject_writes_a_header_where_the_client_sent_none() {
+    // The half that does not read. Without it, an origin reached by a request that carried no
+    // `traceparent` would have no context at all, and `propagate` would be silently absent for
+    // exactly the traffic this server itself originates.
+    let Some((server, _origin)) = trace_server("inject") else {
+        return;
+    };
+    let answer = exchange(
+        &server.address,
+        b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+    );
+    let seen = answer.text().trim().to_string();
+    assert_eq!(seen.len(), 55, "a header must be written anyway: {seen:?}");
+    assert!(
+        seen.starts_with("00-"),
+        "the value must be a valid traceparent: {seen}"
+    );
+    // **Sampled, because a request with no inbound context is a root.** The default sampler is
+    // OTel's `ParentBased(root=AlwaysOn)`, so this is the flag a backend is told to act on and the
+    // flag the exporter writes into the span it keeps. Reporting `-00` here was the bug that made a
+    // standalone deployment export nothing while `[telemetry]` looked configured.
+    assert!(
+        seen.ends_with("-01"),
+        "a root must be recorded, so the header must say so: {seen}"
+    );
+}
+
+#[test]
+fn ignore_does_not_participate_but_does_not_strip_the_header_either() {
+    // **`ignore` is "do not participate", not "strip".** A `traceparent` is an ordinary request
+    // header, and a proxy that deleted one under a tracing setting would be breaking a correlation
+    // its client set up, for a reason of its own. So the origin still sees the client's value; what
+    // `ignore` changes is that this server neither continues the trace nor writes a header of its
+    // own — which is observable in the *exported span's trace id*, and is asserted in
+    // `volucer-observe`'s unit tests rather than here, because there is nothing at the wire to see.
+    //
+    // Still worth pinning: it is the assertion that `ignore` did not quietly become a strip list,
+    // which would be a behaviour change for every deployment behind a client that traces.
+    let Some((server, _origin)) = trace_server("ignore") else {
+        return;
+    };
+    assert_eq!(get_with_trace(&server.address, CLIENT_TRACE), CLIENT_TRACE);
+}
+
+/// The caller's `sampled` flag reaches the backend **on the wire**, which is where a backend reads
+/// it from.
+///
+/// The distinction this pins is the one the whole sampler exists for: an explicit `-00` is a caller
+/// asking not to be recorded, and it must survive the hop; an absent header is a *root*, which the
+/// default records. An implementation that flattened both to one answer would pass one half of this
+/// test whichever answer it picked.
+#[test]
+fn the_sampled_flag_is_relayed_and_a_root_is_recorded() {
+    const UNSAMPLED: &str = "00-aaaaaaaabbbbbbbbccccccccdddddddd-1111111111111111-00";
+
+    let Some((server, _origin)) = trace_server("propagate") else {
+        return;
+    };
+    // An explicit `-00` is honoured: this is nginx's `otel_trace $otel_parent_sampled`, and it is
+    // what stops a proxy spending a tracing budget somebody upstream already declined to spend.
+    let dropped = get_with_trace(&server.address, UNSAMPLED);
+    assert_eq!(&dropped[3..35], "aaaaaaaabbbbbbbbccccccccdddddddd");
+    assert!(
+        dropped.ends_with("-00"),
+        "the caller declined to be recorded, so the backend must be told: {dropped}"
+    );
+
+    // And a request with no context at all is a root, which the default sampler records.
+    let answer = exchange(
+        &server.address,
+        b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+    );
+    let root = answer.text().trim().to_string();
+    assert!(
+        root.ends_with("-01"),
+        "a root must be recorded, or a standalone deployment exports nothing: {root}"
+    );
+}
+
+/// `always` overrides a caller's `-00`, and says so on the header.
+///
+/// The point of asserting the header rather than the export: the backend reads the header, so a
+/// server that exported the span and told the backend `-00` would produce exactly the orphaned
+/// parent span the default exists to prevent.
+#[test]
+fn always_records_a_trace_the_caller_declined_and_says_so_on_the_wire() {
+    const UNSAMPLED: &str = "00-aaaaaaaabbbbbbbbccccccccdddddddd-1111111111111111-00";
+
+    let Some((server, _origin)) = trace_server_with("propagate", volucer_observe::Sampler::Always)
+    else {
+        return;
+    };
+    let seen = get_with_trace(&server.address, UNSAMPLED);
+    assert_eq!(&seen[3..35], "aaaaaaaabbbbbbbbccccccccdddddddd");
+    assert!(
+        seen.ends_with("-01"),
+        "always must flip the flag it exports, or the backend drops a trace we kept: {seen}"
+    );
+}
+
+/// A ratio writes the flag its decision reached, for both outcomes.
+///
+/// Run over several requests with **different trace ids**, because the decision is a function of the
+/// trace id alone: reusing one caller would produce one decision repeated, which says nothing about
+/// the mechanism. Both outcomes are required to appear, which is the property that distinguishes a
+/// ratio from `always` and from a sampler that drops everything.
+#[test]
+fn a_ratio_writes_the_flag_its_decision_reached() {
+    let Some((server, _origin)) = trace_server_with(
+        "propagate",
+        volucer_observe::Sampler::ratio(0.5).expect("a ratio"),
+    ) else {
+        return;
+    };
+    let mut kept = 0;
+    let mut dropped = 0;
+    for step in 0u8..24 {
+        // A distinct trace id per request, spread across the whole 56-bit sampling space: the
+        // sampler reads the low seven bytes, so writing the step *into* those bytes puts each
+        // request at a different point in the range. Ids clustered low would all land on the same
+        // side of the threshold and the test would say nothing.
+        let mut bytes = [0xeeu8; 16];
+        bytes[0] = 0x11;
+        // The low 56 bits, with the step in the top byte of that window and a low byte that varies
+        // too, so no two requests share a decision by accident.
+        bytes[9] = step.wrapping_mul(11);
+        bytes[15] = step.wrapping_mul(7).wrapping_add(1);
+        let caller = format!(
+            "00-{}-2222222222222222-01",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let seen = get_with_trace(&server.address, &caller);
+        assert_eq!(seen.len(), 55, "{seen}");
+        assert_eq!(
+            &seen[3..35],
+            &caller[3..35],
+            "the trace must be continued, or the ratio was not applied to this caller's id"
+        );
+        if seen.ends_with("-01") {
+            kept += 1;
+        } else {
+            dropped += 1;
+        }
+    }
+    // A generous band on purpose: this is a deterministic hash over 24 trace ids, so the split is a
+    // property of those ids and not of the ratio. What must hold is that both answers occur — a
+    // constant sampler cannot produce both.
+    assert!(kept > 0, "0.5 dropped every trace");
+    assert!(dropped > 0, "0.5 kept every trace");
 }

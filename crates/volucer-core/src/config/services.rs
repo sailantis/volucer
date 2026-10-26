@@ -17,14 +17,19 @@ use super::*;
 /// traces" expressible only by leaving keys unset, which is the two-statements-one-thing this
 /// project's `[server.tls]` documentation already refuses.
 ///
-/// # The `traceparent` this exports is the one already sent to PHP
+/// # The `traceparent` this exports names the span a backend was told about
 ///
 /// Worth stating because it is the reason the export is driven directly rather than through a
-/// `tracing` subscriber layer: `volucer-observe` mints a trace id and a span id per request and puts
-/// *that* header on the request it hands a backend, so PHP's spans — and any origin's — name this
-/// server's span as their parent. An exporter that minted its own span id would export a parent no
-/// child points at, and the waterfall would break at exactly the seam it exists to show.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `tracing` subscriber layer: `volucer-observe` mints a trace id and a span id per request, and
+/// when `[server].trace_context` is `propagate` or `inject` it puts *that* header on the request it
+/// hands a backend — so PHP's spans, and any origin's, name this server's span as their parent. An
+/// exporter that minted its own span id would export a parent no child points at, and the waterfall
+/// would break at exactly the seam it exists to show.
+///
+/// Under the default, `extract`, the backend keeps the client's header, so its spans are siblings
+/// of this server's rather than children — which is the behaviour that predates the key, and the
+/// reason `propagate` names an *additional* behaviour rather than a correction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// The collector's OTLP/HTTP endpoint: where `/v1/traces` is appended.
@@ -81,6 +86,144 @@ pub struct TelemetryConfig {
     /// timeout is what makes the feature usable below the batch size.
     #[serde(default = "default_telemetry_interval_ms")]
     pub interval_ms: u64,
+
+    /// Which traces are exported. Defaults to `"parent_based"`.
+    ///
+    /// # Why this is here rather than beside `[server].trace_context`
+    ///
+    /// Because it is a different question. `trace_context` decides **what a backend is handed** — a
+    /// fact about the request path that exists whether or not this process exports anything — while
+    /// this decides **what leaves the process**, which is a fact about cost. Folding them together
+    /// would make "propagate, but let the caller decide whether to record" inexpressible, and that is
+    /// the ordinary shape of a proxy behind a tracing front-end.
+    ///
+    /// # The three values
+    ///
+    /// | Value | Exports |
+    /// | --- | --- |
+    /// | `"parent_based"` — the default | The traces an upstream service already decided to record, **and** a request that arrived with no `traceparent` at all. OTel's `ParentBased(root=AlwaysOn)`. |
+    /// | `"always"` | Every trace, whatever the inbound flag said. |
+    /// | `"ratio"` | The fraction given by [`Self::sample_ratio`], chosen deterministically from the trace id. |
+    ///
+    /// **`parent_based` is the default because it is what makes a trace one trace.** Under
+    /// `[server] trace_context = "propagate"` a backend is handed this server's context; if this hop
+    /// exported a trace the caller had marked `-00` while the backend honoured the flag, a trace view
+    /// would show Volucer's span as an orphan with no children — which looks like a broken backend.
+    /// nginx spells the same policy `otel_trace $otel_parent_sampled`.
+    ///
+    /// A request with **no** inbound `traceparent` is the other half and is not the same thing: it
+    /// has no parent to defer to, so it is recorded. Without that, a single-service deployment with
+    /// nothing in front of it would export nothing while believing tracing was on.
+    ///
+    /// This is *not* a per-request switch. Sampling never removes a request from the access log, and
+    /// never changes the trace id: a dropped trace is still logged with the id to search for, so a
+    /// missing span is diagnosable from the log rather than invisible.
+    ///
+    /// There is deliberately no `"never"`: a deployment that wants no traces leaves the table out,
+    /// and a second way to say it would be a way for the two to disagree.
+    #[serde(default)]
+    pub sample: SampleMode,
+
+    /// The fraction of traces exported when `sample = "ratio"`, between `2^-56` and `1`.
+    ///
+    /// Required for `"ratio"` and **refused for the other two**, on the same rule `[telemetry.headers]`
+    /// follows for a malformed name: a setting that will be ignored is worse than one that is absent,
+    /// because an operator who wrote it believes it does something.
+    ///
+    /// The decision is a function of the trace id alone — the seven rightmost bytes, per the W3C
+    /// consistent-probability rule — so every hop applying the same fraction agrees, and lowering the
+    /// fraction only ever removes traces. `1.0` is exact ("all") rather than approximate, and `0.0` is
+    /// accepted and means "none", which is how a deployment turns tracing off without deleting a
+    /// table that carries its endpoint and headers.
+    ///
+    /// Out-of-range values are refused rather than clamped: `1.5` is an arithmetic error, and reading
+    /// it as "all traces" is how a tracing bill gets decided by a typo.
+    #[serde(default)]
+    pub sample_ratio: Option<f64>,
+}
+
+/// What `[server].trace_context` says, in the configuration model.
+///
+/// A mirror of `volucer_observe::TracePropagation`, and duplicated for the same reason
+/// [`ChecksumMode`] is: `volucer-core` is the leaf crate every other one depends on, so it cannot
+/// take a dependency on the crate that owns the behaviour. The two are converted in one place —
+/// where the process builds its `Observability` — and a test asserts the mappings agree, so a
+/// variant added to one and not the other is a compile error rather than a silently ignored key.
+///
+/// # Why this is a `[server]` key and not a `[telemetry]` one
+///
+/// It decides **what a backend receives**, which is a property of the request path; `[telemetry]`
+/// is about where finished spans go, and it requires an `endpoint` because an exporter with nowhere
+/// to send is not a feature. A deployment with an nginx in front and a collector behind the
+/// application still wants its backend's spans joined to the caller's trace, and it exports nothing
+/// from here — so a key that only existed inside `[telemetry]` could not express it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationMode {
+    /// Neither read the client's context nor write ours.
+    Ignore,
+    /// Read and continue the client's context. The client's header still reaches the backend.
+    #[default]
+    Extract,
+    /// Start a fresh trace here and hand it to the backend.
+    Inject,
+    /// Read and continue the client's context, and hand *ours* to the backend.
+    Propagate,
+}
+
+impl PropagationMode {
+    /// The value as written in configuration.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Extract => "extract",
+            Self::Inject => "inject",
+            Self::Propagate => "propagate",
+        }
+    }
+
+    /// Whether an inbound `traceparent` is read.
+    #[must_use]
+    pub fn extracts(self) -> bool {
+        matches!(self, Self::Extract | Self::Propagate)
+    }
+
+    /// Whether a backend receives this server's context instead of the client's.
+    #[must_use]
+    pub fn injects(self) -> bool {
+        matches!(self, Self::Inject | Self::Propagate)
+    }
+}
+
+/// What `[telemetry].sample` says, in the configuration model.
+///
+/// A mirror of the *policy* half of `volucer_observe::Sampler`, and the split is worth stating: the
+/// ratio's value lives beside it in [`TelemetryConfig::sample_ratio`] because a value the behaviour
+/// type holds cannot be validated at parse time by the crate that owns the configuration. So the two
+/// crates share the three names and the validation, and neither duplicates the arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleMode {
+    /// Export the traces an upstream service already decided to record. The default.
+    #[default]
+    ParentBased,
+    /// Export every trace, whatever the inbound flag said.
+    Always,
+    /// Export the fraction given by [`TelemetryConfig::sample_ratio`].
+    Ratio,
+}
+
+impl SampleMode {
+    /// The value as written in configuration and printed by `volucer check`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentBased => "parent_based",
+            Self::Always => "always",
+            Self::Ratio => "ratio",
+        }
+    }
 }
 
 fn default_service_name() -> String {
@@ -105,6 +248,15 @@ fn default_telemetry_interval_ms() -> u64 {
 /// deployment's: a collector that served traces elsewhere would not be an OTLP collector, and an
 /// operator who needs a path prefix has a reverse proxy for exactly that.
 pub const OTLP_TRACES_PATH: &str = "/v1/traces";
+
+/// The smallest `[telemetry].sample_ratio` that is not zero: `2^-56`.
+///
+/// Not an arbitrary floor but the arithmetic of the scheme. The sampling decision reads 56 bits of
+/// the trace id, so no smaller probability can be expressed — a request to keep one trace in
+/// 2^57 is a request this cannot honour, and accepting it would be claiming a precision that does
+/// not exist. Declared here, in the configuration model, because it is a *validation* bound; the
+/// behaviour crate's `Sampler::MIN_RATIO` is the same number and a test asserts they agree.
+pub const MIN_SAMPLE_RATIO: f64 = 1.0 / (1u64 << 56) as f64;
 
 impl TelemetryConfig {
     /// The endpoint as an *origin* — scheme and authority, no path.

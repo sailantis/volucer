@@ -9,6 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[telemetry].sample` controls which traces are exported.** The default, `parent_based`, follows
+  the sampling decision in an incoming trace and records requests with no `traceparent` (root
+  requests). `always` exports every trace. `ratio` exports the fraction configured by
+  `[telemetry].sample_ratio`, selected deterministically from the trace ID using the W3C
+  consistent-probability rule. This lets every hop using the same ratio agree on which traces to
+  record; lowering the ratio only removes traces. Ratios `0` and `1` are exact, and the smallest
+  non-zero ratio is `2^-56`, the resolution of the 56-bit decision. Invalid or unused ratio settings
+  are rejected at startup rather than clamped or ignored. Sampling does not affect access logging or
+  change the trace ID, so a trace omitted from export can still be found in the log by its ID.
 - **`-o` can update entries in an array of tables.** For example,
   `-o server.routes[0].backend=app` updates a field on the first entry. Using the array's length as
   the index appends an entry; skipping an index or targeting a container of the wrong type is
@@ -18,9 +27,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   like TOML but are invalid — including PHP array syntax (`['k' => 'v']`) and JSON
   (`[{"k": "v"}]`) — now produce a syntax error instead of being treated as strings and failing
   later with a type error.
+- **`[server] trace_context` decides what a backend is handed as its `traceparent`.** The four
+  values are nginx's `otel_trace_context` — `ignore`, `extract`, `inject`, `propagate` — with the
+  same meaning, and `extract` is the default because it is what the server has always done: the
+  client's header reaches the backend unchanged, so a backend's spans are *siblings* of this
+  server's span. Under `propagate` the backend is handed this server's own context instead, so its
+  spans are *children* and a trace view shows one request rather than two branches hanging from it.
+  The replacement applies to all three backend kinds — a worker's `HTTP_TRACEPARENT`, an
+  `upstream` origin's forwarded header, and the FastCGI listener's `PARAMS` block, where the entry
+  is replaced rather than appended to because two entries would leave the parent decided by
+  whichever one an application reads first. The key needs no `[telemetry]` table: it is about what a
+  backend is told, which is exactly what the deployment that exports nothing from here (nginx in
+  front, a collector behind the application) still has to configure. Without it, a backend's spans
+  and this server's were siblings, so a waterfall split at the hop this server had just added.
+- **The access log carries the trace id**, after the two timings and before the request id, as the
+  32 lowercase hex characters a collector shows — nginx spells the same value `$otel_trace_id`. A
+  `-` in the text format and `null` in the JSON one when the request belongs to no trace, the same
+  distinction `origin_time` makes. Without it, joining a log line to a trace was a manual copy of a
+  timestamp into a query.
 
 ### Fixed
 
+- **An unsampled trace was exported as sampled.** The OTLP encoder wrote `"flags":1` unconditionally
+  and ignored the `sampled` bit, so a caller that sent `traceparent …-00` had its trace propagated
+  onward as *unsampled* while this server exported its span as *sampled* — the backend and the
+  collector were told opposite things about one trace, and nothing on the wire failed. The flag is
+  now carried from the request's context into the span, so the bit on the outbound `traceparent` and
+  the bit in the exported payload are one decision. This is what nginx's `otel_trace
+  $otel_parent_sampled` covers, and it is why a trace the caller dropped now produces no export at
+  all rather than an orphaned parent span.
+- **A request with no `traceparent` was treated as unsampled.** It has no parent to defer to — it is
+  a *root* — and reporting it `00` meant a standalone deployment, with no proxy in front, exported
+  nothing at all while `[telemetry]` looked configured. Roots are now recorded, which is OTel's
+  `ParentBased(root=AlwaysOn)`; an explicit `-00` from a caller is still obeyed.
 - **The docs claimed arrays of tables and maps could only be set in a file.** Maps always took
   dotted keys, and an array of tables could already be replaced with an inline TOML value
   (`-o 'server.routes=[{ path_prefix = "/api" }]'`). Both pages now describe what the parser does.

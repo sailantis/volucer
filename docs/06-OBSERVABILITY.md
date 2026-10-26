@@ -29,21 +29,24 @@ the service account can write to it before starting Volucer.
 
 ### The format
 
-The default format follows nginx's `combined` layout, with three fields appended:
+The default format follows nginx's `combined` layout, with four fields appended:
 
 ```
-127.0.0.1 - - [16/Oct/2026:21:35:05 +0000] "GET /x HTTP/1.1" 200 21 "-" "curl/8" 0.012 0.004 3f2504e0-4f89-11d3-9a0c-0305e82c3301
+127.0.0.1 - - [16/Oct/2026:21:35:05 +0000] "GET /x HTTP/1.1" 200 21 "-" "curl/8" 0.012 0.004 4bf92f3577b34da6a3ce929d0e0e4736 3f2504e0-4f89-11d3-9a0c-0305e82c3301
 ```
 
-These fields are total request time, time to the origin's first byte, and request ID.
-Total request time includes the time spent receiving the client's request body. The
-origin-time field helps distinguish time spent waiting for an origin from time spent
-receiving or processing the request.
+The four appended fields, in order, are total request time, time to the origin's first byte,
+trace ID, and request ID. Total request time includes receiving the client's request body.
+Compare it with the origin time to distinguish time spent waiting for the origin from time
+spent receiving or processing the request.
 
-The origin-time field is `-` when the request had no origin, such as a static-file response.
-An origin that responds immediately has a measured duration instead. With
-`format = "json"`, each line is a JSON object and `origin_time` is `null` when there was no
-origin.
+The trace ID uses the same 32 lowercase hexadecimal characters shown by a trace collector
+(nginx's `$otel_trace_id`), so you can copy it from a log line directly into a trace query.
+It is `-` when the request has no trace, and `null` in JSON format.
+
+Origin time is `-` when the request has no origin, such as a static-file response. If an
+origin responds immediately, its measured duration is still recorded. In JSON format, each
+line is an object and `origin_time` is `null` when there was no origin.
 
 ### Rotation
 
@@ -221,11 +224,49 @@ if you do not need both.
 
 Volucer parses and continues the W3C `traceparent` header. When a valid header is present,
 the request keeps its trace ID and Volucer creates a span for its own work. If the header is
-missing or malformed, Volucer starts a new, unsampled trace.
+missing or malformed, Volucer starts a new trace — a **root**, which the default sampler
+records.
 
-Volucer forwards trace context to backends without additional configuration. For PHP
-workers, `traceparent` is exposed as `HTTP_TRACEPARENT`; the header is not removed by the
-strip lists.
+What a backend is handed is decided by `[server].trace_context`, which has the same four
+values as nginx's `otel_trace_context`:
+
+| Value | Reads the client's `traceparent` | Writes Volucer's for the backend |
+|---|---|---|
+| `ignore` | no | no |
+| `extract` | yes | no — **the default** |
+| `inject` | no | yes |
+| `propagate` | yes | yes |
+
+```toml
+[server]
+trace_context = "propagate"
+```
+
+Under `extract`, the default, a client's header reaches the backend unchanged. That is what
+this server has always done, and it means a backend's spans are **siblings** of Volucer's
+span: both name the caller as their parent.
+
+Under `propagate`, the backend is handed *Volucer's* context instead, so its spans are
+**children** of Volucer's span and a trace view shows one request rather than two branches
+hanging from it. This is nginx's `otel_trace_context propagate`, and it is the value to set
+when the backend produces its own spans.
+
+The replacement applies to every backend kind:
+
+- a worker sees `HTTP_TRACEPARENT` in the CGI environment it rebuilds from the request;
+- an `upstream` origin receives the header on the request it is proxied;
+- a FastCGI backend — including the FastCGI *listener*, behind nginx — is dispatched with
+  the `PARAMS` entry replaced rather than appended to. Replacing matters: two
+  `HTTP_TRACEPARENT` entries would leave the parent decided by whichever one the application
+  reads first.
+
+`ignore` does not *strip* the header. A `traceparent` is an ordinary request header, and
+Volucer relays the environment it was given; `ignore` only means this server neither reads
+the trace nor writes one.
+
+The key works without a `[telemetry]` table. That is deliberate: the shape that needs it most
+is nginx in front doing the exporting, with the application's own collector behind it, where
+this process exports nothing but still has to hand the backend a context to join.
 
 ## Exporting traces
 
@@ -236,6 +277,8 @@ collector:
 [telemetry]
 endpoint = "http://127.0.0.1:4318"   # the collector; /v1/traces is appended
 service_name = "myapp"               # the `service.name` resource attribute
+# sample = "parent_based"            # which traces are exported — see below
+# sample_ratio = 0.1                 # only with sample = "ratio"
 # timeout_ms = 10000                 # per export request
 # batch_size = 512
 # interval_ms = 5000                 # send a partly-filled batch after this long
@@ -248,9 +291,11 @@ Volucer sends OTLP/JSON requests to the collector's `/v1/traces` endpoint using 
 HTTP client shared with the `upstream` backend. This does not add an OpenTelemetry SDK
 dependency, and HTTPS endpoints use the server's existing TLS configuration.
 
-For each request, Volucer creates a server span and forwards its trace and span context to
-the backend. This allows spans produced by a worker or origin to appear as children of the
-Volucer span, without requiring application changes to establish the parent context.
+For each request, Volucer creates a server span and, with `trace_context = "propagate"` or
+`"inject"`, hands the backend the trace and span context of that span. This is what allows
+spans produced by a worker or origin to appear as **children** of the Volucer span, without
+requiring application changes to establish the parent context. Under the default `extract`,
+the client's header is relayed instead and a backend's spans are siblings of this server's.
 
 The server span includes `http.request.method`, `url.path`, `server.address`, and
 `http.response.status_code`. The query string is omitted from `url.path` to avoid exporting
@@ -262,3 +307,60 @@ collector failures can result in lost spans but do not add request latency. Volu
 first export failure and recovery, and reports exported, lost, and queue-dropped spans at
 shutdown. Failed batches are dropped rather than retried, preventing an unbounded retry
 queue from consuming process memory during a collector outage.
+
+## Sampling
+
+`[telemetry].sample` decides which traces leave the process. It is the cost control that
+`trace_context` is not: `trace_context` says what a *backend* is handed and works with no
+`[telemetry]` table at all, while `sample` says what this server sends to its collector.
+
+| Value | What is exported |
+|---|---|
+| `"parent_based"` — **the default** | The traces an upstream service already decided to record, **and** a request that arrived with no `traceparent` at all. OTel's `ParentBased(root=AlwaysOn)`. |
+| `"always"` | Every trace, whatever the caller's flag said. |
+| `"ratio"` | The fraction given by `sample_ratio`, chosen deterministically from the trace id. |
+
+The two halves of the default are worth separating, because only one is obvious:
+
+- **A caller that says `-00` is obeyed.** That is a service declining to spend its tracing
+  budget on this request, and a proxy that flipped the bit would make every downstream span
+  appear regardless. nginx spells this policy `otel_trace $otel_parent_sampled`.
+- **A request with no `traceparent` is recorded.** It has no parent to defer to — it is a
+  *root* — and treating its absent flag as `-00` would leave a standalone deployment, with
+  nothing in front of it, exporting nothing at all while `[telemetry]` looked configured.
+
+The decision is applied in one place and read twice: it becomes the `sampled` bit on the
+`traceparent` a backend receives, and it decides whether this server's own span is exported.
+One answer, so a backend can never be told `-01` by a server that then dropped the span — the
+mismatch that makes a trace view show an orphaned parent with children it does not admit to.
+
+### Ratio sampling
+
+```toml
+[telemetry]
+endpoint = "http://127.0.0.1:4318"
+sample = "ratio"
+sample_ratio = 0.1          # one trace in ten
+```
+
+The decision is a function of the trace id and of nothing else — no clock, no counter, no
+process state — so every hop applying the same fraction agrees about the same trace. The
+arithmetic follows the W3C consistent-probability rule that OpenTelemetry's `ProbabilitySampler`
+uses: the randomness is the seven rightmost bytes of the trace id, and a trace is kept when that
+value is at or above a threshold derived from the fraction. Lowering the fraction therefore only
+ever *removes* traces, so a backend may sample more generously than the front-end without
+losing anything the front-end kept.
+
+`0.0` and `1.0` are exact — no traces and all traces — and the smallest accepted non-zero value
+is `2^-56`, which is the resolution of 56 bits of trace id. Values outside `0.0`–`1.0` are
+refused rather than clamped: `1.5` is an arithmetic error, and reading it as "all traces" is how
+a tracing bill gets decided by a typo. `sample_ratio` beside any mode other than `"ratio"` is
+refused too, for the reason `[metrics.collect].buckets` is refused on a counter: a setting read
+by nothing is worse than one that is absent.
+
+### What sampling never does
+
+It does not touch the access log, and it does not change the trace id. A dropped trace is still
+logged with the same correlation id, so a span that is missing from the collector is still
+findable in the log by its trace id. That is why the decision is applied at the recording site
+rather than by not minting an id.

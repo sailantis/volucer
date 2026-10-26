@@ -128,6 +128,10 @@ fn config(endpoint: &str) -> TelemetryConfig {
         // Short, so the test does not depend on filling a batch — which is the property being
         // tested: a partly-filled batch must be sent on time.
         interval_ms: 100,
+        // `always`, because these tests are about the wire rather than about cost, and the
+        // default (`parent_based`) would drop a request that arrived without a sampled parent.
+        sample: volucer_core::config::SampleMode::Always,
+        sample_ratio: None,
     }
 }
 
@@ -195,6 +199,12 @@ fn a_recorded_request_reaches_a_collector_with_the_ids_the_request_carried() {
     assert_eq!(span["parentSpanId"], "00f067aa0ba902b7");
     assert_eq!(span["kind"], 2, "a server span");
     assert_eq!(span["name"], "http.request");
+    // The caller's `-01` is the flag exported, so the collector and the backend were told the same
+    // thing. A literal `1` here would pass this assertion and be wrong for every `-00` trace.
+    assert_eq!(
+        span["flags"], 1,
+        "the sampled flag must be the one the request carried"
+    );
 
     // And the attributes carry what the request carried, with the status as a number so a backend
     // can range-query it.
@@ -338,4 +348,81 @@ fn an_unreachable_collector_loses_spans_and_never_fails_a_request() {
         counts.exported, 0,
         "nothing can have been exported to a port nothing listens on"
     );
+}
+
+/// A trace the caller asked **not** to record is not exported — and the collector, being absent,
+/// cannot be the reason. This is the end-to-end half of the flag fix: the encoder can carry a zero
+/// flag, and `record_server_span` can decline, but only this shows that a real exporter posting to
+/// a real collector sends nothing for a `-00` request.
+#[test]
+fn a_request_the_caller_marked_unsampled_produces_no_export_at_all() {
+    let (endpoint, received) = collector();
+    let mut settings = config(&endpoint);
+    settings.interval_ms = 50;
+    settings.sample = volucer_core::config::SampleMode::ParentBased;
+    let exporter = Arc::new(Exporter::start(&settings).expect("an exporter"));
+    let observe = Observability::disabled()
+        .with_spans(exporter.recorder())
+        .with_sampling(volucer_observe::Sampler::ParentBased);
+
+    // The caller's flag is clear: "do not record this". nginx filters on `$otel_parent_sampled`
+    // for exactly this case.
+    let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+    let context = observe.begin(Some("abc-123"), Some(caller));
+    assert!(
+        !context.trace.sampled(),
+        "the caller's flag must be honoured"
+    );
+    observe.record_server_span(
+        &context,
+        context.started_at,
+        std::time::SystemTime::now(),
+        volucer_observe::ServerSpanAttributes {
+            method: "GET",
+            path: "/checkout",
+            host: Some("shop.example"),
+            status: 200,
+            name: "http.request",
+            status_message: None,
+            extra: &[],
+        },
+    );
+
+    // And a root — no inbound `traceparent` — *is* exported, which is the other half of the
+    // default: without it, a standalone deployment would export nothing while believing otherwise.
+    let root = observe.begin(None, None);
+    assert!(root.trace.sampled(), "a root must be recorded");
+    observe.record_server_span(
+        &root,
+        root.started_at,
+        std::time::SystemTime::now(),
+        volucer_observe::ServerSpanAttributes {
+            method: "GET",
+            path: "/",
+            host: None,
+            status: 200,
+            name: "http.request",
+            status_message: None,
+            extra: &[],
+        },
+    );
+
+    let request = received
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the root's span must be exported");
+    let json: Value = serde_json::from_str(&request.body).expect("valid JSON");
+    let spans = json["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("an array");
+    assert_eq!(
+        spans.len(),
+        1,
+        "only the root was exported; the unsampled trace must have produced nothing"
+    );
+    // The one that arrived is the root's, not the dropped trace's — asserted by the trace id,
+    // because a batch of one that happened to be the wrong one would satisfy the count.
+    assert_eq!(spans[0]["traceId"], root.trace.trace_id_hex());
+    assert_eq!(spans[0]["flags"], 1);
+
+    exporter.stop();
 }

@@ -159,10 +159,12 @@ fn push_span(out: &mut String, span: &Span) {
         push_hex(out, &parent);
         out.push('"');
     }
-    // Flags: bit 0 is W3C's `sampled`. Always 1 here, because this server only exports a span it has
-    // already decided to record — the encoding path is reached by finished work, not by a sampling
-    // decision. `kind` and `name` follow.
-    out.push_str(",\"flags\":1,\"name\":");
+    // The trace flags, which for this server's spans is the `sampled` bit and nothing else. Written
+    // from the span rather than as a literal `1`: the flag says whether the *trace* is recorded, and
+    // a span that reached this point was recorded — but the field must agree with the `traceparent`
+    // the backend was handed, or a collector is told a trace is complete that a backend was told to
+    // drop. OTLP's `flags` is a `uint32`, and the value is the low byte.
+    let _ = write!(out, ",\"flags\":{},\"name\":", span.flags);
     push_json_string(out, span.name);
     let _ = write!(out, ",\"kind\":{}", span.kind.otlp());
     let _ = write!(
@@ -343,6 +345,7 @@ mod tests {
             ],
             status: SpanStatus::Unset,
             status_message: None,
+            flags: volucer_observe::span::TRACE_FLAG_SAMPLED,
         }
     }
 
@@ -459,6 +462,31 @@ mod tests {
         let kind = &json["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["kind"];
         assert_eq!(*kind, 1);
         assert_ne!(*kind, 0);
+    }
+
+    /// The `flags` field carries the sampled bit from the span rather than a constant.
+    ///
+    /// **The bug this test exists for.** The encoder wrote `"flags":1` unconditionally, so an
+    /// inbound `-00` trace was propagated to the backend as unsampled and exported to the collector
+    /// as sampled. Nothing on the wire failed; the two just disagreed, and the only way to see it
+    /// was to compare a `traceparent` with a collector's payload.
+    #[test]
+    fn the_sampled_flag_is_carried_and_not_assumed() {
+        let mut dropped = span();
+        dropped.flags = 0;
+        let json = encode_one(dropped);
+        assert_eq!(
+            json["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["flags"], 0,
+            "an unsampled trace must not be exported as sampled"
+        );
+
+        // And the flag is a number rather than a string or a boolean: OTLP's `flags` is a
+        // `uint32` in protobuf JSON, where every 64-bit integer is a string but a 32-bit one is
+        // not — the distinction that catches a producer treating all integers alike.
+        let json = encode_one(span());
+        let flags = &json["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["flags"];
+        assert_eq!(*flags, 1);
+        assert!(flags.is_number(), "flags must be a number, not a string");
     }
 
     /// The resource has to be there, because it is what every backend groups by, and the scope name
