@@ -5,7 +5,7 @@ backend. For the server-side configuration, see [Backends](02-BACKENDS.md).
 
 ## Install the SDK
 
-```console
+```sh
 composer require sailantis/volucer-php-sdk
 ```
 
@@ -41,9 +41,9 @@ SDK uses that socket instead of stdio. `Worker::create()` does not read this env
 variable and would attempt to use stdin/stdout, which are not connected to the worker
 protocol in this setup. Without the variable, `connect()` behaves like `create()`.
 
-| `VOLUCER_WORKER_SOCKET` value | Transport |
-|---|---|
-| `127.0.0.1:34567` | loopback TCP — the ephemeral port the server bound |
+| `VOLUCER_WORKER_SOCKET` value     | Transport                                                 |
+| --------------------------------- | --------------------------------------------------------- |
+| `127.0.0.1:34567`                 | loopback TCP — the ephemeral port the server bound        |
 | `unix:/run/volucer/worker.0.sock` | a unix socket, from `socket = "unix:/run/volucer/worker"` |
 
 ## The SDK is a transport, not a framework
@@ -57,11 +57,11 @@ application's existing interfaces.
 
 The handler receives the `Request` and returns one of:
 
-| Return | Result |
-|---|---|
-| `Response` | sent exactly as given |
-| `string` | sent as a `200` `text/html` body |
-| `null` | the captured output becomes the body |
+| Return     | Result                               |
+| ---------- | ------------------------------------ |
+| `Response` | sent exactly as given                |
+| `string`   | sent as a `200` `text/html` body     |
+| `null`     | the captured output becomes the body |
 
 If the handler throws, the SDK logs the exception to stderr, responds with `500`, and keeps
 the worker running so it can handle later requests.
@@ -115,16 +115,16 @@ polling.
 
 ## `Request`
 
-| Member | Notes |
-|---|---|
-| `method`, `uri`, `protocol` | as sent |
-| `headers` | `name => value`; `header($name)` looks up case-insensitively |
-| `body` | the raw request body |
-| `contentType()` | shorthand for the `Content-Type` header |
-| `query()` | the query string parsed the way PHP populates `$_GET` |
-| `cookies()` | the `Cookie` header parsed the way PHP populates `$_COOKIE` |
-| `serverVars()` | CGI-style variables derived from the request (for legacy code) |
-| `remoteAddr`, `scriptFilename`, `https` | as sent |
+| Member                                  | Notes                                                          |
+| --------------------------------------- | -------------------------------------------------------------- |
+| `method`, `uri`, `protocol`             | as sent                                                        |
+| `headers`                               | `name => value`; `header($name)` looks up case-insensitively   |
+| `body`                                  | the raw request body                                           |
+| `contentType()`                         | shorthand for the `Content-Type` header                        |
+| `query()`                               | the query string parsed the way PHP populates `$_GET`          |
+| `cookies()`                             | the `Cookie` header parsed the way PHP populates `$_COOKIE`    |
+| `serverVars()`                          | CGI-style variables derived from the request (for legacy code) |
+| `remoteAddr`, `scriptFilename`, `https` | as sent                                                        |
 
 ## `Response`
 
@@ -142,15 +142,15 @@ to include multiple headers with the same name, such as multiple `Set-Cookie` he
 
 ## `Worker`
 
-| Method | Purpose |
-|---|---|
-| `Worker::create($in?, $out?)` | Bind explicit streams (default: stdio), force `display_errors=stderr` |
-| `Worker::connect()` | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it |
-| `run($handler)` | Handshake, then serve until EOF |
-| `emitLog($message, $level)` | One log record, unsolicited |
-| `emitMetric($name, $value, $unit)` | One metric sample, unsolicited |
-| `recycle()` | Ask the server to replace this worker after the request |
-| `currentRequestId()` | The in-flight request id, for telemetry correlation |
+| Method                             | Purpose                                                                |
+| ---------------------------------- | ---------------------------------------------------------------------- |
+| `Worker::create($in?, $out?)`      | Bind explicit streams (default: stdio), force `display_errors=stderr`  |
+| `Worker::connect()`                | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it |
+| `run($handler)`                    | Handshake, then serve until EOF                                        |
+| `emitLog($message, $level)`        | One log record, unsolicited                                            |
+| `emitMetric($name, $value, $unit)` | One metric sample, unsolicited                                         |
+| `recycle()`                        | Ask the server to replace this worker after the request                |
+| `currentRequestId()`               | The in-flight request id, for telemetry correlation                    |
 
 The `$name` passed to `emitMetric()` must match the Prometheus name pattern
 `[a-zA-Z_][a-zA-Z0-9_]*` and be declared under the server's `[metrics.collect]` table.
@@ -165,13 +165,13 @@ Workers do not run under a PHP SAPI, so PHP does not automatically manage reques
 or send response headers through `header()` and `setcookie()`. `Volucer\Session` provides
 the session-cookie integration for worker requests.
 
-| Method | Purpose |
-|---|---|
-| `begin($request)` | Adopt the session the request presented, and relax PHP's cookie handling |
-| `beginWithCookies($cookies)` | The same, for a request that is not a `Volucer\Request` |
-| `applyTo($response)` | **Add the `Set-Cookie` and end the request** — the normal call |
-| `cookie()` | The `Set-Cookie` value alone, for a response object this SDK does not own |
-| `end()` | End the session and forget the id, if you did not use `applyTo()` |
+| Method                       | Purpose                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| `begin($request)`            | Adopt the session the request presented, and relax PHP's cookie handling  |
+| `beginWithCookies($cookies)` | The same, for a request that is not a `Volucer\Request`                   |
+| `applyTo($response)`         | **Add the `Set-Cookie` and end the request** — the normal call            |
+| `cookie()`                   | The `Set-Cookie` value alone, for a response object this SDK does not own |
+| `end()`                      | End the session and forget the id, if you did not use `applyTo()`         |
 
 ```php
 $session = new Session();
@@ -333,11 +333,11 @@ Worker::connect()->consume(function (Volucer\Job $job, Worker $worker) {
 
 The handler's return value determines the job outcome:
 
-| Return | Outcome |
-|---|---|
-| anything else, including `true` | `ack` — the job is done |
-| `false` | `requeue` — run it again |
-| a string | `reject` — the string is the reason |
+| Return                          | Outcome                             |
+| ------------------------------- | ----------------------------------- |
+| anything else, including `true` | `ack` — the job is done             |
+| `false`                         | `requeue` — run it again            |
+| a string                        | `reject` — the string is the reason |
 
 If the handler throws, the SDK requeues the job rather than acknowledging it. The job lease
 then expires before it is retried, preventing an immediate retry loop.

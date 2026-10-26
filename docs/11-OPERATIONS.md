@@ -8,7 +8,7 @@ and release operations.
 On Unix, send `SIGHUP` to reload and apply the configuration file. Windows has no
 `SIGHUP` equivalent, so restart the server there.
 
-```console
+```sh
 kill -HUP $(pidof volucer)      # or: systemctl reload volucer
 ```
 
@@ -37,15 +37,15 @@ The following settings can be reloaded:
 
 The following settings require a restart. Volucer reports them during reload:
 
-| Setting | Why it cannot be reloaded |
-|---|---|
-| `http`, `https`, `fastcgi` | A bound socket cannot move |
-| Backends, their commands and worker counts | Those are running processes with live pipes |
-| `[server.env]` and a backend's `env` | Existing processes retain their environment; replacement workers could otherwise receive different values from running workers |
-| `[server.tls]` `min_version` and `alpn` | They are baked into the `rustls` server config the acceptor holds |
-| `[server.proxy]` | Whose forwarded headers are believed is a statement about this deployment's topology |
-| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless** |
-| `[status]` address | The listener is bound |
+| Setting                                                 | Why it cannot be reloaded                                                                                                      |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `http`, `https`, `fastcgi`                              | A bound socket cannot move                                                                                                     |
+| Backends, their commands and worker counts              | Those are running processes with live pipes                                                                                    |
+| `[server.env]` and a backend's `env`                    | Existing processes retain their environment; replacement workers could otherwise receive different values from running workers |
+| `[server.tls]` `min_version` and `alpn`                 | They are baked into the `rustls` server config the acceptor holds                                                              |
+| `[server.proxy]`                                        | Whose forwarded headers are believed is a statement about this deployment's topology                                           |
+| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   |
+| `[status]` address                                      | The listener is bound                                                                                                          |
 
 ### A reload is whole-or-nothing
 
@@ -225,7 +225,7 @@ The `[status]` listener provides separate liveness and readiness probes:
 address = "127.0.0.1:2114"
 ```
 
-```console
+```sh
 volucer health --url http://127.0.0.1:2114/health   # is the process running?
 volucer health --url http://127.0.0.1:2114/ready    # should traffic be sent here?
 ```
@@ -255,7 +255,7 @@ Use a published image or build one from a source checkout.
 Each release publishes musl and glibc images to GitHub Container Registry for
 `linux/amd64` and `linux/arm64`:
 
-```console
+```sh
 docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based: the recommended one
 docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you need a libc
 ```
@@ -263,9 +263,9 @@ docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you nee
 The default `musl` image uses a `scratch` base and has no libc dependency. The glibc image
 uses a Debian base and always has a `-glibc` suffix:
 
-| Tag | Image |
-|---|---|
-| `0.2.0`, `0.2`, `latest` | musl, `scratch` base |
+| Tag                                        | Image                         |
+| ------------------------------------------ | ----------------------------- |
+| `0.2.0`, `0.2`, `latest`                   | musl, `scratch` base          |
 | `0.2.0-glibc`, `0.2-glibc`, `latest-glibc` | glibc, `debian:bookworm-slim` |
 
 The `latest` tag changes only for final releases. A pre-release such as `v0.3.0-rc.1`
@@ -280,7 +280,7 @@ The package must be made public after the first release publishes it. See
 `packaging/docker/Dockerfile` builds both images from the same crate. On a 4-vCPU machine
 with a cold Cargo cache, builds take approximately 3m45s for musl and 1m40s for glibc:
 
-```console
+```sh
 docker build -f packaging/docker/Dockerfile --target musl -t volucer .           # the host's architecture
 docker build -f packaging/docker/Dockerfile --target glibc -t volucer:glibc .
 ```
@@ -305,7 +305,7 @@ before the build begins.
 Both images use the same runtime contract. Replace the local image name with a published
 image to use a release build:
 
-```console
+```sh
 docker run --rm \
     -p 8080:8080 -p 9080:9080 \
     -v "$PWD/volucer.toml:/etc/volucer/volucer.toml:ro" \
@@ -316,7 +316,7 @@ docker run --rm \
 You can run the image without mounting a configuration file by providing settings on the
 command line:
 
-```console
+```sh
 docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" \
     ghcr.io/sailantis/volucer:latest \
     serve --listen 0.0.0.0:8080 --document-root /srv/public \
@@ -364,25 +364,25 @@ from `[metrics]` if that is the only configured listener. It exits successfully 
 2xx response; other statuses, including 404, fail the check. Diagnostic details are written
 to stderr and appear in Docker's health log:
 
-```console
+```sh
 $ docker inspect --format '{{json .State.Health}}' volucer | jq -r '.Log[].Output'
 volucer: could not connect to 127.0.0.1:9080: connection refused
 ```
 
 The command chooses its probe target using these settings, in order of increasing precedence:
 
-| Setting | Effect |
-|---|---|
+| Setting                 | Effect                                                                                                                        |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `VOLUCER_HEALTH_CONFIG` | The configuration file to read. The image defaults to `/etc/volucer/volucer.toml`; set this if the file is mounted elsewhere. |
-| `VOLUCER_HEALTH_URL` | A URL to probe instead of reading the configuration. |
-| `--url` / `--config` | The flags, which win over both — so a variable someone forgot does not fight a probe typed by hand. |
+| `VOLUCER_HEALTH_URL`    | A URL to probe instead of reading the configuration.                                                                          |
+| `--url` / `--config`    | The flags, which win over both — so a variable someone forgot does not fight a probe typed by hand.                           |
 
 The image's built-in health check uses `/health`, not `/ready`. A failed Docker health check
 may lead to a container restart, so a server should not fail it merely because its worker
 pool is still starting. Use `/ready` separately for a load balancer or another component
 that decides whether to send traffic:
 
-```console
+```sh
 docker exec volucer volucer health --ready
 ```
 
@@ -393,7 +393,7 @@ Use a published image, or build from the checkout:
 ```yaml
 services:
   app:
-    image: ghcr.io/sailantis/volucer:0.2.0      # or: build: {context: ., target: musl}
+    image: ghcr.io/sailantis/volucer:0.2.0 # or: build: {context: ., target: musl}
     ports:
       - "8080:8080"
       - "9080:9080"
@@ -435,7 +435,7 @@ The first push creates the package as private, even when the repository is publi
 the first release, change the package visibility to public in its settings or use the
 GitHub API for an organization-owned package:
 
-```console
+```sh
 gh api --method PATCH /orgs/sailantis/packages/container/volucer -f visibility=public
 ```
 

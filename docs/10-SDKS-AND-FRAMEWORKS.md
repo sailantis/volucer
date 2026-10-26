@@ -8,11 +8,11 @@ selected PHP frameworks.
 The SDKs implement the worker side of the [worker protocol](09-WORKER-PROTOCOL.md). Their
 repositories include package-manager manifests and tests for the protocol's wire format.
 
-| SDK | Package | Install |
-|---|---|---|
-| PHP | `sailantis/volucer-worker` | `composer require sailantis/volucer-worker` |
-| Python | `volucer-worker` | `pip install volucer-worker` |
-| Ruby | `volucer-worker` | `gem install volucer-worker` |
+| SDK    | Package                    | Install                                     |
+| ------ | -------------------------- | ------------------------------------------- |
+| PHP    | `sailantis/volucer-worker` | `composer require sailantis/volucer-worker` |
+| Python | `volucer-worker`           | `pip install volucer-worker`                |
+| Ruby   | `volucer-worker`           | `gem install volucer-worker`                |
 
 The SDKs provide transport rather than a framework: they do not require a router, container,
 or middleware pipeline. Their `Request` and `Response` objects are plain value objects.
@@ -115,7 +115,7 @@ Use a framework bridge when you need worker-channel features such as:
 
 ### Spiral
 
-```console
+```sh
 composer require sailantis/spiral-volucer
 ```
 
@@ -146,7 +146,7 @@ dispatcher inside this scope.
 
 ### Symfony
 
-```console
+```sh
 composer require sailantis/symfony-volucer
 ```
 
@@ -164,7 +164,7 @@ kernel is rebooted per request; no changes to Symfony itself are required.
 
 ### Laravel
 
-```console
+```sh
 composer require sailantis/laravel-volucer
 ```
 
@@ -184,7 +184,7 @@ worker loop.
 
 ### Azera
 
-```console
+```sh
 composer require sailantis/azera-volucer
 ```
 
@@ -211,7 +211,7 @@ and middleware pipeline across requests.
 `volucer-cli` is a Composer package that downloads and installs the Volucer binary for your
 platform after verifying its checksum.
 
-```console
+```sh
 composer require --dev sailantis/volucer-cli
 vendor/bin/volucer-cli
 ```
@@ -243,12 +243,12 @@ as an alternative.
 
 ## Which one should I use?
 
-| If you want | Use |
-|---|---|
-| The simplest path, and a running server now | The [install scripts](00-GETTING-STARTED.md#install) |
-| PHP on the worker channel | `sailantis/volucer-worker` |
-| Django, Flask or Rails on the worker channel | The Python or Ruby SDK |
-| An existing PHP framework, on the worker channel | The framework bridge |
-| An existing app, changed as little as possible | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md) |
-| Any FastCGI server, started and supervised | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server) |
-| Node, Go or any other HTTP origin | The `upstream` backend |
+| If you want                                      | Use                                                                              |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| The simplest path, and a running server now      | The [install scripts](00-GETTING-STARTED.md#install)                             |
+| PHP on the worker channel                        | `sailantis/volucer-worker`                                                       |
+| Django, Flask or Rails on the worker channel     | The Python or Ruby SDK                                                           |
+| An existing PHP framework, on the worker channel | The framework bridge                                                             |
+| An existing app, changed as little as possible   | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md)                       |
+| Any FastCGI server, started and supervised       | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server) |
+| Node, Go or any other HTTP origin                | The `upstream` backend                                                           |

@@ -88,7 +88,7 @@ After the package is public, you can pull it without `docker login`. See [Publis
 
 To build either image from a checkout, use `packaging/docker/Dockerfile`:
 
-```console
+```sh
 docker build -f packaging/docker/Dockerfile --target musl -t volucer .
 ```
 

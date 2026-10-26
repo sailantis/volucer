@@ -16,10 +16,10 @@ format = "combined"               # or "json"
 request_id_header = "X-Request-Id"
 ```
 
-| Key | Type | Default | What it does |
-|---|---|---|---|
-| `path` | path | **required** | Where the log is written. |
-| `format` | string | `"combined"` | `"combined"` or `"json"`. |
+| Key                 | Type   | Default          | What it does                           |
+| ------------------- | ------ | ---------------- | -------------------------------------- |
+| `path`              | path   | **required**     | Where the log is written.              |
+| `format`            | string | `"combined"`     | `"combined"` or `"json"`.              |
 | `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from. |
 
 Volucer does not create the parent directory. If it does not exist or cannot be opened,
@@ -165,7 +165,7 @@ address = "127.0.0.1:2114"
 allow_worker_reset = true
 ```
 
-```console
+```sh
 curl -sf http://127.0.0.1:2114/workers | jq        # the list
 curl -sf -XPOST http://127.0.0.1:2114/workers/3/reset
 ```
@@ -196,12 +196,12 @@ type = "counter"          # "counter", "gauge" or "histogram"
 help = "Application requests handled"
 ```
 
-| Key | Type | Default | What it does |
-|---|---|---|---|
-| `address` | string | **required** | Where the Prometheus endpoint listens. |
-| `path` | string | `"/metrics"` | The endpoint path. |
-| `prefix` | string | absent | A prefix for the metric names. |
-| `collect` | table of tables | empty | The metrics to collect. |
+| Key       | Type            | Default      | What it does                           |
+| --------- | --------------- | ------------ | -------------------------------------- |
+| `address` | string          | **required** | Where the Prometheus endpoint listens. |
+| `path`    | string          | `"/metrics"` | The endpoint path.                     |
+| `prefix`  | string          | absent       | A prefix for the metric names.         |
+| `collect` | table of tables | empty        | The metrics to collect.                |
 
 `[metrics]` and `[status]` share a listener. If both are configured, their `address` values
 must match; different addresses cause startup to fail. Configure only the feature you need
@@ -209,11 +209,11 @@ if you do not need both.
 
 `[metrics.collect.<name>]`:
 
-| Key | Type | Default | What it does |
-|---|---|---|---|
-| `type` | string | **required** | `"counter"`, `"gauge"` or `"histogram"`. |
-| `help` | string | **required** | The description, as Prometheus requires. |
-| `buckets` | array of numbers | empty | The bucket boundaries. Histograms only. |
+| Key       | Type             | Default      | What it does                             |
+| --------- | ---------------- | ------------ | ---------------------------------------- |
+| `type`    | string           | **required** | `"counter"`, `"gauge"` or `"histogram"`. |
+| `help`    | string           | **required** | The description, as Prometheus requires. |
+| `buckets` | array of numbers | empty        | The bucket boundaries. Histograms only.  |
 
 `buckets` is valid only for histograms. Volucer rejects it for counters and gauges.
 

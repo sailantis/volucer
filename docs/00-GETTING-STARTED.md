@@ -10,11 +10,11 @@ existing backends, and serves applications over HTTP or FastCGI.
 
 Choose a backend for each route:
 
-| Backend | How it works | Use it when |
-|---|---|---|
-| **Worker** | The app starts once and stays resident. The app resets request-scoped state between requests. | You use a Volucer worker SDK or implement the worker protocol, and want to avoid repeated startup. |
-| **FastCGI** | A FastCGI backend handles requests and resets request state. | You want to keep an existing FastCGI application and its request lifecycle. |
-| **HTTP upstream** | Volucer routes requests to an HTTP server. | Your application already runs its own HTTP server. |
+| Backend           | How it works                                                                                  | Use it when                                                                                        |
+| ----------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| **Worker**        | The app starts once and stays resident. The app resets request-scoped state between requests. | You use a Volucer worker SDK or implement the worker protocol, and want to avoid repeated startup. |
+| **FastCGI**       | A FastCGI backend handles requests and resets request state.                                  | You want to keep an existing FastCGI application and its request lifecycle.                        |
+| **HTTP upstream** | Volucer routes requests to an HTTP server.                                                    | Your application already runs its own HTTP server.                                                 |
 
 All routes use the same listener. For example, one Volucer process can serve `/api` with
 a worker and `/admin` through FastCGI.
@@ -39,7 +39,7 @@ Python, and Ruby.
 
 ### Linux and macOS
 
-```console
+```sh
 curl -fsSL https://github.com/sailantis/volucer/releases/latest/download/install.sh | sh
 ```
 
@@ -77,15 +77,15 @@ explicitly disabled with `off`.
 The installers read settings from environment variables, which work with both
 `curl | sh` and `irm | iex`. They support these settings:
 
-| Variable | Effect |
-|---|---|
-| `VOLUCER_VERSION` | Install a specific tag instead of the newest release. |
-| `VOLUCER_INSTALL_DIR` | Where to put the binary. |
-| `VOLUCER_FORCE=1` | Replace an existing binary. |
-| `VOLUCER_MODIFY_PATH` | `1` (default) or `0` — whether the installer may add the install directory to `PATH`. |
-| `VOLUCER_DOWNLOAD_URL` | A mirror, a GitHub Enterprise host, or an air-gapped host. |
-| `VOLUCER_API` | The release API root. |
-| `VOLUCER_VERIFY` | `auto` (default), `require` or `off` — whether to check the build provenance attestation. |
+| Variable               | Effect                                                                                    |
+| ---------------------- | ----------------------------------------------------------------------------------------- |
+| `VOLUCER_VERSION`      | Install a specific tag instead of the newest release.                                     |
+| `VOLUCER_INSTALL_DIR`  | Where to put the binary.                                                                  |
+| `VOLUCER_FORCE=1`      | Replace an existing binary.                                                               |
+| `VOLUCER_MODIFY_PATH`  | `1` (default) or `0` — whether the installer may add the install directory to `PATH`.     |
+| `VOLUCER_DOWNLOAD_URL` | A mirror, a GitHub Enterprise host, or an air-gapped host.                                |
+| `VOLUCER_API`          | The release API root.                                                                     |
+| `VOLUCER_VERIFY`       | `auto` (default), `require` or `off` — whether to check the build provenance attestation. |
 
 `install.ps1` also accepts parameters (`-Version`, `-InstallDir`, `-Force`, `-BaseUrl`,
 `-Verify`, and `-ModifyPath`). If a parameter is not supplied, it uses the corresponding
@@ -100,7 +100,7 @@ to `1`.
 
 Every release publishes `linux/amd64` and `linux/arm64` images to GitHub Container Registry:
 
-```console
+```sh
 docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based: the recommended one
 docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you need a libc
 ```
@@ -112,7 +112,7 @@ The default image uses musl and is based on `scratch`; the glibc image always ca
 
 To build either image from a checkout instead, use `packaging/docker/Dockerfile`:
 
-```console
+```sh
 docker build -f packaging/docker/Dockerfile --target musl -t volucer .
 ```
 
@@ -131,7 +131,7 @@ adjacent `.sha256` file, and put the binary on your `PATH`.
 
 Run `volucer check` before starting the server:
 
-```console
+```sh
 volucer check
 ```
 
@@ -203,7 +203,7 @@ minimal file shown below first.
 If Volucer cannot find your PHP installation, provide the directory containing its
 binaries:
 
-```console
+```sh
 volucer check --php-dir /usr/local/php/bin
 ```
 
@@ -256,7 +256,7 @@ The application needs a `worker.php` entry point and the worker SDK. See
 
 ## Start the server
 
-```console
+```sh
 volucer serve
 ```
 
@@ -265,20 +265,20 @@ With the example configuration above, the application is available at
 
 `volucer serve` accepts these options:
 
-| Option | Effect |
-|---|---|
-| `-c`, `--config <PATH>` | The configuration file. Defaults to `volucer.toml` in the working directory, and is optional — see below. |
-| `-o`, `--override <KEY=VALUE>` | Set one key, in `dot.notation`. Repeatable. |
-| `--listen <ADDR>` | Shorthand for `-o server.http=<ADDR>`. |
-| `--fastcgi <ADDR>` | Shorthand for `-o server.fastcgi=<ADDR>`. |
-| `--document-root <PATH>`, `--root <PATH>` | Override `server.document_root`. |
-| `--front-controller <NAME>` | Override `server.front_controller`. Set it to an empty string to serve only real files. |
-| `--php-cgi [<PATH>]` | Serve a `php-cgi` pool as the default backend — see below. |
-| `--worker <COMMAND>` | Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`. |
-| `--fcgi <COMMAND>` | Serve any FastCGI server as the default backend, e.g. `--fcgi "python fcgi_app.py --bind {address}"`. |
-| `--workers <N>` | How many slots the chosen backend starts. Requires one of the three flags above. |
-| `--concurrency <N>` | How many requests one `--fcgi` slot serves at once. `--fcgi` only. `--capacity` is the old spelling and still parses. |
-| `--max-connections <N>` | Maximum concurrent client connections. Defaults to `512`. |
+| Option                                    | Effect                                                                                                                |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `-c`, `--config <PATH>`                   | The configuration file. Defaults to `volucer.toml` in the working directory, and is optional — see below.             |
+| `-o`, `--override <KEY=VALUE>`            | Set one key, in `dot.notation`. Repeatable.                                                                           |
+| `--listen <ADDR>`                         | Shorthand for `-o server.http=<ADDR>`.                                                                                |
+| `--fastcgi <ADDR>`                        | Shorthand for `-o server.fastcgi=<ADDR>`.                                                                             |
+| `--document-root <PATH>`, `--root <PATH>` | Override `server.document_root`.                                                                                      |
+| `--front-controller <NAME>`               | Override `server.front_controller`. Set it to an empty string to serve only real files.                               |
+| `--php-cgi [<PATH>]`                      | Serve a `php-cgi` pool as the default backend — see below.                                                            |
+| `--worker <COMMAND>`                      | Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`.                                     |
+| `--fcgi <COMMAND>`                        | Serve any FastCGI server as the default backend, e.g. `--fcgi "python fcgi_app.py --bind {address}"`.                 |
+| `--workers <N>`                           | How many slots the chosen backend starts. Requires one of the three flags above.                                      |
+| `--concurrency <N>`                       | How many requests one `--fcgi` slot serves at once. `--fcgi` only. `--capacity` is the old spelling and still parses. |
+| `--max-connections <N>`                   | Maximum concurrent client connections. Defaults to `512`.                                                             |
 
 Command-line options override values in the configuration file. Use them to supply
 deployment-specific settings without maintaining a separate file for each environment.
@@ -287,7 +287,7 @@ deployment-specific settings without maintaining a separate file for each enviro
 
 For local development with PHP, these options are often enough:
 
-```console
+```sh
 volucer serve --listen 127.0.0.1:8080 --root public --php-cgi
 ```
 
@@ -300,7 +300,7 @@ With no value, `--php-cgi` looks for `php-cgi` using the same search order as
 `volucer check`: `PATH` first, then conventional installation directories. On Windows,
 the search also uses `PATHEXT`. Pass a path to select a specific executable:
 
-```console
+```sh
 volucer serve --listen 127.0.0.1:8080 --root public \
     --php-cgi=C:\php-8.3.31\php-cgi.exe --workers=5
 ```
@@ -315,7 +315,7 @@ serving traffic. Volucer applies these flags before `-o` overrides, so
 You can also select a worker or another FastCGI server from the command line.
 **Worker mode** starts a persistent process and boots the application once:
 
-```console
+```sh
 volucer serve --listen 127.0.0.1:8080 --root public --worker "php worker.php" --workers=5
 ```
 
@@ -338,7 +338,7 @@ my-project/
 
 For a FastCGI application, such as a WSGI, Rack, or Go server, use `--fcgi`:
 
-```console
+```sh
 volucer serve --listen 127.0.0.1:8080 --root public \
     --fcgi "python fcgi_app.py --bind {address}" --workers=2 --concurrency=4
 ```
@@ -370,7 +370,7 @@ not pass `-c` and there is no `volucer.toml` in the working directory, configure
 server with `-o`, `--listen`, and `--fastcgi`. This can be useful for a container command
 or systemd unit:
 
-```console
+```sh
 volucer serve \
     --listen 0.0.0.0:8080 \
     -o server.document_root=public \
@@ -418,7 +418,7 @@ not name a file returns 404, similar to nginx's `location ~ \.php$`.
 
 ## Check the version
 
-```console
+```sh
 volucer version
 ```
 
@@ -438,7 +438,7 @@ volucer 0.1.0
 
 ## Check whether a running server is healthy
 
-```console
+```sh
 volucer health --config volucer.toml          # /health: is the process alive?
 volucer health --config volucer.toml --ready  # /ready: should traffic be sent here?
 volucer health --url http://127.0.0.1:2114/health
