@@ -422,44 +422,6 @@ Use environment variables and `${...}` expansion to provide configuration values
 example `http = "0.0.0.0:${PORT:-8080}"`. Compose's `env_file:` and Docker's
 `--env-file` provide the variables; Volucer does not load `.env` files itself.
 
-### Publishing
-
-The release workflow publishes multi-architecture image manifests to
-`ghcr.io/<repository>` for `linux/amd64` and `linux/arm64` on each `v*` tag. Image publishing
-runs after the archive publishing job succeeds.
-
-The workflow authenticates to GHCR using its `GITHUB_TOKEN` and `packages: write`
-permission; no separate secret is required.
-
-The first push creates the package as private, even when the repository is public.
-
-**The organization may have to allow public packages first.** An organization can forbid
-its members from publishing public packages, and the package settings page then greys out
-the *Public* option with "Setting is disabled by organization administrators". The REST
-API does not say so: `PATCH /orgs/{org}/packages/container/{name}` answers `404 Not Found`
-rather than `403`, which reads like a wrong URL or a missing token scope and is neither —
-`GET` on the same URL returns `200` throughout. An organization owner lifts it in
-**Organization settings → Packages → Package creation** by allowing *Public*, after which
-the per-package setting can be changed in its own settings or with:
-
-```sh
-gh api --method PATCH /orgs/sailantis/packages/container/volucer -f visibility=public
-```
-
-Until the package is public, pulling it requires authentication. The build sets
-`org.opencontainers.image.source` to link the package to the repository.
-
-The workflow has two relevant properties:
-
-- Each image and architecture is pushed by digest. Tags are created only after all
-  architectures have built and passed smoke tests, preventing an incomplete multi-platform
-  release from being pulled.
-- The glibc image always has a `-glibc` suffix; `latest` and `latest-glibc` refer to
-  different images.
-
-`.github/workflows/ci.yml` builds and smoke-tests both images on every push to `main`. The
-release workflow runs the same smoke test against the published image digests.
-
 ## The access log and logrotate
 
 On `SIGHUP`, Volucer closes and reopens the access-log file. Configure `logrotate` to signal

@@ -105,10 +105,7 @@ docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based: the
 docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you need a libc
 ```
 
-The default image uses musl and is based on `scratch`; the glibc image always carries the
-`-glibc` suffix. For reproducible deployments, pin a version tag such as `0.3.0` instead of
-`latest`. The package has to be made public once after its first release; see
-[Publishing](11-OPERATIONS.md#publishing).
+The default image uses musl and is based on `scratch`; the glibc image always carries the `-glibc` suffix. For reproducible deployments, pin a version tag such as `0.3.0` instead of `latest`.
 
 To build either image from a checkout instead, use `packaging/docker/Dockerfile`:
 
