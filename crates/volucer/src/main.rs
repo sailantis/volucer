@@ -73,6 +73,11 @@ enum Command {
         /// string: `-o 'server.http="0.0.0.0:8080"'`. `${NAME}` and `${NAME:-default}` are
         /// expanded first, as in the file.
         ///
+        /// An **array of tables** takes an index: `-o server.routes[0].backend=app` amends the
+        /// first route, and `-o server.routes[2].path_prefix=/x` appends when the array holds two
+        /// (a larger index is refused rather than padded). A key that itself contains a dot is
+        /// quoted: `-o 'server.env."APP.NAME"=x'`.
+        ///
         /// **A key that does not exist is an error**, exactly as a typo in `volucer.toml` is —
         /// the strictness is the feature. Applied in the order given, after `--listen` and
         /// `--fastcgi`, so a later pair wins over an earlier one.
@@ -1046,13 +1051,179 @@ fn literal(text: &str) -> toml::Value {
         .unwrap_or_else(|| toml::Value::String(text.to_string()))
 }
 
+/// One segment of an override's key: a table key, or an index into an array.
+///
+/// The bracket form exists because the value side cannot reach into an array that is already
+/// there: `-o 'server.routes=[…]'` *replaces* the file's routes, so amending one route of twenty
+/// had no spelling at all. `-o server.routes[3].backend=staging` is that spelling, and it reads
+/// the way the same thing reads in PHP.
+#[derive(Debug, PartialEq)]
+enum KeySegment {
+    /// A table key, and the key a value is finally inserted under.
+    Key(String),
+    /// An index into an array. Only `[N]` has a form here: `[]` would have to mean "append", which
+    /// would make the result depend on how many pairs were written before it.
+    Index(usize),
+}
+
+/// Split a `KEY=VALUE` pair at the first `=` that is **not inside a quoted key**.
+///
+/// `split_once('=')` is nearly right, but quoting is what lets a map key hold a dot
+/// (`server.env."APP.NAME"`), and a key that may hold a dot may hold an `=` too. Scanning with the
+/// quote state means the value keeps every `=` it has, which is also what a query string in a
+/// value needs.
+fn split_pair(pair: &str) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in pair.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '=' if !quoted => return Some((&pair[..index], &pair[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a dotted key into segments, accepting `name[N]` and `"quoted name"` on the way.
+///
+/// Quoting is TOML's own, and it is what makes the two things a plain dot-split cannot express
+/// possible: a map key that contains a dot (`server.env."APP.NAME"=x`) and a key that only looks
+/// like an index (`server.env."routes[0]"=x`). Inside a quoted key every character is literal, so
+/// the two syntaxes cannot be mistaken for one another.
+fn key_segments(key: &str) -> Result<Vec<KeySegment>, ServerError> {
+    let problem = |reason: &str| {
+        invalid_override(format!(
+            "--override {key:?} {reason}; a dotted key is `section.key`, an element of an array of \
+             tables is `section.array[0].key`, and a key that itself holds a dot is \
+             `section.\"quoted.key\"`"
+        ))
+    };
+
+    let chars: Vec<char> = key.chars().collect();
+    let mut segments = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            let (name, next) = quoted_key(&chars, i).ok_or_else(|| {
+                problem("has a quoted key that is unterminated (`\\\"` and `\\\\` are the escapes)")
+            })?;
+            segments.push(KeySegment::Key(name));
+            i = next;
+        } else if chars[i] == '[' {
+            let (index, next) = index_segment(&chars, i)
+                .ok_or_else(|| problem("has a bracket that is not an index; write `[0]`"))?;
+            segments.push(KeySegment::Index(index));
+            i = next;
+        } else {
+            let start = i;
+            while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                i += 1;
+            }
+            if start == i {
+                return Err(problem("has an empty segment"));
+            }
+            let segment: String = chars[start..i].iter().collect();
+            if segment.contains('"') {
+                return Err(problem(
+                    "has a quote inside an unquoted key; quote the whole key",
+                ));
+            }
+            // A `]` here is an index that lost its `[`, which is a typo worth naming rather than
+            // turning into a table key called `http]`.
+            if segment.contains(']') {
+                return Err(problem(
+                    "has a `]` without a matching `[`; an index is written `[0]`",
+                ));
+            }
+            segments.push(KeySegment::Key(segment));
+            // `routes[0]` is one key in PHP and two segments here, and either way no dot sits
+            // between the name and the bracket, so the bracket is allowed to abut the name.
+            if i < chars.len() && chars[i] == '[' {
+                continue;
+            }
+        }
+
+        if i == chars.len() {
+            break;
+        }
+        if chars[i] != '.' {
+            return Err(problem(
+                "has something after a segment that is neither `.` nor `[`",
+            ));
+        }
+        i += 1;
+        if i == chars.len() {
+            return Err(problem("ends with a dot"));
+        }
+    }
+    Ok(segments)
+}
+
+/// Read `[N]` starting at `chars[open]`, returning the index and the position after the `]`.
+///
+/// `[01]` is accepted as `1`; a negative or empty index is not, because neither names an element
+/// of an array that has a length.
+fn index_segment(chars: &[char], open: usize) -> Option<(usize, usize)> {
+    let mut index = 0usize;
+    let mut i = open + 1;
+    let start = i;
+    while i < chars.len() {
+        let Some(digit) = chars[i].to_digit(10) else {
+            break;
+        };
+        index = index.checked_mul(10)?.checked_add(digit as usize)?;
+        i += 1;
+    }
+    if i == start || chars.get(i) != Some(&']') {
+        return None;
+    }
+    Some((index, i + 1))
+}
+
+/// Read a `"quoted key"` starting at `chars[open]`, returning the key and the position after it.
+fn quoted_key(chars: &[char], open: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 1;
+                match *chars.get(i)? {
+                    '"' => name.push('"'),
+                    '\\' => name.push('\\'),
+                    _ => return None,
+                }
+                i += 1;
+            }
+            '"' => return Some((name, i + 1)),
+            other => {
+                name.push(other);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Whether raw text opens like a TOML array or table.
+fn opens_structured(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with('[') || text.starts_with('{')
+}
+
 /// Lay one `KEY=VALUE` pair onto the table.
 ///
 /// The value is read by [`literal`], which is what gives `-o backends.app.workers=8` an integer and
 /// `-o server.http=127.0.0.1:8080` the string it looks like — no per-key knowledge here, and no way
 /// for this function to disagree with the file's own typing.
 fn apply_override(table: &mut toml::Table, pair: &str) -> Result<(), ServerError> {
-    let (key, raw) = pair.split_once('=').ok_or_else(|| {
+    let (key, raw) = split_pair(pair).ok_or_else(|| {
         invalid_override(format!(
             "--override {pair:?} is not KEY=VALUE; write -o server.http=127.0.0.1:8080 \
              (quote the whole pair in a shell)"
@@ -1071,36 +1242,125 @@ fn apply_override(table: &mut toml::Table, pair: &str) -> Result<(), ServerError
         .map_err(|reason| invalid_override(format!("--override {key}: {reason}")))?;
     let value = literal(&expanded);
 
-    let mut cursor = table;
-    let mut segments = key.split('.').peekable();
-    while let Some(segment) = segments.next() {
-        if segment.is_empty() {
-            return Err(invalid_override(format!(
-                "--override {key:?} has an empty key segment; a dotted key is `section.key`"
-            )));
+    // `literal` answers "a string" for anything it cannot parse, which is right for a listener and
+    // wrong for an array: `['a' => 'b']` — PHP, or JSON with `:` — would become a *string* and be
+    // refused later for being the wrong type, a message that names neither the real mistake nor
+    // the file format. Only a value that opens like TOML and did not parse is caught here, so a
+    // quoted `"[time]"` is still an ordinary string.
+    if opens_structured(&expanded) && matches!(value, toml::Value::String(_)) {
+        return Err(invalid_override(format!(
+            "--override {key}: {} is not a TOML array or table; PHP and JSON syntax are not read \
+             here, so write TOML inline syntax — `[{{ key = \"value\" }}]` for an array of tables — \
+             or quote the value to force a string",
+            expanded.trim()
+        )));
+    }
+
+    place(table, &key_segments(key)?, value, key)
+}
+
+/// Walk `segments` from `cursor`, inserting `value` at the end.
+///
+/// A table or an array is created only where a segment needs one, so `-o server.http=…` never
+/// grows an empty `routes` array. An existing container of the *wrong* shape is refused rather
+/// than replaced, because both `-o server.routes[0].backend=…` and `-o server.routes=[…]` are
+/// writable and replacing would make the result depend on the order the pairs were written in —
+/// a precedence an operator cannot see in the file they are reasoning about.
+fn place(
+    cursor: &mut toml::Table,
+    segments: &[KeySegment],
+    value: toml::Value,
+    key: &str,
+) -> Result<(), ServerError> {
+    let Some((head, rest)) = segments.split_first() else {
+        return Err(invalid_override(format!(
+            "--override {key:?} names no key; write it as KEY=VALUE"
+        )));
+    };
+    let KeySegment::Key(name) = head else {
+        return Err(invalid_override(format!(
+            "--override {key:?} indexes a value that is not there; an index needs an array to \
+             index, so write `section.array[0]`"
+        )));
+    };
+    if rest.is_empty() {
+        cursor.insert(name.clone(), value);
+        return Ok(());
+    }
+
+    let wants_array = matches!(rest[0], KeySegment::Index(_));
+    let entry = cursor.entry(name.clone()).or_insert_with(|| {
+        if wants_array {
+            toml::Value::Array(Vec::new())
+        } else {
+            toml::Value::Table(toml::Table::new())
         }
-        if segments.peek().is_none() {
-            cursor.insert(segment.to_string(), value);
+    });
+    match entry {
+        toml::Value::Table(table) if !wants_array => place(table, rest, value, key),
+        toml::Value::Array(items) if wants_array => place_in_array(items, rest, value, key),
+        other => {
+            let hint = if wants_array {
+                format!("it is not an array, so write `{name}.key` or replace it with `{name}=[…]`")
+            } else {
+                format!("it is not a table, so write `{name}[0].key`")
+            };
+            Err(invalid_override(format!(
+                "--override {key:?} passes through {name:?}, which already holds a {}; {hint}",
+                other.type_str()
+            )))
+        }
+    }
+}
+
+/// Take `segments` (which begin with an index) inside `items` and insert `value` where they end.
+///
+/// An index may name an existing element or **one past the end**, which appends and is the only
+/// way to add an entry without writing the whole array — the reason this syntax exists. Anything
+/// further is refused rather than padded: an element invented in the middle would be a route or a
+/// backend that nobody wrote and that no default can guess.
+fn place_in_array(
+    items: &mut Vec<toml::Value>,
+    segments: &[KeySegment],
+    value: toml::Value,
+    key: &str,
+) -> Result<(), ServerError> {
+    let Some((head, rest)) = segments.split_first() else {
+        return Err(invalid_override(format!(
+            "--override {key:?} names no key; write it as KEY=VALUE"
+        )));
+    };
+    let KeySegment::Index(index) = *head else {
+        return Err(invalid_override(format!(
+            "--override {key:?} names an array but no element; write `[…]` or `[0]`"
+        )));
+    };
+    if index > items.len() {
+        return Err(invalid_override(format!(
+            "--override {key:?} names element {index} of an array that holds {}; an index may add \
+             one element at the end, not leave a gap",
+            items.len()
+        )));
+    }
+    if index == items.len() {
+        if rest.is_empty() {
+            items.push(value);
             return Ok(());
         }
-        // A table in the way, or a table created for a key that did not exist yet. A *non*-table in
-        // the way is refused rather than replaced: `-o server=1 -o server.http=…` would otherwise
-        // silently choose depending on the order the pairs were written in.
-        let entry = cursor
-            .entry(segment.to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        cursor = match entry {
-            toml::Value::Table(table) => table,
-            other => {
-                return Err(invalid_override(format!(
-                    "--override {key:?} passes through {segment:?}, which is already set to {}; \
-                     name a section, not a value",
-                    other.type_str()
-                )))
-            }
-        };
+        items.push(toml::Value::Table(toml::Table::new()));
     }
-    Ok(())
+    if rest.is_empty() {
+        items[index] = value;
+        return Ok(());
+    }
+    match &mut items[index] {
+        toml::Value::Table(table) => place(table, rest, value, key),
+        other => Err(invalid_override(format!(
+            "--override {key:?} passes through element {index}, which already holds a {}; name a \
+             key inside it, or replace the element with `[{index}]=…`",
+            other.type_str()
+        ))),
+    }
 }
 
 /// One `-o` pair that cannot be applied.
@@ -4036,6 +4296,171 @@ mod tests {
         assert!(
             err.to_string().contains("server"),
             "the refusal must name the key it could not pass through: {err}"
+        );
+    }
+
+    /// A bracketed index reaches into an array of tables, which is what a dotted key cannot do.
+    ///
+    /// The case that motivated it: `-o 'server.routes=[…]'` replaces the whole array, so amending
+    /// one route of twenty had no spelling. Every assertion is on the *table*, before
+    /// deserialization, because the grammar is the part being pinned — and the deserialization at
+    /// the end is what proves the segments landed where a file's `[[server.routes]]` would have.
+    #[test]
+    fn an_index_reaches_into_an_array_of_tables() {
+        let mut table = toml::Table::new();
+        apply_override(&mut table, "server.http=127.0.0.1:8080")
+            .expect("a listener is not an array");
+        apply_override(&mut table, r#"server.routes[0].path_prefix="/api""#)
+            .expect("the empty array it has to create is its own");
+        apply_override(&mut table, r#"server.routes[0].backend="app""#).expect("a sibling");
+        apply_override(&mut table, r#"server.routes[1].path_prefix="/admin""#)
+            .expect("one past the end appends");
+
+        let config = Config::from_table(table.clone()).expect("the table deserializes");
+        assert_eq!(config.server.http.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(config.server.routes.len(), 2, "one appended, one amended");
+        assert_eq!(config.server.routes[0].path_prefix.as_deref(), Some("/api"));
+        assert_eq!(
+            config.server.routes[1].path_prefix.as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(
+            config.server.routes[0].backend.as_deref(),
+            Some("app"),
+            "the second pair must amend element 0, not replace it"
+        );
+
+        // `[1]` on a fresh table is a gap, and a gap is refused: an element invented in the middle
+        // would be a route nobody wrote.
+        let mut table = toml::Table::new();
+        let err = apply_override(&mut table, "server.routes[1].backend=app")
+            .expect_err("an index past the end plus one is not an append");
+        assert!(err.to_string().contains("gap"), "{err}");
+
+        // And a table cannot be indexed, nor an array walked without one. Both are refused by the
+        // schema rather than here — this function is deliberately schema-blind, so it builds what
+        // it is told and the one strict deserializer says the type is wrong.
+        let mut table = toml::Table::new();
+        apply_override(&mut table, "server[0].http=127.0.0.1:8080").expect("the grammar allows it");
+        assert!(
+            Config::from_table(table).is_err(),
+            "`server` is a table, so an index into it must fail validation"
+        );
+        let mut table = toml::Table::new();
+        apply_override(&mut table, r#"server.routes={path_prefix="/api"}"#).expect("a table value");
+        assert!(
+            Config::from_table(table).is_err(),
+            "`routes` is a sequence, so a table of one must fail validation"
+        );
+    }
+
+    /// A quoted segment is how a map key that holds a dot is written, and it is the one place a
+    /// bracket is a literal character rather than an index.
+    #[test]
+    fn a_quoted_segment_is_literal() {
+        let mut table = toml::Table::new();
+        apply_override(&mut table, r#"server.env."APP.NAME"=x"#).expect("a quoted key");
+        apply_override(&mut table, r#"server.env."routes[0]"=literal"#)
+            .expect("a bracket in a quoted key is a character");
+        apply_override(&mut table, r#"server.env.APP_ENV=prod"#).expect("a plain key still works");
+
+        let env = table["server"]["env"].as_table().expect("env is a table");
+        assert_eq!(env["APP.NAME"].as_str(), Some("x"));
+        assert_eq!(env["routes[0]"].as_str(), Some("literal"));
+        assert_eq!(env["APP_ENV"].as_str(), Some("prod"));
+        assert!(
+            table["server"].get("routes").is_none(),
+            "a quoted bracket must not invent an array"
+        );
+    }
+
+    /// The key grammar says which spellings it takes and names the one that is wrong.
+    ///
+    /// `[01]` and a trailing dot are here so that the accepted set is stated rather than assumed:
+    /// leading zeros are just a number, and a dot promises a segment that is not there.
+    #[test]
+    fn a_key_segment_is_a_name_or_an_index() {
+        let cases: &[(&str, &[KeySegment])] = &[
+            (
+                "server.http",
+                &[
+                    KeySegment::Key("server".into()),
+                    KeySegment::Key("http".into()),
+                ],
+            ),
+            (
+                "server.routes[02].backend",
+                &[
+                    KeySegment::Key("server".into()),
+                    KeySegment::Key("routes".into()),
+                    KeySegment::Index(2),
+                    KeySegment::Key("backend".into()),
+                ],
+            ),
+            (
+                r#"server.env."a.b""#,
+                &[
+                    KeySegment::Key("server".into()),
+                    KeySegment::Key("env".into()),
+                    KeySegment::Key("a.b".into()),
+                ],
+            ),
+            (
+                r#"server.env."a\"b""#,
+                &[
+                    KeySegment::Key("server".into()),
+                    KeySegment::Key("env".into()),
+                    KeySegment::Key(r#"a"b"#.into()),
+                ],
+            ),
+        ];
+        for (key, expected) in cases {
+            let segments = key_segments(key).unwrap_or_else(|err| panic!("key {key:?}: {err}"));
+            assert_eq!(segments, *expected, "key {key:?}");
+        }
+
+        for key in [
+            "server..http",
+            "server.",
+            ".server",
+            "server.http]",
+            "server.routes[]",
+            "server.routes[-1]",
+            "server.routes[a]",
+            r#"server.env.a"b""#,
+            r#"server.env."unterminated"#,
+        ] {
+            assert!(key_segments(key).is_err(), "key {key:?} must be refused");
+        }
+    }
+
+    /// A value that opens like TOML and did not parse is refused as a *syntax* error, not silently
+    /// read as a string.
+    ///
+    /// `['a' => 'b']` is the PHP spelling and `[{"a": "b"}]` the JSON one; both would otherwise
+    /// become a string and fail later with "invalid type: string" — a message that names neither
+    /// the mistake nor the fix. A quoted value is still a string, so `-o 'x="[time]"'` keeps
+    /// working.
+    #[test]
+    fn a_structured_value_that_is_not_toml_names_the_syntax_it_expected() {
+        let mut table = toml::Table::new();
+        for pair in [
+            r#"server.routes=['a' => 'b']"#,
+            r#"server.routes=[{"a": "b"}]"#,
+            "server.routes=[{path_prefix=/api}]",
+            "server.routes={",
+        ] {
+            let err = apply_override(&mut table, pair).expect_err("PHP and JSON are not read");
+            let message = err.to_string();
+            assert!(message.contains("TOML"), "{pair}: {message}");
+        }
+
+        let mut table = toml::Table::new();
+        apply_override(&mut table, r#"server.env.LITERAL="[time]""#).expect("quoted is a string");
+        assert_eq!(
+            table["server"]["env"]["LITERAL"].as_str(),
+            Some("[time]"),
+            "a quoted value must reach the table as text, not be refused as malformed TOML"
         );
     }
 

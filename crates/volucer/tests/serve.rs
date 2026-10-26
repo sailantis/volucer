@@ -4483,6 +4483,97 @@ fn an_override_wins_over_the_file_and_over_the_listen_sugar() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// An index amendments or appends one element of an array of tables in the file.
+///
+/// **This is the case the syntax exists for.** `-o 'server.routes=[…]'` replaces the array, so
+/// before indexing, a route that already existed could only be changed by editing the file — no
+/// use to a container that mounts it read-only, or a unit file that wants one extra route. All
+/// three effects are asserted on a running server: element 0 is untouched, element 1 keeps its
+/// element but answers on a new prefix, and element 2 exists at all because the index appended it.
+#[test]
+fn an_override_index_amends_and_appends_routes_in_the_file() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-route-index-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let public = root.join("public");
+    // A route's prefix is part of the path it resolves, so each route gets its own directory: what
+    // makes "amended" visible is that `/two-amended` answers and, had element 1 kept its file
+    // prefix, it would not.
+    for (dir, file, body) in [
+        ("one", "one.txt", "ONE"),
+        ("two-amended", "amended.txt", "AMENDED"),
+        ("three", "three.txt", "THREE"),
+    ] {
+        let dir = public.join(dir);
+        std::fs::create_dir_all(&dir).expect("create a document root");
+        std::fs::write(dir.join(file), body).expect("write the marker");
+    }
+
+    let Some(port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+
+    // Three prefixes, but only two routes: `/three` must not answer until an override adds it.
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {}\n\n\
+             [server.static_files]\nenabled = true\n\n\
+             [[server.routes]]\npath_prefix = \"/one\"\npolicy = \"static\"\n\n\
+             [[server.routes]]\npath_prefix = \"/two\"\npolicy = \"static\"\n",
+            toml_string(&public.display().to_string())
+        ),
+    )
+    .expect("write the config");
+
+    let http = format!("server.http=127.0.0.1:{port}");
+    let server = Server::start_with(
+        &binary,
+        &config_path,
+        &[
+            "-o",
+            &http,
+            "-o",
+            "server.routes[1].path_prefix=/two-amended",
+            "-o",
+            "server.routes[2].path_prefix=/three",
+            "-o",
+            "server.routes[2].policy=static",
+        ],
+    );
+    let Some(server) = server else {
+        let _ = std::fs::remove_dir_all(&root);
+        panic!("the server did not start");
+    };
+
+    let address = format!("127.0.0.1:{port}");
+    assert_eq!(
+        http_get(&address, "/one/one.txt").text(),
+        "ONE",
+        "element 0 must be untouched by an override that names element 1"
+    );
+    assert_eq!(
+        http_get(&address, "/three/three.txt").text(),
+        "THREE",
+        "element 2 must be appended, since the file only had two"
+    );
+    assert_eq!(
+        http_get(&address, "/two-amended/amended.txt").text(),
+        "AMENDED",
+        "element 1's own prefix must have been replaced by the override"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An override the schema does not have is a startup error, exactly as a typo in the file is.
 ///
 /// **This is the property the feature would be worse without.** A command line that accepted

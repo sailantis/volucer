@@ -399,10 +399,28 @@ Keep these rules in mind when setting options on the command line:
 - **Unknown keys are errors.** A typo such as `-o server.htpp=…` stops startup and names
   the invalid key instead of silently using a default.
 
-Arrays of tables (such as `[[server.routes]]` or a site's `[sites.x]` table) and `map`
-values can only be set in a file; they have no `dot.notation` form. To serve only real
-files, use `--front-controller ''`. An empty `-o server.front_controller=` is not valid
-because the empty value is reserved for that option.
+Use TOML dotted-key syntax to override values inside tables. For example,
+`-o backends.app.workers=8` sets a worker count, and `-o sites.app.document_root=public`
+sets a site's document root. If a key contains a dot, quote that key:
+`-o 'server.env."APP.NAME"=x'`.
+
+To override fields in an **array of tables**, include the element's index:
+
+```sh
+volucer serve --listen 0.0.0.0:8080 \
+    -o server.routes[0].path_prefix=/api \
+    -o server.routes[0].backend=app \
+    -o server.routes[1].path_prefix=/admin
+```
+
+An index updates that element; using the next index appends an element. Skipped indices are
+rejected rather than filled with empty entries. To replace the entire array instead, provide an
+inline TOML value, such as
+`-o 'server.routes=[{ path_prefix = "/api", backend = "app" }]'`. Override values use TOML
+syntax, not PHP array syntax (`['k' => 'v']`) or JSON.
+
+To serve only real files, use `--front-controller ''`. An empty `-o server.front_controller=` is
+not valid because the empty value is reserved for that option.
 
 When there is **no configuration file**, relative paths such as
 `server.tls.certificate`, `[server.acme].cache`, and the access-log path resolve from the

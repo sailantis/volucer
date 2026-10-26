@@ -7,6 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`-o` can update entries in an array of tables.** For example,
+  `-o server.routes[0].backend=app` updates a field on the first entry. Using the array's length as
+  the index appends an entry; skipping an index or targeting a container of the wrong type is
+  rejected rather than silently padded or replaced. The whole array can still be replaced with an
+  inline TOML value, such as `-o 'server.routes=[…]'`. Quoted key segments
+  (`-o 'server.env."APP.NAME"=x'`) allow map keys to contain dots or brackets. Values that look
+  like TOML but are invalid — including PHP array syntax (`['k' => 'v']`) and JSON
+  (`[{"k": "v"}]`) — now produce a syntax error instead of being treated as strings and failing
+  later with a type error.
+
+### Fixed
+
+- **The docs claimed arrays of tables and maps could only be set in a file.** Maps always took
+  dotted keys, and an array of tables could already be replaced with an inline TOML value
+  (`-o 'server.routes=[{ path_prefix = "/api" }]'`). Both pages now describe what the parser does.
+
 ## [0.3.0] - 2026-10-26
 
 ### Added

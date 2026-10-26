@@ -37,8 +37,20 @@ determines how their values are interpreted:
 `-o server.fastcgi=…`. Volucer applies them **before** all `-o` pairs, so an explicit
 override such as `-o server.http=…` takes precedence over `--listen …`.
 
-Arrays of tables (such as `[[server.routes]]` and `[sites.<name>]`) and `map` values
-cannot be expressed with dotted keys, so they must be set in a file.
+Use dotted keys to override values in maps, which are ordinary TOML tables. For example,
+`-o backends.app.workers=8` sets a worker count. If a key itself contains a dot, quote it:
+`-o 'server.env."APP.NAME"=x'`.
+
+Address entries in an **array of tables** by their zero-based index:
+
+| Form | Effect |
+|---|---|
+| `-o server.routes[0].backend=app` | Sets a field on the first element. |
+| `-o server.routes[2].path_prefix=/x` | Appends an element if the array currently has two entries. Indices beyond the next available position are rejected, not padded. |
+| `-o 'server.routes=[{ path_prefix = "/api" }]'` | Replaces the entire array with the supplied inline TOML value. |
+
+Override values use TOML syntax. PHP array syntax (`['k' => 'v']`) and JSON are not accepted;
+in an inline array of tables, separate each key from its value with `=`.
 
 **`server.front_controller` cannot be set with `-o`.** Its empty string means “serve only
 real files,” but TOML treats an empty string as a missing value for this key. Use
