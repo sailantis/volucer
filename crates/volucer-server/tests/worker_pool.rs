@@ -995,13 +995,23 @@ fn the_pool_reports_the_time_requests_spent_waiting_for_a_slot() {
     let _serial = serial();
     require_sdk!();
 
-    // A pool of two, so eight simultaneous requests have to queue three deep. The
-    // handler sleeps rather than returning at once, because the wait being measured is
-    // the time spent behind another *request*, and a handler that could not be caught
-    // mid-request would leave nothing to wait behind.
+    // A pool of two, so eight simultaneous requests have to queue three deep. The handler
+    // sleeps rather than returning at once, because the wait being measured is the time spent
+    // behind another *request*, and a handler that could not be caught mid-request would leave
+    // nothing to wait behind.
+    //
+    // The handler also blocks while a gate file exists. That is what makes the queue *real*
+    // rather than hoped for: with the gate closed the two holders cannot finish, so every
+    // further request is parked for a slot no matter how the threads are scheduled. Spawning
+    // eight threads and trusting them to overlap was the flake — on a loaded runner they
+    // started far enough apart that each found an idle slot, and the counter this test exists
+    // for was never asked to report anything. The gate does not exist for the idle phase, so
+    // the handler there returns at once.
+    let hold_us: u64 = 50_000;
     let dir = std::env::temp_dir().join(format!("volucer-wait-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the fixture directory");
     let script = dir.join("slow-worker.php");
+    let gate = dir.join("close-the-gate");
     let autoload = sdk_dir().join("autoload.php").display().to_string();
     std::fs::write(
         &script,
@@ -1013,10 +1023,18 @@ use Volucer\Response;
 use Volucer\Worker;
 $worker = Worker::connect();
 $worker->run(static function (Request $request, Worker $worker): Response|null {{
-    usleep(50000);
+    $deadline = microtime(true) + 60;
+    while (file_exists('{gate}')) {{
+        if (microtime(true) > $deadline) {{
+            return Response::json(['error' => 'the gate never opened'], 500);
+        }}
+        usleep(1000);
+    }}
+    usleep({hold_us});
     return Response::json(['pid' => getmypid()]);
 }});
-"#
+"#,
+            gate = gate.display(),
         ),
     )
     .expect("write the worker");
@@ -1038,7 +1056,13 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         transport: Default::default(),
         socket: None,
     };
-    let pool = WorkerPool::start("test", &config).expect("pool starts");
+    let mut pool = WorkerPool::start("test", &config).expect("pool starts");
+    // The default bound is the production one, and this test is about the measurement rather
+    // than about the policy: on a loaded runner the queue below can outlast `MAX_SLOT_WAIT`,
+    // and the pool then answers `503` — correctly, but the counter this test exists for was
+    // never asked. The policy has its own test (`a_full_pool_refuses_rather_than_queueing_
+    // when_the_wait_is_none`), so the bound is raised here to take it out of the way.
+    pool.set_max_wait(Some(Duration::from_secs(30)));
 
     // Idle: one request against two workers has nothing to wait for, so the pool must say
     // so. Not *zero*: the figure includes the scan's own lock-and-release, which every
@@ -1055,14 +1079,48 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         "one request against two idle workers waits for nothing but the scan: {idle} us"
     );
 
-    // Contended: eight requests for two workers. The later batches each wait for a whole
-    // 50 ms request to finish, so the pool's mean is at least tens of milliseconds.
+    // Contended: eight requests for two workers. The gate is closed first, then the two
+    // holders are started, and only once both slots are leased is the rest of the queue fed.
+    // With the gate closed the holders cannot finish, so each further request is provably
+    // parked for a slot — the test no longer depends on how the threads happen to be
+    // scheduled, which is what made it flake on a loaded runner.
     let requests: usize = 8;
     let contended_at = std::time::Instant::now();
     let answers: Vec<u16> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..requests)
+        std::fs::write(&gate, b"closed").expect("close the gate");
+
+        let mut handles: Vec<_> = (0..workers as usize)
             .map(|_| scope.spawn(|| pool.request(&get("/")).map(|r| r.parse_status_headers().0)))
             .collect();
+
+        // Wait until both slots are actually leased, so the queue below is fed against a pool
+        // that is provably full.
+        let mut waited = Duration::ZERO;
+        while pool.free_slots() != 0 && waited < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += Duration::from_millis(1);
+        }
+        assert_eq!(
+            pool.free_slots(),
+            0,
+            "both slots are leased before the queue is fed"
+        );
+
+        handles.extend(
+            (0..requests - workers as usize).map(|_| {
+                scope.spawn(|| pool.request(&get("/")).map(|r| r.parse_status_headers().0))
+            }),
+        );
+
+        // The gate stays shut until the queue is as deep as it is going to get, or the holders
+        // finish early and the late arrivals find free slots instead of a queue. There is no
+        // counter for "parked" to wait on and none is added just for a test, so this is a fixed
+        // span: long enough for eight thread spawns on a loaded runner. It does not gate
+        // correctness — anything that arrives later still queues behind the holders, because
+        // the gate is still shut.
+        std::thread::sleep(Duration::from_millis(250));
+        std::fs::remove_file(&gate).expect("open the gate");
+
         handles
             .into_iter()
             .map(|handle| {
@@ -1079,17 +1137,19 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     assert_eq!(pool.requests_served(), 1 + requests as u64);
     let (busiest, busiest_us) = pool.busiest_slot_wait_us();
     let mean = pool.mean_slot_wait_us();
+    let mean_floor_us = hold_us / 2 / 5;
     // The wall clock comes first because it says whether there was anything to queue for.
-    // Eight 50 ms requests on two workers is four batches, so anything near eight batches
-    // means they never overlapped and a wait of zero would be the truth rather than a bug.
+    // Eight requests of `hold_us` on two workers is four batches, so anything near eight
+    // batches means they never overlapped and a wait of zero would be the truth rather than
+    // a bug.
     assert!(
-        contended_for >= Duration::from_millis(150),
-        "eight 50 ms requests on two workers take at least four batches: {contended_for:?}"
+        contended_for >= Duration::from_micros(hold_us * requests as u64 / workers as u64 / 2),
+        "eight {hold_us} us requests on two workers take at least four batches: {contended_for:?}"
     );
     assert!(
-        mean >= 20_000,
-        "eight requests on two 50 ms workers queue for tens of milliseconds each, not {mean} us \
-         (busiest slot {busiest} at {busiest_us} us, {contended_for:?} wall clock)"
+        mean >= mean_floor_us,
+        "eight requests on two {hold_us} us workers queue for at least {mean_floor_us} us each, \
+         not {mean} us (busiest slot {busiest} at {busiest_us} us, {contended_for:?} wall clock)"
     );
 
     // And the wait lands on the slots rather than on the pool as a whole: a request waits
@@ -1112,8 +1172,8 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         "the median wait cannot exceed the tail: p50 {p50} us, p99 {p99} us"
     );
     assert!(
-        p99 >= 20_000,
-        "one queueing wait in a hundred is a whole 50 ms request: p99 is {p99} us"
+        p99 >= mean_floor_us,
+        "one queueing wait in a hundred is most of a {hold_us} us request: p99 is {p99} us"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
