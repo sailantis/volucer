@@ -1084,15 +1084,36 @@ impl CgiPool {
 
     /// Replace a locked slot's process with a fresh one on the same address.
     ///
-    /// The replacement is booted before the old process is killed, so a slot that
-    /// cannot be restarted keeps working rather than being left dead.
+    /// **The old process is stopped before the replacement is spawned, and that order is not
+    /// negotiable.** A slot keeps its address, and one port can only be bound once: `php-cgi`
+    /// that loses the bind exits with status 255, which surfaces here as `StartupExited` and,
+    /// on the request path, as a failed recycle of a slot that had just served successfully.
+    ///
+    /// This used to boot the replacement first, on the reasoning that a slot that cannot be
+    /// restarted then keeps working rather than being left dead. That trade is not available:
+    /// macOS refuses the second bind outright, and `Test (macos-latest)` failed on the second
+    /// request of `recycling_replaces_the_process_after_max_requests` for exactly that reason.
+    /// The platforms that *appeared* to allow it allow it by sharing the port — Windows
+    /// `SO_REUSEADDR` lets a second process take a port that is already listening, measured
+    /// with two `php-cgi -b 127.0.0.1:<port>` alive at once — so the replacement was silently
+    /// hijacking the address rather than taking it over, and the old worker was still serving
+    /// the connections it had already accepted.
+    ///
+    /// So the old process is stopped and reaped first, and a spawn that fails after that is
+    /// reported: the slot is left without a process, which the next request repairs through
+    /// this same function, and the failure is named rather than hidden behind a worker that
+    /// only looked healthy because it was the previous one.
     fn replace_locked(&self, slot: &mut Slot) -> Result<()> {
         let address = slot.address();
+        // Stopped and reaped before the address is offered again: `kill` is a signal, and the
+        // listening socket is still open until the process has actually gone. `shutdown` does
+        // the same two steps for the same reason.
+        let _ = crate::lifecycle::kill(&mut slot.child);
+        let _ = slot.child.wait();
+
         let mut replacement = self.spawn_slot(&address)?;
         replacement.served = 0;
-        let mut old = std::mem::replace(slot, replacement);
-        let _ = crate::lifecycle::kill(&mut old.child);
-        let _ = old.child.wait();
+        *slot = replacement;
         Ok(())
     }
 

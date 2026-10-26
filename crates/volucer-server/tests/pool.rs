@@ -581,12 +581,31 @@ fn recycling_replaces_the_process_after_max_requests() {
     }
 
     // Two requests is the limit, so the slot must have been replaced.
+    let recycled = pool.pids()[0];
     assert_ne!(
-        pool.pids()[0],
-        original,
+        recycled, original,
         "the slot should have been recycled after max_requests"
     );
     assert_eq!(pool.ports(), vec![base], "the recycled slot kept the port");
+
+    // The process that was replaced is *gone*, not merely no longer in the pool.
+    //
+    // This is the half that the old order broke and that a "the replacement answered" check
+    // cannot see. `replace_locked` used to spawn the replacement before killing the original,
+    // so on a platform that hands two processes one listening socket the old worker stayed
+    // alive and kept serving connections it had already accepted — the pool reported a fresh
+    // slot while the previous process was still running. On macOS the second bind is refused
+    // instead, which surfaced as `StartupExited { status: 255 }` on the second request.
+    //
+    // Waiting briefly because a kill is a signal: the process is reaped by `child.wait()` in
+    // `replace_locked`, so it has already exited by the time this returns, and the sleep only
+    // gives the OS a moment to make `is_running` agree on every platform.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !is_running(original),
+        "the replaced worker {original} is still running; the replacement did not take the \
+         address over cleanly"
+    );
 
     pool.shutdown();
     let _ = std::fs::remove_dir_all(&root);

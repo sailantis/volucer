@@ -39,19 +39,41 @@ pub fn find_php_cgi() -> Option<PathBuf> {
 
 /// Find a run of `count` consecutive unused ports, returning the first.
 ///
-/// Consecutive matters: the pool starts at `base_port` and increments, so
-/// scattered free ports would not all be used. Every port in the run is held
-/// while checking, so the run cannot be picked twice.
+/// Consecutive matters: the pool starts at `base_port` and increments, so scattered free
+/// ports would not all be used. Every port in the run is held while checking, so the run
+/// cannot be picked twice.
+///
+/// **Scanned from a per-call offset rather than taken from `bind(0)`.** `bind(0)` asks the
+/// kernel for "any port", and on `macos-latest` the kernel hands out the most recently
+/// released port first — so the next call in the same binary was offered the port the
+/// previous one had just given up. Every test in a suite is a thread of one process, so they
+/// walked the same numbers in the same order and the loser bound an address another test had
+/// already taken. That surfaced as `unsupported FastCGI version 72` — 72 being `H` — when a
+/// slot found somebody else's HTTP listener, and as `StartupExited { status: 255 }` when
+/// `php-cgi` lost the bind outright.
+///
+/// `crates/volucer/tests/serve.rs` was fixed this way on its own; this is the copy the
+/// `volucer-server` suites use, and it still had the defect. The range is chosen to sit
+/// inside every platform's usable window — macOS keeps ephemeral ports up to 65535, Windows
+/// reserves much of 49xxx-65xxx for Hyper-V, Linux starts at 32768 — since only "consecutive
+/// and currently free" is required.
 pub fn free_port_run(count: usize) -> Option<u16> {
-    for _ in 0..64 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-        let base = probe.local_addr().expect("bound address").port();
-        drop(probe);
+    const FIRST: u16 = 20_000;
+    const LAST: u16 = 60_000;
 
+    // A per-call offset, not just a per-process one: every test in this binary runs as a
+    // thread of the same process, so a `pid`-derived start alone would have them all walking
+    // the same ports in the same order.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let span = u32::from(LAST - FIRST - count as u16);
+    let start = (std::process::id().wrapping_mul(2654435761) ^ call.wrapping_mul(40503)) % span;
+    for attempt in 0..64u32 {
+        let base = FIRST + ((start + attempt * 97) % span) as u16;
         let mut held = Vec::with_capacity(count);
         for offset in 0..count {
-            let port = base.checked_add(offset as u16)?;
-            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            match std::net::TcpListener::bind(("127.0.0.1", base + offset as u16)) {
                 Ok(listener) => held.push(listener),
                 Err(_) => break,
             }
