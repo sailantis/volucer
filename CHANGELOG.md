@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A route tie went to the later entry, not the earlier one.** `select_route` used
+  `Iterator::max_by_key`, which returns the *last* maximum, while the table's own documentation —
+  and `Config::route_backend`'s — says ties are settled by declaration order so the earlier entry
+  wins. The two disagreed harmlessly for as long as a tie meant two routes that behaved identically
+  for routing. They no longer do: `[rpc]` derives a backend's token from the name a route selects,
+  so reversing the tie handed one backend's call plane to another. Two regression tests now pin both
+  halves of the rule — that a tie goes to the earlier entry, and that a later route stating *more*
+  constraints still wins.
+
 ### Added
 
 - **`[rpc]` gives a FastCGI or HTTP application the services a worker reaches over its channel.**
@@ -22,6 +33,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process would pay for one on every request, so the token travels on each call and a withdrawn grant
   takes effect on the next one. `services` is now accepted on `external`, `spawn_cgi` and `upstream`
   backends; a grant without `[rpc]`, and `[rpc]` with nothing granted, are both refused at startup.
+  The PHP SDK's `Volucer\Rpc` is the other half: it dials that listener from `$_SERVER`, and because
+  `Kv`, `Lock` and `Jobs` are written against a shared `CallPlane` seam, the same storage code runs
+  over either transport.
 - **`[telemetry].sample` controls which traces are exported.** The default, `parent_based`, follows
   the sampling decision in an incoming trace and records requests with no `traceparent` (root
   requests). `always` exports every trace. `ratio` exports the fraction configured by

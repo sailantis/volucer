@@ -703,6 +703,15 @@ pub fn select_backend<'a>(
 }
 
 /// [`select_backend`], keeping the route so its other properties are available.
+///
+/// **`max_by_key` alone would be wrong, and the difference decides what a backend is granted.**
+/// `Iterator::max_by_key` returns the *last* maximum, while the rule this table documents — and
+/// which [`Config::route_backend`] states — is that ties go to the **earlier** entry. For a while the
+/// two disagreed harmlessly: a tie meant two routes that behaved identically for routing. They no
+/// longer behave identically, because `[rpc]` derives a token from the backend a route selects, so
+/// reversing the tie hands one backend's call plane to another. `max_by` with a `>=` on the
+/// comparison is the standard way to get the first maximum, and it is spelled out rather than
+/// relying on `max_by_key`'s documented-but-easy-to-miss reverse scan.
 pub fn select_route<'a>(
     routes: &'a [RouteConfig],
     host: Option<&str>,
@@ -711,7 +720,17 @@ pub fn select_route<'a>(
     routes
         .iter()
         .filter(|route| route.matches(host, path))
-        .max_by_key(|route| (route.specificity(), route.has_exact_host()))
+        .max_by(|left, right| {
+            let left = (left.specificity(), left.has_exact_host());
+            let right = (right.specificity(), right.has_exact_host());
+            // `>=` rather than `>`: on a tie the *earlier* route has to win, so as `max_by` walks
+            // forward it must not replace its current best with an equally good later one.
+            if left >= right {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        })
 }
 
 /// Whether a route proves its path names a script, so the caller need not `stat` it.

@@ -242,3 +242,79 @@ backend = "app"
     let err = config.validate().expect_err("must fail");
     assert!(err.to_string().contains("must start with"), "{err}");
 }
+#[test]
+fn a_tie_goes_to_the_earlier_route() {
+    // The documented rule, and the one this table's own docstring states: "ties are broken by
+    // declaration order so the earlier entry wins". `Iterator::max_by_key` breaks the other way —
+    // it returns the *last* maximum — so this assertion is what keeps the implementation and the
+    // documentation the same claim.
+    //
+    // **It is not a cosmetic ordering.** `[rpc]` derives a backend's token from the name a route
+    // selects, so two routes that tie and name different backends decide which call plane a request
+    // is handed. Before `[rpc]` existed a tie meant two routes that behaved identically; the test
+    // exists because that stopped being true.
+    let text = r#"
+[server]
+default_backend = "first"
+http = "127.0.0.1:8080"
+
+[backends.first]
+kind = "worker"
+command = "php first.php"
+
+[backends.second]
+kind = "worker"
+command = "php second.php"
+
+[[server.routes]]
+path_prefix = "/api"
+backend = "first"
+
+[[server.routes]]
+path_prefix = "/api"
+backend = "second"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config.validate().expect("config validates");
+    assert_eq!(
+        config.route_backend(None, "/api/x"),
+        Some("first"),
+        "an equally specific later route must not displace an earlier one"
+    );
+}
+
+#[test]
+fn a_more_specific_later_route_still_beats_an_earlier_one() {
+    // The other half of the same rule: declaration order settles only a *tie*. A later route that
+    // states more constraints wins, which is what makes the previous test about ties rather than
+    // about position in the file.
+    let text = r#"
+[server]
+default_backend = "plain"
+http = "127.0.0.1:8080"
+
+[backends.plain]
+kind = "worker"
+command = "php plain.php"
+
+[backends.specific]
+kind = "worker"
+command = "php specific.php"
+
+[[server.routes]]
+path_prefix = "/api"
+backend = "plain"
+
+[[server.routes]]
+host = "api.example"
+path_prefix = "/"
+backend = "specific"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config.validate().expect("config validates");
+    assert_eq!(
+        config.route_backend(Some("api.example"), "/api/x"),
+        Some("specific"),
+        "specificity is decided before declaration order"
+    );
+}

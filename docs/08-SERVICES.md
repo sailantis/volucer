@@ -85,12 +85,18 @@ because a CGI process would pay the cost of a handshake on every request. This a
 a token sent over an existing connection is checked on the next call.
 
 ```php
-$address = $_SERVER['VOLUCER_RPC'];
-$token   = $_SERVER['VOLUCER_RPC_TOKEN'];
+// The whole client. It reads VOLUCER_RPC and VOLUCER_RPC_TOKEN from the request it was handed.
+$rpc = Volucer\Rpc::connect();
 
-$stream = stream_socket_client('tcp://' . $address);
-// ... or 'unix://' when [rpc].listen is a unix path
+$rpc->kv('cache')->set('greeting', 'hello');
+$rpc->lock()->acquire('pdf:create');
 ```
+
+The frames are the worker protocol's, so a client written against the SDK's `Frame`/`Header` works
+too — but there is no reason to write one. `Rpc` connects lazily (a request that never touches a
+store pays nothing), reconnects after a broken connection, and puts the token on every call. It
+enforces the deadline itself, because the server's `call_timeout_seconds` governs only how long it
+will spend *writing* an answer.
 
 `[rpc].listen` may be a `unix:` path or a loopback `host:port`. A wildcard bind is rejected:
 every call on this socket mutates something, and the token identifies a backend within one
@@ -105,6 +111,21 @@ host; it is not a defence against another host.
 
 An `upstream` backend that grants services is handled the same way, except that it receives
 the same two values as the request headers `X-Volucer-Rpc` and `X-Volucer-Rpc-Token`.
+
+**`Volucer\Rpc` is that client, in the PHP SDK.** `Kv`, `Lock` and `Jobs` are written against a
+three-method `CallPlane` interface — `call()`, `lastCallError()`, `lastCallWasUnknown()` — which both
+`Worker` and `Rpc` implement, so the storage code is the same over either transport and only the type
+that built it differs:
+
+```php
+$kv = $worker->kv('cache');     // inside a worker
+$kv = $rpc->kv('cache');        // inside a FastCGI request
+```
+
+Two things it does that a worker's channel does not need, and both are worth knowing before relying
+on one. A call has a **deadline** (`Rpc::connect(timeout: …)`, default 10 s, which has to cover a
+`lock()->acquire()` that waits), and `lastCallWasUnknown()` is reachable on a path a worker never has
+— a connection that broke after the call was written may still have been served.
 
 ## Key-value storage
 
