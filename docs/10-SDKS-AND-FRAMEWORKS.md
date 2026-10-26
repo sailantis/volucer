@@ -1,12 +1,12 @@
 # SDKs and Frameworks
 
-**Worker SDKs and framework integrations for PHP, Python, and Ruby.**
+Volucer provides worker SDKs for PHP, Python, and Ruby, along with integrations for
+selected PHP frameworks.
 
 ## The SDKs
 
-Three SDKs implement the other end of the [worker protocol](09-WORKER-PROTOCOL.md), and each
-pins the same frozen wire bytes as the Rust tests. They live in separate repositories
-because each one's package manager needs a manifest at the root.
+The SDKs implement the worker side of the [worker protocol](09-WORKER-PROTOCOL.md). Their
+repositories include package-manager manifests and tests for the protocol's wire format.
 
 | SDK | Package | Install |
 |---|---|---|
@@ -14,21 +14,21 @@ because each one's package manager needs a manifest at the root.
 | Python | `volucer-worker` | `pip install volucer-worker` |
 | Ruby | `volucer-worker` | `gem install volucer-worker` |
 
-All three are **transports, not frameworks**. There is no router, no container and no
-middleware pipeline, because a package that forced one could not be used from the many
-applications that already have their own. `Request` and `Response` are plain value objects,
-and a WSGI or Rack application needs no adapter at all.
+The SDKs provide transport rather than a framework: they do not require a router, container,
+or middleware pipeline. Their `Request` and `Response` objects are plain value objects.
+Python WSGI and Ruby Rack applications can be connected using the supplied adapters.
 
-**A Python or Ruby deployment needs no PHP on the host.** The PHP 8.2 floor is the PHP SDK's
-own: it is the version that has `memory_reset_peak_usage()`, which the SDK calls so that each
-request reports its own peak memory. The server does not enforce that floor on workers — a
-worker that reports no PHP version is a normal one — and a Python worker reports none.
+Python and Ruby workers do not require PHP to be installed on the host. The PHP SDK requires
+PHP 8.2 or later because it uses `memory_reset_peak_usage()` to report peak memory per
+request. This is a PHP SDK requirement, not a server-side restriction; workers that do not
+report a PHP version are supported.
 
 ### PHP
 
-The PHP SDK is used by the framework integrations.
+The PHP SDK is also used by the framework integrations described below.
 
-It uses PHP's standard `hash` and `json` extensions. It requires no FFI or build step.
+The SDK uses PHP's standard `hash` and `json` extensions. It does not require FFI or a build
+step.
 
 ```php
 <?php
@@ -56,11 +56,11 @@ def handle(request, worker):
 Worker.connect().run(handle)
 ```
 
-`Worker.connect()` honours `VOLUCER_WORKER_SOCKET` and falls back to stdio. It is the call a
-worker file should make; `Worker.create()` is the explicit-streams form, used when you are
-binding streams yourself.
+`Worker.connect()` uses `VOLUCER_WORKER_SOCKET` when Volucer sets it and otherwise falls
+back to stdio. Use it in a worker entry point. `Worker.create()` is for explicitly
+providing the streams.
 
-A plain WSGI application needs no adapter beyond what the package already has:
+Use the supplied `wsgi` adapter to serve an existing WSGI application:
 
 ```python
 from volucer_worker import Worker, wsgi
@@ -69,15 +69,14 @@ from myapp import application
 Worker.connect().run(wsgi.call(application))
 ```
 
-Python 3.10 or newer. Nothing is required at runtime beyond the standard library, and there
-are no optional dependencies — a worker SDK loads before an application's own environment is
-known to work, so a dependency here is a failure mode unrelated to the protocol.
+The SDK requires Python 3.10 or later and has no runtime dependencies beyond the standard
+library. This keeps worker startup independent of optional SDK dependencies.
 
-For Django or Flask applications, the `upstream` backend can supervise gunicorn over HTTP
-without an SDK, and the `spawn_cgi` backend can run any FastCGI server — gunicorn's `flup`
-worker, a `flup-fcgi` process — without one either. Use the worker SDK when you need its
-worker-channel features, such as: the `kv`, `lock`, `jobs` and `metrics` services, recycling
-on RSS, and no HTTP framing on the hot path.
+For Django and Flask applications, Volucer's `upstream` backend can supervise gunicorn over
+HTTP without a worker SDK. The `spawn_cgi` backend can also run a FastCGI server, such as
+gunicorn's `flup` worker or a `flup-fcgi` process. Use the worker SDK when you need
+worker-channel features such as key-value storage, locks, jobs, metrics, memory-based worker
+recycling, or direct request handling without HTTP between the server and worker.
 
 ### Ruby
 
@@ -88,28 +87,27 @@ require 'my_app'
 Volucer::Worker.connect.run(&Volucer::Rack.handler(MyApp.new))
 ```
 
-Any Rack application works, including a Rails app. `Volucer::Worker.connect` honours
-`VOLUCER_WORKER_SOCKET` and falls back to stdio; `Volucer::Worker.create` is the
-explicit-streams form, used when you are binding streams yourself.
+The Rack adapter supports Rack applications, including Rails. `Volucer::Worker.connect`
+uses `VOLUCER_WORKER_SOCKET` when available and otherwise uses stdio. Use
+`Volucer::Worker.create` when providing streams explicitly.
 
-Ruby 3.1 or newer. No runtime dependencies beyond the standard library, deliberately: a
-worker SDK is loaded before an application's own gems are known to work.
+The SDK requires Ruby 3.1 or later and has no runtime dependencies beyond the standard
+library.
 
-For Rails or Sinatra applications, the `upstream` backend can supervise Puma over HTTP
-without the worker SDK, and the `spawn_cgi` backend can run a FastCGI Rack server without
-one either.
+For Rails and Sinatra applications, the `upstream` backend can supervise Puma over HTTP
+without the worker SDK. The `spawn_cgi` backend can run a FastCGI Rack server as well.
 
 ## The framework bridges
 
-Four framework bridges are available. A bridge boots the framework and calls its entry
-point in a worker loop; it does not require changes to the framework itself.
+Four framework bridges are available. Each boots the framework and invokes its entry point
+from a worker loop without requiring changes to the framework.
 
 ### Why a bridge rather than the `upstream` backend
 
-The `upstream` backend can supervise Puma, gunicorn, FrankenPHP, or `php artisan serve`
-over HTTP without a worker package.
+The `upstream` backend can supervise an existing HTTP application, including Puma, gunicorn,
+FrankenPHP, or `php artisan serve`, without a worker package.
 
-A bridge exists for the case where **the worker channel itself** is what you want:
+Use a framework bridge when you need worker-channel features such as:
 
 - the `kv`, `lock`, `jobs` and `metrics` services, reachable from inside a request
 - recycling on RSS, with the framework's own container still warm
@@ -141,12 +139,10 @@ $container = $app->getContainer();
 (new WorkerRunner($container->get(Http::class), $container))->run();
 ```
 
-`ContainerInterface::runScope()` provides per-request isolation. Objects created inside a
-scope — the PSR-7 request, its bindings,
-every resolved instance — is discarded when the scope ends, and the outer container keeps
-only what is genuinely application-scoped.
-
-The bridge runs the existing dispatcher inside a scope.
+`ContainerInterface::runScope()` isolates each request. When the scope ends, objects created
+within it—including the PSR-7 request, its bindings, and resolved instances—are discarded.
+The outer container retains application-scoped objects. The bridge runs Spiral's existing
+dispatcher inside this scope.
 
 ### Symfony
 
@@ -163,8 +159,8 @@ return [
 ];
 ```
 
-Then create a worker entry point that boots the kernel and calls `handle()` in a loop. The
-kernel is rebooted per request, so no upstream change is needed.
+Create a worker entry point that boots the kernel and calls `handle()` for each request. The
+kernel is rebooted per request; no changes to Symfony itself are required.
 
 ### Laravel
 
@@ -181,10 +177,10 @@ return [
 ];
 ```
 
-This is a standalone bridge, not an Octane driver. Octane's engine list is hardcoded
-in `StartCommand`, so `octane:start --server=volucer` would be an upstream pull request
-rather than something a package can add. What a package *can* do is boot the framework
-itself and call into it in a loop.
+This package is a standalone bridge, not a Laravel Octane driver. Octane's supported engine
+list is hardcoded in `StartCommand`, so adding Volucer to `octane:start --server=volucer`
+would require an upstream change. The bridge instead boots Laravel and invokes it in a
+worker loop.
 
 ### Azera
 
@@ -192,7 +188,7 @@ itself and call into it in a loop.
 composer require sailantis/azera-volucer
 ```
 
-Point a `worker` backend at the entry point the package provides:
+Configure a `worker` backend to launch the entry point provided by the package:
 
 ```toml
 [server]
@@ -207,20 +203,21 @@ command = "php vendor/sailantis/azera-volucer/azera-worker.php"
 workers = 4
 ```
 
-The package reuses the Azera `AppContext` DI container, Router, Dispatcher, and middleware
-pipeline across requests.
+The package reuses Azera's `AppContext` dependency-injection container, router, dispatcher,
+and middleware pipeline across requests.
 
 ## `volucer-cli`
 
-A Composer package that downloads the volucer binary for your platform, verifies its
-checksum, and installs it.
+`volucer-cli` is a Composer package that downloads and installs the Volucer binary for your
+platform after verifying its checksum.
 
 ```console
 composer require --dev sailantis/volucer-cli
 vendor/bin/volucer-cli
 ```
 
-The server is a single Rust binary. This Composer package downloads and installs that binary.
+Volucer is distributed as a single Rust binary. This Composer package installs that binary
+from a release.
 
 ```
 volucer-cli [install] [options]
@@ -235,16 +232,14 @@ volucer-cli [install] [options]
   --help              This text.
 ```
 
-The installer fetches the archive to a temporary file,
-fetches the release's own `SHA-256` and compares it **before anything is extracted**, and
-only then moves the binary into place. A failure at any step leaves your existing binary
-exactly as it was.
+The installer downloads the archive to a temporary file and compares it with the release's
+`SHA-256` checksum before extracting anything. It then installs the binary. If any step
+fails, the existing binary is left unchanged.
 
-The install scripts in the server repository are the supported installation method. They
-use common command-line tools and avoid maintaining a second implementation of archive
-extraction and checksum verification.
-
-The Composer installer remains available as an alternative.
+The installation scripts in the server repository are the recommended installation
+method. They use common command-line tools and avoid maintaining a separate implementation
+of archive extraction and checksum verification. The Composer installer remains available
+as an alternative.
 
 ## Which one should I use?
 

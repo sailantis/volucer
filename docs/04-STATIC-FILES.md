@@ -1,18 +1,17 @@
 # Static Files
 
-**Serving assets, directories and precompressed files from the document root.**
+Volucer can serve static files from each site's document root, including directory
+indexes and precompressed assets.
 
 ## It is on by default
 
-A site serves its own assets unless it says otherwise. You do not need to configure
-anything.
+Static-file serving is enabled by default for each site. No additional configuration is
+required.
 
-Turning it on only changes the answer for a path that names a real, non-script file. A path
-that names nothing, or names a `.php` script, reaches the front controller exactly as
-before — so a front-controller application behaves the same either way.
-
-The reason it is on rather than off is simply that every site has assets, and making each
-one ask for its own was a line that said nothing.
+The static layer handles paths that resolve to real, non-script files. Paths that do not
+resolve to a file, and paths that name a `.php` script, continue to the front controller
+as before. Enabling static serving therefore does not change how front-controller
+applications handle those requests.
 
 ## Turning it off
 
@@ -21,17 +20,17 @@ one ask for its own was a line that said nothing.
 static_files = false
 ```
 
-`serve_only = "backend"` is exactly the same state. `static_files = true` is the short form
-of `enabled = true` when the rest is at its defaults.
+`serve_only = "backend"` has the same effect. When all other options use their defaults,
+`static_files = true` is shorthand for `enabled = true`.
 
-Because static content is served over **HTTP** only, asking for it in a configuration with
-no `server.http` listener is refused. Leaving the key out is not asking, so a FastCGI-only
-deployment is unaffected by the default.
+Static files are served over HTTP. Volucer rejects an explicit static-file configuration
+when no `server.http` listener is configured. Omitting the setting does not enable static
+serving on a FastCGI-only deployment.
 
 ## A files-only site
 
-**No backend is needed at all.** A configuration with a listener, a document root and
-nothing else is valid, and `volucer serve` starts and serves it:
+A files-only site does not need a backend. A listener, document root, and
+`serve_only = "static"` are sufficient:
 
 ```toml
 [server]
@@ -40,50 +39,52 @@ document_root = "/srv/site"
 serve_only = "static"
 ```
 
-Serve it with `--front-controller ''` so a path that names no file is a 404 rather than
-something handed to a script. Without that flag the default front controller (`index.php`)
-is still in effect, so a path naming no file has nowhere to go and answers 500 —
-`volucer check` warns about exactly this case, once, at startup.
+Use `--front-controller ''` so requests for paths that do not name a file return 404.
+Without this flag, the default front controller (`index.php`) remains active. If that file
+is unavailable to handle a request, Volucer returns 500. `volucer check` reports this
+configuration issue at startup.
 
 ## The rule
 
-The document root is the same `server.document_root` that routing already resolves scripts
-against, so one setting describes the whole site.
+Static files are resolved under the same document root as scripts:
+`server.document_root`.
 
-A request is answered from disk when the path names a real file under the document root,
-and goes to PHP when it does not. `/assets/app.css` is a file; `/about` is not, so the
-front controller still sees it. That one sentence is the whole rule.
+If a request path resolves to a real file under the document root, Volucer serves it from
+disk. Otherwise, it dispatches the request to the application. For example,
+`/assets/app.css` may resolve to a file, while `/about` can continue to the front
+controller.
 
 ## Two rules that always hold
 
-These hold whether or not static serving is enabled, because both are about what PHP is
-asked to run rather than about this layer:
+These protections apply whether or not static serving is enabled:
 
-- **A file that is not a script is never run as one.** Only `.php`, `.php3` and `.phtml`
-  can be the script; anything else falls through to the front controller as application
-  input. Without this, `php-cgi` would emit a file it cannot parse verbatim — `GET
-  /config.json` and, worse, `GET /.env`.
-- **A dotfile is never given to the application**, not even as `PATH_INFO`, for the same
-  reason. It answers 404 on every method.
+- **Non-script files are never executed as scripts.** Only files with `.php`, `.php3`, or
+  `.phtml` extensions can be executed. Other paths are passed to the front controller as
+  application input. This prevents `php-cgi` from returning the contents of files it
+  cannot parse, such as `/config.json` or `/.env`.
+- **Dotfiles are never passed to the application**, including as `PATH_INFO`. Requests
+  for dotfiles return 404 for every method.
 
 ## What the layer serves
 
 | Feature | Detail |
 |---|---|
-| Content types | A table of what a web build contains; anything unknown is `application/octet-stream` |
-| Validators | `ETag` (length + mtime) and `Last-Modified`, with 304s for `If-None-Match` / `If-Modified-Since` |
-| Ranges | `bytes=0-99`, `bytes=100-`, `bytes=-500`, several at once, 416 for a range past the end, `If-Range` |
-| Precompressed | `file.br` then `file.gz` when the client asked — opt-in, and only when the file exists |
-| Directory indexes | `index.html`, with a 301 from `/docs` to `/docs/` |
-| Caching | One `Cache-Control` for everything, because a per-extension guess goes stale silently |
-| Refusals | Dotfiles answer 404, and a `..` segment answers 403 rather than being clamped |
-| Scripts | A `.php`/`.php3`/`.phtml` path is never served from disk, so its source cannot be disclosed |
+| Feature | Behavior |
+|---|---|
+| Content types | Uses a built-in table of common web content types; unknown types use `application/octet-stream`. |
+| Validators | Sends `ETag` (based on length and modification time) and `Last-Modified`; supports 304 responses for `If-None-Match` and `If-Modified-Since`. |
+| Ranges | Supports single and multiple byte ranges, including `bytes=0-99`, `bytes=100-`, and `bytes=-500`; returns 416 for ranges beyond the file and supports `If-Range`. |
+| Precompressed files | Tries `file.br`, then `file.gz`, when requested by the client. This is opt-in and requires the file to exist. |
+| Directory indexes | Serves `index.html` for directories and redirects `/docs` to `/docs/` with a 301 response. |
+| Caching | Applies one `Cache-Control` value to all served files. |
+| Refusals | Returns 404 for dotfiles and 403 for paths containing a `..` segment. |
+| Scripts | Never serves `.php`, `.php3`, or `.phtml` files from disk, preventing source disclosure. |
 
 ## Methods
 
-The static layer handles only `GET`, `HEAD` and `OPTIONS`. A `POST` to a path that names a
-file goes to the front controller, so a framework can route it. Those two rules above are
-what keep that from becoming a way to read a file.
+The static layer handles `GET`, `HEAD`, and `OPTIONS`. Other methods, including `POST`,
+are dispatched to the front controller even when the path names a file. This allows the
+application to route those requests without exposing the file contents.
 
 ## Precompressed files
 
@@ -92,71 +93,71 @@ what keep that from becoming a way to read a file.
 precompressed = true
 ```
 
-Serves `app.js.br` or `app.js.gz` when one exists and the client accepts it.
+When the client accepts a supported encoding, serves `app.js.br` or `app.js.gz` if the
+corresponding file exists.
 
-**Volucer does not produce those files** — it relays them with the right
-`Content-Encoding`, which is why that path costs nothing. Generating them is your build's
-job.
+Volucer does not generate compressed files. It serves the prebuilt file and sets the
+appropriate `Content-Encoding` header. Generate these files as part of your build.
 
-This is opt-in, because it assumes the build produced them, and silently serving a stale
-one is worse than not serving it at all.
+This option is disabled by default because it assumes your build produces the compressed
+files. A missing file is not an error; Volucer serves the original instead.
 
 ## Cost
 
-Serving a file costs no PHP worker and no `spawn_blocking`: path resolution is one blocking
-`stat`, and the bytes stream through in 64 KiB blocks with a content-length frame, so the
-response is not chunked.
+Serving a file does not use a PHP worker or `spawn_blocking`. Path resolution performs one
+blocking `stat`; file contents are streamed in 64 KiB blocks with a content-length frame,
+so the response is not chunked.
 
-Zero-copy (`sendfile`) is deliberately not used — that would be a Unix-only second code
-path — so a large file is copied per block.
+Volucer does not use zero-copy `sendfile`; that would require a separate Unix-only code
+path. File data is copied in blocks as it is streamed.
 
 ## Configuration
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `enabled` | bool | `true` | Serve files from the document root. |
-| `precompressed` | bool | `false` | Serve `file.gz` or `file.br` when the client accepts that encoding. |
+| `precompressed` | bool | `false` | Serve `file.br` or `file.gz` when the client accepts that encoding. |
 | `directory_index` | bool | `true` | Serve `index.html` for a directory. |
-| `dotfiles` | string | `"deny"` | `"deny"` or `"allow"`. |
-| `cache_control` | string | `"public, max-age=3600"` | The `Cache-Control` header on served files. |
-| `max_multirange_bytes` | integer | `1048576` | The largest total a multi-range request may ask for. |
+| `dotfiles` | string | `"deny"` | Set to `"deny"` or `"allow"` to control dotfile access. |
+| `cache_control` | string | `"public, max-age=3600"` | Set the `Cache-Control` response header for served files. |
+| `max_multirange_bytes` | integer | `1048576` | Limit the total size requested by a multi-range request. |
 
-`dotfiles = "deny"` answers **404**, not 403. Which files exist is not something a client
-needs to learn.
+With `dotfiles = "deny"`, requests return 404 rather than 403, so the response does not
+reveal whether a dotfile exists.
 
-`dotfiles = "allow"` is only sensible when the document root holds nothing but published
-assets.
+Use `dotfiles = "allow"` only when the document root contains published assets and no
+sensitive dotfiles.
 
-**Writing the table is not the same as leaving it out.** The table states overrides, and a
-table that does not say `enabled = true` does not turn the layer on — it leaves the
-inherited setting alone. So this turns it *off*:
+The table specifies overrides to the current settings. Omitting `enabled` does not
+automatically enable or disable static serving; it leaves the inherited value unchanged.
+For example, this disables the static layer:
 
 ```toml
 [server.static_files]
 enabled = false
 ```
 
-And this changes the other keys while saying nothing about whether it runs:
+This changes `cache_control` while leaving `enabled` unchanged:
 
 ```toml
 [server.static_files]
 cache_control = "public, max-age=60"
 ```
 
-A site inherits this per key, so a site naming `precompressed = true` keeps the server's
-`cache_control`.
+Site settings are inherited per key. A site that sets `precompressed = true`, for
+example, continues to inherit the server's `cache_control`.
 
 ## Compression is a separate thing
 
-Two different mechanisms, and the split matters:
+Static-file compression and response compression are separate mechanisms:
 
 | What | Compressed by | Cost per request |
 |---|---|---|
-| Static files | **your build**, as `.br`/`.gz` beside the file | nothing |
-| Backend responses | **volucer**, if you ask for it | CPU, on the request path |
+| Static files | Your build, producing `.br` or `.gz` files beside the originals | No compression work per request |
+| Backend responses | Volucer, when enabled | CPU on the request path |
 
-A backend's output cannot be precompressed, because it does not exist until the request
-runs. That is what `[server.compression]` is for:
+Backend response bodies are generated for each request, so they cannot be precompressed
+in the build. Configure runtime response compression with `[server.compression]`:
 
 ```toml
 [server.compression]
@@ -166,36 +167,35 @@ level = 6                      # gzip 1-9, zstd 1-19, clamped per encoding
 min_length = 1024              # bodies below this are passed through
 ```
 
-Off by default is a deliberate inversion of nginx's. Compressing a response spends CPU on
-the request path of a server designed around one request at a time per worker slot, so
-this is a choice to make knowingly rather than discover in a profile.
+Runtime compression is disabled by default. It uses CPU while handling a request, so
+enable it when the reduction in response size is worth that cost for your workload.
 
-**gzip is first** because every client accepts it. **zstd** is offered because it is
-smaller for text and current browsers support it; its window is clamped to 8 MiB, which is
-the largest browsers accept.
+Gzip is listed first because it is widely supported. Zstandard is also available and can
+produce smaller text responses; its window is limited to 8 MiB, the largest size accepted
+by current browsers.
 
-**brotli is deliberately not offered at runtime.** Its reference implementation defaults
-to quality 11, which is a build-time setting misapplied to a request path. Brotli belongs
-offline, at high quality, producing the `.br` files the static layer already serves.
+Brotli is not offered for runtime compression. Its reference implementation defaults to
+quality 11, which is more appropriate for build-time processing. Generate Brotli
+`.br` files ahead of time and serve them with the static-file layer instead.
 
 ### What is never compressed
 
-Whatever the configuration says:
+These responses are not compressed, regardless of configuration:
 
-- a body under `min_length`, or one that came out *larger* after encoding;
-- a response that already carries `Content-Encoding`, or a `Content-Range` — the bytes are
-  a window into another representation;
-- content that is already entropy-coded: images other than SVG and icons, video, audio,
-  fonts, zip/gzip/zstd archives, PDF, wasm, and `application/grpc`, which negotiates its
-  own encoding.
+- Bodies smaller than `min_length`, or bodies that would become larger after compression.
+- Responses that already have `Content-Encoding` or `Content-Range`. A range response is
+  a portion of another representation.
+- Content that is already compressed or encoded: images other than SVG and icons, video,
+  audio, fonts, ZIP/GZIP/Zstandard archives, PDF, WebAssembly, and `application/grpc`,
+  which negotiates its own encoding.
 
-`Vary: accept-encoding` is added to a compressed response, appended to whatever the
-application already sent, so a cache cannot hand a gzip answer to a client that cannot
-read it. A client sending `q=0` for both encodings gets the plain body, not a 406 — the
-request is still servable.
+Compressed responses include `Vary: accept-encoding`, appended to any existing `Vary`
+value. This prevents caches from serving a compressed response to a client that does not
+accept that encoding. If a client sets `q=0` for both supported encodings, Volucer sends
+the uncompressed response rather than returning 406.
 
-A site can override any of it, and a list a site states **replaces** the server's rather
-than adding to it:
+A site can override these settings. If it specifies an `encodings` list, that list
+replaces the server-level list rather than adding to it:
 
 ```toml
 [sites.api.compression]

@@ -1,12 +1,13 @@
 # TLS and ACME
 
-**HTTPS, with a certificate you supply or one that is issued for you.**
+Configure HTTPS with certificates you provide or certificates issued automatically
+through ACME.
 
 ## Turning TLS on
 
-`[server.tls]` is what turns TLS on — there is no `enabled` key, because a flag and a
-certificate are two statements about one thing and two statements can disagree. A table
-without both paths is an error rather than a defaulted half.
+TLS is enabled by adding `[server.tls]`; there is no separate `enabled` option. When
+managing certificates manually, both `certificate` and `key` are required. A table with
+only one of them is invalid.
 
 ```toml
 [server]
@@ -22,25 +23,24 @@ plain = false                       # also answer cleartext on this same port
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `certificate` | path | absent | The PEM certificate chain, leaf first. |
-| `key` | path | absent | The PEM private key. |
-| `min_version` | string | `"1.2"` | `"1.2"` or `"1.3"`. A floor, not a cap. |
-| `alpn` | array of strings | `["h2", "http/1.1"]` | The protocols offered. |
-| `plain` | bool | `false` | Also accept cleartext on the TLS port. |
+| `certificate` | path | absent | PEM certificate chain, with the leaf certificate first. |
+| `key` | path | absent | PEM private key. |
+| `min_version` | string | `"1.2"` | Minimum TLS version: `"1.2"` or `"1.3"`. |
+| `alpn` | array of strings | `["h2", "http/1.1"]` | Application protocols offered during negotiation. |
+| `plain` | bool | `false` | Also accept cleartext HTTP on the TLS port. |
 
-A relative `certificate`/`key` resolves against **the directory holding the config file**.
-That is a deliberate exception to `document_root`'s rule, which is relative to the
-process's working directory: a certificate beside `volucer.toml` is the usual case, and
-resolving it against wherever the process started would be a footgun with a security
-consequence. `volucer check` prints the path it resolved.
+Relative paths for `certificate` and `key` resolve from the configuration file's
+directory. This differs from `document_root`, which is relative to the process working
+directory. Resolving certificates beside the configuration file makes their location
+independent of where the process was started. `volucer check` displays the resolved paths.
 
-Do not drop `http/1.1` from `alpn`. The server can serve both, and a client that offers
-only HTTP/1.1 is a client you want to serve.
+Keep `http/1.1` in `alpn`. Volucer supports both HTTP/2 and HTTP/1.1, and some clients
+offer only HTTP/1.1.
 
 ## Plain HTTP and TLS together
 
-All four shapes work. `http` always keeps its name and meaning, so no existing
-configuration changes behaviour.
+Volucer supports each of these listener configurations. The `http` setting retains its
+existing meaning, so existing cleartext configurations continue to work unchanged.
 
 | Shape | Configuration |
 |---|---|
@@ -49,19 +49,18 @@ configuration changes behaviour.
 | **Both on one port** | `[server.tls].plain = true` |
 | Both, conventional ports | `http = "...:80"` and `https = "...:443"` |
 
-**One port carrying both** works by looking at the first byte: a TLS record always begins
-with `0x16`, and a plaintext request begins an ASCII method letter. This is what nginx's
-`ssl_preread` does, and it costs one peek per *connection* — never per request, because the
-protocol is decided once and then the connection is one path or the other.
+When one port serves both protocols, Volucer inspects the first byte of the connection.
+A TLS record begins with `0x16`; a cleartext request begins with an ASCII method letter.
+The protocol is detected once per connection, not once per request.
 
-It is a **detection, not a downgrade**: a client that offers TLS and fails the handshake
-still fails. There is no fallback to cleartext on a handshake error. And because accepting
-cleartext on a port that clients believe is encrypted is a security decision, `plain` is off
-by default and is logged loudly at startup when on.
+This is protocol detection, not a downgrade mechanism. If a client starts a TLS handshake
+and that handshake fails, Volucer does not retry the connection as cleartext. Since
+accepting cleartext on a TLS port is a security-sensitive choice, `plain` is disabled by
+default and its use is logged at startup.
 
-No port is privileged either: `https://host:8443` sends the identical ClientHello. Only
-two things genuinely need a fixed port, and both are `https`'s job — **ACME HTTP-01** (the
-challenge server always contacts `:80`) and an **`:80 → :443` redirect**.
+HTTPS does not require a privileged port; `https://host:8443` uses the same TLS handshake
+as the default HTTPS port. ACME HTTP-01 validation requires port 80, and a conventional
+`:80` to `:443` redirect uses both standard ports.
 
 ### Redirecting to HTTPS
 
@@ -76,18 +75,17 @@ certificate = "certs/default.crt"
 key = "certs/default.key"
 ```
 
-`redirect_to_https` is off by default because a redirect is a deployment's decision. It
-needs something actually serving cleartext to fire on — a separate `https`, or
-`plain = true` — so setting it with TLS on `http` alone is an error rather than a silently
-inert key.
+`redirect_to_https` defaults to `false`. It requires a cleartext listener, either a
+separate `https` listener or `plain = true`. Enabling it when TLS is configured on `http`
+alone is an error because there would be no cleartext requests to redirect.
 
-The redirect answers `301`, keeps the path and query, and names the `https` port rather
-than the port the request arrived on; `:443` is left out of the authority because it is the
-default.
+The redirect returns 301, preserves the path and query, and uses the configured `https`
+port rather than the port that received the request. The default port, `443`, is omitted
+from the authority.
 
-**It applies to cleartext connections only.** With `plain = true` one listener carries both
-protocols, and a redirect on the TLS half would send the client back to where it just came
-from — an infinite loop. The decision is per connection for exactly that reason.
+Redirects apply only to cleartext connections. When `plain = true`, the same listener
+accepts both protocols; redirecting its TLS connections would send clients back to the
+same URL and cause a loop. Volucer makes the decision based on the connection protocol.
 
 ### Redirecting one site rather than all of them
 
@@ -105,21 +103,20 @@ protocols = ["http", "https"]
 redirect_to_https = false     # deliberately cleartext on this address
 ```
 
-This is the case a single deployment-wide boolean cannot express. A site bound to an
-internal address with `protocols = ["http"]` is *deliberately* cleartext — it has no
-certificate for that name and no reason for one — and redirecting it would send its clients
-to a scheme it does not serve.
+Per-site configuration allows an internal site to remain cleartext while other sites
+redirect to HTTPS. For example, a site bound to an internal address with
+`protocols = ["http"]` may not have a certificate and should not redirect clients to a
+scheme it does not serve.
 
-Two combinations are refused as inert rather than accepted:
+Volucer rejects these combinations because the redirect could never work:
 
-- `redirect_to_https = true` on a site whose `protocols` excludes `"http"` — such a site
-  never receives a cleartext request to redirect.
-- `redirect_to_https = true` on a site whose `protocols` excludes `"https"` — the redirect
-  would point at a scheme this site does not answer.
+- `redirect_to_https = true` when the site's `protocols` excludes `"http"`. The site
+  cannot receive cleartext requests to redirect.
+- `redirect_to_https = true` when the site's `protocols` excludes `"https"`. The
+  redirect would target a scheme the site does not serve.
 
-The redirect is resolved **from the site**, so it is decided after site selection rather
-than before it. It stays ahead of everything that costs work: a redirect is one host probe
-and a comparison, and the body has not been read at that point.
+Volucer resolves redirects using the selected site's settings. It checks the redirect
+before doing further request processing; the request body has not been read at that point.
 
 ### `Strict-Transport-Security`
 
@@ -134,45 +131,43 @@ include_subdomains = true
 preload = true
 ```
 
-`[server.hsts]` is what a site inherits; a site's own table names only the directives it
-changes, so the example above keeps the server's `includeSubdomains` where it does not
-override it. **Absent means no header at all**, the same rule `redirect_to_https` follows.
+Sites inherit the policy from `[server.hsts]`. A site's HSTS table overrides only the
+directives it specifies, so unspecified values continue to inherit. If no HSTS policy is
+configured, Volucer sends no HSTS header.
 
-`max_age_s` is required on `[server.hsts]`, because there is nothing above it to inherit
-from. There is deliberately no bare `hsts = true`: a policy nobody chose is a pin a browser
-keeps enforcing until the name is reached again *over TLS*, so a wrong duration is not
-undone by editing the file.
+`max_age_s` is required in `[server.hsts]` because there is no higher-level value to
+inherit. There is no `hsts = true` shortcut: browsers retain an HSTS policy until they
+receive an updated policy over TLS, so choosing an unsuitable duration can have lasting
+effects.
 
-`enabled = false` on a site turns off a policy it would otherwise inherit. That is why the
-switch is a key rather than the table's presence — removing the table means "inherit".
+Set `enabled = false` on a site to disable a policy it would otherwise inherit. Removing
+the site's HSTS table means "inherit," not "disable."
 
-`max_age_s = 0` is refused: in the header it means "delete this policy", so writing it in a
-table would be two statements about one thing.
+Volucer rejects `max_age_s = 0`. In an HSTS header, zero removes a stored policy, so it
+does not represent an active policy to configure.
 
-`preload = true` requires `include_subdomains = true` and at least a year
-(`31536000`), which is what the preload list itself enforces.
+`preload = true` requires `include_subdomains = true` and a `max_age_s` of at least one
+year (`31536000`), as required for preload-list inclusion.
 
-**Sent only over a secure transport.** RFC 6797 §7.2 forbids the header on a non-secure
-transport, so a `plain = true` port sends it on the TLS half and never on the cleartext one,
-and a redirect answer — cleartext by definition — does not carry it. It **is** sent on error
-answers: a policy belongs to the name, so a 404 tells the browser about it just as a 200
-does (nginx's `add_header … always`).
+HSTS is sent only over a secure transport, as required by RFC 6797 §7.2. On a
+`plain = true` listener, Volucer sends it on TLS connections but not cleartext ones.
+Redirect responses are cleartext and do not include the header. Error responses, such as
+404s, do include it, just as successful responses do.
 
-**Not sent over FastCGI.** The proxy in front terminates TLS and writes its own response
-headers; `HTTPS` is the proxy's claim rather than a fact about this server's socket.
+HSTS is not sent over FastCGI. The proxy terminates TLS and is responsible for response
+headers; the `HTTPS` value it sends is not a property of Volucer's connection.
 
-Two placements are refused because the header could never be honoured:
+Volucer rejects HSTS configuration in these cases because the policy cannot be applied:
 
-- A site with no `hosts` — the address-only `default_server` shape. A browser stores a policy
-  against a **host name** and never against an IP (RFC 6797 §8.3), so every client that could
-  reach such a site would ignore it.
-- A site whose `protocols` excludes `"https"`, and a deployment with no `[server.tls]` at
-  all: there is no secure transport to send it on.
+- A site without `hosts` (the address-only default-site shape). Browsers store HSTS by
+  hostname, not IP address (RFC 6797 §8.3), so the policy would not apply.
+- A site whose `protocols` excludes `"https"`, or a deployment without `[server.tls]`.
+  Neither has a secure transport on which to send the header.
 
-`volucer check` warns when `include_subdomains` on one site covers another site in the same
-file — a browser that has visited the parent then refuses cleartext to the child, including
-an internal address it resolves to. HSTS is deliberately *not* address-bound: a policy set on
-a public address applies to the name wherever it resolves.
+`volucer check` warns when one site's `include_subdomains` policy covers another site in
+the same configuration. After visiting the parent, a browser will also require HTTPS for
+the child hostname, even if it resolves to an internal address. HSTS applies to hostnames,
+not addresses, so a policy follows the name wherever it resolves.
 
 ## Per-site certificates
 
@@ -182,25 +177,25 @@ certificate = "certs/shop.crt"
 key = "certs/shop.key"
 ```
 
-Only `certificate` and `key` can be per site. The name is claimed in the TLS handshake,
-before any request exists, so a per-site table can only be about *which certificate is
-presented* — `min_version`, `alpn` and `plain` describe the socket, and setting one per
-site is an error rather than a key that does nothing.
+Only `certificate` and `key` can be set per site. Volucer selects the certificate during
+the TLS handshake, before an HTTP request exists. Options such as `min_version`, `alpn`,
+and `plain` configure the listener, not an individual site's certificate; setting them
+per site is an error.
 
-Certificates are selected by **SNI**, not by the `Host` header: exact name, then the
-longest `*.` wildcard, then the server's certificate. The two *should* agree but need not —
-a client may claim one name in the handshake and another in the request. That is not an
-error: the certificate for the claimed name is presented, and the request is then served by
-whatever site its `Host` selects.
+Volucer selects certificates using SNI, not the HTTP `Host` header. It chooses an exact
+name first, then the longest matching `*.` wildcard, and otherwise uses the server
+certificate. SNI and `Host` can differ: Volucer presents the certificate selected by SNI,
+then routes the request to the site selected by `Host`.
 
 ## What TLS costs when it is off
 
-Nothing measurable. With no `[server.tls]` there is no peek, no branch, and no TLS value is
-constructed — the cleartext path is the same code it was before TLS existed.
+Without `[server.tls]`, Volucer does not inspect the connection for TLS or construct TLS
+state. Cleartext requests use the same path as before TLS support was added.
 
 ## Automatic certificates
 
-Opt in with a `[server.acme]` table. Without one, nothing about the server changes.
+Automatic certificate management is opt-in. Add a `[server.acme]` table to configure it;
+without that table, Volucer's behavior is unchanged.
 
 ```toml
 [server]
@@ -220,57 +215,53 @@ contact = ["mailto:ops@example.com"]
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `enabled` | bool | `true` | Issue certificates. |
-| `authority` | string | `"staging"` | `"staging"` or `"production"`. |
-| `domains` | array of strings | derived from the site's hosts | The names to issue for. |
-| `contact` | array of strings | absent | Addresses the CA warns about failing renewals. |
-| `cache` | path | `"acme-cache"` | Where issued certificates are kept. |
+| `enabled` | bool | `true` | Issue certificates when enabled. |
+| `authority` | string | `"staging"` | Select `"staging"` or `"production"`. |
+| `domains` | array of strings | Derived from the site's hosts | Names to include in the certificate. |
+| `contact` | array of strings | absent | Contact addresses for CA notifications about renewal failures. |
+| `cache` | path | `"acme-cache"` | Directory for issued certificates and account data. |
 
-`enabled` and the presence of a table are two statements rather than one, and the reason is
-the thing a boolean cannot express: *"keep these settings and do not use them yet"*.
-Removing the table is how you turn ACME off, and it throws away a contact and an authority
-that would have to be retyped correctly afterwards.
+The table's presence configures ACME; `enabled` controls whether Volucer uses those
+settings to issue certificates. This allows you to retain settings while issuance is
+disabled. Removing the table disables ACME and removes those settings.
 
 ### The certificate and key may be left out
 
-`[server.tls]` stays required — it is what turns TLS on — but its `certificate` and `key`
-may be **left out entirely** when ACME is configured. A self-signed placeholder is then
-generated **in memory** for the names in `domains`, and the first issuance replaces it.
-Nothing is written to disk: the placeholder is never trusted, so a private key on disk for
-it would be a liability with no benefit.
+`[server.tls]` is still required to enable TLS, but ACME allows its `certificate` and
+`key` to be omitted. Volucer then generates an in-memory self-signed placeholder for the
+configured `domains`. The first issued certificate replaces it. The placeholder is not
+written to disk because it is not trusted.
 
-A pair that is not named and no ACME table that **issues** is an error, so a deployment
-cannot end up serving a placeholder for ever by omission — including by setting the only
-table it has to `enabled = false`.
+If no certificate and key are configured and no ACME table is enabled to issue one,
+startup fails. This also applies when the only ACME table has `enabled = false`.
 
-An issued certificate **replaces the one being served, without a restart**. The next
-handshake gets the new certificate. That is also why `[server.tls]` is still required
-rather than optional: a TLS listener with nothing to serve fails every handshake that is
-not a challenge.
+An issued certificate replaces the certificate currently in use without a restart; new
+TLS handshakes receive the updated certificate. `[server.tls]` remains required because
+the TLS listener needs a certificate to serve while ACME validation is in progress.
 
 ### The challenge
 
-**Only the `tls-alpn-01` challenge is used**, and not by preference: `http-01` serves
-`/.well-known/acme-challenge/<token>`, a path this server's own static layer refuses
-because it starts with a dot. TLS-ALPN-01 needs no `:80` and no dotfile policy change —
-the handshake goes to the same `:443` the site already uses.
+Volucer uses the `tls-alpn-01` challenge. The `http-01` challenge requires serving
+`/.well-known/acme-challenge/<token>`, a path the static layer refuses because it begins
+with a dot. TLS-ALPN-01 uses the TLS handshake on the port the site already serves and
+does not require port 80 or a dotfile policy change.
 
-It does require the **TLS port to be publicly reachable** and the name to resolve to this
-machine. There is no DNS-01 support: that is the escape hatch for a machine behind a NAT,
-and it puts DNS API credentials on the web server.
+The TLS port must be publicly reachable, and each name must resolve to this machine.
+Volucer does not support DNS-01 validation, which is commonly used for hosts behind NAT
+and requires DNS API credentials on the server.
 
 ### Staging is the default
 
-A production account has per-week rate limits, and a first deployment that reached
-production by omission would spend them on its own mistakes. Staging runs the real
-protocol and issues certificates no browser trusts.
+Staging is the default to help avoid production rate limits during initial setup. It uses
+the ACME protocol but issues certificates that browsers do not trust.
 
-`authority = "production"` has to be named. The value is an enum rather than a URL, so
-production cannot be typed by accident.
+Set `authority = "production"` to use the production service. The value is an enum rather
+than a URL, reducing the chance of selecting production unintentionally.
 
 ### `enabled = false`
 
-Keeps the table and its settings and issues nothing. Two things it is for:
+Retains the table and its settings without issuing certificates. This is useful for
+staging configuration or temporarily pausing orders:
 
 ```toml
 [server.acme]
@@ -279,50 +270,45 @@ contact = ["mailto:ops@example.com"]
 authority = "production"
 ```
 
-- **Staging settings** for sites that inherit them, or **parking an order** during an
-  incident, without deleting values that would have to be retyped correctly afterwards. A
-  disabled table may leave `domains` out entirely, since it orders nothing.
-- It is **not inherited** from `[server.acme]` to a site. Turning the deployment's orders
-  off must not silence the sites, because the deployments with several unrelated hostnames
-  are exactly the ones with several orders. Silence is said where it is wanted.
+- Keep staging settings for sites that inherit them, or pause an order during an incident
+  without deleting its configuration. A disabled table can omit `domains` because it
+  does not create an order.
+- `enabled` is not inherited from `[server.acme]` by a site. Disable issuance on each
+  ACME table where you want it paused.
 
 ### The cache
 
-An issued certificate is cached, and a **restart with a valid cached certificate serves it
-immediately and spends no rate limit**. The cache is a directory beside the configuration
-file (`acme-cache` by default), and the account lives there too.
+Volucer caches issued certificates. On restart, a valid cached certificate is served
+immediately without using the CA's issuance rate limit. By default, the cache directory
+is `acme-cache` beside the configuration file; account data is stored there as well.
 
-That directory holds the ACME **account key** and the certificate's **private key**, so volucer
-creates it `0700` and tightens any file already in it to `0600` on every start — including a
-cache directory made by an older version, or by hand, which is why the mode is applied at
-startup rather than only when the directory is first created. On a shared host that is the
-difference between the keys being readable by every local user and by none but the service
-account, and it matches what the file-backed KV driver does for the same reason. There is no
-equivalent on Windows, where a file's ACL comes from its parent directory and a cache under a
-user's profile is already private.
+The cache contains the ACME account key and certificate private keys. On startup,
+Volucer sets the directory permissions to `0700` and files in it to `0600`. It reapplies
+these permissions to existing cache entries as well, including caches created by older
+versions or manually. This restricts access to the service account on shared Unix hosts.
+Windows uses ACLs inherited from the parent directory instead; a cache under a user's
+profile is already private.
 
-If the `cache` path exists as a *file* rather than a directory, startup fails and names the
-path: every later write would fail anyway, and reporting it here is what keeps it from
-surfacing later as a network error from a CA.
+If the configured `cache` path exists as a file rather than a directory, startup fails
+and reports the path. This identifies the problem before a later write fails during
+certificate issuance.
 
 ```bash
 kill -HUP $(pidof volucer)     # pick up a certificate you replaced by hand
 volucer check --config volucer.toml
 ```
 
-`check` is the one to watch, because **the failure mode here is silence**. Issuance that
-never succeeds looks exactly like issuance that is working: the port is up, the previous
-certificate serves, and the only symptom is a certificate that expires weeks later. So
-`check` prints the authority, the names, whether a certificate has ever been cached, and the
-days left on each certificate being served — and shouts when the authority is production.
+Use `volucer check` to monitor issuance. A failed renewal may not immediately affect
+service because the previous certificate remains available, so check reports the
+authority, configured names, whether a certificate has been cached, and the remaining
+validity of each certificate in use. It also warns when production is selected.
 
-A deployment with no `contact` is also called out: it is the only channel the CA has to
-warn that renewals are failing.
+The check also reports when no `contact` is configured. Contact details give the CA a
+way to notify you about renewal failures.
 
 ## One certificate per site
 
-A deployment serving unrelated hostnames wants a certificate per hostname, not one
-covering all of them. A site's own table gets its own order, account and certificate:
+Use a site-level ACME table to issue a separate certificate for a site:
 
 ```toml
 [server]
@@ -343,41 +329,39 @@ document_root = "/srv/corp"
 # domains omitted: derived from this site's hosts
 ```
 
-`domains` may be left out, and then it is **derived from the site's `hosts`** — with every
-wildcard dropped, and dropped ones logged, because `*.corp.internal` is a host *pattern*
-and a certificate name cannot be one. If nothing is left, that is an error naming the
-wildcards, rather than an ACME request for an empty set.
+If omitted, `domains` is derived from the site's `hosts`. Wildcard entries are excluded
+and logged because a certificate must contain concrete names, not patterns such as
+`*.corp.internal`. If no names remain, Volucer reports an error listing the wildcards
+rather than submitting an empty request.
 
-`authority`, `contact` and `cache` are all optional too; omitting them inherits the
-deployment's, which is what keeps several sites' certificates in one cache directory and
-their orders on **one account** when the contact matches.
+`authority`, `contact`, and `cache` are also optional. If omitted, they inherit the
+deployment-level values. This allows sites to share a cache directory and, when they use
+the same contact, an ACME account.
 
-**`contact` is what the account is keyed by** — the account file is named after a hash of
-the contact list and the directory URL — so it decides which scopes *share* an account, and
-Let's Encrypt's rate limits are per account. Omitting it to inherit is therefore not just
-convenience: two sites that each repeat the same contact get one account, and two that
-differ get two. The second is invisible in the configuration, so the account count is worth
-understanding before giving sites their own.
+The contact list and ACME directory URL determine the account key; the account file is
+named using a hash of those values. Sites with the same contact and authority therefore
+share an account, while different contacts create separate accounts. This matters because
+Let's Encrypt applies rate limits per account.
 
-The site's certificate **replaces** the deployment's for that site's hosts only. A site
-may also name its own `[sites.corp.tls]` pair *and* have a table here: the named pair
-serves until the order replaces it, which is how a deployment migrates from a certificate
-issued elsewhere.
+The site's issued certificate replaces the deployment certificate for that site's hosts
+only. A site can also specify its own `[sites.corp.tls]` certificate and key; these are
+used until ACME issues a replacement. This supports migration from a certificate managed
+outside Volucer.
 
-**A name belongs to one table.** Listing it in both this and `[server.acme]` is refused,
-naming both tables. It would not work: a validation handshake carries only the SNI name,
-so the deployment's challenge source answers first — with a challenge certificate
-committing to the *deployment's* key authorization while the CA is asking this server for
-the site's — and the site's order could then never succeed.
+Each domain must belong to only one ACME table. Volucer rejects a name listed in both a
+site table and `[server.acme]`, and identifies the conflicting tables. During validation,
+the TLS handshake identifies the domain through SNI. If both tables tried to validate
+the same name, the deployment's challenge could answer with a key authorization that
+does not match the site's order.
 
-| | where it goes |
+| Use case | Configuration |
 |---|---|
-| a deployment with one certificate for everything | `[server.acme]` |
-| a certificate per vhost | `[sites.<name>.acme]`, inheriting the contact and cache |
-| a certificate an operator manages by hand | `[sites.<name>.tls]`, or `[server.tls]` |
-| settings that are staged but must not issue | `enabled = false` on either table |
+| One certificate for the deployment | `[server.acme]` |
+| A certificate per site | `[sites.<name>.acme]`, optionally inheriting contact and cache settings |
+| A certificate managed outside Volucer | `[sites.<name>.tls]` or `[server.tls]` |
+| Retain settings without issuing certificates | Set `enabled = false` on the relevant table |
 
-## The provider
+## ACME provider
 
-The provider is Let's Encrypt, and it is the only one that works today. `authority` is an
-enum, not a URL, so production has to be named rather than typed by accident.
+Let's Encrypt is the only supported ACME provider. `authority` is an enum rather than a
+URL, so select `"production"` explicitly when needed.

@@ -1,14 +1,13 @@
 # Observability
 
-**An access log, a request id that spans your tiers, a rate limiter, Prometheus metrics and
-distributed tracing — without OpenTelemetry.**
-
-The order is deliberate: a framework exports spans, this server had no spans and no request
-identity, so adopting one first would have meant wiring an exporter to nothing.
+Volucer includes request logging and identifiers, rate limiting, worker-control routes,
+Prometheus metrics, and distributed trace propagation and export. These features are
+independent and opt-in where appropriate. Trace export uses OTLP/JSON without requiring an
+OpenTelemetry SDK dependency.
 
 ## The access log
 
-**Off by default**, so upgrading changes nothing. `[server.access_log]` turns it on:
+The access log is disabled by default. Add `[server.access_log]` to enable it:
 
 ```toml
 [server.access_log]
@@ -23,40 +22,34 @@ request_id_header = "X-Request-Id"
 | `format` | string | `"combined"` | `"combined"` or `"json"`. |
 | `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from. |
 
-**The directory is not created for you.** If `logs/` does not exist, the server starts,
-serves normally and writes nothing: the failure is reported once at startup rather than per
-request, and requests are never failed because a log could not be written. Create the
-directory before the first start.
+Volucer does not create the parent directory. If it does not exist or cannot be opened,
+startup reports the problem once and the server continues without writing the access log.
+Requests continue to be served even if a later write fails. Create the directory and ensure
+the service account can write to it before starting Volucer.
 
 ### The format
 
-The default line is nginx's `combined` format with three fields appended, so a script
-written for nginx reads this log too:
+The default format follows nginx's `combined` layout, with three fields appended:
 
 ```
 127.0.0.1 - - [16/Oct/2026:21:35:05 +0000] "GET /x HTTP/1.1" 200 21 "-" "curl/8" 0.012 0.004 3f2504e0-4f89-11d3-9a0c-0305e82c3301
 ```
 
-The three additions are the whole request's time, the time to the origin's first byte, and
-the request id.
+These fields are total request time, time to the origin's first byte, and request ID.
+Total request time includes the time spent receiving the client's request body. The
+origin-time field helps distinguish time spent waiting for an origin from time spent
+receiving or processing the request.
 
-**The first includes the client's own upload**, which is what nginx's `$request_time` does
-and what surprises people about it. The second is the field that separates this server's
-work from the client's slowness.
-
-`-` means there was no origin: a static file never had one, where an origin that answered
-instantly did. Rendering both as `0.000` would make a graph of a mixed deployment wrong in
-the direction that flatters it. `format = "json"` emits one object per line instead, with
-`origin_time: null` for the same distinction.
+The origin-time field is `-` when the request had no origin, such as a static-file response.
+An origin that responds immediately has a measured duration instead. With
+`format = "json"`, each line is a JSON object and `origin_time` is `null` when there was no
+origin.
 
 ### Rotation
 
-**`SIGHUP` closes and reopens the file, so `logrotate` works.**
-
-That is the whole reason the reopen exists: `logrotate` renames the log and signals the
-process, and a server that does not reopen keeps writing to the **unlinked inode**. Every
-write succeeds, the path holds a fresh empty file, and the log is found to be empty during
-the incident it was needed for.
+On Unix, `SIGHUP` closes and reopens the access-log file. This supports rotation tools such
+as `logrotate`, which rename the active file before signaling the server. Reopening ensures
+subsequent writes go to the new file rather than the renamed one.
 
 ```text
 /var/log/volucer/access.log {
@@ -69,39 +62,30 @@ the incident it was needed for.
 }
 ```
 
-The signal reopens unconditionally, before the configuration is even read — a rotation is a
-change to the filesystem and a config that fails to parse is not a reason to keep writing
-into a renamed file.
-
-**Rotation by size or age is not built**, deliberately: `logrotate` knows the deployment's
-retention policy, and a second rotator is a second schedule to get wrong. `SIGHUP` also does
-not change the log's path, format or `request_id_header` — those are chosen at startup.
+The signal reopens the log independently of configuration reloads. Volucer does not rotate
+logs by size or age; use a system log-rotation tool to apply the deployment's retention
+policy. `SIGHUP` does not change the log path, format, or `request_id_header`; these
+settings are read at startup.
 
 ### What it is not
 
-**It is not the diagnostic log, and that separation is the point.** An access log that
-shared a verbosity filter with diagnostics would be one setting away from silence, and both
-directions are wrong: raising verbosity to debug a worker would flood it, and quieting the
-diagnostics would erase the record of who requested what.
+The access log is separate from diagnostic logging and is not controlled by the diagnostic
+log level. Its behavior has a few important limitations:
 
-Three things it deliberately does not do:
-
-- **A failed write never fails a request.** A full disk or a revoked permission means the
-  log is lost, not that the server stops. The failure is reported **once**, not per request.
-  A path that cannot be opened at startup is the same: `volucer check` says so, and `serve`
-  serves without it.
-- **`bytes_sent` is `0` for a streamed body.** A backend's answer is in memory and knows
-  its length; a static file or an origin's answer does not until it has been written.
-  Counting it for real would put a wrapper task on the hot path for one log field. Text
-  responses from a backend report the real figure.
-- **Values containing a space, quote, backslash or newline are escaped** as `\x20`, `\x22`,
-  `\x5C` and `\n`. This is a security rule, not tidiness: the line is space-separated, so an
-  unescaped space in a `User-Agent` lets a client write fields of *this* log line.
+- A failed write does not fail the request. For example, a full disk or changed permissions
+  can prevent logging while the server continues to serve traffic. Volucer reports a
+  persistent write failure once rather than once per request. `volucer check` also reports
+  a path that cannot be opened at startup.
+- `bytes_sent` is `0` for streamed bodies, including static files and origin responses.
+  Buffered text responses from a backend report their actual size.
+- In the combined format, spaces, quotes, backslashes, and newlines in values are escaped
+  as `\x20`, `\x22`, `\x5C`, and `\n`. This prevents request-controlled values from adding
+  fields or lines to the log.
 
 ### The client address behind a proxy
 
-**The first field is the client's address, which behind a proxy has to be told to the
-server.** That is `[server.proxy]`, and without it the field is the proxy:
+When Volucer is behind a proxy, the access log's client-address field reflects the proxy
+unless trusted proxy headers are configured with `[server.proxy]`:
 
 ```toml
 [server.proxy]
@@ -109,49 +93,37 @@ trusted_subnets = ["127.0.0.1", "10.0.0.0/8"]   # the networks whose word is bel
 trusted_headers = ["X-Real-Ip", "X-Forwarded-For"]   # consulted in this order
 ```
 
-**The trust list is the feature, not the headers.** `X-Forwarded-For` is a request header,
-so any client can send one; an address from a header is believed only when the TCP peer is
-inside a configured network. With no list — the default — no header is read at all, which is
-also why a direct deployment needs no configuration.
+Volucer trusts a forwarded address only when the TCP peer belongs to a configured
+`trusted_subnets` range. Without a trust list, it ignores forwarded-address headers. Invalid
+subnet values cause startup to fail rather than silently reducing the configured trust list.
 
-A range that does not parse stops the server rather than being dropped: a trust list is
-somewhere a typo is a security decision, and a shortened list is not visible afterwards.
+Headers are checked in the order listed in `trusted_headers`; the first one containing a
+parsable address is used. Because proxies append values to `X-Forwarded-For`, its
+left-most address may be a client-supplied claim. Configure the header order to match the
+proxy topology you control.
 
-The **order** of `trusted_headers` is the security-relevant part: the first header that
-yields a parsable address wins. It is worth knowing what the default does *not* fix:
-`X-Forwarded-For` is appended to by every hop, so behind a CDN its left-most element is the
-client's own *claim* rather than its address. A deployment that knows its topology should
-name the list.
-
-On the **FastCGI** listener this table is deliberately not consulted. nginx sets
-`REMOTE_ADDR` to the address it saw the client at, already resolved by nginx's own `real_ip`
-handling, so the param is the client's address even though the socket belongs to nginx.
+The FastCGI listener does not use this table. In a typical nginx setup, nginx applies its
+own `real_ip` configuration and sets `REMOTE_ADDR` to the resolved client address before
+forwarding the request.
 
 ## The request id
 
-Every request gets one, and it is **echoed on the response** — including on error pages,
-because a client that cannot quote its id has no way to report the error.
+Volucer assigns every request an ID and returns it in the response, including error
+responses. Generated IDs contain 32 hexadecimal characters, matching the shape of nginx's
+`$request_id`.
 
-Generated ids are 32 hex characters, which is exactly nginx's `$request_id` shape, so one
-`awk` reads both logs.
+By default, Volucer adopts an inbound `X-Request-Id` when it contains a valid identifier.
+This lets clients and upstream services correlate logs across tiers. Adopted values are
+preserved verbatim, including UUID hyphens and letter case. Set `request_id_header = ""` to
+always generate a new ID instead.
 
-**An inbound `X-Request-Id` is adopted by default**, and that is the opposite of nginx's
-behaviour on purpose: one id across the tiers is the feature, and an id that changes at
-every hop cannot correlate a client's log with this server's.
-
-The value is returned **verbatim** — a UUID keeps its hyphens and its letter case, because
-a normalised value is not findable in the client's own log. Set `request_id_header = ""` for
-nginx's always-generate semantics.
-
-A value that is not a plain identifier is **replaced, never refused**: a newline in an
-adopted id would let a client forge whole log records, and a space would break the field
-count. A client's malformed header must not become a client's failed request.
+Malformed values are replaced with a generated ID rather than causing the request to fail.
+This prevents newlines or spaces in a client-supplied value from corrupting log records.
 
 ## Rate limiting
 
-**Off by default**, and off is *no limiter* rather than a limiter configured to allow
-everything: an unconfigured request path does one check and touches no map, no clock and no
-lock.
+Rate limiting is disabled by default. When no policy is configured, requests do not incur
+rate-limit bookkeeping.
 
 ```toml
 [server.rate_limit]
@@ -162,37 +134,30 @@ interval_ms = 60000   # how long `rate` requests take to accrue
 # max_entries = 10000 # identities tracked before new ones are refused
 ```
 
-A **token bucket that refills continuously**, not a windowed counter: a `limit_req`-style
-counter lets a client spend one window's allowance just before a boundary and the next just
-after, doubling the instantaneous rate. A bucket cannot hold more than `burst` and refills at
-a fixed rate.
+The limiter uses a continuously refilling token bucket. Its capacity is `burst`, and tokens
+refill at a rate determined by `rate` and `interval_ms`. Unlike a fixed-window counter, a
+token bucket does not allow a client to spend two full windows' allowances on either side
+of a window boundary. `burst` defaults to `rate`, so the full configured allowance can be
+used at once and then refills over the interval.
 
-`burst` defaults to `rate` rather than to RoadRunner's `1`, because `rate = 60,
-interval_ms = 60000` reads as "60 a minute" — the allowance is spendable at once and returns
-over the minute.
+With `key = "header"`, configure the header name as well. Header values are not
+authenticated identities: clients can choose them, so use a value set by a trusted proxy.
+Values are hashed rather than stored, so long values do not increase the size of each entry.
 
-`key = "header"` needs a `header` name, and **that value is not an authenticated identity**:
-a client chooses it, so a client that varies it gets one bucket per request until the table
-fills. Its use is a header the *proxy* sets. Values are hashed rather than stored, so a long
-value costs one entry.
+Requests that exceed the limit receive `429` and `Retry-After`, with
+`Cache-Control: no-store` to prevent shared caches from reusing the refusal. gRPC requests
+instead receive `RESOURCE_EXHAUSTED` in the trailers.
 
-**A refusal is `429` with `Retry-After`**, and `Cache-Control: no-store` so a shared cache
-cannot serve one client's refusal to another. A **gRPC** call is refused as
-`RESOURCE_EXHAUSTED` in the trailers instead, because a gRPC client cannot read a `429` at
-all.
+With `key = "ip"`, Volucer uses the address resolved by `[server.proxy]`, not necessarily
+the TCP peer. Configure trusted proxy handling when the limiter needs to distinguish
+clients connecting through a proxy.
 
-The `ip` key is the address `[server.proxy]` resolves, **not** the socket peer — behind
-nginx without that table every request would be charged to the proxy and no two clients
-could be told apart.
-
-One policy per process, shared by both front-ends, and it does not distinguish routes or
-sites: a bucket's identity is (who, *which limit*), so two policies over one client are two
-buckets.
+One policy applies process-wide to both front ends; it does not vary by route or site.
 
 ## The worker-control routes
 
-**Off by default**, and the default is the safety: a deployment that configured `[status]`
-for an orchestrator gains no mutation surface by upgrading.
+Worker-control routes are disabled by default. To expose them, configure `[status]` and
+explicitly enable resets:
 
 ```toml
 [status]
@@ -205,21 +170,18 @@ curl -sf http://127.0.0.1:2114/workers | jq        # the list
 curl -sf -XPOST http://127.0.0.1:2114/workers/3/reset
 ```
 
-`GET /workers` answers JSON with one entry per worker across every pool. `index` is the
-**global** one a reset takes; `slot` is the pool's own, which is the number that pool's log
-uses. Both are reported because with two backends they are different numbers.
+`GET /workers` returns JSON describing workers across all pools. The `index` is the
+process-wide worker index used by the reset route; `slot` is the worker's index within its
+pool and corresponds to the number used in that pool's logs.
 
-**A refusal is a status code, so `curl -f` is the whole client**: `404` for an index that
-does not exist, `409` for a worker that is serving a request (retry when it is idle), `500`
-for a replacement that did not boot. That is why the reset boots through `spawn_blocking` —
-a 30-second PHP start on the listener's own thread would stall the readiness probe this
-port exists to answer.
+Reset responses use HTTP status codes: `404` means the index does not exist, `409` means
+the worker is currently serving a request, and `500` means the replacement worker failed
+to start. A busy worker can be reset after it becomes idle. Worker replacement runs via
+`spawn_blocking`, so a slow startup does not block the status listener.
 
-**There is no authentication.** What protects these routes is that they do not exist until
-the flag is set — `404` on the path, not `403` — and that a wildcard `address` with the
-flag on is **refused at startup**. An unauthenticated `POST` that recycles workers,
-reachable from anywhere, is a remote kill switch. Put `[status]` on loopback or a private
-interface and reach it through your orchestrator's network, or don't turn it on.
+These routes do not provide authentication. Keep the listener on loopback or a private
+interface and restrict access through your network configuration. If resets are enabled,
+Volucer refuses to start when the status listener is bound to a wildcard address.
 
 ## Metrics
 
@@ -241,9 +203,9 @@ help = "Application requests handled"
 | `prefix` | string | absent | A prefix for the metric names. |
 | `collect` | table of tables | empty | The metrics to collect. |
 
-**`[metrics]` and `[status]` share one listener.** If you configure both, they must carry the
-same `address`; two different addresses are refused at startup rather than silently binding
-one and dropping the other. Configure only one if you only need one.
+`[metrics]` and `[status]` share a listener. If both are configured, their `address` values
+must match; different addresses cause startup to fail. Configure only the feature you need
+if you do not need both.
 
 `[metrics.collect.<name>]`:
 
@@ -253,27 +215,22 @@ one and dropping the other. Configure only one if you only need one.
 | `help` | string | **required** | The description, as Prometheus requires. |
 | `buckets` | array of numbers | empty | The bucket boundaries. Histograms only. |
 
-`buckets` on a counter or a gauge is refused. A setting that is read by nothing looks
-supported and cannot work.
+`buckets` is valid only for histograms. Volucer rejects it for counters and gauges.
 
 ## Trace context
 
-The W3C `traceparent` header is parsed and continued: the trace id is the client's, and
-this server contributes its own span, because two hops claiming one span is what corrupts a
-waterfall.
+Volucer parses and continues the W3C `traceparent` header. When a valid header is present,
+the request keeps its trace ID and Volucer creates a span for its own work. If the header is
+missing or malformed, Volucer starts a new, unsampled trace.
 
-A request with no `traceparent` starts a **new trace, unsampled** — accepting a header is
-not the same as volunteering to record a trace, and the party that knows what that costs is
-the one collecting spans.
-
-It is **forwarded to backends with no configuration at all**: `traceparent` becomes
-`HTTP_TRACEPARENT` for PHP and is in neither strip list, so a correlation id already reaches
-your application today. A malformed `traceparent` starts a fresh trace rather than returning
-an error.
+Volucer forwards trace context to backends without additional configuration. For PHP
+workers, `traceparent` is exposed as `HTTP_TRACEPARENT`; the header is not removed by the
+strip lists.
 
 ## Exporting traces
 
-**Off by default**, like the access log, and for the same reason. `[telemetry]` turns it on:
+Trace export is disabled by default. Configure `[telemetry]` to send spans to an OTLP
+collector:
 
 ```toml
 [telemetry]
@@ -287,27 +244,21 @@ service_name = "myapp"               # the `service.name` resource attribute
 "x-honeycomb-team" = "..."
 ```
 
-`POST /v1/traces` with a hand-written OTLP/JSON body, over the same pooled HTTP client the
-`upstream` backend uses — so **it adds no dependency to the build**, and `https:` works with
-the TLS configuration the rest of the server already has.
+Volucer sends OTLP/JSON requests to the collector's `/v1/traces` endpoint using the pooled
+HTTP client shared with the `upstream` backend. This does not add an OpenTelemetry SDK
+dependency, and HTTPS endpoints use the server's existing TLS configuration.
 
-**The exported span carries the ids the request already has.** This server mints a trace id
-and a span id per request and puts *that* `traceparent` on the request it hands a backend,
-so a PHP worker's own span — or an origin's — names this server's span as its parent, and
-the trace is one tree rather than two. Nothing in an application has to change to be part of
-a trace.
+For each request, Volucer creates a server span and forwards its trace and span context to
+the backend. This allows spans produced by a worker or origin to appear as children of the
+Volucer span, without requiring application changes to establish the parent context.
 
-An exported server span contains: `http.request.method`, `url.path` (**not** the query
-string, which is unbounded and often a secret), `server.address`, and
-`http.response.status_code`. A 5xx sets the span's status to error; a 4xx does not, because
-marking a client's mistake as a server fault is how an error-rate alert becomes noise.
+The server span includes `http.request.method`, `url.path`, `server.address`, and
+`http.response.status_code`. The query string is omitted from `url.path` to avoid exporting
+unbounded or potentially sensitive values. A 5xx response sets the span status to error;
+4xx responses do not.
 
-Two rules it follows that are worth knowing before turning it on:
-
-- **A request never waits on the collector.** Recording a span is a queue send; sending
-  happens on the exporter's own thread. A collector that is slow, refusing, or absent costs
-  spans and never latency — and it is said out loud: the first failure of an outage is
-  logged, the recovery is logged, and the shutdown summary prints how many spans were
-  exported, lost, and dropped at the queue.
-- **A batch is dropped, never retried.** A retry queue is what turns a collector outage into
-  an application outage, by growing without bound in the process's memory.
+Trace export runs asynchronously. Requests enqueue spans without waiting for the collector;
+collector failures can result in lost spans but do not add request latency. Volucer logs the
+first export failure and recovery, and reports exported, lost, and queue-dropped spans at
+shutdown. Failed batches are dropped rather than retried, preventing an unbounded retry
+queue from consuming process memory during a collector outage.

@@ -1,31 +1,26 @@
 # Operations
 
-**Reloading, running behind nginx, systemd, containers, and the release process.**
+This guide covers configuration reloads, reverse-proxy deployments, systemd, containers,
+and release operations.
 
 ## Reloading
 
-Send `SIGHUP` and the configuration file is re-read and applied. **Unix only** — Windows has
-no `SIGHUP` and no equivalent, so a Windows deployment restarts.
+On Unix, send `SIGHUP` to reload and apply the configuration file. Windows has no
+`SIGHUP` equivalent, so restart the server there.
 
 ```console
 kill -HUP $(pidof volucer)      # or: systemctl reload volucer
 ```
 
-The reloadable state is one value behind one pointer, and replacing it affects the **next**
-request. An in-flight request keeps the configuration it started under — the only ordering
-that can be explained to an operator, and the reason there is one pointer rather than one per
-setting: three separate swaps would let a request take a new site table with an old routing
-map, which would look like a site serving the wrong document root rather than like a race.
+Reloadable configuration is replaced as a single snapshot. New requests use the updated
+configuration; in-flight requests continue with the snapshot they started with. HTTP and
+FastCGI front ends share the same site configuration, so a reload applies to both.
 
-The same signal reaches **every** front-end: an HTTP listener and a FastCGI listener share
-one site table, so a reload cannot take effect on `:80` and leave nginx reaching the old pool.
-
-**A reload never stops the server.** `SIGHUP` reloads and `SIGTERM` stops; they are handled
-per signal, so a `kill -HUP` can never take the server down by accident.
+`SIGHUP` reloads configuration. `SIGTERM` stops the server.
 
 ### What a reload changes
 
-**Reloadable:**
+The following settings can be reloaded:
 
 - `[server.tls]` and `[sites.*.tls]` certificates and keys
 - `[sites.*]` `hosts`, `document_root`, `front_controller`, `script_extensions`,
@@ -34,22 +29,19 @@ per signal, so a `kill -HUP` can never take the server down by accident.
 - `redirect_to_https`
 - A backend's `grpc_services` and `grpc_serve_any` — a widened grant admits the next call,
   on the same connection
-- A backend's `grpc_proto`, which is re-read: the `.proto` files are parsed again, so a `service`
-  added to one of them is granted on the next call. The files are **not watched** — the change
-  takes effect when you signal, which is also what makes a half-written file harmless
+- A backend's `grpc_proto`. Volucer rereads the `.proto` files and applies newly declared
+  services to subsequent calls. Files are not watched; changes take effect after a reload.
 - `[server.rate_limit]`, with every tracked caller's bucket carried across when the `key` and
   `header` are unchanged
 - `[status] allow_worker_reset`, in both directions
 
-**Restart-only, and reported on every reload** rather than left to be discovered — a setting
-the implementation cannot honour should be *stated*, or the operator finds out from
-behaviour:
+The following settings require a restart. Volucer reports them during reload:
 
 | Setting | Why it cannot be reloaded |
 |---|---|
 | `http`, `https`, `fastcgi` | A bound socket cannot move |
 | Backends, their commands and worker counts | Those are running processes with live pipes |
-| `[server.env]` and a backend's `env` | They are the environment of processes already running; a replacement worker would get the new value and its siblings would not |
+| `[server.env]` and a backend's `env` | Existing processes retain their environment; replacement workers could otherwise receive different values from running workers |
 | `[server.tls]` `min_version` and `alpn` | They are baked into the `rustls` server config the acceptor holds |
 | `[server.proxy]` | Whose forwarded headers are believed is a statement about this deployment's topology |
 | `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless** |
@@ -57,31 +49,25 @@ behaviour:
 
 ### A reload is whole-or-nothing
 
-A file that does not parse, or does not validate, is refused with a logged reason and the
-previous configuration keeps serving. There is no way to apply half of one — including when
-the bad file names settings the server *can* apply.
+If configuration parsing or validation fails, Volucer logs the reason and continues serving
+with the previous configuration. It does not apply a partially valid configuration.
 
-**A `.proto` file that `grpc_proto` names is part of that same "whole"**, even though it is not
-`volucer.toml`. It is read while the configuration is loaded, so an unreadable `.proto`, or one
-whose set resolves to no service at all, refuses the reload entirely rather than installing a
-backend granted nothing.
+Files named by `grpc_proto` are read as part of configuration loading. An unreadable file or
+a set of files that resolves to no services also causes the reload to fail.
 
-There are two tables — the sites and the certificates — and each is whole-or-nothing **on its
-own**, applied site table first and certificates after. That ordering is deliberate: a
-certificate that cannot be read then leaves a valid site change in effect instead of refusing
-both.
+The site table and certificate table are applied independently, with sites applied first.
+If a certificate cannot be read, valid site changes can still take effect.
 
-**With `[server.acme]`, an issued certificate is carried across a reload** rather than
-rebuilt from the configuration, and the reload **merges the two populations**: the table is
-rebuilt from the file and every certificate that was issued is re-registered over it, so a
-renewed PEM is read *and* an issued certificate stays in service. A name the configuration
-says nothing about keeps the certificate it had. If you are migrating a deployment *away*
-from ACME, remove `[server.acme]` and restart.
+When `[server.acme]` is configured, issued certificates are retained across reloads. The
+certificate table is rebuilt from configuration, then certificates issued by ACME are
+registered again. This allows newly configured PEM files to load while keeping issued
+certificates active. If a name is no longer configured, its existing certificate remains
+registered. To migrate away from ACME, remove `[server.acme]` and restart the server.
 
 ## Behind nginx
 
-You do not need nginx — volucer serves static files and speaks HTTP itself. But if you have
-one, use the FastCGI listener:
+Volucer can serve HTTP and static files without nginx. If you use nginx, connect it to
+Volucer's FastCGI listener:
 
 ```toml
 [server]
@@ -110,10 +96,8 @@ server {
 }
 ```
 
-**`try_files` has a trap worth knowing.** It treats every argument except the last as a
-*file test*, so `/index.php` is checked on disk, found, and served **as a static file** —
-nginx hands out the PHP source, unparsed, with a `200`. The last argument is the fallback,
-not the first.
+In nginx, `try_files` treats every argument except the last as a file test. This means that
+the following front-controller configuration is unsafe:
 
 The obvious spelling of a front controller is:
 
@@ -122,11 +106,12 @@ location / { try_files /index.php =404; }
 location = /index.php { fastcgi_pass ...; }
 ```
 
-and it is wrong for that reason. The shape above — one `try_files` whose fallback is the
-script, and a `location` matching the script — does not have the trap.
+In this configuration, `/index.php` is tested as a file and may be served as static content,
+exposing the PHP source. The last `try_files` argument is the fallback, not the first. The
+example above instead uses the script as the fallback and routes it to the FastCGI location.
 
-If you use nginx, tell volucer who the real client is, or the access log records nginx
-instead of the client and the rate limiter throttles nginx:
+To have Volucer use the original client address for access logs and rate limiting, configure
+nginx's trusted address range and forwarded header:
 
 ```toml
 [server.proxy]
@@ -170,12 +155,11 @@ ReadWritePaths=/var/lib/volucer
 WantedBy=multi-user.target
 ```
 
-`ExecReload` is the reason this unit exists at all: `SIGHUP` re-reads the configuration and
-applies it whole, or refuses it and keeps serving the previous one. Without a unit there is
-nothing to wire the signal to.
+`ExecReload` sends `SIGHUP` to reload configuration. If the new configuration is invalid,
+the server continues using the previous one.
 
-**A unit can also carry the configuration instead of a file**, which is one thing fewer to
-mount and one thing fewer to read from disk:
+You can also provide configuration through command-line arguments instead of a
+configuration file:
 
 ```ini
 ExecStart=/usr/local/bin/volucer serve \
@@ -187,17 +171,15 @@ ExecStart=/usr/local/bin/volucer serve \
     -o backends.app.workers=0
 ```
 
-The overrides are replayed by `SIGHUP` exactly as they were given, so a reload never installs a
-configuration nobody wrote. Without a file there is nothing new to read, so a reload re-applies
-the same command line — which is what a `logrotate` postrotate hook needs, and which still
-refreshes the certificate table. A changed `ExecStart` takes effect when the service is restarted:
-a flag is not a file, so there is nothing for the signal to pick up.
+On `SIGHUP`, Volucer reapplies the same command-line overrides. Without a configuration
+file, there are no file changes to read. Changes to `ExecStart` take effect only after the
+service restarts.
 
-`SIGTERM` drains: the listeners stop, in-flight requests finish, and the pool's PHP children
-are killed with their parent rather than orphaned.
+On `SIGTERM`, Volucer stops accepting connections and lets in-flight requests finish. Worker
+processes are stopped with the server.
 
-The ACME cache lives under the state directory, so `[server.acme] cache` and the unit's
-`StateDirectory` have to agree. The pair the unit ships with is:
+Store the ACME cache under the systemd state directory and configure the cache path to match
+`StateDirectory`:
 
 ```toml
 [server.acme]
@@ -206,10 +188,9 @@ cache = "/var/lib/volucer/acme-cache"
 
 ### Secrets and environment
 
-**volucer loads no `.env` file of its own**, and that is deliberate: `EnvironmentFile=` here,
-`docker run --env-file` and Compose's `env_file:` already do it, and a second loader would be a
-second precedence rule and a second path-resolution rule for one job. What volucer does is read
-the environment it is given, in the file, through `${...}`:
+Volucer does not load a `.env` file itself. Use systemd's `EnvironmentFile=`, Docker's
+`--env-file`, or Compose's `env_file:` to provide variables. Volucer can expand those
+variables in configuration using `${...}`:
 
 ```ini
 # the unit
@@ -228,18 +209,16 @@ command = "php worker.php"
 workers = ${WORKERS:-0}
 ```
 
-The unit's environment takes precedence over `EnvironmentFile=`, and both are visible to the
-expansion. Values are then handed to the application through `[server.env]` (shared) or a
-backend's own `env` (one table), and `config.describe` reports the names with the values
-elided — so a credential supplied this way never travels to a worker.
+Variables set directly in the unit take precedence over values from `EnvironmentFile=`.
+Expanded values can be passed to applications through `[server.env]` or a backend's `env`
+table. `config.describe` displays variable names without their values.
 
-`volucer check` performs the same expansion, so a missing variable is reported by `check` before
-`serve` is ever restarted onto it.
+`volucer check` performs the same expansion as `serve` and reports missing variables before
+you restart the service.
 
 ## Health checks
 
-The `[status]` listener answers two probes, and the difference between them is the one an
-orchestrator acts on:
+The `[status]` listener provides separate liveness and readiness probes:
 
 ```toml
 [status]
@@ -251,89 +230,80 @@ volucer health --url http://127.0.0.1:2114/health   # is the process running?
 volucer health --url http://127.0.0.1:2114/ready    # should traffic be sent here?
 ```
 
-`curl -sf` does the same thing against the same URLs — `volucer health` exists because a
-`scratch` container has no `curl` to run it with, not because the endpoints need a client.
-See [the Docker section](#health-checks-in-the-image) for that case.
+`curl -sf` can query these endpoints as well. The `volucer health` command is useful in
+minimal containers that do not include curl; see [Health checks in the image](#health-checks-in-the-image).
 
-**`/health` answers 200 while the process is running**, even if nothing is ready yet. It is
-the answer to "should this container be restarted", and restarting a server that is merely
-still booting turns a slow start into a crash loop.
+`/health` returns 200 while the process is running, even if its services are not ready. Use
+it as a liveness check to decide whether the process should be restarted.
 
-**`/ready` answers the configured `unavailable_status_code` — `503` by default — until every
-service reports ready.** It is the answer to "should traffic be sent here", and a probe that
-returned 200 while the pools were still booting is how a rolling deploy sends traffic to a
-server that answers 502.
+`/ready` returns the configured `unavailable_status_code` (503 by default) until all
+services report ready. Use it to determine whether the instance should receive traffic.
 
-Every other path is a 404, on both, so neither endpoint becomes a second way to ask whether
-the server is up.
+Both endpoints return 404 for other paths. Bind the status listener to loopback or a private
+interface and restrict access through the deployment network.
 
-Bind it to loopback or a private interface and reach it through your orchestrator's network.
-
-`allow_worker_reset` adds the worker-control routes to the same listener. Read
+`allow_worker_reset` adds worker-control routes to the same listener. See
 [Observability](06-OBSERVABILITY.md#the-worker-control-routes) before turning it on — there
-is no authentication on those routes.
+is no authentication for those routes.
 
 ## Docker
 
-There are two ways to get an image: pull a published one, or build it from a checkout.
+Use a published image or build one from a source checkout.
 
 ### Pulling a published image
 
-Every release publishes both images to GitHub Container Registry, for `linux/amd64` and
-`linux/arm64`:
+Each release publishes musl and glibc images to GitHub Container Registry for
+`linux/amd64` and `linux/arm64`:
 
 ```console
 docker pull ghcr.io/sailantis/volucer:latest          # musl, scratch-based: the recommended one
 docker pull ghcr.io/sailantis/volucer:latest-glibc    # Debian-based, if you need a libc
 ```
 
-The `musl` image is the default — it has no libc dependency and is smaller, which is what a
-`scratch` base allows. **`glibc` always carries a suffix**, so a bare pull is never the base
-image by accident:
+The default `musl` image uses a `scratch` base and has no libc dependency. The glibc image
+uses a Debian base and always has a `-glibc` suffix:
 
 | Tag | Image |
 |---|---|
 | `0.2.0`, `0.2`, `latest` | musl, `scratch` base |
 | `0.2.0-glibc`, `0.2-glibc`, `latest-glibc` | glibc, `debian:bookworm-slim` |
 
-`latest` moves only for a final release: a pre-release such as `v0.3.0-rc.1` publishes
-`0.3.0` and `0.3` and leaves `latest` where it is, because `latest` is what a bare
-`docker pull` installs. Pin `0.2.0` rather than `latest` in anything that must not change
-under it.
+The `latest` tag changes only for final releases. A pre-release such as `v0.3.0-rc.1`
+publishes the `0.3.0` and `0.3` tags without moving `latest`. Pin a version such as `0.2.0`
+for deployments that must not change when a new release is published.
 
-The package has to be made public once, after the first release publishes it — see
-[Publishing](#publishing) — after which no `docker login` is needed to pull it.
+The package must be made public after the first release publishes it. See
+[Publishing](#publishing); once public, pulling the image does not require `docker login`.
 
 ### Building it yourself
 
-`packaging/docker/Dockerfile` builds both images from the one crate, measured at about
-3m45s for `musl` and 1m40s for `glibc` on a 4-vCPU machine with a cold Cargo cache:
+`packaging/docker/Dockerfile` builds both images from the same crate. On a 4-vCPU machine
+with a cold Cargo cache, builds take approximately 3m45s for musl and 1m40s for glibc:
 
 ```console
 docker build -f packaging/docker/Dockerfile --target musl -t volucer .           # the host's architecture
 docker build -f packaging/docker/Dockerfile --target glibc -t volucer:glibc .
 ```
 
-`-f` is required: the Dockerfile is in `packaging/docker/`, not at the repository root, while the
-build context has to be the root because `COPY . .` copies the whole cargo workspace.
+The `-f` option is required because the Dockerfile is in `packaging/docker/`. Use the
+repository root as the build context because `COPY . .` needs the full Cargo workspace.
 
-`--target musl` resolves the Rust target from `--platform`, so
-`docker build -f packaging/docker/Dockerfile --platform linux/arm64 --target musl` produces an
-`aarch64` binary rather than a mislabelled `x86_64` one. An architecture with no musl target is a
-build failure, not a fallback.
+`--target musl` selects the Rust target based on `--platform`. For example,
+`docker build -f packaging/docker/Dockerfile --platform linux/arm64 --target musl` produces
+an `aarch64` binary. If an architecture has no musl target, the build fails rather than
+falling back to another architecture.
 
 The two images are 23 MB (`musl`, `scratch`) and 149 MB (`glibc`, `debian:bookworm-slim`).
 
-There is no archive to fetch and nothing to verify by hand, because the binary is built into
-the image. `.dockerignore` keeps `target/` and `.git/` out of the build context, which they
-would otherwise dominate: a checkout of this repository has a `target/` directory in the tens of
-gigabytes, and every byte of it would be uploaded and written into a layer before the compiler
-started.
+The binary is built into the image, so there is no archive to download or verify separately.
+`.dockerignore` excludes `target/` and `.git/` from the build context. Without this, the
+repository's potentially large `target/` directory would be uploaded and copied into a layer
+before the build begins.
 
 ### Running it
 
-Both images have the same contract, so the same invocation works for either — a published image
-name drops in for the local one:
+Both images use the same runtime contract. Replace the local image name with a published
+image to use a release build:
 
 ```console
 docker run --rm \
@@ -343,8 +313,8 @@ docker run --rm \
     ghcr.io/sailantis/volucer:latest
 ```
 
-**The image can also be run with no configuration file at all**, which is the shape that needs
-nothing mounted and no entrypoint script to generate one:
+You can run the image without mounting a configuration file by providing settings on the
+command line:
 
 ```console
 docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" \
@@ -356,14 +326,16 @@ docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" \
         -o status.address=0.0.0.0:9080
 ```
 
-Note the subcommand: `ENTRYPOINT` is the binary, so arguments after the image name replace the
-default `serve --config /etc/volucer/volucer.toml` and `serve` has to be named explicitly.
+The image's `ENTRYPOINT` is the Volucer binary. Arguments after the image name replace the
+default `serve --config /etc/volucer/volucer.toml`, so include the `serve` subcommand.
 
-The `HEALTHCHECK` reads `[status]` from a file, so a fileless container needs the probe pointed
-at the URL instead: `HEALTHCHECK CMD ["/volucer", "health", "--url",
-"http://127.0.0.1:9080/health"]`. See [Health checks](#health-checks-in-the-image) below.
+The image's `HEALTHCHECK` normally reads `[status]` from a configuration file. For a
+fileless container, configure the check with a URL such as
+`HEALTHCHECK CMD ["/volucer", "health", "--url", "http://127.0.0.1:9080/health"]`. See
+[Health checks in the image](#health-checks-in-the-image).
 
-The configuration has to do two things a host deployment does not, and neither is optional:
+In a container, configure both listeners to bind to addresses reachable from outside the
+container:
 
 ```toml
 [server]
@@ -374,49 +346,41 @@ document_root = "/srv/public"
 address = "0.0.0.0:9080"       # what `docker exec ... health` probes, and what EXPOSE names
 ```
 
-A `127.0.0.1` listener is reachable only from inside the container's network namespace, so
-`-p 8080:8080` publishes a port nothing answers on. The failure looks like a broken image, and
-it is a bind address.
+Listeners bound to `127.0.0.1` are reachable only within the container's network namespace.
+Publishing such a port with `-p` does not make the listener externally reachable.
 
 ### Health checks in the image
 
-Both images declare a `HEALTHCHECK`, and it is the binary itself rather than `curl`:
+Both images define a `HEALTHCHECK` that runs the Volucer binary directly:
 
 ```dockerfile
 HEALTHCHECK CMD ["/usr/local/bin/volucer", "health"]
 ```
 
-That is not a stylistic choice. The `musl` target is `FROM scratch`, which has no shell, no
-`curl` and no `/bin/sh` — so the conventional `HEALTHCHECK CMD curl -f http://localhost/health`
-would be a line that never executes. Docker does not report that as a broken check; it reports
-the container as `unhealthy` after the start period with no output at all, which is the least
-actionable failure a container can have. The subcommand reproduces `curl -f`'s contract — exit
-`0` or nonzero — and adds the detail that a shell one-liner throws away.
-
-`volucer health` reads the address from `[status]`, or from `[metrics]` when that is the only
-one present, because the two share one listener. It exits `0` only for a `2xx`; anything else,
-including a `404` from an image whose configuration lost its `[status]` table, fails the probe.
-The reason goes to stderr, which Docker keeps in the health log — so `docker inspect` answers
-"why is this unhealthy" with the server's own words rather than a bare timeout:
+The musl image uses `FROM scratch`, which contains neither a shell nor curl. A shell-based
+health check would therefore fail to run. The `volucer health` command is self-contained and
+returns an exit code suitable for Docker. It reads the listener address from `[status]`, or
+from `[metrics]` if that is the only configured listener. It exits successfully only for a
+2xx response; other statuses, including 404, fail the check. Diagnostic details are written
+to stderr and appear in Docker's health log:
 
 ```console
 $ docker inspect --format '{{json .State.Health}}' volucer | jq -r '.Log[].Output'
 volucer: could not connect to 127.0.0.1:9080: connection refused
 ```
 
-Three things decide what it probes, in increasing precedence:
+The command chooses its probe target using these settings, in order of increasing precedence:
 
 | Setting | Effect |
 |---|---|
-| `VOLUCER_HEALTH_CONFIG` | The configuration file the probe reads. Defaults to `/etc/volucer/volucer.toml` in the image, so a deployment that overrides `CMD` to mount its file elsewhere overrides this too. |
+| `VOLUCER_HEALTH_CONFIG` | The configuration file to read. The image defaults to `/etc/volucer/volucer.toml`; set this if the file is mounted elsewhere. |
 | `VOLUCER_HEALTH_URL` | A URL to probe instead of reading the configuration. |
 | `--url` / `--config` | The flags, which win over both — so a variable someone forgot does not fight a probe typed by hand. |
 
-`/health` is what the image's check uses, and `/ready` is deliberately *not*: Docker restarts
-a container whose health check fails, and a server still booting its worker pool must not be
-killed for it. `/ready` is the traffic question, and answering it here would turn a slow start
-into a crash loop — the exact inversion the two endpoints exist to prevent. Probe it separately
-where a load balancer reads it:
+The image's built-in health check uses `/health`, not `/ready`. A failed Docker health check
+may lead to a container restart, so a server should not fail it merely because its worker
+pool is still starting. Use `/ready` separately for a load balancer or another component
+that decides whether to send traffic:
 
 ```console
 docker exec volucer volucer health --ready
@@ -424,7 +388,7 @@ docker exec volucer volucer health --ready
 
 ### Compose
 
-Use the published image, or `build:` if you are working from a checkout:
+Use a published image, or build from the checkout:
 
 ```yaml
 services:
@@ -449,60 +413,50 @@ services:
       start_period: 20s
 ```
 
-The `healthcheck:` block is not redundant with the one in the image: it replaces it, and this
-is where `/ready` belongs. `restart: unless-stopped` with an `unhealthy` container is a restart
-loop, which is why the image's own default asks the liveness question and this one — read by
-whatever routes traffic — asks the readiness one.
+The Compose `healthcheck:` block replaces the image's default health check. Use `/ready`
+there when the check is used to decide whether the application should receive traffic.
+Choose a `start_period` long enough for the worker pool to start; otherwise, a slow but
+successful startup may fail the health check.
 
-`start_period` is the number worth thinking about rather than copying: it has to exceed the
-longest time the pool takes to boot, or a server that is starting correctly is restarted for
-being slow. `volucer check` reports what the deployment will start before it starts it.
-
-Environment variables reach the configuration through `${...}` — `http = "0.0.0.0:${PORT:-8080}"`
-— because volucer deliberately loads no `.env` file of its own. `env_file:` and
-`docker run --env-file` already do that, and a second loader would be a second precedence rule
-for one job.
+Use environment variables and `${...}` expansion to provide configuration values, for
+example `http = "0.0.0.0:${PORT:-8080}"`. Compose's `env_file:` and Docker's
+`--env-file` provide the variables; Volucer does not load `.env` files itself.
 
 ### Publishing
 
-The release workflow publishes both images to `ghcr.io/<repository>` on every `v*` tag, for
-`linux/amd64` and `linux/arm64`, as a multi-architecture manifest list. It is the last job in
-the pipeline and it depends on `publish`, so an image tag never exists for a release whose
-archives failed to install.
+The release workflow publishes multi-architecture image manifests to
+`ghcr.io/<repository>` for `linux/amd64` and `linux/arm64` on each `v*` tag. Image publishing
+runs after the archive publishing job succeeds.
 
-Nothing is stored as a secret: the workflow authenticates to ghcr with its own `GITHUB_TOKEN`
-and the `packages: write` permission, because the package belongs to the repository that built
-it.
+The workflow authenticates to GHCR using its `GITHUB_TOKEN` and `packages: write`
+permission; no separate secret is required.
 
-**The first push creates the package as private, even for a public repository.** GHCR does not
-inherit repository visibility — access *rules* inherit, visibility does not — so one manual step
-is needed after the first release: the package's **Settings → Danger Zone → Change visibility**,
-or the API for an organization-owned package:
+The first push creates the package as private, even when the repository is public. After
+the first release, change the package visibility to public in its settings or use the
+GitHub API for an organization-owned package:
 
 ```console
 gh api --method PATCH /orgs/sailantis/packages/container/volucer -f visibility=public
 ```
 
-Until that is done, `docker pull` needs a login and the README's one-liner does not work. The
-build passes `org.opencontainers.image.source`, which is what links the package to this
-repository; an unlinked package cannot be managed from the repository's settings page at all.
+Until the package is public, pulling it requires authentication. The build sets
+`org.opencontainers.image.source` to link the package to the repository.
 
-Two properties are deliberate and worth not undoing:
+The workflow has two relevant properties:
 
-- **A build never creates a tag.** Each `(image, architecture)` pair is pushed by digest — an
-  addressable but unreferenced `sha256:…` — and the tags are created in one separate job once
-  every architecture has been built and smoke-tested. A tag written during the build would be
-  pullable while its sibling architecture was still compiling.
-- **`glibc` always carries a suffix.** `latest` and `latest-glibc` are different images, so a bare
-  pull cannot resolve to the base image by accident.
+- Each image and architecture is pushed by digest. Tags are created only after all
+  architectures have built and passed smoke tests, preventing an incomplete multi-platform
+  release from being pulled.
+- The glibc image always has a `-glibc` suffix; `latest` and `latest-glibc` refer to
+  different images.
 
-`.github/workflows/ci.yml` builds both images on every push to `main` and exercises
-`packaging/docker/smoke-test.sh` against them, which is the same script the release runs against
-the pushed digest. Without that job the first execution of the Dockerfile would be release day.
+`.github/workflows/ci.yml` builds and smoke-tests both images on every push to `main`. The
+release workflow runs the same smoke test against the published image digests.
 
 ## The access log and logrotate
 
-`SIGHUP` closes and reopens the log file, which is what makes `logrotate` work:
+On `SIGHUP`, Volucer closes and reopens the access-log file. Configure `logrotate` to signal
+the server after rotating the file:
 
 ```text
 /var/log/volucer/access.log {
@@ -515,18 +469,15 @@ the pushed digest. Without that job the first execution of the Dockerfile would 
 }
 ```
 
-The signal reopens unconditionally, before the configuration is even read — a rotation is a
-change to the filesystem, and a config that fails to parse is not a reason to keep writing
-into a renamed file.
-
-See [Observability](06-OBSERVABILITY.md#the-access-log) for the format.
+The log is reopened even if configuration reload fails. For supported formats and details,
+see [Observability](06-OBSERVABILITY.md#the-access-log).
 
 ## Installing the binary
 
-The install scripts are the supported path. See
+Use the install scripts to install the binary. See
 [Getting Started](00-GETTING-STARTED.md#install).
 
-Each release publishes a per-target archive with a `.sha256` beside it:
+Each release includes a target-specific archive and a corresponding `.sha256` checksum file:
 
 ```
 volucer-0.1.0-x86_64-unknown-linux-gnu.tar.gz
@@ -537,26 +488,25 @@ volucer-0.1.0-x86_64-apple-darwin.tar.gz
 volucer-0.1.0-x86_64-pc-windows-msvc.zip
 ```
 
-Each archive holds the binary, the README, the licence and the systemd unit.
+Each archive contains the binary, README, license, and systemd unit.
 
 ## Running as a different user
 
-Volucer needs to read its document root and write to its ACME cache. It does not need to
-write to its own binary, its configuration or the document root, which is what the
-`ProtectSystem=strict` and `ReadWritePaths` lines in the unit are for.
+Volucer needs read access to the document root and write access to the ACME cache. It does
+not need write access to its binary, configuration, or document root. The systemd unit's
+`ProtectSystem=strict` and `ReadWritePaths` settings reflect these requirements.
 
-If you run it as a non-root user, that user needs read access to the document root and write
-access to the ACME cache directory. The `php-cgi` and worker processes inherit the server's
-user, so they need the same.
+When running Volucer as a non-root user, grant that user read access to the document root
+and write access to the ACME cache. PHP-CGI and worker processes run as the same user and
+need the corresponding access.
 
 ## Upgrading
 
-1. Read the [changelog](../CHANGELOG.md) for the version you are moving to.
-2. Install the new binary alongside the old one, or replace it.
-3. Run `volucer check --config volucer.toml` with the new binary. It reports what the new
-   build resolves, and refuses a configuration the new build will not accept.
+1. Review the [changelog](../CHANGELOG.md) for the target version.
+2. Install the new binary alongside the current one, or replace the current binary.
+3. Run `volucer check --config volucer.toml` with the new binary to verify the configuration.
 4. Restart the service.
 
-A configuration that the new build refuses is refused **at startup**, not silently
-reinterpreted — the configuration model is strict, so a removed or renamed key stops the
-server rather than being ignored.
+Configuration is strict. If the new version no longer accepts a setting, `volucer check`
+reports the problem and the server refuses to start rather than silently ignoring or
+reinterpreting the setting.

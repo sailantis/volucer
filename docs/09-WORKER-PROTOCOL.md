@@ -1,71 +1,69 @@
 # The Worker Protocol
 
-**The wire format between volucer and a PHP worker.**
+This page summarizes version 1 of the wire protocol between Volucer and a worker.
 
-**Version 1.** The normative specification is
+The normative specification is
 [`docs/worker-protocol.md`](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md)
-in the server repository, and `crates/volucer-worker` is its reference implementation. The
-tests in that crate pin the bytes exactly.
+in the server repository. `crates/volucer-worker` is the reference implementation, and its
+tests verify the encoded bytes.
 
-**Four implementations exist**, and each pins the same frozen bytes rather than its own: the
-Rust reference, [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk),
+The protocol is implemented by the Rust reference and the
+[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk),
 [`sailantis/volucer-python-sdk`](https://github.com/sailantis/volucer-python-sdk) and
-[`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk). Each lives in
-its own repository because its package manager needs a manifest at the root, and a release of
-each links back to the specification at a pinned commit.
+[`sailantis/volucer-ruby-sdk`](https://github.com/sailantis/volucer-ruby-sdk). Each SDK
+repository links to the specification at a pinned commit.
 
-**You probably do not need this page.** If you are writing a worker in PHP, use the SDK. If
-you are writing one in another language, read the specification — this page is the summary
-that tells you what to look for.
+If you are writing a PHP worker, use the PHP SDK. If you are implementing a worker in
+another language, consult the normative specification; this page is an overview, not a
+replacement for it.
 
 ## Why it exists
 
-Worker mode boots a PHP application once and serves many requests from it. That needs a
-channel the child can talk back on, and neither of the obvious candidates works:
+Worker mode keeps an application process alive to handle multiple requests. The worker also
+needs a channel for sending messages back to Volucer. The two common alternatives do not
+provide the required behavior:
 
-- **FastCGI cannot carry it.** FastCGI is server-driven and half-duplex: the worker can only
-  answer the request it was handed. It has no way to push a log line, a metric, or a
-  "recycle me" notice — and worker mode is exactly the case where the worker needs to talk
-  first.
-- **goridge is a framing codec, not a protocol.** Adopting its 12-byte header saves the easy
-  part while importing a versioning commitment to its wire format; adopting its semantics
-  means becoming a RoadRunner clone.
+- FastCGI is server-driven: the worker answers the request it receives, but cannot send
+  unsolicited messages such as logs, metrics, or a request to recycle.
+- Goridge provides framing, not the worker-service semantics Volucer needs. Using its
+  framing would also tie Volucer to its wire-format versioning; adopting its semantics would
+  require compatibility with RoadRunner's protocol.
 
-So volucer models the same proven header shape and owns a message set.
+Volucer therefore uses a similar frame header with its own versioned message types and
+semantics.
 
 ## Transport
 
-The channel is the child process's **stdin/stdout pipe** by default. That is portable, needs
-no port per worker, and cannot exhaust sockets. `stderr` is *not* part of the protocol: it
-is free for the worker to write to, and the supervisor drains it so the pipe buffer cannot
-fill and block the child.
+By default, the protocol uses the child process's stdin and stdout pipes. This works across
+platforms and does not require a separate port for each worker. Stderr is outside the
+protocol and remains available for diagnostics; the supervisor drains it to prevent the pipe
+buffer from filling and blocking the worker.
 
 ```
   volucer ──HELLO/REQUEST/CONTROL/PING/CALL──►  php worker  (stdin)
             ◄─HELLO_ACK/RESPONSE/BODY/RETURN ──  … ──LOG/METRIC/EVENT─  (stdout)
 ```
 
-`transport = "socket"` moves the same frames onto a socket. **Nothing about the protocol
-changes** — the frames, the handshake and the ordering are identical; only the file
-descriptor they travel on differs.
+With `transport = "socket"`, the same frames, handshake, and ordering are used over a
+socket. Only the transport changes.
 
-The server picks the socket and tells the worker where it is, in `VOLUCER_WORKER_SOCKET`:
+Volucer creates the socket and provides its address to the worker through
+`VOLUCER_WORKER_SOCKET`:
 
 | Value | Transport |
 |---|---|
 | `127.0.0.1:34567` | loopback TCP, an ephemeral port the server bound |
 | `unix:/run/volucer/worker.0.sock` | a unix socket, from the backend's `socket` key |
 
-A **named pipe** is deliberately not offered for the worker transport: the protocol needs the
-connection as a reader and a writer at once, and a Windows pipe's state is per connection, so
-it cannot be duplicated into two halves.
+Named pipes are not supported as a worker transport. The protocol requires a bidirectional
+connection, while a Windows pipe's state is tied to each connection and cannot be split into
+independent read and write halves.
 
-The protocol is **symmetric**: the same codec reads what it wrote, so an SDK mirrors the
-specification rather than inverting it.
+The protocol is symmetric: both sides use the same frame format to read and write messages.
 
 ## Frame format
 
-Every frame is a 16-byte header followed by exactly `payload_len` payload bytes.
+Each frame consists of a 16-byte header followed by exactly `payload_len` bytes.
 
 ```
 offset  size  field
@@ -77,7 +75,7 @@ offset  size  field
 12      4     crc32c(payload)    CRC-32C, see below
 ```
 
-All multi-byte integers are **little-endian**.
+All multi-byte integers use little-endian byte order.
 
 The reference frame, in bytes, for `REQUEST` with `request_id = 1`, `payload_len = 2`:
 
@@ -98,11 +96,12 @@ aa d0 7b 29   crc32c("{}") = 0x297BD0AA
 | `MAX_PAYLOAD_LEN` | 64 MiB | A corrupt `payload_len` must not make the reader allocate 4 GiB |
 | `MAX_BODY_CHUNK` | 64 KiB | Bounds the memory a single frame can demand |
 
-A frame declaring more than `MAX_PAYLOAD_LEN` is rejected **before** allocating.
+A frame that declares more than `MAX_PAYLOAD_LEN` is rejected before the receiver allocates
+its payload buffer.
 
 ## Message types
 
-The numbering is part of the protocol. These values must never be reordered or reused.
+Message type numbers are part of the protocol. Do not reorder or reuse them.
 
 | # | Name | Direction | Correlated | Carries |
 |---|---|---|---|---|
@@ -125,37 +124,33 @@ The numbering is part of the protocol. These values must never be reordered or r
 | 17 | `JOB` | server → worker | yes | `pipeline`, `id`, `task`, `headers`, `attempts`, `body_len` |
 | 18 | `ACK` | worker → server | yes | `outcome` (`ack`, `requeue`, `reject`) and an optional `reason` |
 
-An unknown type number is rejected rather than skipped: skipping it would silently misalign
-the reader from the sender's expectations.
+Unknown type numbers are rejected rather than skipped, since skipping one could leave the
+reader and sender out of sync.
 
 ### Which types each side may receive
 
-A worker handles `HELLO`, `REQUEST`, `JOB`, `PING`, `CONTROL` and `RETURN`. It **originates**
-`CALL`, `ACK` and never receives one. It does not handle `RESPONSE`, `BODY`, `END`,
-`HELLO_ACK`, `CONTROL_ACK`, `PONG` or `ERROR` — a server sending any of those is a protocol
-error, and both the Rust codec and the PHP SDK refuse them rather than guessing.
+A worker may receive `HELLO`, `REQUEST`, `JOB`, `PING`, `CONTROL`, and `RETURN`. It sends
+`CALL` and `ACK`; it must not receive them. A worker must also reject server messages that
+are worker-to-server only, including `RESPONSE`, `BODY`, `END`, `HELLO_ACK`, `CONTROL_ACK`,
+`PONG`, and `ERROR`.
 
-The server is the mirror image: it **originates** `REQUEST`, `JOB`, `HELLO`, `CONTROL` and
-`PING`, **answers** `CALL` with a `RETURN`, and treats a `CALL` arriving *at* it as a protocol
-error.
-
-**The one sentence to remember:** a call travels from the side that has a question to the
-side that has the answer, and in this protocol the application is the side with the questions.
+The server sends `REQUEST`, `JOB`, `HELLO`, `CONTROL`, and `PING`, and answers a worker's
+`CALL` with `RETURN`. A `CALL` received by the server is a protocol error. In general, a
+`CALL` is sent by the side requesting a service; in this protocol, that is the worker.
 
 ## Body framing
 
-A body is zero or more `BODY` frames in the direction of travel, all sharing the request's
-id. Two invariants apply, and a reader must enforce both:
+A body consists of zero or more `BODY` frames in the direction of travel. All frames use
+the same request ID. Receivers must enforce both of these rules:
 
-1. **`body_len` is authoritative.** The receiver knows how much to expect before the first
-   byte arrives, and a short body is *detected* rather than hanging.
-2. **The last `BODY` frame carries `LAST`.** A cheap second check that catches a stream that
-   has desynchronised in a way the length alone would not.
+1. `body_len` specifies the exact number of bytes to receive, allowing the receiver to detect
+   a short body.
+2. The final `BODY` frame carries the `LAST` flag.
 
-A body of zero length sends **no** `BODY` frames at all.
+A zero-length body has no `BODY` frames.
 
-Bodies are never JSON. Base64 inside JSON inflates an upload by a third and makes the runtime
-do work per byte on the hot path, so bytes travel as bytes.
+Bodies are transmitted as raw bytes, not JSON or base64. This avoids base64 expansion and
+unnecessary per-byte encoding work.
 
 ## Flags
 
@@ -167,56 +162,52 @@ do work per byte on the hot path, so bytes travel as bytes.
 | `0x0008` | `ERROR` | The sender is reporting a failure |
 | `0x0010` | `NO_CHECKSUM` | The `crc32c` field is **not** a checksum and must not be verified |
 
-`NO_CHECKSUM` is a **flag rather than a zero checksum**, because zero is already a real
-checksum: `crc32c("") == 0`, which every empty-payload frame carries.
+`NO_CHECKSUM` is a flag rather than a zero checksum value. Zero is a valid checksum:
+`crc32c("") == 0`, including for frames with an empty payload.
 
 ## Checksum
 
-The header carries **CRC-32C (Castagnoli)**: polynomial `0x82F63B78`, reflected, initial and
-final value `!0`. This is the "crc32c" algorithm, *not* the "crc32b" one that zlib and PHP's
-plain `crc32()` use.
+The header carries CRC-32C (Castagnoli), using reflected polynomial `0x82F63B78` and
+initial and final values of `!0`. This is the `crc32c` algorithm, not `crc32b` as used by
+zlib and PHP's standard `crc32()` function.
 
 ```
 crc32c("123456789") == 0xE3069283
 crc32c("")          == 0x00000000
 ```
 
-The same value is what `hash('crc32c', '123456789')` produces in PHP, which is why the PHP SDK
-can use the built-in hash rather than reimplementing the polynomial.
+In PHP, `hash('crc32c', '123456789')` produces the same value, allowing the PHP SDK to use
+the built-in hash implementation.
 
-A mismatch means framing has already desynchronised, so the stream is unrecoverable and the
-worker must be discarded.
+A checksum mismatch indicates that the stream may be out of sync. The connection cannot be
+recovered, so the worker must be discarded.
 
 ### Turning it off
 
-The checksum is optional and negotiated:
+Checksum validation can be disabled through a handshake negotiation:
 
-- The server may set `no_checksum: true` in its `HELLO`, which is an **offer**.
-- The worker **answers** with `no_checksum` in its `HELLO_ACK`, `true` only if it understood
-  the field and agrees.
-- Only when both said `true` does either end stop hashing.
+- The server may include `no_checksum: true` in `HELLO` to offer disabling checksums.
+- The worker sets `no_checksum` in `HELLO_ACK` to `true` only if it supports and accepts the
+  option.
+- Checksums are disabled only when both sides agree.
 
-Three properties are deliberate:
+The negotiation has these constraints:
 
-1. **The handshake is always checksummed.** The agreement is carried *in* frames, so the
-   frames that carry it must themselves be verified.
-2. **A sender cannot turn the check off by itself.** A frame claiming `NO_CHECKSUM` on an end
-   that never agreed is a protocol violation, and is refused as such.
-3. **A frame that says it is checksummed still is.** The policy relaxes the check only for
-   frames that opt out.
+1. The handshake is always checksummed because it carries the negotiation itself.
+2. A sender cannot disable checksums unilaterally. A `NO_CHECKSUM` frame before agreement
+   is a protocol violation.
+3. Frames without the `NO_CHECKSUM` flag remain subject to checksum validation.
 
 ## Correlation
 
-`request_id` is meaningful for `REQUEST`, `RESPONSE`, `BODY`, `END`, `CALL`, `RETURN`, `JOB`
-and `ACK`. Every other type is unsolicited and **must** carry `request_id = 0`.
+`request_id` correlates `REQUEST`, `RESPONSE`, `BODY`, `END`, `CALL`, `RETURN`, `JOB`, and
+`ACK`. Other message types are unsolicited and must use `request_id = 0`.
 
-Request ids are allocated by the server, start at **1**, and increment per request. **`0` is
-reserved** and never used as a request id, so a correlation bug is visible instead of silently
-matching. The counter wraps at `u32::MAX` back to 1, skipping 0.
+The server allocates request IDs starting at 1 and increments the value for each request.
+Zero is reserved. After `u32::MAX`, the counter wraps to 1.
 
-**Call ids are allocated downward from `u32::MAX`**, so the two ranges meet only after four
-billion requests and a mix-up between a call and a request is a visible correlation failure
-rather than a silent match.
+Call IDs are allocated downward from `u32::MAX`, keeping them separate from the
+server-allocated request ID range until the ranges meet.
 
 ## Exchange sequences
 
@@ -227,13 +218,12 @@ server  ──HELLO (version)─────────────────
         ◄─HELLO_ACK (version, php, sapi, pid)─
 ```
 
-The worker's `protocol_version` is checked **here**, at boot, not on the first request: a
-mismatched SDK is a configuration problem and should look like one.
+Volucer validates the worker's `protocol_version` during the handshake at startup. A
+version mismatch therefore fails before the worker receives requests.
 
-`runtime` identifies the implementation and the **build** it is running, as
-`volucer-worker-php/7c6945f`. The build is not the protocol version: the protocol is `1` and
-moves only when the wire format does, while the build names one particular checkout or
-release of the SDK.
+The `runtime` field identifies the implementation and build, for example
+`volucer-worker-php/7c6945f`. It is distinct from the protocol version: the protocol version
+changes with the wire format, while the runtime value identifies a particular SDK build.
 
 ### Serving a request
 
@@ -245,13 +235,13 @@ server  ──REQUEST (id, metadata, body_len)─►  worker
         ◄─END (id, app_status, rss, duration)──────
 ```
 
-`app_status` in `END` is the **application's** exit status and is **not** the HTTP status. A
-worker that throws can report `app_status = 1` while the response head still carries
-`status = 500`.
+`app_status` in `END` is the application's status, not the HTTP response status. For
+example, a worker may report `app_status = 1` after an exception while the response head
+contains HTTP `status = 500`.
 
-`END` also carries `peak_memory_bytes`, so the supervisor can recycle a worker on an RSS
-threshold, and `keep_alive`. A worker that handled a fatal error reports `keep_alive = false`
-and is replaced instead of reused.
+`END` also carries `peak_memory_bytes` and `keep_alive`. The supervisor can use the memory
+value to recycle workers above a configured threshold. A worker that encounters a fatal
+error sets `keep_alive = false`, so it is replaced rather than reused.
 
 ### A call, mid-request
 
@@ -262,13 +252,12 @@ server  ──REQUEST (id, …)────────────────�
         ◄─RESPONSE (id, status, …)────────
 ```
 
-**A worker may only call while a request is in flight.** The server has one reader per
-worker, parked on `recv()` *between* requests — so a call made when the worker is idle has no
-reader to answer it and would block until the request deadline. Both sides enforce this.
+Workers may send `CALL` only while handling a request. Between requests, the server's worker
+reader is waiting for the next request and cannot process a call. Both sides enforce this
+restriction.
 
-Calls must be answered even when they cannot be served — a `RETURN` carrying an error, never
-a dropped frame — because dropping one leaves the worker blocked on a read that will not
-return until the request's deadline kills it.
+The server must answer every call with `RETURN`, including calls that fail. Dropping a call
+would leave the worker waiting for a response until the request deadline.
 
 ### A job
 
@@ -278,17 +267,12 @@ server  ──JOB (id, pipeline, task, headers, body_len)──►  worker
         ◄─ACK (id, outcome, reason?)────────────────────────
 ```
 
-A job is a **separate exchange with its own frame type**, and the reason is the one thing a
-consumer and a request handler must not share: **per-request state reset.** A request handler
-resets what the last request left behind. A consumer does the *opposite*: boot once, keep the
-connection pool, the container and the warm caches.
+Jobs use a distinct `JOB` frame rather than being represented as a kind of `REQUEST`.
+Request workers reset request-specific state between requests; consumers may retain state
+between jobs. A separate frame type makes the kind of work explicit to each implementation.
 
-That difference cannot be expressed by a flag on `REQUEST` without making "is this a request
-or a job?" a question each implementation answers for itself, which is how one of them gets
-it wrong.
-
-`ACK` is the terminal frame and the only place in this protocol where a payload **decides
-something the server does** rather than something it reports:
+`ACK` is the terminal frame for a job exchange. Its payload determines how the server
+handles the job:
 
 | `outcome` | The queue does | Why |
 |---|---|---|
@@ -296,43 +280,39 @@ something the server does** rather than something it reports:
 | `requeue` | Negatively acknowledges, so the job is handed out again | Not done, and it should be retried |
 | `reject` | **Settles the reservation without recording a failure** | Not done, and it must not come back |
 
-`reject` is the arm worth reading twice. Nacking it would bring the job back for ever, and
-the server imposes no retry count, no backoff and no dead-lettering. What makes the policy
-writable is that the driver increments `attempts` on every reservation, so an application
-that wants "give up after three" reads the number it is given.
+`reject` settles the reservation without retrying the job. The server does not impose a
+retry limit, backoff, or dead-letter policy. The driver increments `attempts` on each
+reservation, allowing the application to implement its own retry policy.
 
-The reservation is deliberately **not** the job id. The server holds the reservation and sends
-only the job; `ACK` correlates by the frame's `request_id`.
+The reservation ID is not the job ID. The server holds the reservation and sends the job;
+`ACK` is correlated using the frame's `request_id`.
 
 ### gRPC calls
 
-A gRPC call is delivered as an ordinary `REQUEST`, and this is a decision rather than a
-shortcut: **the server never parses a gRPC message**, so a call is a request whose body
-happens to be length-delimited framed messages instead of a form.
+A gRPC call is delivered in a `REQUEST` frame. Volucer does not parse gRPC messages; the
+request body contains the length-delimited gRPC message bytes.
 
-What tells the two apart is `content-type`, on **both** sides. A worker identifies a call by
-the media type of the request it just read, exactly as the server did before delivering it.
+Both sides identify gRPC requests by their `content-type`. The worker uses the content type
+from the request it receives, matching the server's classification.
 
-The outcome travels in the *trailer* section, and the status is `200` — because a gRPC client
-reads the outcome from the trailer section, so an HTTP error status would be invisible to it.
+The gRPC status and outcome are sent in the trailer section, and the HTTP status is `200`.
+gRPC clients read the result from the trailers rather than from an HTTP error status.
 
 ### Shutdown
 
-When the server wants the worker to stop it closes the child's stdin. The worker reads that
-as a clean EOF and exits on its own. There is **no signal to catch** and no flag to poll.
+When Volucer stops a worker, it closes the child's stdin. The worker reads EOF and exits
+cleanly; it does not need to handle a signal or poll for a shutdown flag.
 
 ## Implementing a worker
 
-The four things to get right, in order:
+When implementing a worker, ensure that it:
 
-1. **stdout is the protocol channel.** Capture your application's output rather than writing
-   it there. The PHP SDK does this with an output buffer and `display_errors=stderr`; another
-   language needs its own equivalent.
-2. **The handshake comes first.** Check the protocol version, and answer with your runtime
-   identification.
-3. **One request at a time.** The server leases a worker to one request.
-4. **A body is bytes, not JSON.** Read `body_len` bytes, honour the `LAST` flag.
+1. Uses stdout only for protocol frames. Capture application output or direct it elsewhere;
+   the PHP SDK uses an output buffer and `display_errors=stderr`.
+2. Completes the handshake first, checking the protocol version and reporting its runtime.
+3. Handles one request at a time; Volucer assigns a worker to one request at a time.
+4. Reads bodies as raw bytes, using `body_len` and the `LAST` flag.
 
 Read the [normative specification](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md)
-before implementing. It pins the exact bytes, and the four existing SDKs are four
-independent implementations of it.
+before implementing a worker. It defines the exact wire format; the existing SDKs provide
+independent implementations for reference.

@@ -1,6 +1,7 @@
 # Services
 
-**Key-value storage, locks, queues and gRPC, from inside a running request.**
+This guide describes the key-value storage, lock, queue, and gRPC services available to
+Volucer workers.
 
 ## Enabling services
 
@@ -14,11 +15,9 @@ command = "php worker.php"
 services = ["kv.cache", "lock", "jobs"]     # the grant
 ```
 
-A service the backend does not name is refused on purpose. The alternative — a worker
-reaching anything it asks for — turns the worker channel into a remote-execution surface,
-and the only thing protecting it is the fact that the list is explicit.
-
-A name the server does not know is **refused by name**, the same way a misspelled key is.
+Workers can call only the services granted to their backend. An unlisted service or an
+unknown service name is rejected. This explicit allowlist limits what a worker can access
+through the worker channel.
 
 ### The names
 
@@ -30,25 +29,16 @@ A name the server does not know is **refused by name**, the same way a misspelle
 | `config` | The deployment's own description, redacted |
 | `workers` | The worker list and the reset call |
 
-**KV is named per storage; the others are not.** A KV storage is *named* because one
-deployment wants several with different lifetimes and backends — a session cache and a
-fragment cache are different things — and a worker has to say which one it is calling.
-
-The lock backend is a single mechanism: a lock is named by its *resource*, so two lock
-tables would be two independent views of one namespace. Two processes locked on
-`"pdf:create"` through two tables would not see each other, which is a bug that is
-invisible in configuration and appears in production. So there is exactly one `lock` name
-to write.
+Key-value access is granted per storage, allowing a deployment to use separate stores for
+different purposes. The lock backend is a single service; individual locks are identified
+by their resource name, so there is only one `lock` grant.
 
 ## The call plane
 
-These services are reached over the worker channel — a `CALL`/`RETURN` pair, which is a
-frame the worker writes *unprompted*, mid-request, and the server answers.
-
-That is the difference from FastCGI, and it is why this protocol exists: in FastCGI the
-worker can only answer the request it was handed. A worker that needs a lock, a cache or
-a queue needs to ask the server for something, and it needs to do that while a request is
-in flight.
+Workers call these services over the worker channel using `CALL` and `RETURN` frames. A
+worker can make a call while handling a request, and the server sends the result over the
+same channel. Unlike FastCGI, this protocol allows a worker to ask the server for services
+such as storage, locks, and queues during request handling.
 
 ## Key-value storage
 
@@ -75,14 +65,12 @@ $value = $kv->get('greeting', $found);
 | `setMultiple($values, $ttl = null)` | Several at once |
 | `getMany($keys)` | Several at once, missing keys omitted |
 
-### `setIfAbsent` is the one to reach for
+### ### Using `setIfAbsent` for atomic writes
 
-**Where a real invariant is at stake, use `Kv::setIfAbsent`** — the storage's own
-conditional write, atomic per driver (`SET NX` on Redis, `O_CREAT|O_EXCL` on `file`, a
-shard lock in memory).
-
-That is the difference between a lock and an invariant. A lock is a hint that something
-else might be happening; a conditional write is the thing itself.
+Use `Kv::setIfAbsent()` when a value must be created only if the key does not already
+exist. The operation is atomic for each driver: for example, Redis uses `SET NX`, the file
+driver uses `O_CREAT|O_EXCL`, and the in-memory driver uses a shard lock. This is a
+conditional write on the storage itself, unlike a separate lock around application logic.
 
 ### Serializers
 
@@ -124,20 +112,15 @@ try {
 | `holders($resource)` | Who holds it |
 | `updateTtl($resource, $id, $ttl)` | Extend the lease |
 
-`acquire()` returns the **lock id** you pass to `release()`, or `null` when it could not be
-taken. `ttl` is in seconds; `ttl = 0` means no expiry.
+`acquire()` returns a lock ID to pass to `release()`, or `null` if the lock could not be
+acquired. TTL values are in seconds; `ttl = 0` means the lock does not expire.
 
 ### Locks are not a correctness primitive
 
-This is worth stating plainly, because the API is shaped so that an application can be
-correct about it rather than only warned.
-
-**A TTL lock has no fencing token.** A worker that stalls past its lease can be writing
-while somebody else holds it. The lock prevents *casual* overlap; it does not prevent a
-paused process from carrying on.
-
-Use a lock to avoid duplicated work. Where a real invariant is at stake, use
-`Kv::setIfAbsent` — the storage's own conditional write, atomic per driver.
+TTL-based locks do not provide fencing tokens. If a worker stalls until its lease expires,
+another worker may acquire the lock while the first worker is still running. Use locks to
+reduce duplicate work, but do not rely on them alone to protect critical invariants. For an
+atomic conditional write, use `Kv::setIfAbsent()`.
 
 ## Queues
 
@@ -161,12 +144,13 @@ $queue->pipelines();  // every pipeline the server has
 | `size()` | The size of each pipeline |
 | `pipelines()` | The names of every pipeline |
 
-`$task` names what to do; `$payload` is the bytes; `$headers` is a per-job header map.
+`$task` identifies the work to perform, `$payload` contains the job data, and `$headers`
+provides per-job metadata.
 
 ### Consuming
 
-A consumer is a worker that receives jobs rather than HTTP requests. The same worker file
-can do either:
+A consumer is a worker that receives jobs instead of HTTP requests. The same worker
+application can be configured for either type of work:
 
 ```php
 Worker::connect()->consume(function (Volucer\Job $job, Worker $worker) {
@@ -174,15 +158,16 @@ Worker::connect()->consume(function (Volucer\Job $job, Worker $worker) {
 });
 ```
 
-| Return | Outcome |
+| Return value | Outcome |
 |---|---|
-| anything else, including `true` | `ack` — the job is done |
-| `false` | `requeue` — run it again |
-| a string | `reject` — the string is the reason |
+| Anything except `false` or a string (including `true`) | `ack` — the job is complete |
+| `false` | `requeue` — make the job available again |
+| A string | `reject` — use the string as the reason |
 
-A consumer is told apart from a request worker by the frame the work arrives in, because
-the difference an application has to know is whether its own state is reset between units
-of work: **a request worker resets, a consumer does not.**
+The incoming frame identifies whether the worker is handling a request or a job. Request
+workers reset request state between requests; consumers do not automatically reset
+application state between jobs. Ensure a consumer cleans up any job-specific state before
+processing the next job.
 
 ### Configuring the server side
 
@@ -201,10 +186,10 @@ job_lease_seconds = 300     # how long a reserved job is held
 prefetch = 1                # how many to reserve in advance
 ```
 
-`pool` is required when `consume` is not empty. `job_lease_seconds` is deliberately not
-the request timeout, because the work is deliberately different work: five minutes is long
-enough for anything an HTTP request would not have been allowed to do, and short enough
-that a consumer which died does not leave work stuck for an hour.
+Configure `[jobs.pool]` when `consume` is non-empty. `job_lease_seconds` controls how long
+a reserved job remains leased; it is separate from the HTTP request timeout. Choose a lease
+long enough for the job to complete, while ensuring abandoned jobs become available again
+in a reasonable time if a consumer exits unexpectedly.
 
 ## gRPC
 
@@ -217,17 +202,17 @@ command = "php worker.php"
 grpc_services = ["greeter.Greeter"]
 ```
 
-A call for an unlisted service receives `UNIMPLEMENTED` before the request body is read or a
-worker is assigned.
+A call for a service not listed in `grpc_services` receives `UNIMPLEMENTED` before Volucer
+reads the request body or assigns a worker.
 
-Changes to `grpc_services` take effect on the next request after `SIGHUP`, including requests on
-existing connections. The list is part of the same configuration generation as the site table,
-so route and service-list changes are applied together.
+After `SIGHUP`, changes to `grpc_services` apply to the next request, including requests on
+existing connections. The service list and site configuration are loaded as one generation,
+so their changes take effect together.
 
 ### Serving any service instead of naming them
 
-To deliver all well-formed gRPC method paths to the worker, leave `grpc_services` unset and set
-`grpc_serve_any`:
+To deliver every well-formed gRPC method path to the worker, leave `grpc_services` unset
+and set `grpc_serve_any`:
 
 ```toml
 [backends.app]
@@ -236,16 +221,17 @@ command = "php worker.php"
 grpc_serve_any = true
 ```
 
-Every well-formed `/pkg.Service/Method` is delivered to the application, which returns
-`UNIMPLEMENTED` for methods it does not implement. For services declared in `.proto` files,
-`grpc_proto` can be used to build the service list instead.
+With this option, Volucer sends each well-formed `/pkg.Service/Method` path to the
+application. The application is responsible for returning `UNIMPLEMENTED` for methods it
+does not implement. To derive an explicit service list from `.proto` files, configure
+`grpc_proto` instead.
 
 Configuration rules, checked when the file is read:
 
 - `grpc_serve_any` cannot be combined with a non-empty `grpc_services`.
 - The request path must still match `/pkg.Service/Method`.
 
-Startup logs a warning for each backend using `grpc_serve_any`.
+Volucer logs a warning at startup for each backend using `grpc_serve_any`.
 
 `grpc_services` is also available on an `attach` backend, with the same rules.
 
@@ -260,7 +246,8 @@ command = "php worker.php"
 grpc_proto = ["proto/greeter.proto"]
 ```
 
-An entry is a file or a directory, and a directory is searched recursively for `*.proto`:
+Each entry can be a file or directory. Volucer searches directories recursively for
+`*.proto` files:
 
 ```toml
 grpc_proto = ["proto/"]     # everything under proto/, at any depth
@@ -268,22 +255,22 @@ grpc_proto = ["proto/"]     # everything under proto/, at any depth
 
 Paths are resolved relative to the directory containing `volucer.toml`.
 
-The parser reads the file-scope `package` and top-level `service` declarations. It does not follow
-`import` statements or treat text in comments, strings, or message bodies as declarations. Files
-without a `package` declare bare service names. A file with a malformed `package` contributes no
-services.
+The parser reads file-scope `package` declarations and top-level `service` declarations. It
+does not follow `import` statements, or treat text in comments, strings, or message bodies
+as declarations. A service in a file without a package uses its bare name. A file with an
+invalid `package` declaration contributes no services.
 
 `grpc_proto`, `grpc_services`, and `grpc_serve_any = true` are mutually exclusive. Combining
 them causes a configuration error.
 
-The configuration is rejected if:
+Volucer rejects the configuration if:
 
 - an entry cannot be read or is neither a file nor a directory;
 - the entries resolve to no services.
 
-The files are read when configuration is loaded by `serve`, `check`, or `SIGHUP`. Changes take
-effect after reloading, not when files are saved. If a reload resolves no services, it is rejected
-and the previous configuration remains active.
+Volucer reads these files when configuration is loaded by `serve`, `check`, or `SIGHUP`.
+Saving a `.proto` file does not apply changes until configuration is reloaded. If a reload
+resolves no services, Volucer rejects it and keeps the previous configuration active.
 
 `volucer check` displays the entries and the services they resolve to:
 
@@ -293,8 +280,8 @@ and the previous configuration remains active.
       grpc from:         2 service(s) from grpc_proto: proto/
 ```
 
-The output includes the service count for each entry, which can be compared with the services
-implemented by the application.
+The output reports the number of services resolved from each entry. Compare it with the
+services implemented by the application to verify the configured list.
 
 ### Handling a call
 
@@ -309,8 +296,8 @@ Worker::connect()->onGrpc(function (Volucer\Request $request, Worker $worker): V
 });
 ```
 
-A worker that serves **only** gRPC can use `grpc()` instead, which registers the handler
-and serves it with no HTTP routes:
+A worker dedicated to gRPC can use `grpc()` instead. It registers the handler and serves
+without HTTP routes:
 
 ```php
 Worker::connect()->grpc(function (Volucer\Request $request, Worker $worker): Volucer\GrpcResponse {
@@ -318,7 +305,7 @@ Worker::connect()->grpc(function (Volucer\Request $request, Worker $worker): Vol
 });
 ```
 
-A worker that serves both calls the two halves separately.
+A worker that handles both HTTP and gRPC registers the two handlers separately.
 
 | Method | Purpose |
 |---|---|
@@ -328,29 +315,29 @@ A worker that serves both calls the two halves separately.
 | `GrpcResponse::isOk()` | Whether it succeeded |
 | `GrpcResponse::statusName()` | The status, by name |
 
-`fail()` uses the gRPC status codes: `12` is `UNIMPLEMENTED`, `13` is `INTERNAL`, `14` is
-`UNAVAILABLE`.
+`fail()` accepts gRPC status codes. For example, `12` is `UNIMPLEMENTED`, `13` is
+`INTERNAL`, and `14` is `UNAVAILABLE`.
 
-The handler may also return a plain `string` or `null`, in which case the captured output
-is the message body and the status is success.
+The handler may also return a string or `null`. In either case, captured output becomes the
+message body and the response status indicates success.
 
 ### The server never parses a message
 
-Volucer routes on the `:path` and carries the framed bytes. **The application owns the
-schema** — `.proto` files never enter the server's build or its dependency graph, so a
-schema change is an application deploy rather than a server one.
+Volucer routes gRPC requests using `:path` and forwards the framed message bytes. The
+application owns the schema; `.proto` files are not included in the server build or
+dependency graph. Schema changes therefore require an application deployment, not a server
+build.
 
-The one thing a handler has to state is its outcome, as a `GrpcResponse`. The status and
-the message become two response headers, and the server moves them into the trailer
-section — the worker protocol's response head has nowhere else to put them.
+Return a `GrpcResponse` to specify the gRPC status and message. The worker protocol carries
+these values in response headers, which Volucer moves into the gRPC trailer section.
 
-`Content-Type: application/grpc` is set for you. A gRPC client refuses a reply that does
-not carry it before it reads a byte of the body, so a handler that forgot would see its
-message rejected for a reason it could not discover from the answer.
+Volucer sets `Content-Type: application/grpc` on the response. gRPC clients require this
+header to recognize the response.
 
 ## Serving gRPC from an origin
 
-A gRPC origin that already speaks the protocol is reached as an `upstream` backend. See
+A gRPC origin that already implements the protocol can be configured as an `upstream`
+backend. See
 [Backends](02-BACKENDS.md#grpc).
 
 ```toml
@@ -360,5 +347,6 @@ origin = "unix:/run/greeter.sock"
 protocol = "h2c"
 ```
 
-That is Tier A: the proxy relays to an origin that already speaks gRPC. The `worker`
-backend is Tier B: the application serves the service itself, with no origin at all.
+In this arrangement, Volucer proxies requests to an existing gRPC origin. With the `worker`
+backend, the application implements the gRPC service directly and no separate origin is
+required.
