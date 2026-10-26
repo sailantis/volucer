@@ -7,13 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-26
+
 ### Added
 
 - **Container images are published to `ghcr.io/<repository>`.** Every `v*` tag pushes a
   multi-architecture manifest list (`linux/amd64` and `linux/arm64`) of both the `scratch`-based
   musl image and the Debian-based glibc image, so `docker pull ghcr.io/sailantis/volucer:latest`
   works without a checkout or a Rust toolchain. `musl` is the recommended image and takes the
-  unsuffixed tags (`0.2.0`, `0.2`, `latest`); `glibc` always carries a suffix (`0.2.0-glibc`,
+  unsuffixed tags (`0.3.0`, `0.3`, `latest`); `glibc` always carries a suffix (`0.3.0-glibc`,
   `latest-glibc`), so a bare pull cannot resolve to the base image by accident. `latest`
   deliberately does not move for a pre-release tag. The images are pushed by digest during the
   build and tagged only in a final job that depends on the release being published, so a
@@ -131,8 +133,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is gone: a listener now supplies only the port a redirect should name, and *whether* a request is
   redirected comes from the resolved site. A cleartext listener that no site redirects on no longer
   logs that it will.
-- **`default_backend` and `routes` now belong in `[server]`.** Old top-level keys fail with a
-  migration hint; the compatibility shim will be removed in the next release.
+- **`default_backend` and `routes` now belong in `[server]`.** A file that still has the top-level
+  key fails at startup with a message naming the new location, instead of the `unknown field` the
+  parser would otherwise produce. The key is not read at all, so an old file cannot half-work: it
+  is rejected until the table is moved.
 - **`config.describe` redacts `env` and `headers` values and URL userinfo.**
 - **`spawn_cgi` starts slots concurrently.** Port allocation remains serial; at 32 workers,
   startup fell from 10–14 seconds to about 2.1 seconds.
@@ -155,6 +159,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   successful connection.
 - **`serve` accepts HTTPS-only configurations**, matching `check`.
 - **End-to-end test failures include server stderr** for easier diagnosis.
+- **Recycled `spawn_cgi` slots stop and reap the previous process before restarting.** This
+  prevents the replacement from binding an address still held by its predecessor. On platforms
+  that allow both processes to bind, the old process could otherwise continue serving connections
+  while the pool treated the replacement as the active worker.
+- **`volucer-server` tests avoid reusing recently released ports.** The shared test helper now
+  scans a bounded port range, avoiding collisions caused by the operating system returning a
+  just-released port to another concurrently running test.
+- **The worker-pool slot-wait test establishes a real queue before measuring wait time.** A gate
+  keeps the initial requests in flight while queued requests are submitted, and the test no longer
+  depends on the production request timeout or on threads happening to overlap under load.
 
 ## [0.2.0] - 2026-10-22
 
@@ -197,6 +211,7 @@ The first release: one binary that serves PHP without embedding it.
 - **`volucer check`** reports listeners, backends, PHP binaries and selection reasons.
 - **Release archives for six targets**, platform installers and a systemd unit.
 
-[Unreleased]: https://github.com/sailantis/volucer/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sailantis/volucer/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sailantis/volucer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sailantis/volucer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sailantis/volucer/releases/tag/v0.1.0
