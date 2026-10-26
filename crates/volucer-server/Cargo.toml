@@ -36,6 +36,7 @@ volucer-jobs.workspace = true
 # thing that owns a connection pool — so it belongs here rather than in the listener, which only
 # has to know how to *call* this.
 volucer-upstream.workspace = true
+getrandom.workspace = true
 bytes.workspace = true
 # `TokioIo` adapts a `tokio` IO to `hyper`'s `Read`/`Write`, which is what a request body needs to
 # cross between the listener's runtime and this crate's client.

@@ -9,6 +9,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[rpc]` gives a FastCGI or HTTP application the services a worker reaches over its channel.**
+  A worker asks for `kv`, `lock` and `jobs` with `CALL` frames on the stream that carries its
+  requests; a FastCGI application has no such stream, because it exists for one request and can only
+  answer what it was handed. The new listener is a socket the application dials instead: same frames,
+  same codec, and the **same `services` list**, so a deployment cannot grant a cache to its workers
+  and forget the same cache for the same application. Volucer injects `VOLUCER_RPC` and
+  `VOLUCER_RPC_TOKEN` into every request a granted backend serves — or `X-Volucer-Rpc` and
+  `X-Volucer-Rpc-Token` for an `upstream` origin — so the address is written once, in one file.
+  A backend that grants nothing is handed neither, which is what stops an unprivileged application
+  from attempting a call that would only be refused. There is deliberately no handshake: a CGI
+  process would pay for one on every request, so the token travels on each call and a withdrawn grant
+  takes effect on the next one. `services` is now accepted on `external`, `spawn_cgi` and `upstream`
+  backends; a grant without `[rpc]`, and `[rpc]` with nothing granted, are both refused at startup.
 - **`[telemetry].sample` controls which traces are exported.** The default, `parent_based`, follows
   the sampling decision in an incoming trace and records requests with no `traceparent` (root
   requests). `always` exports every trace. `ratio` exports the fraction configured by

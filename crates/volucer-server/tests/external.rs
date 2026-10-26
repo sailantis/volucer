@@ -201,6 +201,7 @@ fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) ->
             BackendConfig::External(ExternalConfig {
                 socket: socket.to_string(),
                 max_connections,
+                services: Vec::new(),
             }),
         )]
         .into_iter()

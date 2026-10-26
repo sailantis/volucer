@@ -2082,6 +2082,7 @@ name = "volucer-server"
 version = "0.3.0"
 dependencies = [
  "bytes",
+ "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-util",

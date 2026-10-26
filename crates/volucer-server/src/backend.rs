@@ -719,6 +719,7 @@ mod tests {
             &BackendConfig::External(ExternalConfig {
                 socket: "127.0.0.1:9000".to_string(),
                 max_connections: None,
+                services: Vec::new(),
             }),
         )
         .unwrap();
@@ -739,6 +740,7 @@ mod tests {
             &BackendConfig::External(ExternalConfig {
                 socket: socket.to_string(),
                 max_connections: None,
+                services: Vec::new(),
             }),
         )
         .unwrap_err();

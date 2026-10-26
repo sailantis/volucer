@@ -132,6 +132,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
                 working_dir: None,
                 env: Default::default(),
                 legacy_capacity: None,
+                services: Vec::new(),
             }),
         )]
         .into_iter()
@@ -265,6 +266,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
     let socket_of = |port: u16| volucer_core::config::ExternalConfig {
         socket: format!("127.0.0.1:{port}"),
         max_connections: None,
+        services: Vec::new(),
     };
     let config = Config {
         server: ServerConfig {
@@ -523,6 +525,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket: "127.0.0.1:1".to_string(),
                 max_connections: None,
+                services: Vec::new(),
             }),
         )]
         .into_iter()
@@ -728,6 +731,7 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket: "127.0.0.1:1".to_string(),
                 max_connections: None,
+                services: Vec::new(),
             }),
         )]
         .into_iter()
@@ -1035,6 +1039,7 @@ fn fastcgi_round_trip_with_trace(
                 working_dir: None,
                 env: Default::default(),
                 legacy_capacity: None,
+                services: Vec::new(),
             }),
         )]
         .into_iter()
@@ -1207,4 +1212,224 @@ fn the_fastcgi_front_end_does_not_strip_the_header_under_ignore() {
         return;
     };
     assert_eq!(seen, CLIENT_TRACE, "`ignore` must not rewrite the relay");
+}
+
+/// A script that prints two CGI variables, as PHP sees them, separated by `|`.
+///
+/// Two rather than one because the call plane's params are a *pair*: an address with the wrong token
+/// is a call refused for a reason that reads like a missing grant, so a test asserting one of them
+/// could pass while the deployment was unusable.
+fn echo_params_script(root: &Path, names: &[&str]) -> std::path::PathBuf {
+    let echoes = names
+        .iter()
+        .map(|name| format!("echo $_SERVER[{name:?}] ?? '-'; echo '|';"))
+        .collect::<String>();
+    write_script(
+        root,
+        "echo.php",
+        &format!("<?php header('Content-Type: text/plain'); {echoes}"),
+    )
+}
+
+/// Send one request through a real front-end and return the body PHP produced.
+///
+/// **Two backends, always, and only one of them granted.** That is what lets one helper answer both
+/// questions: the deployment is valid either way (the pair rule needs *something* granted), and which
+/// backend a request reaches is decided by `default_backend` — so the difference in what PHP sees is
+/// attributable to the grant and nothing else.
+fn fastcgi_rpc_body(granted: bool) -> Option<String> {
+    let Some(php) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return None;
+    };
+    let root =
+        std::env::temp_dir().join(format!("volucer-fcgi-rpc-{}-{granted}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    let script = echo_params_script(
+        &root,
+        &[
+            volucer_core::config::RPC_ENDPOINT_PARAM,
+            volucer_core::config::RPC_TOKEN_PARAM,
+        ],
+    );
+
+    // The same binary and the same document root on both, so the only difference between the two
+    // requests is the `services` list of the backend the route selected.
+    let pool = |services: Vec<String>, port: u16| {
+        BackendConfig::SpawnCgi(SpawnCgiConfig {
+            binary: Some(php.clone()),
+            command: None,
+            workers: 1,
+            bind_host: "127.0.0.1".to_string(),
+            base_port: port,
+            socket: None,
+            max_requests: None,
+            children: 0,
+            concurrency: 0,
+            working_dir: None,
+            env: Default::default(),
+            legacy_capacity: None,
+            services,
+        })
+    };
+    let second = free_port_run(1).expect("a second free port");
+    let config = Config {
+        server: ServerConfig {
+            fastcgi: Some("127.0.0.1:0".to_string()),
+            document_root: Some(root.clone()),
+            default_backend: Some(if granted { "granted" } else { "plain" }.to_string()),
+            ..Default::default()
+        },
+        backends: [
+            (
+                "granted".to_string(),
+                pool(
+                    vec!["kv.cache".to_string()],
+                    free_port_run(1).expect("a free port for the pool"),
+                ),
+            ),
+            ("plain".to_string(), pool(Vec::new(), second)),
+        ]
+        .into_iter()
+        .collect(),
+        kv: [(
+            "cache".to_string(),
+            volucer_core::config::KvStorageConfig::Memory(volucer_core::config::MemoryKvConfig {
+                max_bytes: 1024 * 1024,
+            }),
+        )]
+        .into_iter()
+        .collect(),
+        rpc: Some(volucer_core::config::RpcConfig {
+            listen: "127.0.0.1:6001".to_string(),
+            max_connections: None,
+            idle_timeout_seconds: 300,
+            call_timeout_seconds: 10,
+        }),
+        ..volucer_core::config::Config::default()
+    };
+    config.validate().expect("config validates");
+    let sites = SharedState::new(Sites::from_config(&config, &root));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let listener = FastCgiListener::bind_registered(
+        "127.0.0.1:0",
+        Arc::clone(&dispatcher),
+        Arc::new(Registry::new(sites)),
+        Limits::default(),
+    )
+    .expect("bind the fastcgi listener");
+    let address = listener.local_addr().expect("bound address");
+    let shutdown = listener.shutdown_handle();
+    let handle = std::thread::spawn(move || listener.run());
+    std::thread::sleep(Duration::from_millis(150));
+
+    let params: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (b"REQUEST_METHOD".to_vec(), b"GET".to_vec()),
+        (b"REQUEST_URI".to_vec(), b"/echo.php".to_vec()),
+        (
+            b"SCRIPT_FILENAME".to_vec(),
+            script.to_string_lossy().as_bytes().to_vec(),
+        ),
+        (b"SERVER_PROTOCOL".to_vec(), b"HTTP/1.1".to_vec()),
+        (b"SERVER_NAME".to_vec(), b"example.test".to_vec()),
+        (b"HTTP_HOST".to_vec(), b"example.test".to_vec()),
+        (b"REMOTE_ADDR".to_vec(), b"127.0.0.1".to_vec()),
+    ];
+
+    let mut wire = Vec::new();
+    record::Header::new(RecordType::BeginRequest, 1, 8)
+        .write(&mut wire)
+        .expect("write BEGIN_REQUEST");
+    wire.write_all(&BeginRequest::responder(false).encode())
+        .expect("write begin body");
+    let payload = nvpair::encode_pairs(
+        params
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    );
+    record::write_records(&mut wire, RecordType::Params, 1, &payload, true).expect("write params");
+    record::write_records(&mut wire, RecordType::Stdin, 1, b"", true).expect("write stdin");
+
+    let mut connection = fastcgi_connection(address);
+    connection
+        .get_mut()
+        .write_all(&wire)
+        .expect("send the request");
+    connection.get_mut().flush().expect("flush");
+
+    let mut out = Vec::new();
+    loop {
+        match record::read_record(&mut connection) {
+            Ok(Some(record)) => {
+                let end = record.record_type() == RecordType::EndRequest;
+                out.extend_from_slice(&record.content);
+                if end {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) => panic!("the front-end sent a malformed record: {err}"),
+        }
+    }
+    shutdown.shutdown();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let text = String::from_utf8_lossy(&out).to_string();
+    // The body is everything after the header block, and PHP wrote two values with `|` between them.
+    // The record buffer is zero-padded by the front-end, so the tail is NULs rather than nothing.
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_string();
+    // The fixture writes a trailing `|`, so the last split is empty.
+    Some(body.strip_suffix('|').unwrap_or(&body).to_string())
+}
+
+#[test]
+fn the_front_end_hands_a_granted_application_the_address_and_a_token() {
+    let _serial = serial();
+    let Some(body) = fastcgi_rpc_body(true) else {
+        return;
+    };
+    let mut parts = body.split('|');
+    let address = parts.next().unwrap_or_default();
+    let token = parts.next().unwrap_or_default();
+
+    assert_eq!(
+        address, "127.0.0.1:6001",
+        "the deployment's own [rpc].listen reaches PHP verbatim, which is what makes writing the \
+         address once in one file enough: {body}"
+    );
+    assert_eq!(
+        token.len(),
+        32,
+        "and a token arrives beside it, thirty-two hex characters, so the application has \
+         something to attribute its calls with: {body}"
+    );
+    assert!(
+        token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the token is hex, not the process secret: {body}"
+    );
+}
+
+#[test]
+fn a_backend_that_grants_nothing_is_handed_neither_an_address_nor_a_token() {
+    let _serial = serial();
+    let Some(body) = fastcgi_rpc_body(false) else {
+        return;
+    };
+    // `-` for both, which is what the fixture writes for an absent variable. This is the whole of
+    // the security rule seen from the application's side: a backend with no grant is not told where
+    // the socket is, so it cannot make an attempt that would be refused either.
+    assert_eq!(
+        body, "-|-",
+        "a backend with an empty services list is handed nothing at all, through the same listener \
+         that hands the other backend both: {body}"
+    );
 }

@@ -697,6 +697,15 @@ fn serve_connection(
                     .push((b"HTTP_TRACEPARENT".to_vec(), traceparent.into_bytes())),
             }
         }
+        // And the call plane's address, for a backend whose application may reach it. Resolved
+        // against the backend the *route table* selects, so a request routed away from the default
+        // cannot inherit its token. `None` for a deployment without `[rpc]`, and for a backend that
+        // granted nothing — which is the whole of the rule: an application that is not granted
+        // anything is not told where the socket is.
+        let selected = dispatcher
+            .backend_for_routes(&site.routes, &request)
+            .to_string();
+        dispatcher.inject_rpc_params(&selected, &mut request);
 
         let response = dispatcher.dispatch_with_routes(&site.routes, &request);
         match response {
@@ -812,6 +821,7 @@ mod tests {
                     volucer_core::config::ExternalConfig {
                         socket: "127.0.0.1:1".to_string(),
                         max_connections: None,
+                        services: Vec::new(),
                     },
                 ),
             )]

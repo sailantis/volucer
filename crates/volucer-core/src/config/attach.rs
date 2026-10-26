@@ -58,6 +58,25 @@ pub struct ExternalConfig {
     /// one rather than at startup.
     #[serde(default)]
     pub max_connections: Option<usize>,
+
+    /// Which control namespaces this backend's application may call over `[rpc]`.
+    ///
+    /// **The same allow-list a worker's channel gets**, and deliberately the same key with the same
+    /// meaning: a `worker` reaches `kv`, `lock` and `jobs` over the stream that carries its requests,
+    /// and an `external` backend's application reaches them over the `[rpc]` listener instead. One
+    /// declaration, two transports, so there is no way for a deployment to grant a cache to its
+    /// workers and forget to grant the same cache to the same application's other half.
+    ///
+    /// The default is the empty list, which is the safe one: a connection to the call plane is a
+    /// remote-execution surface, and an application that names nothing reaches nothing. `[rpc]` must
+    /// also be configured for the grant to mean anything — see [`Config::rpc_grants`], and note that
+    /// [`Config::validate`] refuses the grant without the listener rather than leaving a grant that
+    /// cannot be used.
+    ///
+    /// The empty default is also what keeps every existing configuration valid: a file written
+    /// before this key existed reaches exactly what it reached before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
 }
 
 /// A worker pool volucer connects to rather than starts.

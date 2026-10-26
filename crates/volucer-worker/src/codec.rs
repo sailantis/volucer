@@ -1636,6 +1636,7 @@ mod tests {
                 name: "kv.get".to_string(),
                 params: serde_json::json!({ "key": "a" }),
                 traceparent: None,
+                token: None,
             },
         );
         script.head(1, 200, 2);
@@ -1689,6 +1690,7 @@ mod tests {
                 name: "kv.get".to_string(),
                 params: serde_json::Value::Null,
                 traceparent: None,
+                token: None,
             },
         );
         script.head(1, 200, 0);
@@ -1742,6 +1744,7 @@ mod tests {
                 name: "kv.get".to_string(),
                 params: serde_json::Value::Null,
                 traceparent: None,
+                token: None,
             },
         );
         script.head(1, 200, 2);
@@ -1794,6 +1797,7 @@ mod tests {
                 name: "kv.get".to_string(),
                 params: serde_json::Value::Null,
                 traceparent: None,
+                token: None,
             },
         );
         script.head(1, 200, 0);
@@ -2169,6 +2173,7 @@ mod tests {
                     name: "kv.get".to_string(),
                     params: serde_json::json!({"key": "a"}),
                     traceparent: None,
+                    token: None,
                 },
             )
             .json(MessageType::Ack, 1, &Ack::default());

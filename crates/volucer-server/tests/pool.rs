@@ -28,6 +28,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     }
 }
 
@@ -171,6 +172,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     };
 
     let mut pool = CgiPool::start("unix-test", &config).expect("a unix-socket pool starts");
@@ -246,6 +248,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     };
 
     let mut pool = CgiPool::start("pipe-test", &config).expect("a pipe pool starts");
@@ -302,6 +305,7 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     };
 
     let mut pool = CgiPool::start("unix-restart", &config).expect("pool starts");
@@ -719,6 +723,7 @@ fn a_command_driver_serves_through_the_address_it_was_given() {
         working_dir: None,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     };
 
     let mut pool = CgiPool::start("command-test", &config).expect("a command pool starts");
@@ -771,6 +776,7 @@ fn a_command_with_no_address_placeholder_is_a_misconfiguration() {
         working_dir: None,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     };
 
     let err = CgiPool::start("no-placeholder", &config).expect_err("must be refused");
@@ -813,6 +819,7 @@ fn a_command_that_exits_is_not_retried_across_ports() {
         working_dir: None,
         env: Default::default(),
         legacy_capacity: None,
+        services: Vec::new(),
     };
 
     let started = std::time::Instant::now();

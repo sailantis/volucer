@@ -270,6 +270,20 @@ pub struct Call {
     /// change once anything is deployed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
+    /// Which backend made this call, for a call that arrived on the `[rpc]` listener.
+    ///
+    /// **Absent on a worker's channel, and that absence is meaningful.** A worker's registry is built
+    /// for its own backend and installed on that backend's channels, so a call arriving there has
+    /// already been attributed by the connection it came on — a token would be a second answer to a
+    /// question the topology has settled. A call arriving on `[rpc]` has no such connection: the
+    /// socket is shared by every granted backend, so the identity has to travel with the call.
+    ///
+    /// A `#[serde(default)]` field rather than a handshake, because a CGI process is recreated per
+    /// request: any state established up front is paid for on every request, while sixty-four bytes
+    /// on a call that is about to do I/O anyway is not. It also means a stale connection cannot hold
+    /// a grant that a reloaded configuration has withdrawn — the token is judged per call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// The worker's answer to a [`Call`].

@@ -1360,6 +1360,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             legacy_capacity: None,
+            services: Vec::new(),
         };
 
         let launch = SlotLaunch::from_config(&config, "test").expect("the slot resolves");
@@ -1416,6 +1417,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             legacy_capacity: None,
+            services: Vec::new(),
         };
 
         let launch = SlotLaunch::from_config(&config, "test").expect("the slot resolves");
@@ -1654,6 +1656,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             legacy_capacity: None,
+            services: Vec::new(),
         };
         let err = CgiPool::start("test", &config).unwrap_err();
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");

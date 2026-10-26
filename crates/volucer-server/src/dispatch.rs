@@ -21,6 +21,7 @@ use crate::calls::{
     ResetRefusal, WorkerStatus, WorkersNamespace,
 };
 use crate::error::{Result, ServerError};
+use crate::rpc::RpcGrants;
 
 /// Routes requests to backends.
 #[derive(Debug)]
@@ -60,6 +61,36 @@ pub struct Dispatcher {
     /// driver, so there is no cycle to avoid. The consumer side polls these, which is why
     /// they are kept rather than rebuilt.
     queues: Option<Arc<JobsPlane>>,
+    /// The method registry built for each backend, by name.
+    ///
+    /// **Kept for the same reason `grpc_grants` is**, and discarded by the previous version of this
+    /// struct — which is why `[rpc]` could not exist: a worker's registry lives inside its pool's
+    /// channels, where nothing outside can reach it, and a CGI backend's lives nowhere at all
+    /// because nothing installed it. Retaining it here is what lets one listening socket serve the
+    /// *same* namespaces the channels do, over the same stores.
+    ///
+    /// Only the backends that granted something appear, so an empty map means "this deployment has
+    /// no call plane", which is the same question as `[rpc]` being useful.
+    registries: BTreeMap<String, Arc<MethodRegistry>>,
+    /// The call plane, when the deployment configured one and minted a secret for it.
+    ///
+    /// Here rather than only in the listener because the *request path* needs it too: what an
+    /// application is told — the address and its token — is decided per request, by this dispatcher,
+    /// on the way into a backend. Putting it anywhere else would mean a second place that has to
+    /// agree with the listener about which backends exist and what they were granted.
+    ///
+    /// Minted **here**, in the one function that builds both the registries and this handle, so the
+    /// secret is one value per process rather than one per caller. A second `new_secret()` call
+    /// would produce a token the listener had never heard of, and the failure would be every call
+    /// refused with "no backend was issued this token".
+    rpc: Option<Arc<RpcGrants>>,
+    /// The address an application is told to dial, which is `[rpc].listen` verbatim.
+    ///
+    /// A separate field rather than a lookup back into the configuration, because the dispatcher does
+    /// not keep a `Config`: what it needs from one it has already turned into backends, routes and
+    /// grants. Empty when [`Self::rpc`] is `None`, so the two cannot disagree about whether there is
+    /// a call plane.
+    rpc_address: String,
 }
 
 /// What `worker.reset` reaches the pools through, without holding one alive.
@@ -630,25 +661,33 @@ impl Dispatcher {
             // held for the first worker and not for the one that replaced it.
             let backend_config = backend_config.with_server_env(&config.server);
             let backend_config = &backend_config;
-            let registry = match backend_config {
-                BackendConfig::Worker(worker) => {
-                    let registry = Arc::new(worker_registry(
-                        &worker.services,
-                        config,
-                        &directory,
-                        &stores,
-                        &locks,
-                        &jobs,
-                    ));
-                    registries.insert(name.clone(), Arc::clone(&registry));
-                    Some(registry)
-                }
-                // The other three kinds have no channel, so there is nothing to install a handler
-                // on and nothing that can call. Not an oversight: `spawn_cgi` and `external` speak
-                // FastCGI, which has no call surface at all — no frame a server could carry a
-                // method name in — and an upstream is somebody else's process.
-                _ => None,
+            // Everything that has a `services` list gets a registry, and there is exactly **one**
+            // builder for it. What differs is where the list lives and how the registry is used:
+            // a `worker` and an `attach` have a channel to install the handler on, while the three
+            // kinds that answer FastCGI or HTTP have no channel at all and reach it through `[rpc]`
+            // instead — the listener looks the registry up by token.
+            //
+            // One builder is the point rather than tidiness: a registry built twice would mean two
+            // `KvNamespace` values over one store, correct and pointless, and a *second* place to
+            // change when a namespace gains a constructor argument. It also means a deployment
+            // cannot grant a cache to its workers and forget the same cache for the same
+            // application's other half, because there is one list per backend either way.
+            let services = match backend_config {
+                BackendConfig::Worker(worker) => worker.services.as_slice(),
+                BackendConfig::Attach(attach) => attach.services.as_slice(),
+                BackendConfig::External(external) => external.services.as_slice(),
+                BackendConfig::SpawnCgi(cgi) => cgi.services.as_slice(),
+                BackendConfig::Upstream(upstream) => upstream.services.as_slice(),
             };
+            let registry = (!services.is_empty()).then(|| {
+                let registry = Arc::new(worker_registry(
+                    services, config, &directory, &stores, &locks, &jobs,
+                ));
+                registries.insert(name.clone(), Arc::clone(&registry));
+                registry
+            });
+            // A registry is *offered* to a kind that has no channel to install it on; `Backend`
+            // ignores it for those, which is the same contract `from_config_with` already had.
             backends.insert(
                 name.clone(),
                 Backend::from_config_with(name, backend_config, registry)?,
@@ -701,7 +740,81 @@ impl Dispatcher {
             grpc_grants: Arc::new(config.grpc_grants_all()),
             directory,
             queues: jobs,
+            // Minted here if and only if the deployment asked for the call plane *and* has something
+            // to serve on it. `None` for a deployment with `[rpc]` in a file that failed to grant —
+            // `Config::validate` refuses that combination, so this is the test-and-`check` path — and
+            // `None` also means no application is handed a token, which is the honest answer rather
+            // than a socket that refuses everything.
+            rpc: match (&config.rpc, registries.is_empty()) {
+                (Some(_), false) => match crate::rpc::new_secret() {
+                    Some(secret) => Some(Arc::new(RpcGrants::new(registries.clone(), &secret))),
+                    None => {
+                        // No entropy, so no token: the listener is not started either, and the
+                        // failure is a logged error rather than a grant any local process could
+                        // claim. See `rpc::new_secret`.
+                        tracing::error!(
+                            "[rpc] is configured but no random source is available, so tokens \
+                             cannot be minted; the call plane will not be served"
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            },
+            rpc_address: config
+                .rpc
+                .as_ref()
+                .map(|rpc| rpc.listen.clone())
+                .unwrap_or_default(),
+            registries,
         })
+    }
+
+    /// The call plane, when this deployment has one.
+    ///
+    /// `None` means either no `[rpc]` table or nothing granted — both of which mean an application is
+    /// handed no address, so there is nothing for a request path to inject.
+    pub fn rpc(&self) -> Option<&Arc<RpcGrants>> {
+        self.rpc.as_ref()
+    }
+
+    /// The CGI parameters a request to `backend` must carry so that its application can reach the
+    /// call plane.
+    ///
+    /// **Empty for a backend that granted nothing**, which is the whole of the security rule: the
+    /// absence of the address is what stops an application from even trying, the same way the
+    /// absence of a call handler on a worker channel stops it there. A backend that has no grant is
+    /// not handed a token it has to be careful not to misuse.
+    ///
+    /// The address is the one the deployment wrote, which is where the listener binds — see the note
+    /// on port `0` in `[rpc].listen`.
+    pub fn rpc_params(&self, backend: &str) -> Vec<(&'static str, String)> {
+        let Some(rpc) = &self.rpc else {
+            return Vec::new();
+        };
+        let Some(token) = rpc.token_for(backend) else {
+            return Vec::new();
+        };
+        vec![
+            (
+                volucer_core::config::RPC_ENDPOINT_PARAM,
+                self.rpc_address.clone(),
+            ),
+            (volucer_core::config::RPC_TOKEN_PARAM, token.to_string()),
+        ]
+    }
+
+    /// The method registries this deployment built, by backend name.
+    ///
+    /// **The same `Arc`s the worker channels hold**, so a call over `[rpc]` reaches the store its
+    /// sibling worker reaches rather than a second handle to the same thing — and so a `KvNamespace`
+    /// that accumulates anything (a refusal counter, a connection) accumulates it once.
+    ///
+    /// The map is the deployment's *first generation*, exactly as [`Self::grpc_grants`] is: a reload
+    /// rebuilds the dispatcher, and a listener built from a dispatcher therefore starts with what the
+    /// process was configured with. Only backends that granted at least one namespace appear.
+    pub fn registries(&self) -> &BTreeMap<String, Arc<MethodRegistry>> {
+        &self.registries
     }
 
     /// The pools this backend's workers may address through a call, or `None` if they may not.
@@ -917,6 +1030,30 @@ impl Dispatcher {
         self.dispatch_to(name, request)
     }
 
+    /// Write the call plane's address and token into a request that is about to reach `backend`.
+    ///
+    /// **At the front-end, where the request is already `&mut`, rather than inside
+    /// [`Self::dispatch_with_routes`]** — and the reason is mechanical rather than stylistic. Both
+    /// front-ends own their `Request` by the time they dispatch, so this is two assignments; the
+    /// dispatch path sees only `&Request`, so injecting there would mean cloning one, which for a
+    /// `POST` is a copy of the whole body to add two parameters.
+    ///
+    /// One *rule*, two call sites, and the rule that must not be duplicated is [`Self::rpc_params`]:
+    /// which backends have a grant, what their token is, and that a backend without one is handed
+    /// nothing at all.
+    pub fn inject_rpc_params(&self, backend: &str, request: &mut Request) {
+        for (key, value) in self.rpc_params(backend) {
+            // Replace rather than append: two `VOLUCER_RPC` entries is a request whose address is
+            // chosen by whichever one the application reads first, which is the rule
+            // `HTTP_TRACEPARENT` already follows for the same reason.
+            let key = key.as_bytes().to_vec();
+            match request.params.iter_mut().find(|(k, _)| *k == key) {
+                Some(pair) => pair.1 = value.into_bytes(),
+                None => request.params.push((key, value.into_bytes())),
+            }
+        }
+    }
+
     /// The gRPC grants this dispatcher was built with, as its first generation.
     ///
     /// The answer a listener must *start* with. A reload replaces the front-end's own copy — see
@@ -1086,6 +1223,7 @@ mod tests {
             name: name.to_string(),
             params,
             traceparent: None,
+            token: None,
         }
     }
 
@@ -1119,6 +1257,7 @@ mod tests {
         BackendConfig::External(ExternalConfig {
             socket,
             max_connections: None,
+            services: Vec::new(),
         })
     }
 
@@ -1591,6 +1730,7 @@ url = "redis://127.0.0.1:6379"
                 BackendConfig::External(volucer_core::config::ExternalConfig {
                     socket: socket.to_string(),
                     max_connections: None,
+                    services: Vec::new(),
                 }),
             )],
             "fpm",

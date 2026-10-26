@@ -1253,3 +1253,54 @@ base_port = 19001
 # checksum = "required"              # "optional" lets a consumer skip the per-frame crc32c
 # transport = "pipe"                 # or "socket"; the default follows the platform
 # env = { QUEUE_DATABASE = "jobs" }  # a consumer may talk to a different database
+# ---------------------------------------------------------------------------
+# Services for an application that is not a worker.
+#
+# A worker reaches `kv`, `lock` and `jobs` over the channel that carries its
+# requests: CALL and RETURN are two more frame types the server already owns. A
+# FastCGI application has no such channel -- it exists for the length of one
+# request and can only answer what it was handed -- so the call plane gets a
+# socket it dials instead. Same frames, same codec, and deliberately **no
+# handshake**: a CGI process would pay for one on every request, so the token
+# travels with each call.
+#
+# The grant is the *same* `services` list a worker names, which is the point: a
+# deployment cannot grant a cache to its workers and forget the same cache for
+# the same application's other half. Volucer writes the address and the token
+# into every request a granted backend serves, and writes neither for a backend
+# that granted nothing -- so an unprivileged application is not told where the
+# socket is and cannot even make an attempt that would be refused.
+#
+# ```toml
+# [backends.fpm]
+# kind = "external"
+# socket = "unix:/run/php/php-fpm.sock"
+# services = ["kv.cache"]              # the grant
+#
+# [kv.cache]
+# driver = "memory"
+#
+# [rpc]
+# listen = "unix:/run/volucer/rpc.sock"
+# ```
+#
+# `[rpc]` alone is not enough, and the grant alone is not either: a listener with
+# nothing granted is a socket that refuses every call, and a grant with no
+# listener is an application told nothing. Both halves are refused by name at
+# startup rather than left as a key that looks active and cannot work.
+#
+# A wildcard `listen` is refused. Every call on this socket mutates something --
+# kv.set, lock.release, jobs.push -- and the token identifies a backend *within
+# one host*; it is not a defence against another host. Use a unix socket, or
+# loopback.
+#
+# An `upstream` origin that grants services receives the same two values as the
+# headers `X-Volucer-Rpc` and `X-Volucer-Rpc-Token`, because it has no CGI
+# environment to receive a parameter in. Any header a client sends under those
+# names is discarded before the injection, so an origin can trust them.
+# ---------------------------------------------------------------------------
+# [rpc]
+# listen = "unix:/run/volucer/rpc.sock"
+# max_connections = 0                # absent means uncapped; 0 is refused
+# idle_timeout_seconds = 300         # a connection is closed this long after its last call
+# call_timeout_seconds = 10          # per call; shorter than PHP's own max_execution_time

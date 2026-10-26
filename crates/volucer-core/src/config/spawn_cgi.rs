@@ -226,6 +226,15 @@ pub struct SpawnCgiConfig {
     /// with.
     #[serde(default, rename = "capacity", skip_serializing)]
     pub legacy_capacity: Option<u32>,
+
+    /// Which control namespaces this backend's application may call over `[rpc]`.
+    ///
+    /// The same allow-list, the same key and the same meaning as
+    /// [`ExternalConfig::services`](super::ExternalConfig::services), for the same reason: a CGI
+    /// application has no channel of its own, so the call plane is a socket it dials, and this list
+    /// is what a token from this backend entitles it to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
 }
 
 fn default_bind_host() -> String {

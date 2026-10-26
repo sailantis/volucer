@@ -154,6 +154,7 @@ fn a_call_and_its_three_outcomes_round_trip() {
         name: "kv.get".to_string(),
         params: serde_json::json!({ "storage": "default", "key": "session:1" }),
         traceparent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string()),
+        token: None,
     };
     let encoded = Json::encode(&call).expect("encode");
     let decoded: Call = Json::decode(&encoded).expect("decode");

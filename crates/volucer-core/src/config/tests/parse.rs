@@ -411,6 +411,7 @@ fn children_decides_process_count_and_concurrency_together() {
             working_dir: None,
             env: Default::default(),
             legacy_capacity: None,
+            services: Vec::new(),
         }
     }
 

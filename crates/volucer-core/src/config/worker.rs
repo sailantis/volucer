@@ -351,6 +351,66 @@ pub const CALL_NAMESPACES: &[&str] = &[
     "config", "workers",
 ];
 
+/// Check one backend's `services` list, by name and for duplicates.
+///
+/// **One function for all five backend kinds**, because the rule is one rule and a second copy of
+/// this message is how a fix reaches a `worker` and not an `external`. What differs between the
+/// kinds is only *where the list lives* and which kinds consult it at all — a `worker`'s workers
+/// reach the same namespaces over their channel, and a FastCGI backend's application reaches them
+/// over `[rpc]`.
+///
+/// The message names every namespace the deployment actually has, rather than only the rule,
+/// because the failure it prevents is the quiet one: `services = ["kv.session"]` against a
+/// `[kv.sessions]` table is a worker that boots, serves traffic, and cannot reach a cache it was
+/// told it had.
+pub(super) fn validate_services(config: &Config, backend: &str, services: &[String]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for namespace in services {
+        if !config.is_a_call_service(namespace) {
+            return Err(Error::Config(format!(
+                "backends.{backend}: services contains {namespace:?}, which is not a namespace the \
+                 server implements; known namespaces are {known}, a KV storage is named \
+                 \"kv.<name>\" — {storages} — locks are reached as \"lock\", which {lock}, and the \
+                 queues are reached as \"jobs\", which {jobs}",
+                known = CALL_NAMESPACES
+                    .iter()
+                    .map(|name| format!("\"{name}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                storages = if config.kv.is_empty() {
+                    "no [kv.*] table is configured at all".to_string()
+                } else {
+                    format!(
+                        "this deployment has {}",
+                        config
+                            .kv
+                            .keys()
+                            .map(|name| format!("\"kv.{name}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+                lock = if config.lock.is_some() {
+                    "this deployment has a [lock] table"
+                } else {
+                    "needs a [lock] table to be configured"
+                },
+                jobs = if config.jobs.is_some() {
+                    "this deployment has a [jobs] table".to_string()
+                } else {
+                    "needs a [jobs] table to be configured".to_string()
+                }
+            )));
+        }
+        if !seen.insert(namespace) {
+            return Err(Error::Config(format!(
+                "backends.{backend}: services names {namespace:?} twice"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// How strictly the worker protocol's per-frame `crc32c` is enforced.
 ///
 /// A configuration-level mirror of the protocol's `Checksum` policy. It lives here

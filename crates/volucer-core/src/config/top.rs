@@ -103,6 +103,22 @@ pub struct Config {
     /// presence already says everything.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+
+    /// The call plane for FastCGI applications. Absent means no listener, and then a backend's
+    /// `services` list reaches its workers' channel only.
+    ///
+    /// **A third listener beside `[metrics]` and `[status]`, deliberately not a route on
+    /// `[server]`.** What travels here mutates: `kv.set`, `lock.release`, `jobs.push`,
+    /// `worker.reset`. The public listener may be TLS-only, may redirect to HTTPS, and faces the
+    /// internet, so a mutation surface on it would be one misconfiguration away from being public —
+    /// which is exactly the argument `[metrics]` already makes for its own address, with a stronger
+    /// conclusion.
+    ///
+    /// Unlike the other two, this table alone is not enough: a backend also has to grant a
+    /// namespace in its `services`, or the socket would refuse every call. [`Config::validate`]
+    /// refuses that combination by name.
+    #[serde(default)]
+    pub rpc: Option<RpcConfig>,
 }
 
 impl Config {

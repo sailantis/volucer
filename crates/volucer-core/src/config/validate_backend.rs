@@ -21,47 +21,7 @@ impl Config {
                 // becoming a worker that boots, serves traffic, and is silently unable to call
                 // anything. A duplicate is refused for the same reason a duplicate key would be:
                 // it means two lines disagree and only one of them is read.
-                let mut seen = std::collections::BTreeSet::new();
-                for namespace in &w.services {
-                    if !self.is_a_call_service(namespace) {
-                        return bad(format!(
-                            "services contains {namespace:?}, which is not a namespace the server \
-                             implements; known namespaces are {known}, a KV storage is named \
-                             \"kv.<name>\" — {storages} — locks are reached as \"lock\", which \
-                             {lock}, and the queues are reached as \"jobs\", which {jobs}",
-                            known = CALL_NAMESPACES
-                                .iter()
-                                .map(|name| format!("\"{name}\""))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            storages = if self.kv.is_empty() {
-                                "no [kv.*] table is configured at all".to_string()
-                            } else {
-                                format!(
-                                    "this deployment has {}",
-                                    self.kv
-                                        .keys()
-                                        .map(|name| format!("\"kv.{name}\""))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )
-                            },
-                            lock = if self.lock.is_some() {
-                                "this deployment has a [lock] table"
-                            } else {
-                                "needs a [lock] table to be configured"
-                            },
-                            jobs = if self.jobs.is_some() {
-                                "this deployment has a [jobs] table".to_string()
-                            } else {
-                                "needs a [jobs] table to be configured".to_string()
-                            }
-                        ));
-                    }
-                    if !seen.insert(namespace) {
-                        return bad(format!("services names {namespace:?} twice"));
-                    }
-                }
+                validate_services(self, name, &w.services)?;
 
                 // The gRPC side of the same rule, in the other direction: a name here decides what
                 // may be *delivered* to this backend's workers. Checked against protobuf's own
@@ -146,6 +106,11 @@ impl Config {
             BackendConfig::External(e) => {
                 parse_listener(&e.socket)
                     .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
+                // The same allow-list a worker's channel is checked against, because `[rpc]` is the
+                // same call plane reached a different way: an `external` backend's application
+                // dials the listener and asks for a namespace by name, and a name this file cannot
+                // honour is a call that would be refused at runtime with no line saying why.
+                validate_services(self, name, &e.services)?;
                 // `0` is refused rather than read as "unlimited". `max_connections` is an
                 // `Option`, so absent is how "no cap" is spelled; a zero would otherwise be a
                 // backend that can never serve anything, and it would be discovered on the first
@@ -172,10 +137,12 @@ impl Config {
                 // whether a `socket` is a shape the driver can bind. Kept on the type rather
                 // than here so `spawn_cgi`'s rules are not split across two files.
                 c.validate(name).map_err(Error::Config)?;
+                validate_services(self, name, &c.services)?;
             }
             BackendConfig::Upstream(u) => {
                 crate::env::check_env_table(&format!("backends.{name}.env"), &u.env)
                     .map_err(Error::Config)?;
+                validate_services(self, name, &u.services)?;
                 // Parsing is also the validation of the `[backends.<n>.tls]` table: the origin and
                 // the table are only meaningful together, so `OriginSpec::parse` takes the table and
                 // refuses one that has no handshake to describe.

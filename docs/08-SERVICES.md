@@ -33,12 +33,78 @@ Key-value access is granted per storage, allowing a deployment to use separate s
 different purposes. The lock backend is a single service; individual locks are identified
 by their resource name, so there is only one `lock` grant.
 
+The same list applies to every backend kind. A `worker` and an `attach` reach these services
+over their channel; an `external`, `spawn_cgi` or `upstream` backend reaches them through
+`[rpc]`, if one is configured. `config` and `workers` are meaningful only on a channel, so a
+FastCGI application that names them gets a namespace whose calls can never succeed.
+
 ## The call plane
 
 Workers call these services over the worker channel using `CALL` and `RETURN` frames. A
 worker can make a call while handling a request, and the server sends the result over the
 same channel. Unlike FastCGI, this protocol allows a worker to ask the server for services
 such as storage, locks, and queues during request handling.
+
+### An application that is not a worker
+
+A FastCGI application has no such channel. It exists for the duration of one request, the
+server drives it, and it can only answer the frame it was handed — so there is nowhere on
+that protocol for it to ask a question. To give one access to the same services, add an
+`[rpc]` listener. The application connects to this listener, and the listener serves the
+same namespaces over the same stores:
+
+```toml
+[backends.app]
+kind     = "external"
+socket   = "unix:/run/php/php8.3-fpm.sock"
+services = ["kv.cache", "lock"]        # the same grant a worker would name
+
+[kv.cache]
+driver = "memory"
+
+[rpc]
+listen = "unix:/run/volucer/rpc.sock"
+```
+
+Volucer writes two CGI parameters into every request that backend serves:
+
+| Parameter | Value |
+|---|---|
+| `VOLUCER_RPC` | The address from `[rpc].listen` |
+| `VOLUCER_RPC_TOKEN` | The token that identifies this backend |
+
+A backend whose `services` is empty is given neither. It is then not told where the socket
+is, so it cannot even make an attempt that would be refused. This is why `[rpc]` and a
+grant have to be configured together: a listener with no grant would refuse every call, and
+a grant with no listener would give the application nothing to connect to. Volucer rejects
+either configuration at startup.
+
+The wire format is the worker protocol: same frames, same message types, same checksum.
+The difference is that there is no handshake. Instead, every `CALL` carries the token,
+because a CGI process would pay the cost of a handshake on every request. This also means
+a token sent over an existing connection is checked on the next call.
+
+```php
+$address = $_SERVER['VOLUCER_RPC'];
+$token   = $_SERVER['VOLUCER_RPC_TOKEN'];
+
+$stream = stream_socket_client('tcp://' . $address);
+// ... or 'unix://' when [rpc].listen is a unix path
+```
+
+`[rpc].listen` may be a `unix:` path or a loopback `host:port`. A wildcard bind is rejected:
+every call on this socket mutates something, and the token identifies a backend within one
+host; it is not a defence against another host.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listen` | required | `unix:/path` or `127.0.0.1:6001` |
+| `max_connections` | uncapped | Refuse a connection beyond this many. `0` is rejected |
+| `idle_timeout_seconds` | `300` | Close a connection this long after its last call |
+| `call_timeout_seconds` | `10` | How long one call may take before the connection is closed |
+
+An `upstream` backend that grants services is handled the same way, except that it receives
+the same two values as the request headers `X-Volucer-Rpc` and `X-Volucer-Rpc-Token`.
 
 ## Key-value storage
 

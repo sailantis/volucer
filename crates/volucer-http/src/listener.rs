@@ -1720,6 +1720,16 @@ async fn prepare(
             if let Some(traceparent) = &outbound_traceparent {
                 set_cgi_param(&mut cgi_request, "HTTP_TRACEPARENT", traceparent);
             }
+            // The call plane's address, when this backend's application may reach it. The same rule
+            // the FastCGI front-end applies, reached from the other side: one helper, so the two
+            // cannot disagree about which backends have a grant.
+            let selected = front_end
+                .dispatcher
+                .backend_for_routes(&routes, &cgi_request)
+                .to_string();
+            front_end
+                .dispatcher
+                .inject_rpc_params(&selected, &mut cgi_request);
             // The site's own table, so the routing decision above and the dispatch agree.
             //
             // Mapped rather than mapped to an HTTP status here, because *which* mapping applies depends
@@ -1803,6 +1813,35 @@ async fn upstream(
     if let Some(traceparent) = &outbound_traceparent {
         if let Ok(value) = hyper::header::HeaderValue::from_str(traceparent) {
             request_headers.insert(volucer_observe::TRACEPARENT_HEADER, value);
+        }
+    }
+    // The call plane's address and token, as **headers** rather than as CGI params — the same grant,
+    // the same rule, reached by an origin that already speaks HTTP. One origin's application reading
+    // `X-Volucer-Rpc` and a FastCGI application reading `VOLUCER_RPC` are then the same deployment
+    // decision, and neither can be handed either one without the backend having granted something.
+    //
+    // **Both names are removed from what the client sent first**, unconditionally, and this is the
+    // difference from the CGI path rather than a symmetry: a CGI variable is `VOLUCER_RPC` and a
+    // client's header becomes `HTTP_VOLUCER_RPC`, so the namespaces cannot collide there. Here they
+    // can — `prepare_request` forwards a client's `X-Volucer-Rpc-Token` verbatim — so an origin that
+    // trusted the header would trust whatever a public caller sent. Stripped before the injection,
+    // so what arrives is either this server's value or nothing at all.
+    for name in ["x-volucer-rpc", "x-volucer-rpc-token"] {
+        request_headers.remove(name);
+    }
+    // Set before `prepare_request` filters the map, for the reason the traceparent above is.
+    for (name, value) in front_end.dispatcher.rpc_params(backend) {
+        let name = match name {
+            volucer_core::config::RPC_ENDPOINT_PARAM => "x-volucer-rpc",
+            volucer_core::config::RPC_TOKEN_PARAM => "x-volucer-rpc-token",
+            // Unreachable: `rpc_params` returns exactly those two. Skipped rather than panicked,
+            // because a header name this match does not know is not a reason to fail a request.
+            _ => continue,
+        };
+        if let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
+                request_headers.insert(name, value);
+            }
         }
     }
     let request = volucer_upstream::prepare_request(

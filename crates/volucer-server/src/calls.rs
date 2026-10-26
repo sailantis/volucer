@@ -210,6 +210,7 @@ mod tests {
             name: name.to_string(),
             params: serde_json::Value::Null,
             traceparent: None,
+            token: None,
         }
     }
 
@@ -587,6 +588,7 @@ mod tests {
             name: name.to_string(),
             params,
             traceparent: None,
+            token: None,
         }
     }
 

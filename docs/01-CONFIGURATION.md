@@ -515,6 +515,7 @@ Connect to an already-running FastCGI server, such as `php-fpm`.
 |---|---|---|---|
 | `socket` | string | **required** | The FastCGI address, e.g. `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`. |
 | `max_connections` | integer | absent | How many connections to keep open to the pool. |
+| `services` | array of strings | empty | What this backend's application may reach over `[rpc]`. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
 
 There is no `workers` setting for `external`: the pool is managed separately. Configure
 its size where that server is configured, for example with `pm.max_children` or
@@ -544,6 +545,7 @@ Exactly one of `binary` and `command`:
 | `socket` | string | absent | A socket prefix instead of TCP ports. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
 | `env` | table | empty | Extra environment variables for every slot. |
+| `services` | array of strings | empty | What this backend's application may reach over `[rpc]`. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
 
 Setting `children > 0` enables prefork. For the same concurrency, prefork uses about
 4.5× the memory: child processes inherit the listening socket and OPcache segment, so
@@ -618,6 +620,7 @@ or Ruby.
 | `restart_limit` | integer | `3` | How many times to restart the origin. |
 | `restart_backoff_ms` | integer | `1000` | The delay between restarts. |
 | `ready_timeout_ms` | integer | `30000` | How long to wait for the origin to answer. |
+| `services` | array of strings | empty | What this origin's application may reach over `[rpc]`, as headers. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
 
 The default, `restart = "on_failure"`, restarts a process that exits with an error. A
 process that receives `SIGTERM` and exits successfully is treated as an intentional
@@ -694,6 +697,42 @@ because it is a fact about the request path rather than about where spans go —
 `sample` decides what *leaves the process*, which is a different question: a deployment may
 propagate a trace to its backend and still decline to export its own span. See
 [Sampling](06-OBSERVABILITY.md#sampling).
+
+## `[rpc]`
+
+The call plane for applications that are not workers: a socket a FastCGI or HTTP backend's
+application connects to, to reach the `services` its backend names. Absent means no
+listener.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | string | **required** | `unix:/run/volucer/rpc.sock` or `127.0.0.1:6001`. A wildcard address is refused. |
+| `max_connections` | integer | absent | Refuse a connection beyond this many. `0` is refused. |
+| `idle_timeout_seconds` | integer | `300` | Close a connection this long after its last call. `0` is refused. |
+| `call_timeout_seconds` | integer | `10` | A per-call deadline. `0` is refused. |
+
+Unlike `[metrics]` and `[status]`, this table alone is not enough: at least one backend must
+also grant something in its `services`, or the listener would refuse every call. Volucer
+refuses either half alone, and names the key the file is missing.
+
+```toml
+[backends.app]
+kind     = "external"
+socket   = "unix:/run/php/php8.3-fpm.sock"
+services = ["kv.cache"]
+
+[kv.cache]
+driver = "memory"
+
+[rpc]
+listen = "unix:/run/volucer/rpc.sock"
+```
+
+The address and a per-backend token reach the application as the CGI parameters
+`VOLUCER_RPC` and `VOLUCER_RPC_TOKEN`, and an `upstream` origin receives the same two
+values as the headers `X-Volucer-Rpc` and `X-Volucer-Rpc-Token`. A backend that grants
+nothing is given neither. See
+[Services](08-SERVICES.md#an-application-that-is-not-a-worker).
 
 ## `[kv.<name>]`
 

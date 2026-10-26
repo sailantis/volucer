@@ -11,6 +11,7 @@ mod metrics;
 mod parse;
 mod relay;
 mod routes;
+mod rpc;
 mod sampling;
 mod services;
 mod sites;

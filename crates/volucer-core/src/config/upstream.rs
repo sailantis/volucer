@@ -132,6 +132,18 @@ pub struct UpstreamConfig {
     /// seconds rather than milliseconds: Django and Rails both do real work before they listen.
     #[serde(default = "default_upstream_ready_timeout_ms")]
     pub ready_timeout_ms: u64,
+
+    /// Which control namespaces this origin's application may call over `[rpc]`.
+    ///
+    /// The same allow-list, the same key and the same meaning as
+    /// [`ExternalConfig::services`], reached differently: a PHP application has no headers of its
+    /// own to spare, so its token travels as a CGI parameter, while an origin that already speaks
+    /// HTTP receives the same token as a request header. The grant is one declaration either way.
+    ///
+    /// **A grant here does nothing until `[rpc]` exists**, which [`Config::validate`] refuses rather
+    /// than leaving an operator with a key that has no effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
 }
 
 /// Which HTTP version a plaintext or unix-socket origin is spoken to in.
@@ -211,6 +223,7 @@ impl UpstreamConfig {
             restart_limit: default_upstream_restart_limit(),
             restart_backoff_ms: default_upstream_restart_backoff_ms(),
             ready_timeout_ms: default_upstream_ready_timeout_ms(),
+            services: Vec::new(),
         }
     }
 

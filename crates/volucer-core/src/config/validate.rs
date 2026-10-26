@@ -463,6 +463,40 @@ impl Config {
             self.validate_backend(name, backend)?;
         }
 
+        // `[rpc]` is checked after the backends, because the two rules that matter are about the
+        // *pair*: a listener with nothing granted would be a socket that refuses every call, and a
+        // grant with no listener is a key that does nothing — both look supported in a file and
+        // neither can work, which is the failure `spawn_fpm` was removed for.
+        if let Some(rpc) = &self.rpc {
+            rpc.validate().map_err(Error::Config)?;
+            if !self.serves_rpc() {
+                return Err(Error::Config(
+                    "[rpc] is configured but no backend grants anything, so the listener would \
+                     refuse every call it received. Add `services` to the backend whose \
+                     application is meant to reach the cache, a lock or a queue — e.g. \
+                     services = [\"kv.cache\"] — or remove [rpc]"
+                        .to_string(),
+                ));
+            }
+        } else if self.serves_rpc() {
+            // The other direction, and the more likely mistake: the grant is written and looks
+            // active, and the application is handed no address because there is no listener for it
+            // to dial. Named by backend rather than as a general statement, because "somewhere in
+            // your file" is not a search an operator wants to start.
+            let granted = self
+                .rpc_grants()
+                .keys()
+                .map(|name| format!("backends.{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Config(format!(
+                "{granted} grant services the call plane, but no [rpc] listener is configured, so \
+                 there is no address for the application to dial and no token for it to carry. Add \
+                 an [rpc] table — listen = \"unix:/run/volucer/rpc.sock\" is the usual one — or \
+                 remove the grant"
+            )));
+        }
+
         // An upstream is only reachable over HTTP: there is no CGI environment to build for it and
         // the FastCGI front-end has no way to hand it a request. A deployment that configures one
         // and no HTTP listener has configured something that cannot receive a request at all, and

@@ -16,7 +16,8 @@ use volucer_core::sites::Sites;
 use volucer_fcgi::cgi::Routing;
 use volucer_http::{HttpLimits, RunningHttp, RunningStatus};
 use volucer_server::{
-    Consumers, Contention, Dispatcher, FastCgiListener, Limits, ServerError, WorkerPool,
+    Consumers, Contention, Dispatcher, FastCgiListener, Limits, RpcListener, ServerError,
+    WorkerPool,
 };
 
 #[derive(Parser, Debug)]
@@ -2491,6 +2492,38 @@ fn serve(
         }
     };
 
+    // The call plane, when the deployment asked for one. Bound **after** the request listeners, so
+    // a request that arrives during startup reaches a backend that is already up, and **before**
+    // the startup line below, so an occupied address is a message rather than a socket that
+    // silently is not there.
+    //
+    // Refused rather than skipped when `[rpc]` is configured and the dispatcher has no call plane —
+    // which is the no-entropy case in `rpc::new_secret`. A deployment that asked for a call plane
+    // and did not get one must not be told the server started.
+    let rpc_listener = match (&config.rpc, dispatcher.rpc()) {
+        (Some(rpc_config), Some(grants)) => {
+            let listener = RpcListener::bind(rpc_config, Arc::clone(grants)).map_err(|err| {
+                ServerError::Listener {
+                    reason: err.to_string(),
+                }
+            })?;
+            println!(
+                "  rpc:              {} (call plane)",
+                listener.configured_address()
+            );
+            Some(listener)
+        }
+        (Some(_), None) => {
+            return Err(ServerError::Listener {
+                reason:
+                    "[rpc] is configured but the call plane could not be built; see the errors \
+                         above, which name the reason"
+                        .to_string(),
+            })
+        }
+        (None, _) => None,
+    };
+
     println!("press Ctrl-C to stop");
 
     // Each engine is moved **into** a thread of its own, which is what keeps `Arc<Engine>` — and
@@ -2519,6 +2552,31 @@ fn serve(
                 reason: format!("the ACME task could not be started: {err}"),
             })?;
     }
+
+    // On a thread of its own, so the call plane is available from the first request rather than only
+    // after the request listeners stop — and because the FastCGI listener owns this thread. The
+    // handle is kept for the shutdown sequence, which stops it *first*: a call that arrives while
+    // the stores are being torn down should be refused by a closed socket rather than served against
+    // half-live state.
+    let rpc_thread = match rpc_listener {
+        Some(listener) => {
+            let listener = Arc::new(listener);
+            let stop = listener.stop_handle();
+            let running = Arc::clone(&listener);
+            let handle = std::thread::Builder::new()
+                .name("rpc".to_string())
+                .spawn(move || {
+                    if let Err(err) = running.run() {
+                        tracing::error!(%err, "the [rpc] listener stopped with an error");
+                    }
+                })
+                .map_err(|err| ServerError::Listener {
+                    reason: format!("the [rpc] listener could not be started: {err}"),
+                })?;
+            Some((stop, handle, listener))
+        }
+        None => None,
+    };
 
     install_shutdown_handler(
         fastcgi.as_ref().map(|l| l.shutdown_handle()),
@@ -2559,6 +2617,20 @@ fn serve(
     match fastcgi {
         Some(listener) => listener.run()?,
         None => wait_for_shutdown(),
+    }
+
+    // Stopped **first**, before the request listeners and before anything is reaped: a call that
+    // arrives while the stores are being torn down should meet a closed socket rather than be served
+    // against half-live state. The summary follows, and it is printed even at zero because the
+    // interesting case is the deployment whose application never learned to call.
+    if let Some((stop, handle, listener)) = rpc_thread {
+        stop.stop();
+        let _ = handle.join();
+        let stats = listener.stats();
+        println!(
+            "rpc: {} call(s), {} refused, {} connection(s)",
+            stats.calls, stats.refused, stats.connections
+        );
     }
 
     // Stopping the HTTP listener joins its thread, which drops the dispatcher on
@@ -4172,6 +4244,49 @@ fn check(
             }
         }
         None => println!("  telemetry: none (telemetry is unset)"),
+    }
+
+    // The call plane. Printed in both cases, for the reason the status block below is: a deployment
+    // whose FastCGI application "cannot reach the cache" is a question about whether this listener
+    // exists and what each backend was granted, and a report that printed nothing when `[rpc]` was
+    // absent would leave the operator unable to tell "not configured" from "not reported".
+    match &config.rpc {
+        Some(rpc) => {
+            println!("  rpc: {}", rpc.listen);
+            println!(
+                "    idle timeout:     {} s, {} s per call",
+                rpc.idle_timeout_seconds, rpc.call_timeout_seconds
+            );
+            println!(
+                "    connections:      {}",
+                match rpc.max_connections {
+                    Some(limit) => format!("at most {limit}"),
+                    None => "uncapped".to_string(),
+                }
+            );
+            // What each backend may reach, which is the same list its workers get. By name rather
+            // than as a count, because "3 services" is not something an operator can compare with a
+            // file, and the whole failure mode this line prevents is a grant that disagrees with
+            // what the application tries to call.
+            for (backend, services) in config.rpc_grants() {
+                println!("    {backend}: {}", services.join(", "));
+            }
+        }
+        None if config.serves_rpc() => {
+            // Unreachable in a validated configuration — `Config::validate` refuses a grant with no
+            // listener — but printed rather than assumed, because `check` also runs against a file
+            // that failed validation, and there the line is the explanation.
+            println!(
+                "  rpc: none, but {} grants services (validation refuses this)",
+                config
+                    .rpc_grants()
+                    .keys()
+                    .map(|name| format!("backends.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        None => println!("  rpc: none (no FastCGI application can reach the call plane)"),
     }
 
     // The status listener and the one route on it that mutates. Printed in both cases rather than

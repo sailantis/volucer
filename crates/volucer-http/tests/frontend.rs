@@ -517,6 +517,7 @@ fn unreachable_config() -> Config {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket,
                 max_connections: None,
+                services: Vec::new(),
             }),
         )]
         .into_iter()
@@ -1578,6 +1579,10 @@ enum OriginBehaviour {
     /// fixture that can tell "the proxy forwarded the client's header" from "the proxy wrote its
     /// own", which is the whole of `[server].trace_context`.
     EchoTraceparent,
+    /// Answer with the call plane's two headers, as `address|token`, or `-|-` when neither was
+    /// written. The origin-side half of `[rpc]`: a FastCGI application reads a CGI param and an HTTP
+    /// origin reads a header, and only a fixture on this side can prove the second.
+    EchoCallPlane,
 }
 
 /// A test origin: a stdlib listener that answers every request the same way.
@@ -1699,6 +1704,31 @@ fn serve_origin(mut stream: TcpStream, behaviour: OriginBehaviour, seen: &Arc<At
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{traceparent}",
                 traceparent.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+        OriginBehaviour::EchoCallPlane => {
+            let raw = read_request(&mut stream, false);
+            let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+            // The *last* of each, for the same reason the traceparent fixture reads the last: a
+            // proxy that appended beside a client's header would leave both, and this reports what
+            // an origin reading the map would resolve to.
+            let value_of = |name: &str| {
+                head.lines()
+                    .filter_map(|line| line.strip_prefix(name))
+                    .map(|value| value.trim().to_string())
+                    .next_back()
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let body = format!(
+                "{}|{}",
+                value_of("x-volucer-rpc:"),
+                value_of("x-volucer-rpc-token:")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
@@ -3444,4 +3474,139 @@ fn a_ratio_writes_the_flag_its_decision_reached() {
     // constant sampler cannot produce both.
     assert!(kept > 0, "0.5 dropped every trace");
     assert!(dropped > 0, "0.5 kept every trace");
+}
+
+/// An HTTP listener in front of an origin that echoes the call plane's headers.
+///
+/// **Two backends, and only one of them granted.** That is the shape the pair rule needs — `[rpc]`
+/// with nothing granted is refused — and it is also what makes the assertions meaningful: the same
+/// listener, the same deployment, and the difference between what the two origins receive is
+/// attributable to the `services` list and nothing else.
+fn call_plane_server(granted: bool) -> Option<(Server, Origin)> {
+    let origin = Origin::start(OriginBehaviour::EchoCallPlane);
+    let text = format!(
+        r#"
+[server]
+default_backend = "{selected}"
+http = "127.0.0.1:0"
+
+[backends.granted]
+kind = "upstream"
+origin = "http://{origin}"
+services = ["kv.cache"]
+
+[backends.plain]
+kind = "upstream"
+origin = "http://{origin}"
+
+[kv.cache]
+driver = "memory"
+
+[rpc]
+listen = "127.0.0.1:6001"
+"#,
+        selected = if granted { "granted" } else { "plain" },
+        origin = origin.address,
+    );
+    let config = Config::from_toml(&text).expect("the test's configuration parses");
+    config
+        .validate()
+        .expect("a grant beside a listener validates");
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&config, routing.clone())
+        .expect("an upstream backend starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )));
+    let server = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)?;
+    Some((server, origin))
+}
+
+#[test]
+fn an_origin_that_grants_services_is_handed_the_address_and_a_token_as_headers() {
+    // The HTTP half of the call plane. A FastCGI application reads `VOLUCER_RPC` from its CGI
+    // environment; an origin reads a header, and the *grant* is one declaration either way — which is
+    // what this asserts rather than the header names alone.
+    let Some((server, _origin)) = call_plane_server(true) else {
+        return;
+    };
+    let answer = exchange(
+        &server.address,
+        b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(answer.status, 200, "{answer:?}");
+    let body = answer.text().trim().to_string();
+    let mut parts = body.split('|');
+    let address = parts.next().unwrap_or_default();
+    let token = parts.next().unwrap_or_default();
+    assert_eq!(
+        address, "127.0.0.1:6001",
+        "the deployment's own [rpc].listen reaches the origin: {body}"
+    );
+    assert_eq!(
+        token.len(),
+        32,
+        "and a token beside it, thirty-two hex characters: {body}"
+    );
+}
+
+#[test]
+fn an_origin_that_grants_nothing_is_handed_neither_header() {
+    // The absence is the security rule, and it is asserted through the *same* listener that hands the
+    // other backend both — so a listener that injected unconditionally would pass the test above and
+    // fail this one.
+    let Some((server, _origin)) = call_plane_server(false) else {
+        return;
+    };
+    let answer = exchange(
+        &server.address,
+        b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(answer.status, 200, "{answer:?}");
+    assert_eq!(
+        answer.text().trim(),
+        "-|-",
+        "a backend with an empty services list is handed nothing at all"
+    );
+}
+
+#[test]
+fn a_clients_token_header_cannot_survive_to_the_origin() {
+    // **The one place the two transports differ, and the difference is a hazard rather than a
+    // symmetry.** A CGI variable named `VOLUCER_RPC` cannot collide with a client's header, because
+    // a header arrives as `HTTP_VOLUCER_RPC`. Here the names *are* header names, and
+    // `prepare_request` forwards a client's `X-Volucer-Rpc-Token` verbatim — so without the strip an
+    // origin trusting the header would trust whatever a public caller sent.
+    //
+    // The grant is real, so the injection happens and the token is this server's; what must not
+    // happen is the client's value arriving instead of it or beside it.
+    let Some((server, _origin)) = call_plane_server(true) else {
+        return;
+    };
+    let answer = exchange(
+        &server.address,
+        b"GET / HTTP/1.1\r\nHost: example.test\r\n\
+          x-volucer-rpc-token: 00000000000000000000000000000000\r\n\
+          x-volucer-rpc: 127.0.0.1:1\r\n\
+          Connection: close\r\n\r\n",
+    );
+    assert_eq!(answer.status, 200, "{answer:?}");
+    let body = answer.text().trim().to_string();
+    let mut parts = body.split('|');
+    let address = parts.next().unwrap_or_default();
+    let token = parts.next().unwrap_or_default();
+    assert_eq!(
+        address, "127.0.0.1:6001",
+        "the address the origin sees is the deployment's, not the caller's: {body}"
+    );
+    assert_ne!(
+        token, "00000000000000000000000000000000",
+        "the caller's token must not survive to the origin: {body}"
+    );
+    assert_eq!(
+        token.len(),
+        32,
+        "the origin received this server's token: {body}"
+    );
 }
