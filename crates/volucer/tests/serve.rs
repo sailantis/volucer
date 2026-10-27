@@ -312,9 +312,8 @@ impl Server {
                 if !address.is_empty() && address != "(disabled)" {
                     server.https_address = Some(address.to_string());
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("metrics:") {
-                // `serve` prints the metrics/status listener under `metrics:` whichever of the two
-                // tables configured it, because they share one listener.
+            } else if let Some(rest) = trimmed.strip_prefix("status:") {
+                // The status listener is one socket, printed under `status:`.
                 let address = rest.split_whitespace().next().unwrap_or("");
                 if !address.is_empty() && address != "(disabled)" {
                     server.status_address = Some(address.to_string());
@@ -1831,7 +1830,7 @@ fn health_reads_its_target_from_the_configuration_and_exits_on_the_answer() {
     let config_path = root.join("volucer.toml");
     let config = format!(
         "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
-         [status]\naddress = \"127.0.0.1:{status_port}\"\n"
+         [status]\nlisten = \"127.0.0.1:{status_port}\"\n"
     );
     std::fs::write(&config_path, config).expect("write the config");
 
@@ -1916,7 +1915,7 @@ fn health_reads_its_target_from_the_configuration_and_exits_on_the_answer() {
         String::from_utf8_lossy(&tls.stderr)
     );
 
-    // A configuration with no `[status]` and no `[metrics]` serves no probe at all. That is a
+    // A configuration with no `[status]` serves no probe at all. That is a
     // failure and not a skip: a container built from such a file cannot be health checked, and
     // reporting it healthy would hide the misconfiguration behind a green status.
     let bare = root.join("bare.toml");
@@ -1961,7 +1960,7 @@ fn health_probes_loopback_for_a_wildcard_listener() {
     let config_path = root.join("volucer.toml");
     let config = format!(
         "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
-         [status]\naddress = \"0.0.0.0:{port}\"\n"
+         [status]\nlisten = \"0.0.0.0:{port}\"\n"
     );
     std::fs::write(&config_path, config).expect("write the config");
 
@@ -4255,7 +4254,8 @@ fn the_worker_list_and_the_reset_agree_about_a_worker_in_a_second_pool() {
         "[server]\ndefault_backend = \"app\"\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
          [backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 1\n\n\
          [backends.jobs]\nkind = \"worker\"\ncommand = {command}\nworkers = 1\n\n\
-         [status]\naddress = \"127.0.0.1:0\"\nallow_worker_reset = true\n"
+         [status]\nlisten = \"127.0.0.1:0\"\n\
+         \n[status.workers]\nallow = [\"workers.list\", \"workers.reset\"]\n"
     );
     std::fs::write(&config_path, config).expect("write the config");
 

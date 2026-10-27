@@ -232,17 +232,17 @@ pub fn inspect_with_front_controller(
     if config
         .status
         .as_ref()
-        .is_some_and(|status| status.allow_worker_reset)
+        .is_some_and(|status| status.workers.is_some())
         && !config
             .backends
             .values()
             .any(|backend| matches!(backend, BackendConfig::Worker(_)))
     {
         warnings.push(Warning::with_hint(
-            "status.allow_worker_reset is set, but no backend is a worker pool: the routes exist \
-             and every index is a 404",
-            "either add a `kind = \"worker\"` backend, or remove allow_worker_reset — a mutation \
-             route with nothing behind it is an address an attacker can probe for free",
+            "[status.workers] is configured, but no backend is a worker pool: the routes exist and \
+             every index is a 404",
+            "either add a `kind = \"worker\"` backend, or remove [status.workers] — a route with \
+             nothing behind it is an address an attacker can probe for free",
         ));
     }
 

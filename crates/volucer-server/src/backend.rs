@@ -251,7 +251,7 @@ pub struct Contention {
     pub busiest_us: u64,
     /// Worker-emitted samples this pool refused because its queue was full.
     ///
-    /// **The only report of this that a deployment without `[metrics]` ever gets.** The counter in the
+    /// **The only report of this that a deployment without `[status.metrics]` ever gets.** The counter in the
     /// registry is reachable only by a scrape, and a deployment that was never scraped is exactly the
     /// one whose queue could fill unnoticed — so the figure rides here, to be printed once at
     /// shutdown, rather than being left to a graph nobody was drawing.

@@ -419,7 +419,7 @@ fastcgi = "127.0.0.1:9080"
 # ---------------------------------------------------------------------------
 # Rate limiting: refuse a caller that has spent its allowance.
 #
-# OFF unless this table is present, and that is the same convention `[metrics]`
+# OFF unless this table is present, and that is the same convention `[status.metrics]`
 # and `[server.tls]` follow: an `enabled` flag beside a `rate` is two statements
 # about one thing, and two statements can disagree.
 #
@@ -910,7 +910,7 @@ base_port = 19001
 #
 # AND WITHOUT THIS TABLE NOTHING DRAINS THE QUEUE. A worker's sample is held in
 # a per-pool queue until a scrape takes it, and `publish_metrics` has exactly one
-# caller -- the scrape. A deployment with an access log and no [metrics] table
+# caller -- the scrape. A deployment with an access log and no [status.metrics] table
 # therefore never drains it; an earlier version grew for the process's life while
 # its own documentation said the drain bounded it. The queue is now capped at
 # 4096 samples per pool, and what does not fit is counted and reported three ways
@@ -920,31 +920,35 @@ base_port = 19001
 #                                      NOT rr_http_*: that set is RoadRunner's,
 #                                      and this series is volucer's own decision.
 #   a warning, one per 1024 samples  -- so the log of a deployment with no
-#                                      [metrics] table says so;
+#                                      [status.metrics] table says so;
 #   a line at shutdown               -- printed only when something was lost.
 #
 # 4096 is far above what a scrape a minute needs, so it is not a throughput limit
-# -- what it bounds is a deployment that emits and never drains.# ---------------------------------------------------------------------------
-# [metrics]
-# address = "127.0.0.1:2112"
+# -- what it bounds is a deployment that emits and never drains.
+
+# ---------------------------------------------------------------------------
+# [status]
+# listen = "127.0.0.1:2112"
+#
+# [status.metrics]
 # prefix = "myapp_"
 # path = "/metrics"
 #
 # The collected metrics are a table, and it may be written two ways. Both mean
 # the same thing. An inline table is closed *in the text that writes it* --
-# a later [metrics.collect.<name>] header, or a dotted key, is refused with
+# a later [status.metrics.collect.<name>] header, or a dotted key, is refused with
 # "cannot extend value of type inline table". An `-o` override is laid onto the
 # parsed table instead, so it adds an entry to either spelling.
 #
-# [metrics.collect.app_orders_total]
+# [status.metrics.collect.app_orders_total]
 # type = "counter"          # counter | gauge | histogram
 # help = "Orders the application counted"
 #
-# [metrics.collect.app_queue_depth]
+# [status.metrics.collect.app_queue_depth]
 # type = "gauge"
 # help = "Jobs waiting to be consumed"
 #
-# [metrics.collect.app_latency_seconds]
+# [status.metrics.collect.app_latency_seconds]
 # type = "histogram"
 # help = "Time the application took to answer"
 # buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
@@ -977,45 +981,74 @@ base_port = 19001
 #   GET /health  -- the process is alive and should not be restarted. 200 while
 #                   the server is running, even if no worker is ready yet.
 #   GET /ready   -- it can serve traffic now and should be sent some. Answers
-#                   `unavailable_status_code` until every configured service
+#                   `unavailable_status` until every configured service
 #                   reports ready, and 200 afterwards.
 #
 # A readiness probe that returned 200 while the pools were still booting is how
 # a rolling deploy sends traffic to a server that answers 502.
 # ---------------------------------------------------------------------------
 # [status]
-# address = "127.0.0.1:2114"
-# unavailable_status_code = 503   # some load balancers expect 503 specifically
+# listen = "127.0.0.1:2114"
 #
-# `allow_worker_reset` turns the same listener into the operator's lever on a
-# running pool -- the one thing signals cannot do without a restart:
+# What the listener serves is decided by which sub-tables it carries, and by
+# nothing else -- the same presence-is-enablement rule [server.tls] follows. The
+# probes are always there, because a [status] table that carried none would be an
+# address that answers nothing.
 #
-#   GET  /workers               -- JSON, the same document workers.list answers
-#   POST /workers/{index}/reset -- recycle one worker, 200 with its index
+# [status.health]
+# unavailable_status = 503   # some load balancers expect 503 specifically
+#
+# [status.metrics]
+# path = "/metrics"          # the default
+# prefix = "myapp_"
+# collect.example_total = { type = "counter", help = "..." }
+#
+# [status.workers]
+# allow = ["workers.list"]
+#
+# `[status.metrics]` absent means no exposition on this port. `[status.workers]`
+# absent means neither worker route exists.
+#
+# The worker grant is a *method* list rather than a boolean, because the two
+# routes are not equally dangerous:
+#
+#   "workers.list"  -- GET  /workers               JSON, the same document the
+#                                                  workers.list call answers
+#   "workers.reset" -- POST /workers/{index}/reset recycle one worker, 200 with
+#                                                  its index
+#
+# A deployment that wants to *see* a pool should not have to arm a POST to do it,
+# so allow = ["workers.list"] publishes the list and answers 404 to a reset.
+# Naming both adds the recycle. An empty allow is refused: a table that grants
+# nothing is a block written expecting an endpoint.
 #
 # `{index}` is the global one from the GET, so `curl -f -XPOST` is the whole
 # command: no subcommand, no client, and `-f` fails on 404 (no such worker), 409
 # (that worker is serving a request, try again) and 500 (the replacement did not
-# boot). **There is no authentication**: what protects this is that the routes do
-# not exist until this flag is set, which is why an absent or false flag answers
+# boot). **There is no authentication**: what protects this is that a route does
+# not exist until its method is granted, which is why an ungranted one answers
 # 404 -- not 403 -- for the path.
 #
-# Refused rather than warned about on a wildcard address: a POST that recycles a
-# worker, reachable from anywhere, is a remote kill switch with no login.
+# `workers.reset` on a wildcard `listen` is refused rather than warned about: a
+# POST with no authentication that recycles a worker, reachable from anywhere, is
+# a remote kill switch. `workers.list` alone is legal on any address -- a list of
+# workers is a fact about this process, not a lever on it.
 #
-# RELOADABLE, in both directions. A SIGHUP that turns it off makes the routes
+# RELOADABLE, in both directions. A SIGHUP that removes a method makes its route
 # stop existing on the next request -- a 404, the same answer a deployment that
-# never asked for them gives -- so an unauthenticated mutation surface can be
-# closed without restarting a serving process. Turning it ON is subject to the
+# never granted it gives -- so an unauthenticated mutation surface can be closed
+# without restarting a serving process. Adding `workers.reset` is subject to the
 # same wildcard-address refusal through a reload as at startup, because that
 # check runs when the file is read.
 #
-# `address` is not reloadable: the socket is already bound.
-# allow_worker_reset = true
+# `listen` is not reloadable: the socket is already bound.
+#
+# [status.workers]
+# allow = ["workers.list"]
 
 # ---------------------------------------------------------------------------
 # Where spans are exported. Absent means none are, and this is a *push*:
-# unlike the `[metrics]` scrape above, an exporter that cannot reach its
+# unlike the `[status.metrics]` scrape above, an exporter that cannot reach its
 # collector keeps trying for as long as traffic lasts, so the two tables are
 # separate on purpose and a deployment may reasonably have either alone.
 #

@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn a_bare_host_and_port_is_refused_because_it_is_not_an_origin() {
-        // The shape `[metrics].address` takes, so an operator writing this by analogy produces it.
+        // The shape a listener address takes, so an operator writing this by analogy produces it.
         let err = build_origin(&config("127.0.0.1:4318")).expect_err("must be refused");
         assert!(matches!(err, ExportError::Endpoint { .. }), "{err}");
     }

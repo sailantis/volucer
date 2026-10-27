@@ -8,7 +8,7 @@ use super::*;
 
 /// `[telemetry]`: where spans go, and what this process calls itself.
 ///
-/// # Why this is not `[metrics]` with more keys
+/// # Why this is not `[status.metrics]` with more keys
 ///
 /// They are two protocols with different transports and different failure modes. Prometheus
 /// *pulls* on a scrape, so a scrape endpoint that is unreachable costs nothing; OTLP *pushes*, so an

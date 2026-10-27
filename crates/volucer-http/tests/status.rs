@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use volucer_http::status::{Readiness, RunningStatus, StatusServices, WorkerControl};
+use volucer_http::status::{Readiness, RunningStatus, StatusServices, WorkerControl, WorkerGrant};
 
 /// One HTTP/1.1 GET, returning the whole response as text.
 ///
@@ -436,19 +436,52 @@ impl WorkerControl for FakeControl {
 fn worker_services(control: Arc<FakeControl>) -> StatusServices {
     StatusServices {
         workers: Some(control),
+        reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(
+            WorkerGrant::ALL,
+        ))),
         ..StatusServices::default()
     }
 }
 
-/// **A shut gate makes the routes stop existing, and an open one brings them back.**
+/// With no gate at all, **no route answers** — an ungranted method is absent, and absent is the
+/// safe direction.
 ///
-/// The reloadable half of `[status] allow_worker_reset`. Both directions are asserted, and the
-/// *closed* answer is a 404/405 rather than a 403 — the property that stops an attacker enumerating
-/// the surface — so a test that only checked "not 200" would pass against a 403.
+/// A `None` gate used to mean "open", which contradicted its own documentation ("`None` means the
+/// gate is permanently shut") and made a listener built without one fail open. Configuring a
+/// mutation route is a positive act; forgetting to is not consent.
+#[test]
+fn an_absent_gate_leaves_no_worker_route() {
+    let control = Arc::new(FakeControl::with(1, Ok(())));
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            workers: Some(control),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+    for (method, path) in [("GET", "/workers"), ("POST", "/workers/0/reset")] {
+        let (head, _) = request(running.local_addr(), method, path);
+        assert!(
+            head.starts_with("HTTP/1.1 404") || head.starts_with("HTTP/1.1 405"),
+            "no grant means no route, for {method} {path}:\n{head}"
+        );
+    }
+    running.stop();
+}
+
+/// **An ungranted method makes its route stop existing, and a granted one brings it back.**
+///
+/// The reloadable half of `[status.workers] allow`. Both directions are asserted, and the
+/// *ungranted* answer is a 404/405 rather than a 403 — the property that stops an attacker
+/// enumerating the surface — so a test that only checked "not 200" would pass against a 403.
 #[test]
 fn a_shut_gate_removes_the_worker_routes_entirely() {
     let control = Arc::new(FakeControl::with(2, Ok(())));
-    let gate = Arc::new(volucer_http::WorkerResetGate::open());
+    let gate = Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
+        list: true,
+        reset: true,
+    }));
     let running = RunningStatus::start(
         "127.0.0.1:0",
         StatusServices {
@@ -463,13 +496,13 @@ fn a_shut_gate_removes_the_worker_routes_entirely() {
     let (head, _) = get(running.local_addr(), "/workers");
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 
-    // Shut, exactly as a reload that turned the flag off would.
-    assert!(gate.set(false));
+    // Ungranted, exactly as a reload that removed the names would.
+    assert!(gate.set(WorkerGrant::NONE).any());
     let (head, _) = get(running.local_addr(), "/workers");
     assert!(
         head.starts_with("HTTP/1.1 404"),
-        "a closed gate must make the route a 404, not a 403 — an endpoint that exists and refuses \
-         is an endpoint an attacker can enumerate:\n{head}"
+        "an ungranted route must be a 404, not a 403 — an endpoint that exists and refuses is an \
+         endpoint an attacker can enumerate:\n{head}"
     );
     let (head, _) = request(running.local_addr(), "POST", "/workers/1/reset");
     assert!(
@@ -478,27 +511,52 @@ fn a_shut_gate_removes_the_worker_routes_entirely() {
     );
     assert!(
         control.asked.lock().expect("not poisoned").is_empty(),
-        "no reset may have been attempted while the gate was shut"
+        "no reset may have been attempted while the route was ungranted"
     );
 
-    // Opened again, as a reload in the other direction would.
-    assert!(!gate.set(true));
+    // Granted again, as a reload in the other direction would.
+    assert!(!gate.set(WorkerGrant::ALL).any());
     let (head, _) = get(running.local_addr(), "/workers");
     assert!(
         head.starts_with("HTTP/1.1 200"),
-        "opening the gate must bring the routes back with no restart:\n{head}"
+        "granting the route must bring it back with no restart:\n{head}"
     );
     running.stop();
 }
 
-/// With no gate at all, the routes answer — a listener built before the gate existed must not
-/// silently lose its worker-control surface.
+/// The list may be granted without the reset, which is the half that makes the grant a list.
+///
+/// A deployment that wants to *see* a pool should not have to arm a `POST` to do it, and the
+/// refusal that protects the recycle is about the recycle alone.
 #[test]
-fn an_absent_gate_leaves_the_routes_open() {
+fn the_list_may_be_granted_alone() {
     let control = Arc::new(FakeControl::with(1, Ok(())));
-    let running = RunningStatus::start("127.0.0.1:0", worker_services(control)).expect("start");
+    let gate = Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
+        list: true,
+        reset: false,
+    }));
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            workers: Some(Arc::clone(&control) as Arc<dyn volucer_http::WorkerControl>),
+            reset_gate: Some(Arc::clone(&gate)),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+
     let (head, _) = get(running.local_addr(), "/workers");
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let (head, _) = request(running.local_addr(), "POST", "/workers/0/reset");
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "the reset is not granted, so its route must not exist:\n{head}"
+    );
+    assert!(
+        control.asked.lock().expect("not poisoned").is_empty(),
+        "an ungranted reset must not reach the pool"
+    );
     running.stop();
 }
 
@@ -652,6 +710,9 @@ fn slow_resets_do_not_block_the_readiness_probe() {
                 ready: AtomicBool::new(true),
                 reasons: Vec::new(),
             })),
+            reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(
+                WorkerGrant::ALL,
+            ))),
             ..StatusServices::default()
         },
     )

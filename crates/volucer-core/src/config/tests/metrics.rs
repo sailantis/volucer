@@ -11,8 +11,10 @@ fn metrics_is_absent_unless_the_table_is_written() {
 http = "127.0.0.1:8080"
 "#;
     let config = Config::from_toml(text).expect("config parses");
-    assert!(config.metrics.is_none());
-    assert!(config.status.is_none());
+    assert!(
+        config.status.is_none(),
+        "no [status] table means no listener, and therefore no metrics endpoint"
+    );
 }
 
 #[test]
@@ -20,13 +22,15 @@ fn metrics_defaults_its_path_and_accepts_a_prefix() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 prefix = "myapp_"
 "#;
     let config = Config::from_toml(text).expect("config parses");
     config.validate().expect("valid");
-    let metrics = config.metrics.expect("present");
+    let metrics = config.status.expect("present").metrics.expect("present");
     assert_eq!(metrics.path, "/metrics");
     assert_eq!(metrics.prefix.as_deref(), Some("myapp_"));
 }
@@ -36,12 +40,12 @@ fn rejects_a_metrics_address_that_is_not_an_endpoint() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "2112"
+[status]
+listen = "2112"
 "#;
     let config = Config::from_toml(text).expect("config parses");
     let err = config.validate().expect_err("must fail");
-    assert!(err.to_string().contains("metrics.address"), "{err}");
+    assert!(err.to_string().contains("status.listen"), "{err}");
 }
 
 #[test]
@@ -49,8 +53,10 @@ fn rejects_a_metrics_path_without_a_leading_slash() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 path = "metrics"
 "#;
     let config = Config::from_toml(text).expect("config parses");
@@ -65,12 +71,15 @@ path = "metrics"
 fn rejects_a_metrics_prefix_that_is_not_a_name_start() {
     for bad in ["9app_", "app-dash", "app dot", "app:colon"] {
         let text = format!(
-            "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
-             prefix = \"{bad}\"\n"
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2112\"\n\
+             \n[status.metrics]\nprefix = \"{bad}\"\n"
         );
         let config = Config::from_toml(&text).expect("config parses");
         let err = config.validate().expect_err("must fail");
-        assert!(err.to_string().contains("metrics.prefix"), "{bad}: {err}");
+        assert!(
+            err.to_string().contains("status.metrics.prefix"),
+            "{bad}: {err}"
+        );
     }
 }
 
@@ -81,8 +90,10 @@ fn an_empty_metrics_prefix_is_accepted() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 prefix = ""
 "#;
     let config = Config::from_toml(text).expect("config parses");
@@ -99,18 +110,21 @@ fn a_collected_metric_states_its_name_kind_and_help() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
 
-[metrics.collect.app_orders_total]
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
+
+[status.metrics.collect.app_orders_total]
 type = "counter"
 help = "Orders the application counted"
 
-[metrics.collect.app_queue_depth]
+[status.metrics.collect.app_queue_depth]
 type = "gauge"
 help = "Jobs waiting"
 
-[metrics.collect.app_latency_seconds]
+[status.metrics.collect.app_latency_seconds]
 type = "histogram"
 help = "Time to answer"
 buckets = [0.5, 0.1, 1.0]
@@ -118,7 +132,7 @@ buckets = [0.5, 0.1, 1.0]
     let config = Config::from_toml(text).expect("config parses");
     config.validate().expect("valid");
 
-    let metrics = config.metrics.expect("present");
+    let metrics = config.status.expect("present").metrics.expect("present");
     assert_eq!(metrics.collect.len(), 3);
 
     let counter = &metrics.collect["app_orders_total"];
@@ -153,8 +167,8 @@ fn rejects_a_collected_metric_name_prometheus_cannot_parse() {
         "app:orders", // a colon, reserved for recording rules
     ] {
         let text = format!(
-            "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
-             [metrics.collect.\"{bad}\"]\ntype = \"counter\"\nhelp = \"x\"\n"
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2112\"\n\
+             [status.metrics.collect.\"{bad}\"]\ntype = \"counter\"\nhelp = \"x\"\n"
         );
         let config = Config::from_toml(&text).expect("config parses");
         let err = config.validate().expect_err("must fail");
@@ -178,10 +192,13 @@ fn rejects_a_collected_metric_that_claims_the_servers_namespace() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
 
-[metrics.collect.rr_http_request_total]
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
+
+[status.metrics.collect.rr_http_request_total]
 type = "counter"
 help = "Mine now"
 "#;
@@ -198,8 +215,8 @@ help = "Mine now"
 fn rejects_buckets_on_a_kind_that_has_none() {
     for kind in ["counter", "gauge"] {
         let text = format!(
-            "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
-             [metrics.collect.app_x]\ntype = \"{kind}\"\nhelp = \"x\"\nbuckets = [1.0]\n"
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2112\"\n\
+             [status.metrics.collect.app_x]\ntype = \"{kind}\"\nhelp = \"x\"\nbuckets = [1.0]\n"
         );
         let config = Config::from_toml(&text).expect("config parses");
         let err = config.validate().expect_err("must fail");
@@ -213,8 +230,8 @@ fn rejects_buckets_on_a_kind_that_has_none() {
 fn rejects_a_bucket_bound_that_is_not_a_finite_non_negative_number() {
     for bad in ["inf", "-1.0", "nan"] {
         let text = format!(
-            "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
-             [metrics.collect.app_x]\ntype = \"histogram\"\nhelp = \"x\"\nbuckets = [{bad}]\n"
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2112\"\n\
+             [status.metrics.collect.app_x]\ntype = \"histogram\"\nhelp = \"x\"\nbuckets = [{bad}]\n"
         );
         let config = Config::from_toml(&text).expect("config parses");
         let err = config.validate().expect_err("must fail");
@@ -228,8 +245,8 @@ fn rejects_a_bucket_bound_that_is_not_a_finite_non_negative_number() {
 fn rejects_a_collected_metric_with_an_empty_help() {
     for help in ["", "   "] {
         let text = format!(
-            "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
-             [metrics.collect.app_x]\ntype = \"counter\"\nhelp = \"{help}\"\n"
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2112\"\n\
+             [status.metrics.collect.app_x]\ntype = \"counter\"\nhelp = \"{help}\"\n"
         );
         let config = Config::from_toml(&text).expect("config parses");
         let err = config.validate().expect_err("must fail");
@@ -244,10 +261,13 @@ fn rejects_an_unknown_collected_kind() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
 
-[metrics.collect.app_x]
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
+
+[status.metrics.collect.app_x]
 type = "summary"
 help = "x"
 "#;
@@ -257,7 +277,7 @@ help = "x"
 
 /// **This test is why the workspace pins `toml = "1"`.** A newline and a trailing comma inside an
 /// inline table are TOML **1.1**; 1.0 refused both, so this block was unwritable and a table of
-/// application metrics had to be one `[metrics.collect.<name>]` header per metric, four levels
+/// application metrics had to be one `[status.metrics.collect.<name>]` header per metric, four levels
 /// deep. It is asserted here rather than trusted to the version number because the difference is
 /// invisible until someone writes the block: a pin back to `0.8` compiles, passes every other
 /// test, and breaks the syntax in the one file an operator copies from.
@@ -270,8 +290,10 @@ fn an_inline_table_may_span_lines_and_end_with_a_comma() {
 [server]
 http = "127.0.0.1:8080"
 
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 prefix = "myapp_"
 
 collect = {
@@ -285,7 +307,7 @@ collect = {
     let config = Config::from_toml(text).expect("TOML 1.1 inline tables parse");
     config.validate().expect("valid");
 
-    let metrics = config.metrics.expect("present");
+    let metrics = config.status.expect("present").metrics.expect("present");
     assert_eq!(
         metrics.collect.len(),
         2,
@@ -312,7 +334,7 @@ collect = {
 ///
 /// The refusal is the parser's, and it names the key: "cannot extend value of type inline table".
 /// It has to be a test because the rule is about the **text**, which is not where one would look
-/// for it: `-o metrics.collect.app_jobs.type=gauge` adds the same entry without complaint, because
+/// for it: `-o status.metrics.collect.app_jobs.type=gauge` adds the same entry without complaint, because
 /// an override is laid onto the already-parsed table and closure does not survive the parse. That
 /// asymmetry is exactly what makes this easy to get wrong in a document, so both halves are pinned
 /// — here that the text is refused, and in `an_override_reaches_a_closed_inline_table` that the
@@ -324,8 +346,10 @@ fn an_inline_collect_table_is_closed_in_the_text() {
 [server]
 http = "127.0.0.1:8080"
 
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 collect = { app_orders_total = { type = "counter", help = "Orders" } }
 collect.app_jobs.type = "counter"
 "#;
@@ -337,11 +361,13 @@ collect.app_jobs.type = "counter"
 [server]
 http = "127.0.0.1:8080"
 
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 collect = { app_orders_total = { type = "counter", help = "Orders" } }
 
-[metrics.collect.app_jobs]
+[status.metrics.collect.app_jobs]
 type = "counter"
 help = "Jobs"
 "#;
@@ -355,7 +381,7 @@ help = "Jobs"
 /// An override is applied to the parsed `toml::Table`, before deserialization, and inline-table
 /// closure is a property of the parser's view of the **text**. Once the document has become a
 /// table there is no "inline" left to be closed, so a pair that inserts
-/// `metrics.collect.app_jobs` simply lands beside the entries that were written. This test does
+/// `status.metrics.collect.app_jobs` simply lands beside the entries that were written. This test does
 /// what `apply_override` does — insert a parsed literal at a path — and then deserializes, because
 /// the claim only holds if the value both lands and is understood. `apply_override` itself lives in
 /// the binary crate and is covered by `an_override_builds_tables_and_refuses_to_replace_a_value`.
@@ -365,8 +391,10 @@ fn an_override_reaches_a_closed_inline_table() {
 [server]
 http = "127.0.0.1:8080"
 
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 collect = { app_orders_total = { type = "counter", help = "Orders" } }
 "#;
     let mut table: toml::Table = text.parse().expect("the file parses");
@@ -376,13 +404,13 @@ collect = { app_orders_total = { type = "counter", help = "Orders" } }
         .expect("the override value is TOML")
         .remove("v")
         .expect("the fixture names it");
-    table["metrics"]["collect"]
+    table["status"]["metrics"]["collect"]
         .as_table_mut()
         .expect("collect is a table")
         .insert("app_jobs".to_string(), added);
 
     let config = Config::from_table(table).expect("the table deserializes");
-    let metrics = config.metrics.expect("present");
+    let metrics = config.status.expect("present").metrics.expect("present");
     assert_eq!(metrics.collect.len(), 2, "the override added a metric");
     assert_eq!(
         metrics.collect["app_jobs"].kind,

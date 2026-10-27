@@ -38,12 +38,22 @@ over their channel; an `external`, `spawn_cgi` or `upstream` backend reaches the
 `[rpc]`, if one is configured. A backend whose list is empty is granted nothing, and a
 backend that grants nothing is handed no address to dial.
 
+**`config` and `workers` name machinery, not storage, and a deployment without worker pools
+answers them anyway.** `services = ["workers"]` on a CGI backend is accepted by `check`, and
+`workers.list` then *succeeds*, returning `[]` — the call reads the process's pool directory,
+which exists whether or not it holds a pool. Only `workers.reset` can never work there, because
+no index exists to reset. The same is true of `config`, which describes the deployment whatever
+its backends are. So the grant is not an error; it is a grant of an answer nobody wants, and
+`[status.workers]` is the surface to reach for when the goal is to *see* a pool rather than to
+give an application a call plane.
+
 ### Read, and read-write
 
-A namespace is one capability, so granting one grants every method in it. `workers` is the
+A namespace is one capability, so `services` grants every method in it. `workers` is the
 pair to know: `workers.list` is an answer, and `workers.reset` kills worker *N* and waits for
 the replacement to finish its handshake. Both arrive together, which is why an application
-that only wants to display a pool should not be granted `workers` at all.
+that only wants to display a pool should not be granted `workers` at all — and why
+`[status.workers] allow = ["workers.list"]` exists as the narrower way to ask.
 
 The same split runs through the others. `kv` reads with `get`, `has`, `ttl` and `getMultiple`,
 and writes with `set`, `setIfAbsent`, `delete`, `clear` and `setMultiple` — `clear` wiping the

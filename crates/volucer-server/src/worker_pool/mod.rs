@@ -153,7 +153,7 @@ const WAIT_BUCKETS: usize = 20;
 /// **A cap rather than no cap, and the reason is a leak that shipped.** The obvious account of this
 /// queue — "a worker that emits a per-request metric is bounded by the requests it serves" — is true
 /// and irrelevant, because it describes the producer. The consumer is a *scrape*, and a deployment
-/// with `[server.access_log]` and no `[metrics]` table has no scrape at all: `publish_metrics` has one
+/// with `[server.access_log]` and no `[status.metrics]` table has no scrape at all: `publish_metrics` has one
 /// caller, `DispatcherMetrics::refresh`. So every sample an application emitted accumulated for the
 /// process's life. The queue was described in its own doc comment as bounded by the drain, and it was
 /// — when there was a drain.
@@ -211,7 +211,7 @@ struct PendingMetrics {
     ///
     /// - `volucer_metrics_dropped_total` when a scrape does happen, so a graph shows a gap instead of
     ///   a silently flat line;
-    /// - a rate-limited warning, so the log of a deployment with no `[metrics]` table says so;
+    /// - a rate-limited warning, so the log of a deployment with no `[status.metrics]` table says so;
     /// - the shutdown summary, so a load test's log records it even when nobody was reading either.
     dropped: u64,
     /// How much of `dropped` has already reached the registry.
@@ -439,7 +439,7 @@ pub struct WorkerPool {
     ///
     /// **Bounded, and it has to be: the consumer is a scrape, and a deployment need not have one.**
     /// `publish_metrics` has exactly one caller in this server — the scrape's `refresh` — so with no
-    /// `[metrics]` table there is no drain at all, and an earlier version of this field grew for the
+    /// `[status.metrics]` table there is no drain at all, and an earlier version of this field grew for the
     /// process's life while its own documentation claimed the drain bounded it. That account was true
     /// when a scrape happens and silently false when one does not, which is the kind of limit that is
     /// only wrong on the deployments nobody watches. See [`MAX_PENDING_METRICS`].
@@ -1059,7 +1059,7 @@ impl WorkerPool {
         // the `Mutex` makes the drain atomic, and the second scrape finds an empty queue.
         //
         // **The drain is not what bounds the queue**, and this comment used to say it was. Only a
-        // scrape drains, and a deployment need not have one: with no `[metrics]` table nothing calls
+        // scrape drains, and a deployment need not have one: with no `[status.metrics]` table nothing calls
         // this at all. The bound is `MAX_PENDING_METRICS`, applied where samples are pushed. What the
         // drain owes is the *drop count*, so a graph shows the gap rather than a flat line that looks
         // like an application which stopped emitting.
@@ -1288,7 +1288,7 @@ impl WorkerPool {
     /// **The one place samples enter the queue**, so it is where the cap is applied — a second push site
     /// that forgot to check would be a queue that grew past its bound while this one kept counting.
     /// Overflow is warned about from here as well as counted, on a rate, because a deployment with no
-    /// `[metrics]` table never drains and would otherwise never learn that its samples were going
+    /// `[status.metrics]` table never drains and would otherwise never learn that its samples were going
     /// nowhere. See [`MAX_PENDING_METRICS`].
     fn stash_metrics(&self, records: Vec<MetricRecord>) {
         if records.is_empty() {
@@ -1324,7 +1324,7 @@ impl WorkerPool {
     /// How many worker-emitted samples this pool dropped, for the shutdown report.
     ///
     /// Every path that reports a number here is one a *particular* deployment has: only this one is
-    /// reached by a deployment with no `[metrics]` table, which is exactly the deployment that could
+    /// reached by a deployment with no `[status.metrics]` table, which is exactly the deployment that could
     /// fill the queue without anyone noticing.
     pub fn dropped_metrics(&self) -> u64 {
         self.pending_metrics
@@ -2003,7 +2003,7 @@ mod tests {
     /// **The bug this test exists for was a leak, and it was described in the wrong direction.** The
     /// queue's own documentation said the drain bounded it, which is true only when a scrape happens —
     /// and `publish_metrics` has one caller, the scrape. A deployment with `[server.access_log]` and no
-    /// `[metrics]` table therefore grew this for the process's life while reading as safe. So the bound
+    /// `[status.metrics]` table therefore grew this for the process's life while reading as safe. So the bound
     /// is asserted where the samples are pushed, which is the site that does not depend on a scrape.
     #[test]
     fn the_pending_metric_queue_keeps_its_bound_rather_than_growing() {
@@ -2076,7 +2076,7 @@ mod tests {
     /// A queue that was never drained still reports its total at shutdown.
     #[test]
     fn a_drop_count_survives_never_being_scraped() {
-        // The deployment this is about: no `[metrics]` table, so `take_unreported` is never called and
+        // The deployment this is about: no `[status.metrics]` table, so `take_unreported` is never called and
         // `publish_metrics` never runs. `dropped_metrics` is read straight off the queue for the
         // shutdown line, which is the only report that deployment ever gets.
         let mut pending = PendingMetrics {

@@ -255,7 +255,7 @@ enum Command {
 
         /// Probe the listener this configuration file names.
         ///
-        /// The address comes from `[status]`, or from `[metrics]` when that is the only one
+        /// The address comes from `[status].listen`, which is the only one there is
         /// present, because the two share one listener. An unspecified host (`0.0.0.0`, `::`) is
         /// probed on loopback, which is what a container's own address means from inside it.
         ///
@@ -583,7 +583,7 @@ fn sampler_of(telemetry: &volucer_core::config::TelemetryConfig) -> volucer_obse
 #[derive(Debug, thiserror::Error)]
 enum HealthError {
     #[error(
-        "the configuration has no [status] or [metrics] table, so this server serves no \
+        "the configuration has no [status] table, so this server serves no \
          /health or /ready to probe; pass --url instead"
     )]
     NoProbeListener,
@@ -679,19 +679,12 @@ fn health(
 /// The URL a configuration file's own listeners are reachable on.
 fn probe_url_for(config: &Path, path: &str) -> Result<String, HealthError> {
     let loaded = Config::load(config).map_err(|err| HealthError::Config(Box::new(err)))?;
-    // `[status]` first, then `[metrics]`: the two share one listener, and `build_status` already
-    // refuses a configuration where they disagree, so either name points at the port the routes
-    // are on.
+    // One listener, so one address: the readiness probe, the exposition and the worker-control
+    // routes are paths on the same socket, and there is nothing to reconcile.
     let address = loaded
         .status
         .as_ref()
-        .map(|status| status.address.clone())
-        .or_else(|| {
-            loaded
-                .metrics
-                .as_ref()
-                .map(|metrics| metrics.address.clone())
-        })
+        .map(|status| status.listen.clone())
         .ok_or(HealthError::NoProbeListener)?;
     Ok(format!("http://{}{path}", probe_host(&address)))
 }
@@ -2398,16 +2391,13 @@ fn serve(
     // those face the public and may be TLS-only, while this one is meant to be reachable by a
     // scraper and an orchestrator and by nothing else.
     // **One gate for the process**, built before the status listener so the listener and the reloader
-    // hold the same cell. Opening and shutting it on a reload is what makes
-    // `[status] allow_worker_reset` changeable without restarting: the routes stop existing while it
-    // is shut, which is the same answer a deployment that never asked for them gives.
-    let reset_gate = Arc::new(
-        if config.status.as_ref().is_some_and(|s| s.allow_worker_reset) {
-            volucer_http::WorkerResetGate::open()
-        } else {
-            volucer_http::WorkerResetGate::closed()
-        },
-    );
+    // hold the same cell. Replacing it on a reload is what makes `[status.workers] allow` changeable
+    // without restarting: a method that is not granted does not exist, which is the same answer a
+    // deployment that never asked for it gives.
+    let reset_gate = Arc::new(match &config.status {
+        Some(status) => volucer_http::WorkerResetGate::open(worker_grant(status)),
+        None => volucer_http::WorkerResetGate::closed(),
+    });
 
     let status = start_status(&config, &dispatcher, &reset_gate)?;
 
@@ -2678,7 +2668,7 @@ fn serve(
         println!("{}", contention_line(&contention));
         // **Printed only when something was lost**, and separately from the line above because it is a
         // different kind of fact: the contention figures are diagnostics that are always interesting,
-        // while a drop count of zero is noise. A deployment with no `[metrics]` table has no other way
+        // while a drop count of zero is noise. A deployment with no `[status.metrics]` table has no other way
         // to learn that its worker-emitted samples were refused, which is why this is here rather than
         // only in the registry.
         if contention.dropped_metrics > 0 {
@@ -2809,7 +2799,7 @@ impl volucer_http::MetricsSource for DispatcherMetrics {
 /// would be two scrapes with half the numbers in each, and a worker pool that published into one
 /// while the listener rendered the other is exactly the class of bug this step exists to avoid.
 ///
-/// It is initialised on first use, which is the first scrape — so a deployment with no `[metrics]`
+/// It is initialised on first use, which is the first scrape — so a deployment with no `[status.metrics]`
 /// table never builds it at all, and the `describe` calls (idempotent) cost nothing.
 ///
 /// **The application's own names come from the configuration, and they arrive through
@@ -2822,34 +2812,29 @@ static METRICS: std::sync::LazyLock<volucer_metrics::Registry> = std::sync::Lazy
     registry
 });
 
-/// Declare a deployment's `[metrics.collect]` names in the process registry.
+/// Declare a deployment's `[status.metrics.collect]` names in the process registry.
 ///
 /// A one-line forwarder, and the commentary lives on [`volucer_server::describe_collected`] — which
 /// is where the function can be tested rather than copied. What this adds is the process's own
 /// registry, which a test cannot reach.
-fn describe_collected(metrics: &volucer_core::config::MetricsConfig) {
+fn describe_collected(metrics: &volucer_core::config::StatusMetrics) {
     volucer_server::describe_collected(&METRICS, metrics);
 }
 
 /// Build the metrics and status listener, when the configuration asks for one.
 ///
-/// **One listener for both tables**, because a deployment that wants a scraper and an orchestrator
+/// **One listener for one table**, because a deployment that wants a scraper and an orchestrator
 /// wants two paths on one port, and two ports would be two things to firewall. Which endpoints exist
-/// is decided by which tables are present: `[metrics]` without `[status]` serves the exposition and
-/// answers 404 to `/health`, and the reverse.
-///
-/// Where the two name different addresses it is a **refusal**, not a silent choice: two listeners
-/// would double the thread, the runtime and the shutdown path to serve two paths that no deployment
-/// needs on two ports, and quietly honouring one of the two settings would be a configuration that
-/// does not mean what it says.
+/// is decided by which sub-tables are present: `[status.metrics]` absent serves no exposition,
+/// `[status.workers]` absent serves no worker-control route, and the probes are always there.
 fn build_status(
     config: &Config,
     dispatcher: &Arc<Dispatcher>,
     reset_gate: &Arc<volucer_http::WorkerResetGate>,
 ) -> Result<Option<RunningStatus>, ServerError> {
-    if config.metrics.is_none() && config.status.is_none() {
+    let Some(status) = &config.status else {
         return Ok(None);
-    }
+    };
 
     let readiness = || -> Arc<dyn volucer_http::Readiness> {
         Arc::new(DispatcherReadiness {
@@ -2857,26 +2842,7 @@ fn build_status(
         })
     };
 
-    let address = match (&config.metrics, &config.status) {
-        (Some(metrics), Some(status)) => {
-            if metrics.address != status.address {
-                return Err(ServerError::Misconfigured {
-                    backend: "<status>".to_string(),
-                    reason: format!(
-                        "[metrics] listens on {} and [status] on {}; they share one listener, so \
-                         give them the same address or configure only one",
-                        metrics.address, status.address
-                    ),
-                });
-            }
-            status.address.clone()
-        }
-        (Some(metrics), None) => metrics.address.clone(),
-        (None, Some(status)) => status.address.clone(),
-        (None, None) => unreachable!("checked above"),
-    };
-
-    let metrics = config.metrics.as_ref().map(|metrics| {
+    let metrics = status.metrics.as_ref().map(|metrics| {
         // Registered before the listener exists, so the first scrape already knows the application's
         // names. Doing it on scrape would mean the first few scrapes of a fresh process answered
         // "undeclared" for a name the deployment had declared — a race whose symptom is an empty
@@ -2894,41 +2860,69 @@ fn build_status(
 
     let services = volucer_http::StatusServices {
         metrics,
-        readiness: config.status.as_ref().map(|_| readiness()),
-        unavailable_status: config
-            .status
-            .as_ref()
-            .map_or(503, |status| status.unavailable_status_code),
+        // Always present: `[status]` without probes would be an address that answers nothing, and
+        // the operator who wrote one is configuring a probe rather than an empty socket.
+        readiness: Some(readiness()),
+        unavailable_status: status.health.unavailable_status,
         // The worker routes exist only when the deployment asked, and the implementation is the
         // dispatcher's own pool directory — the same one `workers.list` reads, so a `GET /workers`
         // and a worker's own `workers.list` cannot disagree about what a worker is.
         //
         // The gate is a second question and deliberately separate: `workers` says whether there is a
         // pool to control, the gate says whether a caller may reach it *now*. Splitting them is what
-        // lets `[status] allow_worker_reset` be turned off by a reload without dropping the pool
-        // handle — and closed routes are 404s rather than 403s, which is the property that stops an
-        // attacker enumerating them.
+        // lets `[status.workers] allow` be changed by a reload without dropping the pool handle — and
+        // an ungranted route is a 404 rather than a 403, which is the property that stops an attacker
+        // enumerating them.
         workers: workers_control(dispatcher),
         reset_gate: Some(Arc::clone(reset_gate)),
     };
 
-    RunningStatus::start(&address, services)
+    RunningStatus::start(&status.listen, services)
         .map(Some)
         .map_err(|err| ServerError::Listener {
             reason: err.to_string(),
         })
 }
 
+/// The methods a deployment's `[status.workers]` grants, as the listener's own type.
+///
+/// The third seam between `volucer-core` and `volucer-http`, after the sampling policy and the
+/// readiness trait, and for the same reason as those: the configuration model stays free of the
+/// crate that serves, so `volucer-core` remains the leaf every other crate depends on.
+///
+/// An unknown name is ignored with an error rather than asserted on: `Config::validate` refuses one
+/// before a configuration is ever served, so the arm is unreachable from a running server — but this
+/// is also reachable from a `Config` built in a test and never validated, and a panic in a startup
+/// path is a worse answer there than the route simply not existing.
+fn worker_grant(status: &volucer_core::config::StatusConfig) -> volucer_http::WorkerGrant {
+    let mut grant = volucer_http::WorkerGrant::NONE;
+    let Some(workers) = &status.workers else {
+        return grant;
+    };
+    for method in &workers.allow {
+        match method.as_str() {
+            "workers.list" => grant.list = true,
+            "workers.reset" => grant.reset = true,
+            other => tracing::error!(
+                method = other,
+                "[status.workers] names a method this listener does not serve; validation refuses \
+                 one, so this configuration was never checked. The route is not granted"
+            ),
+        }
+    }
+    grant
+}
+
 /// The worker-control routes' implementation, when this deployment has a worker pool at all.
 ///
-/// **No longer gated on `allow_worker_reset`**, and that is the change a reloadable gate forces: the
-/// pool handle has to be there *before* the flag can be turned on, because a reload must not have to
-/// rebuild a listener to start answering `/workers`. Whether a caller may reach the routes is
+/// **Not gated on the grant**, and that is what a reloadable gate forces: the pool handle has to be
+/// there *before* a method can be granted, because a reload must not have to rebuild a listener to
+/// start answering `/workers`. Whether a caller may reach a route is
 /// [`WorkerResetGate`](volucer_http::WorkerResetGate)'s answer, asked per request.
 ///
 /// `None` for a deployment with no worker pool: there is nothing to list, and `/workers` would be an
 /// empty array that looks like a pool with no workers. A static-only or upstream-only deployment gets
-/// no route rather than a misleading one, whatever the gate says.
+/// no route rather than a misleading one, whatever the grant says.
 fn workers_control(dispatcher: &Arc<Dispatcher>) -> Option<Arc<dyn volucer_http::WorkerControl>> {
     let pools = dispatcher.pools()?;
     Some(Arc::new(PoolControl { pools }))
@@ -2967,7 +2961,7 @@ fn start_status(
 ) -> Result<Option<RunningStatus>, ServerError> {
     let running = build_status(config, dispatcher, reset_gate)?;
     if let Some(listener) = &running {
-        println!("  metrics:          {}", listener.local_addr());
+        println!("  status:           {}", listener.local_addr());
     }
     Ok(running)
 }
@@ -3092,7 +3086,7 @@ struct Reloader {
     /// a caller from where they already were. That is the difference between a limit and a limit that
     /// can be escaped by asking the operator to reload.
     rate_limit: Arc<volucer_http::RateLimitCell>,
-    /// The worker-control gate, so `[status] allow_worker_reset` can be turned off — or on — by a
+    /// The worker grant, so `[status.workers] allow` can be changed by a
     /// reload.
     ///
     /// The **same cell the status listener reads**, which is what makes the change visible: the
@@ -3225,24 +3219,27 @@ impl Reloader {
             }
         }
 
-        // The worker-control gate, fourth and independent of the three above. A shut gate makes the
-        // routes 404 on the next request; an open one makes them answer. The validation that refuses a
-        // wildcard `[status] address` beside the flag ran when the file was read, so this cannot open a
-        // mutation surface at an address the deployment would not have been allowed to start with.
+        // The worker-control grant, fourth and independent of the three above. An ungranted method
+        // makes its route 404 on the next request; a granted one makes it answer. The validation that
+        // refuses a wildcard `[status] listen` beside `workers.reset` ran when the file was read, so
+        // this cannot open a mutation surface at an address the deployment would not have been
+        // allowed to start with.
         //
-        // A **removed** `[status]` table closes the gate, because the flag it carried is gone — the
-        // routes are the flag's, and the flag is the table's. `address` is restart-only, which is why
+        // A **removed** `[status]` table closes the gate, because the grant it carried is gone — the
+        // routes are the grant's, and the grant is the table's. `listen` is restart-only, which is why
         // the listener itself survives; only the surface it used to expose does not.
-        let allow_reset = config
-            .status
-            .as_ref()
-            .is_some_and(|status| status.allow_worker_reset);
-        let was_allowed = self.reset_gate.set(allow_reset);
-        if was_allowed != allow_reset {
+        let granted = match &config.status {
+            Some(status) => worker_grant(status),
+            None => volucer_http::WorkerGrant::NONE,
+        };
+        let was = self.reset_gate.set(granted);
+        if was != granted {
             tracing::info!(
-                allow_worker_reset = allow_reset,
-                "the worker-control routes were {} by this reload",
-                if allow_reset { "opened" } else { "closed" }
+                list = granted.list,
+                reset = granted.reset,
+                "this reload changed the worker-control routes: {} list, {} reset",
+                if granted.list { "granted" } else { "removed" },
+                if granted.reset { "granted" } else { "removed" }
             );
         }
 
@@ -3268,7 +3265,7 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
         "a reload does not change: [server.access_log] path, format and request_id_header (SIGHUP closes and reopens the log a rotation moved, but the destination is chosen at startup)",
-        "a reload does not change: [status] address (the listener is bound, so a new address is a new socket)",
+        "a reload does not change: [status] listen (the listener is bound, so a new address is a new socket)",
     ]
 }
 
@@ -4289,28 +4286,48 @@ fn check(
         None => println!("  rpc: none (no FastCGI application can reach the call plane)"),
     }
 
-    // The status listener and the one route on it that mutates. Printed in both cases rather than
-    // only when configured: the *absence* of a mutation surface is the fact an operator auditing
-    // this deployment wants, and a report that printed nothing when `allow_worker_reset` was off
-    // would leave them unable to tell "not configured" from "not reported".
-    match (&config.status, &config.metrics) {
-        (Some(status), _) => {
-            println!("  status: {}", status.address);
+    // The status listener and the routes on it that mutate. Printed in both cases rather than only
+    // when configured: the *absence* of a mutation surface is the fact an operator auditing this
+    // deployment wants, and a report that printed nothing when `workers.reset` was ungranted would
+    // leave them unable to tell "not configured" from "not reported".
+    match &config.status {
+        Some(status) => {
+            println!("  status:           {}", status.listen);
+            let has = |method: &str| {
+                status
+                    .workers
+                    .as_ref()
+                    .is_some_and(|workers| workers.allow.iter().any(|m| m == method))
+            };
+            let routes = match (has("workers.list"), has("workers.reset")) {
+                (true, true) => {
+                    "GET /workers and POST /workers/{index}/reset (no authentication)".to_string()
+                }
+                (true, false) => {
+                    "GET /workers only (no authentication; a reset is not granted)".to_string()
+                }
+                // Worth its own line: the list is how a caller learns an index, so a grant of the
+                // reset alone is a route whose documentation cannot be followed.
+                (false, true) => {
+                    "POST /workers/{index}/reset only (no authentication, and the list that names an \
+                     index is not served)"
+                        .to_string()
+                }
+                (false, false) => "none ([status.workers] is absent, so the routes do not exist)"
+                    .to_string(),
+            };
+            println!("    worker routes:    {routes}");
             println!(
-                "    worker routes:    {}",
-                if status.allow_worker_reset {
-                    "GET /workers and POST /workers/{index}/reset (no authentication)"
-                } else {
-                    "disabled (allow_worker_reset is false; the routes do not exist)"
+                "    metrics:          {}",
+                match &status.metrics {
+                    Some(metrics) =>
+                        format!("{} on this listener at {}", metrics.path, status.listen),
+                    None => "disabled ([status.metrics] is absent)".to_string(),
                 }
             );
         }
-        (None, Some(metrics)) => {
-            println!("  metrics: {}", metrics.address);
-            println!("    worker routes:    disabled (they live on [status], which is unset)");
-        }
-        (None, None) => {
-            println!("  status:           (disabled: no /health, no /ready, and no worker routes)")
+        None => {
+            println!("  status:           (disabled: no /health, no /ready, no /metrics, and no worker routes)")
         }
     }
 
@@ -5243,7 +5260,7 @@ document_root = "/from/file"
             "min_version",
             "server.proxy",
             "server.access_log",
-            "status] address",
+            "status] listen",
         ] {
             assert!(
                 joined.contains(required),
@@ -5254,7 +5271,7 @@ document_root = "/from/file"
 
         // The ones an earlier draft got wrong, in the code's favour. Each is now read per request
         // out of swapped state — `routes` and `static_files` from the site snapshot,
-        // `server.rate_limit` from the shared `RateLimitCell`, `allow_worker_reset` from the
+        // `server.rate_limit` from the shared `RateLimitCell`, the worker grant from the
         // `WorkerResetGate`, and a backend's `grpc_services` from `Reloaded::grpc_grants` — so
         // telling an operator they are restart-only is telling them to restart for nothing.
         for wrong in [
@@ -5262,7 +5279,7 @@ document_root = "/from/file"
             "statics",
             "static_files",
             "server.rate_limit",
-            "allow_worker_reset",
+            "[status.workers]",
             "grpc_services",
         ] {
             assert!(

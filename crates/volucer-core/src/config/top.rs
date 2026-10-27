@@ -39,22 +39,23 @@ pub struct Config {
     #[serde(default)]
     pub sites: BTreeMap<String, SiteConfig>,
 
-    /// The Prometheus endpoint. Absent means no metrics endpoint at all.
+    /// The status listener: readiness, the Prometheus exposition, and the worker-control routes.
+    /// Absent means no listener and none of those endpoints.
     ///
-    /// **The presence of this table is what turns it on**, matching `[server.tls]`: an `enabled`
-    /// flag and an address are two statements about one thing, and two statements can disagree — a
-    /// table with `enabled = true` and no address has to be reported as a mistake, which is a
-    /// question nobody would have asked without the flag.
-    #[serde(default)]
-    pub metrics: Option<MetricsConfig>,
-
-    /// The health and readiness endpoint. Absent means no status endpoint.
-    ///
-    /// The same convention as [`Config::metrics`], and separate from it on purpose: a deployment
-    /// that wants a container orchestrator to poll readiness may well not want a second port
-    /// exposing every counter in the process.
+    /// **One table, because it is one socket.** It replaced a `[metrics]` table and a `[status]`
+    /// table that each named an address for the same listener, which is two settings for one fact —
+    /// and the server could only reconcile them by refusing a file where they disagreed. Each
+    /// endpoint now exists because its *sub-table* does, which is the same presence-as-enablement
+    /// rule `[server.tls]` follows.
     #[serde(default)]
     pub status: Option<StatusConfig>,
+
+    /// The pre-0.4 spelling of [`StatusConfig::metrics`]. See [`Config::legacy_default_backend`].
+    ///
+    /// Refused by name rather than by `toml`'s `unknown field 'metrics'`, because the setting did
+    /// not disappear — it moved one table down and its `address` is now the listener's `listen`.
+    #[serde(default, rename = "metrics", skip_serializing)]
+    pub legacy_metrics: Option<toml::Value>,
 
     /// Key-value storages, by name. Absent means none, and a worker cannot then call `kv.*` at all.
     ///

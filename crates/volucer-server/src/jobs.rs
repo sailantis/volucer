@@ -195,7 +195,7 @@ impl Consumers {
     /// The pool the consumers live in, for a diagnostic and for a scrape.
     ///
     /// Reachable for the same reason a backend's pool is: the metrics a consumer pool publishes are the
-    /// ones `[metrics]` renders, so the scrape path has to be able to reach the pool it is describing.
+    /// ones `[status.metrics]` renders, so the scrape path has to be able to reach the pool it is describing.
     /// A borrow rather than a clone, because holding an `Arc` would keep the consumer processes alive
     /// past the `Consumers` that owns them.
     pub fn pool(&self) -> &Arc<WorkerPool> {

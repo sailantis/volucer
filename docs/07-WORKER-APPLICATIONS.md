@@ -153,7 +153,7 @@ to include multiple headers with the same name, such as multiple `Set-Cookie` he
 | `currentRequestId()`               | The in-flight request id, for telemetry correlation                    |
 
 The `$name` passed to `emitMetric()` must match the Prometheus name pattern
-`[a-zA-Z_][a-zA-Z0-9_]*` and be declared under the server's `[metrics.collect]` table.
+`[a-zA-Z_][a-zA-Z0-9_]*` and be declared under the server's `[status.metrics.collect]` table.
 
 Call `recycle()` when the worker should be replaced after its current request, for example
 if it has accumulated state that cannot be safely cleared. Volucer starts a replacement;

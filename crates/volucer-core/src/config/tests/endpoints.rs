@@ -2,20 +2,161 @@
 
 use super::*;
 
+/// The old shape is refused by name, not by `toml`'s `unknown field`.
+///
+/// **This is the whole reason the shims exist.** `[metrics]` did not disappear, it moved one table
+/// down and its `address` became the listener's `listen` — so `unknown field 'metrics'` would be
+/// true and explain nothing. Each refusal has to name the key that replaced it, or an upgrading
+/// operator is left diffing documentation.
+#[test]
+fn each_pre_nesting_key_is_refused_by_the_name_of_its_replacement() {
+    let cases = [
+        (
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n",
+            "[status.metrics]",
+        ),
+        (
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\naddress = \"127.0.0.1:2114\"\n",
+            "[status] listen",
+        ),
+        (
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n\
+             unavailable_status_code = 503\n",
+            "[status.health]",
+        ),
+        (
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n\
+             allow_worker_reset = true\n",
+            "[status.workers] allow",
+        ),
+    ];
+    for (text, replacement) in cases {
+        let config = Config::from_toml(text).expect("the old shape must still parse");
+        let err = config.validate().expect_err("and then be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(replacement),
+            "the refusal has to name {replacement:?}: {message}"
+        );
+        assert!(
+            message.contains("0.4.0"),
+            "and say which release moved it: {message}"
+        );
+    }
+}
+
+/// A `[status]` table with no `listen` is refused, rather than reported as a missing field by
+/// `toml` before the other shims can be checked.
+#[test]
+fn a_status_table_without_a_listen_is_refused() {
+    let config = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n[status]\n")
+        .expect("an empty table parses");
+    let err = config.validate().expect_err("must be refused");
+    assert!(err.to_string().contains("no `listen`"), "{err}");
+}
+
+/// The status listener is TCP, and a `unix:` address is refused when the file is read.
+///
+/// `parse_listener` accepts the form for every other listener, so without this the value passed
+/// `volucer check` and then failed at bind with `invalid port value` — a settings file that
+/// validates and cannot start.
+#[test]
+fn a_unix_status_listener_is_refused() {
+    let text = "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"unix:/tmp/s.sock\"\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("must be refused");
+    let message = err.to_string();
+    assert!(message.contains("TCP only"), "{message}");
+    assert!(
+        message.contains("host:port"),
+        "the message has to say what to write instead: {message}"
+    );
+}
+
+/// An empty `allow` is a table that grants nothing, which is a block an operator wrote expecting
+/// an endpoint — so it is refused rather than left as a listener answering 404 to a configured
+/// route.
+#[test]
+fn an_empty_worker_grant_is_refused() {
+    let text = "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n\
+                \n[status.workers]\nallow = []\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("must be refused");
+    assert!(err.to_string().contains("empty `allow`"), "{err}");
+}
+
+/// A name that is not one of the listener's two routes is refused, and the message lists them.
+#[test]
+fn an_unknown_worker_method_is_refused() {
+    let text = "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n\
+                \n[status.workers]\nallow = [\"workers.nuke\"]\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("must be refused");
+    let message = err.to_string();
+    assert!(message.contains("workers.nuke"), "{message}");
+    assert!(
+        message.contains("workers.list") && message.contains("workers.reset"),
+        "the refusal has to say what the two routes are: {message}"
+    );
+}
+
+/// The exposition may not take a path the listener already serves.
+///
+/// Two endpoints answering one path would make one of them unreachable, and which one won would be
+/// decided by the order of the router's arms rather than by the file.
+#[test]
+fn a_metrics_path_may_not_shadow_a_probe() {
+    for path in ["/health", "/ready", "/workers"] {
+        let text = format!(
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n\
+             \n[status.metrics]\npath = \"{path}\"\n"
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        let err = config.validate().expect_err("must be refused");
+        assert!(err.to_string().contains(path), "{path}: {err}");
+    }
+}
+
+/// The probes survive every combination of the optional sub-tables, because a `[status]` with none
+/// of them is the ordinary deployment.
+#[test]
+fn the_probes_are_present_whatever_the_sub_tables_say() {
+    for extra in [
+        "",
+        "\n[status.metrics]\npath = \"/metrics\"\n",
+        "\n[status.workers]\nallow = [\"workers.list\"]\n",
+        "\n[status.metrics]\n\n[status.workers]\nallow = [\"workers.list\"]\n",
+    ] {
+        let text = format!(
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n{extra}"
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        config.validate().expect("valid");
+        let status = config.status.expect("present");
+        assert_eq!(
+            status.health.unavailable_status, 503,
+            "the probe has to answer 503 by default in every combination: {extra:?}"
+        );
+    }
+}
+
 #[test]
 fn status_defaults_its_unavailable_code() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
 [status]
-address = "127.0.0.1:2114"
+listen = "127.0.0.1:2114"
 "#;
     let config = Config::from_toml(text).expect("config parses");
     config.validate().expect("valid");
-    assert_eq!(config.status.expect("present").unavailable_status_code, 503);
+    assert_eq!(
+        config.status.expect("present").health.unavailable_status,
+        503
+    );
 }
 
-/// The mutation routes are off unless the file says otherwise, and that default is the feature.
+/// The worker routes are off unless the file says otherwise, and that default is the feature.
 ///
 /// A deployment that configured `[status]` for an orchestrator and then upgraded must not gain a
 /// way to recycle its workers. The assertion is on the *default*, because that is the half an
@@ -26,12 +167,12 @@ fn the_worker_routes_are_off_by_default() {
 [server]
 http = "127.0.0.1:8080"
 [status]
-address = "127.0.0.1:2114"
+listen = "127.0.0.1:2114"
 "#;
     let config = Config::from_toml(text).expect("config parses");
     assert!(
-        !config.status.expect("present").allow_worker_reset,
-        "a [status] table that says nothing about the mutation routes must not enable them"
+        config.status.expect("present").workers.is_none(),
+        "a [status] table that says nothing about the worker routes must not enable them"
     );
 }
 
@@ -47,25 +188,28 @@ fn a_wildcard_status_address_cannot_carry_the_worker_routes() {
 [server]
 http = "127.0.0.1:8080"
 [status]
-address = "0.0.0.0:2114"
-allow_worker_reset = true
+listen = "0.0.0.0:2114"
+
+[status.workers]
+allow = ["workers.list", "workers.reset"]
 "#;
     let config = Config::from_toml(text).expect("config parses");
     let err = config.validate().expect_err("must be refused");
     let message = err.to_string();
-    assert!(message.contains("allow_worker_reset"), "{message}");
+    assert!(message.contains("workers.reset"), "{message}");
     assert!(
         message.contains("every interface"),
         "the message has to say what is wrong with the address: {message}"
     );
 
-    // And the same address without the flag is ordinary: a readiness probe on a wildcard bind is
-    // a deployment somebody chose, and refusing it would be refusing the wrong thing.
-    let text = text.replace("allow_worker_reset = true", "");
+    // And the same address without the reset is ordinary: a readiness probe, a scrape and a worker
+    // list on a wildcard bind are a deployment somebody chose, and refusing them would be refusing
+    // the wrong thing — the list is a fact about this process, not a lever on it.
+    let text = text.replace(r#", "workers.reset""#, "");
     let config = Config::from_toml(&text).expect("config parses");
     config
         .validate()
-        .expect("a wildcard [status] without the mutation routes is legal");
+        .expect("a wildcard [status] that grants only the list is legal");
 }
 
 /// A loopback or a specific private address is accepted, which is the whole of what the check
@@ -78,8 +222,10 @@ fn a_specific_status_address_may_carry_the_worker_routes() {
 [server]
 http = "127.0.0.1:8080"
 [status]
-address = "{address}"
-allow_worker_reset = true
+listen = "{address}"
+
+[status.workers]
+allow = ["workers.list", "workers.reset"]
 "#
         );
         let config = Config::from_toml(&text).expect("config parses");
@@ -87,14 +233,18 @@ allow_worker_reset = true
     }
 }
 
-/// A status *and* a metrics endpoint is a legal deployment: a container orchestrator polls
-/// readiness while something else scrapes. Neither is a listener in the request path, so neither
-/// satisfies the "no listener configured" refusal on its own.
+/// A status listener alone is not a listener in the request path.
+///
+/// A container orchestrator polls readiness while something else scrapes. Neither serves a request,
+/// so neither satisfies the "no listener configured" refusal on its own.
 #[test]
 fn a_metrics_listener_alone_is_not_a_listener() {
     let text = r#"
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
+path = "/metrics"
 "#;
     let config = Config::from_toml(text).expect("config parses");
     let err = config.validate().expect_err("must fail");
@@ -261,8 +411,10 @@ fn rejects_an_unavailable_status_that_is_not_an_http_code() {
 [server]
 http = "127.0.0.1:8080"
 [status]
-address = "127.0.0.1:2114"
-unavailable_status_code = 99
+listen = "127.0.0.1:2114"
+
+[status.health]
+unavailable_status = 99
 "#;
     let config = Config::from_toml(text).expect("config parses");
     let err = config.validate().expect_err("must fail");
@@ -275,10 +427,13 @@ fn rejects_an_unknown_key_in_the_metrics_table() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
-addres = "typo"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
+path = "/metrics"
+pat = "typo"
 "#;
     let err = Config::from_toml(text).expect_err("must fail");
-    assert!(err.to_string().contains("addres"), "{err}");
+    assert!(err.to_string().contains("pat"), "{err}");
 }

@@ -159,19 +159,25 @@ One policy applies process-wide to both front ends; it does not vary by route or
 
 ## The worker-control routes
 
-Worker-control routes are disabled by default. To expose them, configure `[status]` and
-explicitly enable resets:
+Worker-control routes are absent by default. To expose them, name the methods under
+`[status.workers]`:
 
 ```toml
 [status]
-address = "127.0.0.1:2114"
-allow_worker_reset = true
+listen = "127.0.0.1:2114"
+
+[status.workers]
+allow = ["workers.list", "workers.reset"]
 ```
 
 ```sh
 curl -sf http://127.0.0.1:2114/workers | jq        # the list
 curl -sf -XPOST http://127.0.0.1:2114/workers/3/reset
 ```
+
+**`allow` is a grant of methods, not a switch.** `allow = ["workers.list"]` publishes the list and
+answers `404` to a reset, so an operator or a dashboard can see a pool without the file arming a
+`POST`. Adding `"workers.reset"` is what makes the recycle exist.
 
 `GET /workers` returns JSON describing workers across all pools. The `index` is the
 process-wide worker index used by the reset route; `slot` is the worker's index within its
@@ -183,27 +189,32 @@ to start. A busy worker can be reset after it becomes idle. Worker replacement r
 `spawn_blocking`, so a slow startup does not block the status listener.
 
 These routes do not provide authentication. Keep the listener on loopback or a private
-interface and restrict access through your network configuration. If resets are enabled,
-Volucer refuses to start when the status listener is bound to a wildcard address.
+interface and restrict access through your network configuration. Volucer refuses
+`workers.reset` when the status listener is bound to a wildcard address; `workers.list` alone is
+legal anywhere, because a list of workers is a fact about the process rather than a lever on it.
 
 ## Metrics
 
-```toml
-[metrics]
-address = "127.0.0.1:2112"
-path = "/metrics"          # the default
-prefix = "volucer_"       # optional
+The exposition is a route on the status listener, so it needs a `[status]` table. It exists when
+`[status.metrics]` does:
 
-[metrics.collect.app_requests]
-type = "counter"          # "counter", "gauge" or "histogram"
-help = "Application requests handled"
+```toml
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
+path = "/metrics"          # the default
+prefix = "volucer_"        # optional
+collect.app_requests = { type = "counter", help = "Application requests handled" }
 ```
 
 The same table of metrics written as an inline table, which TOML 1.1 allows to span lines:
 
 ```toml
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
+
+[status.metrics]
 prefix = "volucer_"
 
 collect = {
@@ -216,23 +227,18 @@ collect = {
 ```
 
 The two spellings mean the same thing, and one deployment should use one of them. **An inline
-table is closed in the text that writes it** — a later `[metrics.collect.<name>]` header, or a
+table is closed in the text that writes it** — a later `[status.metrics.collect.<name>]` header, or a
 dotted key in the same table, is a parse error — so use headers when the file itself has to
-add to the table in more than one place. `-o metrics.collect.<name>.type=…` works with either,
+add to the table in more than one place. `-o status.metrics.collect.<name>.type=…` works with either,
 because it is applied after parsing.
 
-| Key       | Type            | Default      | What it does                           |
-| --------- | --------------- | ------------ | -------------------------------------- |
-| `address` | string          | **required** | Where the Prometheus endpoint listens. |
-| `path`    | string          | `"/metrics"` | The endpoint path.                     |
-| `prefix`  | string          | absent       | A prefix for the metric names.         |
-| `collect` | table of tables | empty        | The metrics to collect.                |
+| Key       | Type            | Default      | What it does                   |
+| --------- | --------------- | ------------ | ------------------------------ |
+| `path`    | string          | `"/metrics"` | The endpoint path.             |
+| `prefix`  | string          | absent       | A prefix for the metric names. |
+| `collect` | table of tables | empty        | The metrics to collect.        |
 
-`[metrics]` and `[status]` share a listener. If both are configured, their `address` values
-must match; different addresses cause startup to fail. Configure only the feature you need
-if you do not need both.
-
-`[metrics.collect.<name>]`:
+`[status.metrics.collect.<name>]`:
 
 | Key       | Type             | Default      | What it does                             |
 | --------- | ---------------- | ------------ | ---------------------------------------- |

@@ -15,14 +15,14 @@
 //!
 //! # Why a separate listener rather than a route
 //!
-//! The same argument [`MetricsConfig`](super::MetricsConfig) makes, only more so. `[server]`'s
+//! The same argument [`StatusConfig`](super::StatusConfig) makes, only more so. `[server]`'s
 //! listener may be TLS-only, may redirect to HTTPS, and faces the public. What travels on this one is
 //! a **mutation** surface — `kv.set`, `lock.release`, `jobs.push`, `workers.reset` — so it is a
 //! separate address, `unix:` by default, and a TCP address has to be loopback.
 //!
 //! # Enabling it
 //!
-//! **The presence of this table is what turns the listener on**, matching `[metrics]` and
+//! **The presence of this table is what turns the listener on**, matching `[status]` and
 //! `[telemetry]`. It is not enough on its own, though: a backend also has to grant something, or the
 //! listener would be a socket that refuses every call. [`Config::validate`] refuses that combination
 //! by name rather than leaving an operator with a live socket and an application that can reach
@@ -36,7 +36,7 @@ use super::*;
 pub struct RpcConfig {
     /// The address to listen on, e.g. `unix:/run/volucer/rpc.sock` or `127.0.0.1:6001`.
     ///
-    /// Required, and with no default, for the reason `[metrics].address` has none: a default TCP
+    /// Required, and with no default, for the reason `[status].listen` has none: a default TCP
     /// port is either occupied by something else or reachable by somebody it should not be.
     pub listen: String,
 
@@ -121,7 +121,7 @@ impl RpcConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         let listener = parse_listener(&self.listen).map_err(|err| format!("rpc.listen: {err}"))?;
 
-        // A TCP listener has to be loopback, and the rule is the one `[status].allow_worker_reset`
+        // A TCP listener has to be loopback, and the rule is the one `[status.workers]`
         // already follows — with a stronger reason, because every path on this socket mutates
         // something. A unix socket needs no such check: its permissions are the operator's access
         // control, and they set them with `chmod` on a path they chose, which is a decision this

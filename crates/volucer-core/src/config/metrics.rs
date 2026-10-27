@@ -1,16 +1,20 @@
-//! The Prometheus endpoint, and the health and readiness endpoint.
+//! The status listener: where it listens, and the three sets of routes it may carry.
 //!
-//! Two tables, two listeners, and neither inherits the public one.
+//! **One table, one listener.** The readiness probe, the Prometheus exposition and the
+//! worker-control routes are paths on one address, and each of them exists because its sub-table
+//! does. That is the whole model, and it replaced a `[metrics]` table and a `[status]` table that
+//! each named an address for the same socket — two settings for one fact, which the server could
+//! only reconcile by refusing a file where they disagreed.
+//!
+//! The listener is its own rather than a route on `[server]`, and that is not a style choice. The
+//! HTTP listener may be TLS-only, may be behind a redirect to HTTPS, and faces the public; a scrape
+//! endpoint that inherited any of those would be one misconfiguration away from being either
+//! unreachable or public. A separate address on loopback is the shape every other server in this
+//! space uses, and it is the one an operator can firewall as a single line.
 
 use super::*;
 
-/// The Prometheus endpoint.
-///
-/// Its own listener rather than a route on `[server]`, and that is not a style choice. The HTTP
-/// listener may be TLS-only, may be behind a redirect to HTTPS, and faces the public; a scrape
-/// endpoint that inherited any of those would be one misconfiguration away from being either
-/// unreachable or public. A separate address on loopback is the shape every other server in this
-/// space uses, and it is the one an operator can firewall as a single line.
+/// The Prometheus exposition, served on the [`StatusConfig`] listener.
 ///
 /// `PartialEq` only, because [`CollectedMetric::buckets`] is `f64` and an `f64` cannot be `Eq`:
 /// `NaN != NaN`, so the reflexivity `Eq` promises does not hold. A bucket bound may not be `NaN`
@@ -18,14 +22,7 @@ use super::*;
 /// would be the one lie a future refactor could build on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MetricsConfig {
-    /// Where to listen, e.g. `127.0.0.1:2112` or `unix:/run/volucer/metrics.sock`.
-    ///
-    /// Required. There is no default, because a default of `0.0.0.0:2112` would expose every
-    /// counter in the process to whoever can reach the host, and a default of `127.0.0.1:2112`
-    /// would silently collide with a Prometheus already listening there.
-    pub address: String,
-
+pub struct StatusMetrics {
     /// A prefix prepended to every metric this server provides, e.g. `myapp_`.
     ///
     /// Applied at render time, so the metric names in the code stay the ones RoadRunner's
@@ -82,7 +79,7 @@ pub struct CollectedMetric {
     #[serde(rename = "type")]
     pub kind: CollectedKind,
 
-    /// The `# HELP` text. Required, for the reason [`MetricsConfig::collect`] gives: a registry
+    /// The `# HELP` text. Required, for the reason [`StatusMetrics::collect`] gives: a registry
     /// whose names carried no explanation would render a page of bare names, and the text has to be
     /// the *operator's* rather than the worker's, because the operator is the one who declared it.
     pub help: String,
@@ -112,46 +109,130 @@ pub enum CollectedKind {
     Histogram,
 }
 
-/// The health and readiness endpoint.
+/// The status listener, and the routes it carries.
 ///
-/// Two endpoints on one listener, because they answer genuinely different questions and the
-/// difference is the one a container orchestrator acts on: `/health` says the process is alive and
-/// should not be restarted, and `/ready` says it can serve traffic now and should be sent some.
-/// A readiness probe that returned 200 while every worker was still booting is how a rolling deploy
-/// sends traffic to a server that answers 502.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// **`listen` is required; everything else is a sub-table whose presence turns an endpoint on.**
+/// That convention is `[server.tls]`'s and `[server.access_log]`'s, and it is what removes the
+/// `enabled`-flag-versus-address disagreement: there is one address, and a route exists because the
+/// block that describes it is written.
+///
+/// `[status]` alone is the ordinary deployment — a liveness and readiness probe for an orchestrator,
+/// which is why [`StatusHealth`] is not a sub-table an operator has to remember to write.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusConfig {
     /// Where to listen, e.g. `127.0.0.1:2114`.
     ///
-    /// Required, for the same reason [`MetricsConfig::address`] is.
-    pub address: String,
+    /// Required. There is no default, because a default of `0.0.0.0:2114` would expose the
+    /// worker-control routes to whoever can reach the host, and a default of `127.0.0.1:2114` would
+    /// silently collide with something already listening there.
+    ///
+    /// TCP only. `parse_listener` accepts `unix:` and this listener does not bind one, which
+    /// validation refuses rather than leaving as a bind failure after the pools are up.
+    ///
+    /// `#[serde(default)]` and checked in `validate` rather than as a non-`Option` field, so that a
+    /// file still carrying the pre-0.4 `address` key gets the refusal that names the new spelling
+    /// instead of `toml`'s `missing field 'listen'` — which is true and explains nothing.
+    #[serde(default)]
+    pub listen: String,
 
+    /// `/health` and `/ready`. The defaults are the whole of what most deployments need.
+    #[serde(default = "default_health")]
+    pub health: StatusHealth,
+
+    /// The Prometheus exposition at `path`. Absent means this listener serves no metrics.
+    ///
+    /// Absent is a deployment somebody chose: a process may want a readiness probe without
+    /// publishing every counter in it, and a second port is a second thing to firewall.
+    #[serde(default)]
+    pub metrics: Option<StatusMetrics>,
+
+    /// `GET /workers` and `POST /workers/{index}/reset`. Absent means neither route exists.
+    ///
+    /// **Absent, and absent is not "not yet documented" — it is the whole safety of the feature.**
+    /// A `GET` is safe to hand to whoever can reach a port; a `POST` that recycles a worker is not.
+    /// A deployment that configured `[status]` for an orchestrator and then upgraded gains no
+    /// mutation surface: while the routes do not exist `/workers` is a 404 and a `POST` anywhere is
+    /// a 405, not a 403 — an endpoint that exists and refuses is an endpoint an attacker can
+    /// enumerate.
+    ///
+    /// The alternative protection — a token — was considered and not built: the listener is
+    /// configured by whoever runs the process, and the same one-line misconfiguration that exposes
+    /// it to the world would expose the token's own configuration too.
+    #[serde(default)]
+    pub workers: Option<StatusWorkers>,
+
+    /// The pre-0.4 spelling of [`StatusConfig::listen`].
+    #[serde(default, skip_serializing)]
+    pub address: Option<String>,
+
+    /// The pre-0.4 spelling of [`StatusHealth::unavailable_status`].
+    #[serde(default, skip_serializing)]
+    pub unavailable_status_code: Option<u16>,
+
+    /// The pre-0.4 spelling of [`StatusWorkers::allow`].
+    #[serde(default, skip_serializing)]
+    pub allow_worker_reset: Option<bool>,
+}
+
+/// `/health` and `/ready`: two endpoints on one path pair, both always present.
+///
+/// They answer genuinely different questions and the difference is the one a container orchestrator
+/// acts on: `/health` says the process is alive and should not be restarted, and `/ready` says it
+/// can serve traffic now and should be sent some. A readiness probe that returned 200 while every
+/// worker was still booting is how a rolling deploy sends traffic to a server that answers 502.
+///
+/// Always served rather than opted into, because a `[status]` table that carried no probes would be
+/// an address that answers nothing — and the operator who wrote one is configuring a probe, not an
+/// empty socket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusHealth {
     /// What to answer when the server is not ready. Defaults to 503.
     ///
     /// Configurable because the convention is not universal: Kubernetes reads any non-2xx as "do
     /// not send traffic", while some load balancers are configured to expect 503 specifically and
     /// treat anything else as a failed probe of the probe itself.
     #[serde(default = "default_unavailable_status")]
-    pub unavailable_status_code: u16,
+    pub unavailable_status: u16,
+}
 
-    /// Serve the worker-control routes: `GET /workers` and `POST /workers/{index}/reset`.
-    ///
-    /// **Off, and off is not "not yet documented" — it is the whole safety of the feature.** A `GET`
-    /// is safe to hand to whoever can reach a port; a `POST` that recycles a worker is not. So a
-    /// deployment that configured `[status]` for an orchestrator, and then upgraded, gains no
-    /// mutation surface: the routes do not exist until this says so, and until they say so they are
-    /// a 404 (`/workers`) and a 405 (anything else `POST`ed), not a 403 — an endpoint that exists and
-    /// refuses is an endpoint an attacker can enumerate.
-    ///
-    /// The alternative protection — a token — was considered and not built: the listener is
-    /// configured by whoever runs the process, and the same one-line misconfiguration that exposes
-    /// it to the world would expose the token's own configuration too. What protects this is that it
-    /// does not exist unless asked for, which is `[metrics]`'s rule one table over.
-    #[serde(default)]
-    pub allow_worker_reset: bool,
+/// The worker-control routes, and what they may do.
+///
+/// **A method list rather than a `reset = true` flag**, because the two routes are not equally
+/// dangerous and a deployment that wants to *see* a pool should not have to arm a `POST` to do it.
+/// `allow = ["workers.list"]` publishes the list and answers 404 to a reset; naming `workers.reset`
+/// as well adds the recycle. An empty list is refused: a table that grants nothing is a block an
+/// operator wrote expecting an endpoint, and the honest answer is an error rather than a listener
+/// that answers 404 to a route it was configured for.
+///
+/// The names are the call plane's own — the same `workers.list` a worker would name in `services` —
+/// so one vocabulary describes both surfaces, and the method catalogue that decides what `services`
+/// accepts decides what this accepts.
+///
+/// A wildcard address with `workers.reset` in the list is refused, with the argument the flag used
+/// to get: a `POST` with no authentication that recycles a worker, reachable from anywhere, is a
+/// remote kill switch. A list of `workers.list` alone is legal on any address, because a list of
+/// workers is a fact about this process rather than a lever on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusWorkers {
+    /// The methods these routes may serve: `"workers.list"`, `"workers.reset"`, or both.
+    pub allow: Vec<String>,
 }
 
 fn default_unavailable_status() -> u16 {
     503
+}
+
+/// The probes' defaults, which is what a `[status]` table without a `[status.health]` gets.
+///
+/// A named function rather than `#[derive(Default)]`, because those two are not the same thing
+/// here: `Default` would give `unavailable_status` = `0`, which is not an HTTP status code at all,
+/// and the `#[serde(default)]` on the *field* inside `StatusHealth` would not run for the table
+/// that was defaulted as a whole. The value has to come from one place, and this is it.
+fn default_health() -> StatusHealth {
+    StatusHealth {
+        unavailable_status: default_unavailable_status(),
+    }
 }

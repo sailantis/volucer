@@ -9,18 +9,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`[metrics]` and `[status]` are now one table, `[status]`, on one listener.** The old shape had
+  two top-level tables that each named an address for the same socket, which is two settings for one
+  fact — and the server could only reconcile them by *refusing* a file where they disagreed. It did,
+  and the documented example was such a file: `[metrics] address = "127.0.0.1:2112"` beside
+  `[status] address = "127.0.0.1:2114"` failed to start with "they share one listener". The listener
+  is now named once, and each endpoint exists because its sub-table does:
+
+  ```toml
+  [status]
+  listen = "127.0.0.1:2114"
+
+  [status.health]                      # was: [status] unavailable_status_code
+  unavailable_status = 503
+
+  [status.metrics]                     # was: [metrics]
+  path = "/metrics"
+  prefix = "myapp_"
+  collect.app_orders_total = { type = "counter", help = "Orders the application counted" }
+
+  [status.workers]                     # was: [status] allow_worker_reset = true
+  allow = ["workers.list"]
+  ```
+
+  `[status]` alone is the ordinary deployment — `/health` and `/ready` for an orchestrator, because
+  a `[status]` table that carried no probe would be an address answering nothing. A file written the
+  old way is refused by name rather than by `toml`'s `unknown field 'metrics'`: the setting did not
+  disappear, it moved one table down, and each refusal says which key replaced it.
+- **The worker-control routes are granted per method, and the list can be granted alone.**
+  `[status] allow_worker_reset = true` became `[status.workers] allow = ["workers.list"]`, and the
+  two routes are no longer one switch. `workers.list` publishes `GET /workers` and answers 404 to a
+  reset — a deployment that wants to *see* a pool no longer has to arm a `POST` to do it. Naming
+  `workers.reset` adds the recycle. The names are the call plane's own, so one vocabulary describes
+  both surfaces. The wildcard-address refusal now follows the *method* rather than the table: it
+  fires for `workers.reset`, and a `listen = "0.0.0.0:2114"` that grants only the list is legal,
+  because a list of workers is a fact about the process rather than a lever on it. An empty `allow`,
+  and a name that is not one of the two routes, are both refused at startup.
+- **A `None` worker gate now fails closed.** It documented "`None` means the gate is permanently
+  shut" and then treated it as open, so a listener built without one served both routes. Since the
+  grant is now per method, the gate carries a `WorkerGrant` and `None` grants neither — configuring a
+  mutation route is a positive act, and forgetting to is not consent.
+- **`[status].listen` refuses a `unix:` address.** `parse_listener` accepts that form for every other
+  listener and `RunningStatus` binds a `TcpListener`, so `listen = "unix:/run/volucer/status.sock"`
+  passed `volucer check` and then failed at bind with `invalid port value`. The rustdoc advertised
+  the form. It is now refused when the file is read, with the reason: the listener serves an HTTP
+  readiness probe, a scrape and the worker-control routes, and an orchestrator reaches it by address.
+- **The metrics exposition's path may not shadow one of the listener's own routes.** `path =
+  "/health"`, `"/ready"` or `"/workers"` is refused at startup rather than resolved by whichever arm
+  of the router happens to run first.
 - **The configuration parser is now TOML 1.1** (`toml = "1"`, from `0.8` / TOML 1.0). The feature
   this buys is the one that was most awkward to write by hand: an inline table may now span several
   lines and end with a trailing comma, so a deployment's own metrics read as one block —
   `collect = { app_orders_total = { type = "counter", help = "…" }, … }` — instead of one
-  `[metrics.collect.<name>]` header per metric, four levels deep. Nothing in the *code* changed:
-  `toml::Table`, `Value::Table(..).try_into()` and `de::Error` are the same API, and the whole
-  workspace — 1,389 tests — passed without an edit. Three tests pin the new syntax so a silent pin
-  back to `0.8` cannot pass: one asserts the block parses *and* that its entries reach the
-  registry, one asserts the price of the form — an inline table cannot be extended later **in the
-  same text**, by a header or a dotted key — and one asserts the limit of that rule, that an `-o`
-  pair still adds an entry because it is applied after parsing. `volucer.example.toml` and two
-  documentation pages now show both spellings and say when to pick each.
+  `[status.metrics.collect.<name>]` header per metric, four levels deep. Nothing in the *code*
+  changed: `toml::Table`, `Value::Table(..).try_into()` and `de::Error` are the same API, and the
+  whole workspace passed without an edit. Three tests pin the new syntax so a silent pin back to
+  `0.8` cannot pass: one asserts the block parses *and* that its entries reach the registry, one
+  asserts the price of the form — an inline table cannot be extended later **in the same text**, by a
+  header or a dotted key — and one asserts the limit of that rule, that an `-o` pair still adds an
+  entry because it is applied after parsing. `volucer.example.toml` and two documentation pages now
+  show both spellings and say when to pick each.
 
 ### Fixed
 

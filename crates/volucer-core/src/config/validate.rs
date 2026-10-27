@@ -45,110 +45,209 @@ impl Config {
         // names no key — a startup failure an operator cannot trace back to a line in their file.
         crate::env::check_env_table("server.env", &self.server.env).map_err(Error::Config)?;
 
-        // The metrics and status listeners are validated here even though they are not `server.*`,
-        // because a *typo* in an address is a configuration mistake and belongs in the same message
-        // as every other one — `volucer check` reports it before anything tries to bind, rather than
-        // the server failing to start with a bind error after the worker pools are already up.
+        // The status listener is validated here even though it is not `server.*`, because a *typo*
+        // in an address is a configuration mistake and belongs in the same message as every other
+        // one — `volucer check` reports it before anything tries to bind, rather than the server
+        // failing to start with a bind error after the worker pools are already up.
         //
-        // Note that neither counts towards the "no listener configured" refusal above: a deployment
-        // with only `[metrics]` would be a process that serves nothing and reports on it.
-        if let Some(metrics) = &self.metrics {
-            parse_listener(&metrics.address)
-                .map_err(|e| Error::Config(format!("metrics.address: {e}")))?;
-            if !metrics.path.starts_with('/') {
-                return Err(Error::Config(format!(
-                    "metrics.path {:?} must start with '/', e.g. \"/metrics\"",
-                    metrics.path
-                )));
-            }
-            if let Some(prefix) = &metrics.prefix {
-                if !is_metric_name_prefix(prefix) {
-                    return Err(Error::Config(format!(
-                        "metrics.prefix {prefix:?} is not a valid metric name prefix; letters, \
-                         digits and underscores only, e.g. \"myapp_\""
-                    )));
-                }
-            }
-            // A collected name is validated as a *whole* metric name rather than as a prefix, and the
-            // two rules are not the same: a prefix may be empty and may not begin with a digit, while
-            // a name may do neither. A name that broke the rule would still be registered and still
-            // render — as a line Prometheus cannot parse, which drops the whole family and every
-            // family after it. That is silent, so it is refused here instead.
-            for (name, metric) in &metrics.collect {
-                if !is_metric_name(name) {
-                    return Err(Error::Config(format!(
-                        "metrics.collect.{name}: {name:?} is not a valid metric name; it must match \
-                         [a-zA-Z_][a-zA-Z0-9_]*, e.g. \"app_orders_total\""
-                    )));
-                }
-                // The `rr_` namespace is this server's own. An application metric landing there
-                // would collide with a metric an operator's dashboard already has, or silently
-                // replace it, and the failure would be a graph that means two different things over
-                // time. Refused rather than prefixed, because a prefix would make the name in the
-                // application's `emitMetric` and the name in the graph differ, which is a worse
-                // surprise than an error at startup.
-                if name.starts_with("rr_") {
-                    return Err(Error::Config(format!(
-                        "metrics.collect.{name}: names beginning with \"rr_\" are this server's own \
-                         metrics, so an application metric may not claim one; pick another name"
-                    )));
-                }
-                if metric.help.trim().is_empty() {
-                    return Err(Error::Config(format!(
-                        "metrics.collect.{name}: `help` must not be empty; it is the line a reader \
-                         sees six months from now, and a metric without one is a bare name"
-                    )));
-                }
-                // Buckets on a kind that has no buckets is a setting read by nothing, which is the
-                // failure mode `spawn_fpm` was removed for: it looks supported and cannot work.
-                if !metric.buckets.is_empty() && metric.kind != CollectedKind::Histogram {
-                    return Err(Error::Config(format!(
-                        "metrics.collect.{name}: `buckets` is only meaningful for a histogram, and \
-                         this one is declared as a {:?}; remove the key or change the type",
-                        metric.kind
-                    )));
-                }
-                // A bucket that is not a number, or a negative one, is a histogram whose `le` label
-                // would be unparseable. Non-finite is checked as well because TOML lets `inf` and
-                // `nan` be written and neither is a bound.
-                if let Some(bad) = metric.buckets.iter().find(|b| !b.is_finite() || **b < 0.0) {
-                    return Err(Error::Config(format!(
-                        "metrics.collect.{name}: the bucket bound {bad} is not a finite, \
-                         non-negative number"
-                    )));
-                }
-            }
-        }
+        // Note that it does not count towards the "no listener configured" refusal above: a
+        // deployment with only `[status]` would be a process that serves nothing and reports on it.
         if let Some(status) = &self.status {
-            parse_listener(&status.address)
-                .map_err(|e| Error::Config(format!("status.address: {e}")))?;
-            if !(100..=599).contains(&status.unavailable_status_code) {
+            if status.address.is_some() {
+                return Err(Error::Config(
+                    "[status] address was replaced by [status] listen in 0.4.0, because the \
+                     readiness probe, the metrics exposition and the worker-control routes are \
+                     paths on one listener: write `[status]` + `listen = \"...\"` (address is no \
+                     longer read)"
+                        .to_string(),
+                ));
+            }
+            if status.unavailable_status_code.is_some() {
+                return Err(Error::Config(
+                    "[status] unavailable_status_code moved to [status.health] \
+                     unavailable_status in 0.4.0, where the probes it applies to are named"
+                        .to_string(),
+                ));
+            }
+            if status.allow_worker_reset.is_some() {
+                return Err(Error::Config(
+                    "[status] allow_worker_reset was replaced by [status.workers] allow in 0.4.0, \
+                     which names the methods the routes may serve: `allow = [\"workers.list\"]` \
+                     publishes the list and `allow = [\"workers.list\", \"workers.reset\"]` adds \
+                     the recycle (allow_worker_reset is no longer read)"
+                        .to_string(),
+                ));
+            }
+            if status.listen.is_empty() {
+                return Err(Error::Config(
+                    "[status] has no `listen`, so the listener has no address; write e.g. \
+                     listen = \"127.0.0.1:2114\""
+                        .to_string(),
+                ));
+            }
+            // TCP only, and refused by name rather than left to fail at bind. The listener is a
+            // `TcpListener` and always has been, so the `unix:` form `parse_listener` accepts for
+            // the other listeners is one this table cannot honour — and a settings file that passes
+            // `check` and cannot start is the failure mode `volucer check` exists to prevent.
+            match parse_listener(&status.listen)
+                .map_err(|e| Error::Config(format!("status.listen: {e}")))?
+            {
+                Listener::Tcp(_) => {}
+                Listener::Unix(_) => {
+                    return Err(Error::Config(format!(
+                        "status.listen is {}, and the status listener is TCP only — it serves a \
+                         readiness probe, a scrape and the worker-control routes over HTTP, and an \
+                         orchestrator reaches it by address; write a host:port",
+                        status.listen
+                    )));
+                }
+            }
+            if !(100..=599).contains(&status.health.unavailable_status) {
                 return Err(Error::Config(format!(
-                    "status.unavailable_status_code {} is not an HTTP status code",
-                    status.unavailable_status_code
+                    "status.health.unavailable_status {} is not an HTTP status code",
+                    status.health.unavailable_status
                 )));
             }
-            // The mutation routes recycle a worker, so they are worth a refusal rather than a
-            // warning on the one address that makes them reachable from anywhere. A loopback
-            // address is not proof of safety — a container's loopback is the container's — but a
-            // wildcard bind is proof of the opposite, and an operator who wrote one while setting
-            // this flag has almost certainly not meant to. The hint names the fix rather than
-            // restating the rule.
-            if status.allow_worker_reset {
-                let listener = parse_listener(&status.address)
-                    .map_err(|e| Error::Config(format!("status.address: {e}")))?;
-                let broad = match &listener {
-                    Listener::Tcp(address) => address.ip().is_unspecified(),
-                    Listener::Unix(_) => false,
-                };
-                if broad {
+            if let Some(metrics) = &status.metrics {
+                if !metrics.path.starts_with('/') {
                     return Err(Error::Config(format!(
-                        "status.allow_worker_reset is set and status.address is {}, which binds \
-                         every interface; POST /workers/{{index}}/reset recycles a worker and has \
-                         no authentication, so give [status] a loopback or private address and \
-                         reach it through the orchestrator's own network",
-                        status.address
+                        "status.metrics.path {:?} must start with '/', e.g. \"/metrics\"",
+                        metrics.path
                     )));
+                }
+                if let Some(prefix) = &metrics.prefix {
+                    if !is_metric_name_prefix(prefix) {
+                        return Err(Error::Config(format!(
+                            "status.metrics.prefix {prefix:?} is not a valid metric name prefix; \
+                             letters, digits and underscores only, e.g. \"myapp_\""
+                        )));
+                    }
+                }
+                // The exposition path may not collide with a probe: two endpoints on one listener
+                // that answer one path would make one of them unreachable, and which one won would
+                // be decided by the order of the arms in `answer` rather than by the file.
+                if matches!(metrics.path.as_str(), "/health" | "/ready" | "/workers") {
+                    return Err(Error::Config(format!(
+                        "status.metrics.path is {:?}, which is one of this listener's own routes; \
+                         the exposition needs a path of its own",
+                        metrics.path
+                    )));
+                }
+                if let Some(exposed) = metrics.path.strip_prefix("/workers/") {
+                    if !exposed.is_empty() {
+                        return Err(Error::Config(format!(
+                            "status.metrics.path is {:?}, which is inside the worker-control \
+                             route's own prefix; the exposition needs a path of its own",
+                            metrics.path
+                        )));
+                    }
+                }
+                // A collected name is validated as a *whole* metric name rather than as a prefix, and the
+                // two rules are not the same: a prefix may be empty and may not begin with a digit, while
+                // a name may do neither. A name that broke the rule would still be registered and still
+                // render — as a line Prometheus cannot parse, which drops the whole family and every
+                // family after it. That is silent, so it is refused here instead.
+                for (name, metric) in &metrics.collect {
+                    if !is_metric_name(name) {
+                        return Err(Error::Config(format!(
+                            "status.metrics.collect.{name}: {name:?} is not a valid metric name; it \
+                             must match [a-zA-Z_][a-zA-Z0-9_]*, e.g. \"app_orders_total\""
+                        )));
+                    }
+                    // The `rr_` namespace is this server's own. An application metric landing there
+                    // would collide with a metric an operator's dashboard already has, or silently
+                    // replace it, and the failure would be a graph that means two different things over
+                    // time. Refused rather than prefixed, because a prefix would make the name in the
+                    // application's `emitMetric` and the name in the graph differ, which is a worse
+                    // surprise than an error at startup.
+                    if name.starts_with("rr_") {
+                        return Err(Error::Config(format!(
+                            "status.metrics.collect.{name}: names beginning with \"rr_\" are this \
+                             server's own metrics, so an application metric may not claim one; pick \
+                             another name"
+                        )));
+                    }
+                    if metric.help.trim().is_empty() {
+                        return Err(Error::Config(format!(
+                            "status.metrics.collect.{name}: `help` must not be empty; it is the line \
+                             a reader sees six months from now, and a metric without one is a bare \
+                             name"
+                        )));
+                    }
+                    // Buckets on a kind that has no buckets is a setting read by nothing, which is the
+                    // failure mode `spawn_fpm` was removed for: it looks supported and cannot work.
+                    if !metric.buckets.is_empty() && metric.kind != CollectedKind::Histogram {
+                        return Err(Error::Config(format!(
+                            "status.metrics.collect.{name}: `buckets` is only meaningful for a \
+                             histogram, and this one is declared as a {:?}; remove the key or change \
+                             the type",
+                            metric.kind
+                        )));
+                    }
+                    // A bucket that is not a number, or a negative one, is a histogram whose `le` label
+                    // would be unparseable. Non-finite is checked as well because TOML lets `inf` and
+                    // `nan` be written and neither is a bound.
+                    if let Some(bad) = metric.buckets.iter().find(|b| !b.is_finite() || **b < 0.0) {
+                        return Err(Error::Config(format!(
+                            "status.metrics.collect.{name}: the bucket bound {bad} is not a finite, \
+                             non-negative number"
+                        )));
+                    }
+                }
+            }
+            if let Some(workers) = &status.workers {
+                // An empty list is a table an operator wrote expecting an endpoint. Answering 404 to
+                // the route it configured would be the "looks supported and cannot work" failure,
+                // and the fix is either a name or no table at all.
+                if workers.allow.is_empty() {
+                    return Err(Error::Config(
+                        "[status.workers] has an empty `allow`, so it turns on nothing; name the \
+                         methods the routes may serve — allow = [\"workers.list\"] for the list \
+                         alone, or add \"workers.reset\" — or remove the table"
+                            .to_string(),
+                    ));
+                }
+                let mut mutating = false;
+                for method in &workers.allow {
+                    match method.as_str() {
+                        // The two routes this listener has, by the names the call plane uses, so one
+                        // vocabulary describes both surfaces.
+                        "workers.list" => {}
+                        "workers.reset" => mutating = true,
+                        other => {
+                            return Err(Error::Config(format!(
+                                "status.workers.allow contains {other:?}, which is not a route this \
+                                 listener serves; the two are \"workers.list\" (GET /workers) and \
+                                 \"workers.reset\" (POST /workers/{{index}}/reset)"
+                            )));
+                        }
+                    }
+                }
+                // The mutation routes recycle a worker, so they are worth a refusal rather than a
+                // warning on the one address that makes them reachable from anywhere. A loopback
+                // address is not proof of safety — a container's loopback is the container's — but a
+                // wildcard bind is proof of the opposite, and an operator who wrote one while
+                // granting a reset has almost certainly not meant to. The hint names the fix rather
+                // than restating the rule.
+                //
+                // The *list* route alone is legal anywhere: what it publishes is a fact about this
+                // process, and it is already reachable by whoever can reach a status port.
+                if mutating {
+                    let broad = match parse_listener(&status.listen)
+                        .map_err(|e| Error::Config(format!("status.listen: {e}")))?
+                    {
+                        Listener::Tcp(address) => address.ip().is_unspecified(),
+                        Listener::Unix(_) => false,
+                    };
+                    if broad {
+                        return Err(Error::Config(format!(
+                            "status.workers.allow names \"workers.reset\" and status.listen is {}, \
+                             which binds every interface; POST /workers/{{index}}/reset recycles a \
+                             worker and has no authentication, so give [status] a loopback or \
+                             private address and reach it through the orchestrator's own network",
+                            status.listen
+                        )));
+                    }
                 }
             }
         }
@@ -637,6 +736,15 @@ impl Config {
             ));
         }
 
+        if self.legacy_metrics.is_some() {
+            return Err(Error::Config(
+                "[metrics] moved into [status] in 0.4.0, because it is a set of paths on the same \
+                 listener the readiness probe uses: write `[status]` + `listen = \"...\"` and \
+                 `[status.metrics]` with `path`, `prefix` and `collect` (the top-level table is no \
+                 longer read)"
+                    .to_string(),
+            ));
+        }
         match &self.server.default_backend {
             None => {
                 // Backends without a `default_backend` is a typo: nothing could

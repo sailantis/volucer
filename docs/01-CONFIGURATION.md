@@ -26,8 +26,11 @@ span several lines and end with a trailing comma, so a table of application metr
 one block:
 
 ```toml
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2114"
+
+[status.metrics]
+path = "/metrics"
 
 collect = {
     app_orders_total = {
@@ -38,14 +41,14 @@ collect = {
 }
 ```
 
-rather than one `[metrics.collect.<name>]` header per metric. Both spellings mean the same
+rather than one `[status.metrics.collect.<name>]` header per metric. Both spellings mean the same
 thing, and are freely mixed across files.
 
 **An inline table is closed in the text that writes it.** A `collect = { … }` cannot be
-continued in the same file — neither by a later `[metrics.collect.x]` header nor by a dotted
+continued in the same file — neither by a later `[status.metrics.collect.x]` header nor by a dotted
 key — and the parser says so: "cannot extend value of type inline table". An `-o` override is
 *not* affected: it is laid onto the parsed table, where nothing is inline any more, so
-`-o metrics.collect.x.type=counter` adds an entry either way. Use headers when the file
+`-o status.metrics.collect.x.type=counter` adds an entry either way. Use headers when the file
 itself has to grow the table in more than one place.
 
 **Editor tooling has to be told the version.** Taplo — which backs the *Even Better TOML*
@@ -148,8 +151,7 @@ expansion, so it reports the configuration Volucer would actually use.
 | `backends` | table of tables | empty | The named backends. See [Backends](02-BACKENDS.md). |
 | `sites` | table of tables | empty | Per-host applications. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `server` | table | all defaults | Listeners, paths and HTTP behaviour. |
-| `metrics` | table | absent | The Prometheus endpoint. Absent means no endpoint. |
-| `status` | table | absent | The health and worker-control endpoint. Absent means no endpoint. |
+| `status` | table | absent | The status listener: readiness, metrics and worker routes. Absent means no endpoint. |
 | `telemetry` | table | absent | OTLP trace export. Absent means no export. |
 | `kv` | table of tables | empty | Named key-value storages. |
 | `lock` | table | absent | The lock backend. |
@@ -166,8 +168,9 @@ Some features are enabled by the presence of their table. They do not need an
 | `[server.acme]` | Automatic certificates (`enabled` inside it defaults to `true`) |
 | `[server.access_log]` | Access logging |
 | `[server.rate_limit]` | Rate limiting |
-| `[metrics]` | The Prometheus endpoint |
-| `[status]` | The health endpoint |
+| `[status]` | The status listener, and therefore `/health` and `/ready` |
+| `[status.metrics]` | The Prometheus exposition (`/health` and `/ready` stay as they were) |
+| `[status.workers]` | The worker-control routes |
 | `[telemetry]` | OTLP trace export |
 | `[lock]` | The lock backend |
 | `[jobs]` | Queues |
@@ -676,16 +679,30 @@ shutdown and is not restarted.
 | `ca` | path | absent | A CA bundle. Public roots are used when absent. |
 | `sni` | string | absent | The server name to send. |
 
-## `[metrics]`
+## `[status]`
+
+One listener, and three sets of routes whose presence is decided by the sub-tables the file carries
+— the same convention `[server.tls]` follows.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `address` | string | **required** | Where the Prometheus endpoint listens. |
+| `listen` | string | **required** | Where the listener binds. TCP only: `127.0.0.1:2114`. |
+
+`[status.health]` — `GET /health` and `GET /ready`. Always served.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `unavailable_status` | integer | `503` | The code `/ready` returns when the server is not ready. |
+
+`[status.metrics]` — the Prometheus exposition, at `path`. Absent means no metrics endpoint at all.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
 | `path` | string | `"/metrics"` | The endpoint path. |
 | `prefix` | string | absent | A prefix for the metric names. |
 | `collect` | table of tables | empty | The metrics to collect. |
 
-`[metrics.collect.<name>]`:
+`[status.metrics.collect.<name>]`:
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -697,34 +714,48 @@ shutdown and is not restarted.
 than accepting an unused setting.
 
 `collect` may be written as headers or as one inline table. **The inline form is closed in the
-text that writes it**: a later `[metrics.collect.<name>]` header, or a dotted key inside the
+text that writes it**: a later `[status.metrics.collect.<name>]` header, or a dotted key inside the
 same table, is a parse error ("cannot extend value of type inline table"). Overrides are not
-affected — `-o metrics.collect.<name>.type=…` is applied after parsing, so it adds an entry to
-either spelling.
+affected — `-o status.metrics.collect.<name>.type=…` is applied after parsing, so it adds an entry
+to either spelling.
 
-## `[status]`
+`[status.workers]` — `GET /workers` and `POST /workers/{index}/reset`. Absent means neither exists.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `address` | string | **required** | Where the status endpoint listens. |
-| `unavailable_status_code` | integer | `503` | The code returned when the server is not ready. |
-| `allow_worker_reset` | bool | `false` | Expose the worker-control routes. |
+| `allow` | array of strings | **required** | The methods the routes may serve. |
 
-**`allow_worker_reset` does not enable authentication.** Worker-control routes do not
-exist unless this option is enabled, and requests to them otherwise return 404. Volucer
-also rejects this option when `address` is a wildcard. An unauthenticated request that
-recycles workers could otherwise act as a remote kill switch. Bind `[status]` to
-loopback or a private interface and expose it only to your orchestrator, or leave the
-option disabled.
+The two names are `"workers.list"` (`GET /workers`) and `"workers.reset"`
+(`POST /workers/{index}/reset`). **The list is a grant, not a switch:**
 
-`allow_worker_reset` can be changed in either direction with `SIGHUP`. Disabling it
-removes the routes on the next request, returning 404 without restarting the server.
-Enabling it during a reload is subject to the same wildcard-address validation as at
-startup. The `[status]` `address` cannot be reloaded because its socket is already bound.
+```toml
+[status]
+listen = "127.0.0.1:2114"
 
-`volucer health` reads the probe address from this table, so you do not need to specify
-the port again. In a container, a wildcard listener is common; the health command probes
-it through loopback. See [Health checks](11-OPERATIONS.md#health-checks).
+[status.workers]
+allow = ["workers.list"]     # read the pool, and nothing that mutates it
+```
+
+A deployment that wants to *see* a pool should not have to arm a `POST` to do it, so
+`workers.list` alone publishes the list and answers `404` to a reset. Naming both adds the recycle.
+An empty `allow` is refused: a table that grants nothing is a block an operator wrote expecting an
+endpoint.
+
+**Neither route authenticates.** What protects the recycle is that it does not exist until the file
+grants it, and until then `/workers/{i}/reset` answers `405` — not `403`, because an endpoint that
+exists and refuses is an endpoint an attacker can enumerate. Volucer refuses `workers.reset` when
+`listen` is a wildcard address; `workers.list` alone is legal on any address, because a list of
+workers is a fact about the process rather than a lever on it. Bind `[status]` to loopback or a
+private interface and expose it only to your orchestrator.
+
+`allow` can be changed in either direction with `SIGHUP`. Removing a method makes its route a `404`
+on the next request without restarting the server. Adding `workers.reset` during a reload is subject
+to the same wildcard-address refusal as at startup. `[status] listen` cannot be reloaded because its
+socket is already bound.
+
+`volucer health` reads the address from `listen`, so you do not need to specify the port again. In a
+container, a wildcard listener is common; the health command probes it through loopback. See
+[Health checks](11-OPERATIONS.md#health-checks).
 
 ## `[telemetry]`
 
@@ -760,7 +791,7 @@ listener.
 | `idle_timeout_seconds` | integer | `300` | Close a connection this long after its last call. `0` is refused. |
 | `call_timeout_seconds` | integer | `10` | A per-call deadline. `0` is refused. |
 
-Unlike `[metrics]` and `[status]`, this table alone is not enough: at least one backend must
+Unlike `[status]`, this table alone is not enough: at least one backend must
 also grant something in its `services`, or the listener would refuse every call. Volucer
 refuses either half alone, and names the key the file is missing.
 
@@ -907,11 +938,11 @@ backend = "api"
 hosts = ["shop.example.com"]
 document_root = "./shop/public"
 
-[metrics]
-address = "127.0.0.1:2112"
-
 [status]
-address = "127.0.0.1:2114"
+listen = "127.0.0.1:2114"
+
+[status.metrics]
+path = "/metrics"
 
 [telemetry]
 endpoint = "http://127.0.0.1:4318"

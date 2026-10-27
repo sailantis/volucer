@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use volucer_core::config::{
-    BackendConfig, Config, KvStorageConfig, LockConfig, MetricsConfig, PipelineConfig, RouteConfig,
+    BackendConfig, Config, KvStorageConfig, LockConfig, PipelineConfig, RouteConfig,
 };
 use volucer_fcgi::{cgi, Request, Response};
 
@@ -432,7 +432,10 @@ impl std::fmt::Debug for JobsPlane {
 ///
 /// Idempotent, because the registry is. Names are assumed valid: `Config::validate` has refused
 /// anything the exposition could not parse, and a second check here would be a rule written twice.
-pub fn describe_collected(registry: &volucer_metrics::Registry, metrics: &MetricsConfig) {
+pub fn describe_collected(
+    registry: &volucer_metrics::Registry,
+    metrics: &volucer_core::config::StatusMetrics,
+) {
     use volucer_core::config::CollectedKind;
     use volucer_metrics::Kind;
 

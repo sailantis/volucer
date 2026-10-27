@@ -198,20 +198,17 @@ pub struct StatusServices {
     /// listener does not have to depend on `hyper` to say a number. Validation has already refused
     /// anything outside `100..=599`, and the conversion below is where that promise is spent.
     pub unavailable_status: u16,
-    /// The worker-control routes, or `None` to serve none of them.
+    /// The worker-control routes' implementation, or `None` to serve none of them.
     ///
-    /// `None` for a deployment that did not set `[status] allow_worker_reset`, which is every
-    /// deployment until one asks. The routes then do not exist: `/workers` is the same 404 as any
-    /// other unserved path, and a `POST` anywhere is a 405.
-    ///
-    /// **`None` is also what a deployment with no worker pool gets**, and the gate is what makes the
-    /// two distinguishable: see [`StatusServices::reset_gate`]. This field answers "is there a pool to
-    /// control", the gate answers "may a caller reach it right now".
+    /// This is `None` exactly when the process has no worker pool: there is nothing to list, and
+    /// `/workers` would be an empty array that looks like a pool with no workers. Whether a grant of
+    /// `[status.workers]` reaches it is [`StatusServices::reset_gate`]'s answer, asked per request —
+    /// this field answers "is there a pool to control", the gate answers "may a caller reach it now".
     pub workers: Option<Arc<dyn WorkerControl>>,
-    /// Whether the worker-control routes answer at all.
+    /// Which worker-control routes answer.
     ///
-    /// Separated from [`StatusServices::workers`] so `[status] allow_worker_reset` can be turned off
-    /// by a reload without dropping the pool handle — and turned on only for a deployment that has a
+    /// Separated from [`StatusServices::workers`] so `[status.workers] allow` can be changed by a
+    /// reload without dropping the pool handle — and turned on only for a deployment that has a
     /// pool, which `workers` already encodes. `None` means the gate is permanently shut, which is what
     /// a listener built by a caller that never mentioned it gets.
     pub reset_gate: Option<Arc<WorkerResetGate>>,
@@ -244,59 +241,94 @@ impl std::fmt::Debug for StatusServices {
             .field("workers", &self.workers.is_some())
             .field(
                 "reset_gate",
-                &self.reset_gate.as_ref().map(|gate| gate.is_open()),
+                &self.reset_gate.as_ref().map(|gate| gate.routes()),
             )
             .finish()
     }
 }
 
-/// Whether the worker-control routes answer at all.
+/// Whether each worker-control route answers at all.
 ///
-/// **A live gate rather than a construction-time `Option`**, so `[status] allow_worker_reset` can be
-/// turned on and off by a reload. The safety property is unchanged and still the point: while the
-/// gate is shut the routes *do not exist* — `/workers` is a 404 and a `POST` anywhere is a 405, not a
-/// 403 — so an endpoint never appears just because somebody edited a file and signalled. What the
-/// gate adds is the other direction: an operator who turned it on and then wants it gone no longer
-/// has to restart a serving process to close an unauthenticated mutation surface.
+/// **A live gate rather than a construction-time `Option`**, so `[status.workers] allow` can be
+/// changed by a reload. The safety property is unchanged and still the point: while a method is not
+/// granted its route *does not exist* — `/workers` is a 404 and a `POST /workers/{i}/reset` is a 405,
+/// not a 403 — so an endpoint never appears just because somebody edited a file and signalled. What
+/// the gate adds is the other direction: an operator who granted a reset and then wants it gone no
+/// longer has to restart a serving process to close an unauthenticated mutation surface.
+///
+/// **Two methods rather than one boolean**, because the two routes are not equally dangerous. A list
+/// is a fact about this process; a reset is a lever on it. A deployment that wants to *see* a pool
+/// should not have to arm the recycle to do it, and `[status.workers] allow = ["workers.list"]` says
+/// exactly that.
 ///
 /// Deliberately **not** a field of [`StatusServices::workers`]: that is `None` when the deployment
-/// configured no worker pool at all, which is a different answer and must stay a different answer —
-/// a gate cannot conjure a pool. The two are asked in that order, pool first.
+/// configured no worker pool at all, which is a different answer and must stay a different answer — a
+/// gate cannot conjure a pool. The two are asked in that order, pool first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkerGrant {
+    /// `GET /workers`.
+    pub list: bool,
+    /// `POST /workers/{index}/reset`.
+    pub reset: bool,
+}
+
+impl WorkerGrant {
+    /// Both routes, which is what a grant of the whole namespace means.
+    pub const ALL: Self = WorkerGrant {
+        list: true,
+        reset: true,
+    };
+
+    /// Neither, which is what a deployment that never wrote `[status.workers]` gets.
+    pub const NONE: Self = WorkerGrant {
+        list: false,
+        reset: false,
+    };
+
+    /// Whether any route exists, which is the question the listener asks about the surface as a whole.
+    pub fn any(self) -> bool {
+        self.list || self.reset
+    }
+}
+
+/// The live [`WorkerGrant`], in a form a reload can replace.
 #[derive(Debug)]
 pub struct WorkerResetGate {
-    open: Swappable<bool>,
+    open: Swappable<WorkerGrant>,
 }
 
 impl WorkerResetGate {
-    /// A gate that is open — the deployment asked for the routes at startup.
-    pub fn open() -> Self {
+    /// A gate with these routes open — the deployment asked for them at startup.
+    pub fn open(routes: WorkerGrant) -> Self {
         WorkerResetGate {
-            open: Swappable::new(true),
+            open: Swappable::new(routes),
         }
     }
 
-    /// A gate that is shut, which is every deployment until one asks.
+    /// A gate with no route, which is every deployment until one asks.
     pub fn closed() -> Self {
         WorkerResetGate {
-            open: Swappable::new(false),
+            open: Swappable::new(WorkerGrant::NONE),
         }
     }
 
-    /// Whether the routes answer right now.
-    pub fn is_open(&self) -> bool {
+    /// Which routes answer right now.
+    pub fn routes(&self) -> WorkerGrant {
         *self.open.load()
     }
 
-    /// Open or shut the gate, returning what it was.
+    /// Replace the granted routes, returning what they were.
     ///
     /// Whole-or-nothing, and the caller has already validated the configuration it came from — which
-    /// includes the refusal of a wildcard `[status] address` beside this flag. That refusal is what
-    /// makes the *open* direction safe to reach through a reload.
+    /// includes the refusal of a wildcard `[status] listen` beside `workers.reset`. That refusal is
+    /// what makes the *open* direction safe to reach through a reload.
     #[must_use]
-    pub fn set(&self, open: bool) -> bool {
-        *self.open.replace(open)
+    pub fn set(&self, routes: WorkerGrant) -> WorkerGrant {
+        *self.open.replace(routes)
     }
 }
+
+/// The status listener, running on its own thread.
 pub struct RunningStatus {
     shutdown: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -461,16 +493,16 @@ async fn answer(
     // a `POST` has to reach the router at all, and the read-only routes below would answer a `POST` to
     // `/metrics` with the exposition — a body nobody asked for and a status code that says it worked.
     //
-    // The gate is consulted per request rather than baked into `workers`, so `[status]
-    // allow_worker_reset` can be shut — or opened — by a reload. While it is shut the routes do not
-    // exist, which is the same answer a deployment that never asked for them gives.
+    // The gate is consulted per request rather than baked into `workers`, so `[status.workers] allow`
+    // can be changed by a reload. A method the file does not grant does not exist, which is the same
+    // answer a deployment that never asked for it gives.
     if let Some(workers) = &services.workers {
-        if services
+        let grant = services
             .reset_gate
             .as_ref()
-            .is_none_or(|gate| gate.is_open())
-        {
-            if let Some(response) = worker_route(request.method(), path, workers, services).await {
+            .map_or(WorkerGrant::NONE, |gate| gate.routes());
+        if grant.any() {
+            if let Some(response) = worker_route(request.method(), path, workers, grant).await {
                 return response;
             }
         }
@@ -538,26 +570,32 @@ async fn answer(
                 )
             }
         }
-        _ => text(
-            StatusCode::NOT_FOUND,
-            "not found\n".to_string(),
-            "text/plain; charset=utf-8",
-        ),
+        _ => not_found(),
     }
 }
 
-/// The worker-control routes, when the deployment asked for them.
+/// The worker-control routes, for the methods the deployment granted.
 ///
 /// `None` means "this path is not mine", and the caller falls through to the read-only routes. That
 /// is deliberately *not* a 404 from here: `/health` and `/metrics` are still served by the same
 /// listener, so an unmatched path has to be the last word rather than this function's.
+///
+/// **A path this function owns but was not granted a method for is still answered**, and that is the
+/// point of taking [`WorkerGrant`] rather than assuming both. `/workers` with only `workers.reset`
+/// granted is a 404 on `GET` — the route does not exist — but the path is this listener's own, so it
+/// does not silently fall through to a readiness lookup that would answer the same 404 for a
+/// different reason. `/workers/{i}/reset` with only `workers.list` granted answers 405, matching
+/// what an ungranted `POST` has always answered.
 async fn worker_route(
     method: &hyper::Method,
     path: &str,
     workers: &Arc<dyn WorkerControl>,
-    services: &StatusServices,
+    grant: WorkerGrant,
 ) -> Option<Response<Full<Bytes>>> {
     if path == WorkerRoutes::PATH {
+        if !grant.list {
+            return Some(not_found());
+        }
         return Some(match *method {
             hyper::Method::GET => match serde_json::to_value(workers.workers()) {
                 Ok(list) => json(StatusCode::OK, &list),
@@ -583,6 +621,13 @@ async fn worker_route(
     }
 
     let index = WorkerRoutes::reset_index(path)?;
+
+    // A path this listener owns but was not granted a reset for answers 404, and the same answer the
+    // whole route gave before it existed. Decided before the method, so a `GET` to an ungranted reset
+    // path is a 404 rather than the 405 that would tell a caller the route is there.
+    if !grant.reset {
+        return Some(not_found());
+    }
 
     // A `GET` on the reset path is a 405 rather than a 404: the path *is* routed, and the difference
     // is what tells a caller who typed `curl` instead of `curl -XPOST` what they did wrong.
@@ -632,11 +677,19 @@ async fn worker_route(
     // that number is a statement about what "not serving traffic" means to *its* load balancer, and a
     // busy worker is not that. Mixing them would make a retryable `409` arrive as a `503` that takes
     // the whole node out of rotation because one slot was mid-request.
-    let _ = services;
     Some(json(
         status,
         &serde_json::json!({ "error": refusal.to_string(), "index": refusal.index() }),
     ))
+}
+
+/// The listener's own 404, so an ungranted route and an unknown path read the same.
+fn not_found() -> Response<Full<Bytes>> {
+    text(
+        StatusCode::NOT_FOUND,
+        "not found\n".to_string(),
+        "text/plain; charset=utf-8",
+    )
 }
 
 /// A JSON answer, with the length that comes from the body.

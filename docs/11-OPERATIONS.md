@@ -33,7 +33,7 @@ The following settings can be reloaded:
   services to subsequent calls. Files are not watched; changes take effect after a reload.
 - `[server.rate_limit]`, with every tracked caller's bucket carried across when the `key` and
   `header` are unchanged
-- `[status] allow_worker_reset`, in both directions
+- `[status.workers] allow`, in both directions
 
 The following settings require a restart. Volucer reports them during reload:
 
@@ -45,7 +45,7 @@ The following settings require a restart. Volucer reports them during reload:
 | `[server.tls]` `min_version` and `alpn`                 | They are baked into the `rustls` server config the acceptor holds                                                              |
 | `[server.proxy]`                                        | Whose forwarded headers are believed is a statement about this deployment's topology                                           |
 | `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   |
-| `[status]` address                                      | The listener is bound                                                                                                          |
+| `[status]` `listen`                                     | The listener is bound                                                                                                          |
 
 ### A reload is whole-or-nothing
 
@@ -236,15 +236,15 @@ minimal containers that do not include curl; see [Health checks in the image](#h
 `/health` returns 200 while the process is running, even if its services are not ready. Use
 it as a liveness check to decide whether the process should be restarted.
 
-`/ready` returns the configured `unavailable_status_code` (503 by default) until all
+`/ready` returns the configured `unavailable_status` (503 by default) until all
 services report ready. Use it to determine whether the instance should receive traffic.
 
 Both endpoints return 404 for other paths. Bind the status listener to loopback or a private
 interface and restrict access through the deployment network.
 
-`allow_worker_reset` adds worker-control routes to the same listener. See
+`[status.workers] allow` adds worker-control routes to the same listener. See
 [Observability](06-OBSERVABILITY.md#the-worker-control-routes) before turning it on — there
-is no authentication for those routes.
+is no authentication for those routes, and naming `workers.list` alone grants only the read.
 
 ## Docker
 
@@ -323,7 +323,7 @@ docker run --rm -p 8080:8080 -p 9080:9080 -v "$PWD/public:/srv/public:ro" \
         -o server.front_controller=index.php \
         -o backends.app.kind=worker \
         -o "backends.app.command=php /srv/public/worker.php" \
-        -o status.address=0.0.0.0:9080
+        -o status.listen=0.0.0.0:9080
 ```
 
 The image's `ENTRYPOINT` is the Volucer binary. Arguments after the image name replace the
@@ -343,7 +343,7 @@ http = "0.0.0.0:8080"          # not 127.0.0.1: the port has to be reachable fro
 document_root = "/srv/public"
 
 [status]
-address = "0.0.0.0:9080"       # what `docker exec ... health` probes, and what EXPOSE names
+listen = "0.0.0.0:9080"        # what `docker exec ... health` probes, and what EXPOSE names
 ```
 
 Listeners bound to `127.0.0.1` are reachable only within the container's network namespace.
@@ -359,10 +359,9 @@ HEALTHCHECK CMD ["/usr/local/bin/volucer", "health"]
 
 The musl image uses `FROM scratch`, which contains neither a shell nor curl. A shell-based
 health check would therefore fail to run. The `volucer health` command is self-contained and
-returns an exit code suitable for Docker. It reads the listener address from `[status]`, or
-from `[metrics]` if that is the only configured listener. It exits successfully only for a
-2xx response; other statuses, including 404, fail the check. Diagnostic details are written
-to stderr and appear in Docker's health log:
+returns an exit code suitable for Docker. It reads the listener address from `[status]`. It
+exits successfully only for a 2xx response; other statuses, including 404, fail the check.
+Diagnostic details are written to stderr and appear in Docker's health log:
 
 ```sh
 $ docker inspect --format '{{json .State.Health}}' volucer | jq -r '.Log[].Output'

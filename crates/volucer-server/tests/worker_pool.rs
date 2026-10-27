@@ -1389,7 +1389,7 @@ fn a_workers_own_metric_reaches_the_registry() {
     let registry = volucer_metrics::Registry::new();
     // Declared, because the registry refuses a name nobody described — and declaring it here rather
     // than in the pool is the point: a worker publishing a metric is publishing a name the *operator*
-    // has to have decided to accept. The `[metrics] collect` table is what will
+    // has to have decided to accept. The `[status.metrics] collect` table is what will
     // make this a configuration entry rather than a call a test makes by hand.
     registry.describe_histogram(
         "example_request_total",
@@ -1453,23 +1453,27 @@ fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
 /// configuration.
 ///
 /// So this one starts from a `Config` and takes the declaration from it, which is the path
-/// `build_status` takes. If `[metrics.collect]` stops reaching the registry, this fails; the tests
+/// `build_status` takes. If `[status.metrics.collect]` stops reaching the registry, this fails; the tests
 /// above still pass.
 #[test]
 fn a_declared_metric_is_where_an_emitted_sample_lands() {
     let text = r#"
 [server]
 http = "127.0.0.1:8080"
-[metrics]
-address = "127.0.0.1:2112"
+[status]
+listen = "127.0.0.1:2112"
 
-[metrics.collect.example_request_total]
+[status.metrics.collect.example_request_total]
 type = "histogram"
 help = "Requests the example worker counted"
 "#;
     let config = Config::from_toml(text).expect("the configuration parses");
     config.validate().expect("and is valid");
-    let metrics = config.metrics.as_ref().expect("a [metrics] table");
+    let metrics = config
+        .status
+        .as_ref()
+        .and_then(|status| status.metrics.as_ref())
+        .expect("a [status.metrics] table");
 
     let Some(pool) = start(1) else {
         return;
@@ -2246,7 +2250,7 @@ $worker->consume(static function (Job $job, Worker $worker): string|bool|null {{
 
     // The consumer's own telemetry reached the pool's scrape queue rather than being dropped: a job has no
     // response object to carry it, so this is the path that only exists for consumers. The scrape is
-    // asserted to *run*, because a consumer pool that published nothing would be a `[metrics]` table with
+    // asserted to *run*, because a consumer pool that published nothing would be a `[status.metrics]` table with
     // three worker gauges missing and no error anywhere.
     let pool = consumers.pool();
     let registry = volucer_metrics::Registry::new();
@@ -2669,7 +2673,7 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
 /// A pool nobody scrapes still bounds its queue, and still says what it lost.
 ///
 /// **This is the leak, end to end.** `publish_metrics` has one caller — the scrape — so a deployment
-/// with `[server.access_log]` and no `[metrics]` table never drains the worker-metric queue, and an
+/// with `[server.access_log]` and no `[status.metrics]` table never drains the worker-metric queue, and an
 /// earlier version of it grew for the process's life while its documentation claimed the drain bounded
 /// it. The fixture is therefore the deployment in question: a real pool, a real worker emitting samples
 /// on every request, and **no `publish_metrics` call anywhere in the test**.

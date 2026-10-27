@@ -303,7 +303,7 @@ driver = "memory"
 /// lies: an operator copies a block out of it, gets a message about a key that does not exist,
 /// and has no way to tell whether the file is wrong or they are. **Nothing else in the tree
 /// opens this file** — no test, no CI job — so before this, every edit to it was unverified,
-/// including the `[metrics]` and `[status]` tables added alongside it.
+/// including the `[status]` tables added alongside it.
 ///
 /// It is deliberately *not* checked for being complete: a table that the example documents but
 /// nothing else uses would still parse, and asserting on the contents of a comments-heavy file
@@ -388,8 +388,10 @@ fn the_example_configuration_parses_and_validates() {
     // The example documents these two as commented-out defaults, so the check is that the
     // documentation of them survives an edit rather than that they are enabled in it.
     for table in [
-        "# [metrics]",
         "# [status]",
+        "# [status.health]",
+        "# [status.metrics]",
+        "# [status.workers]",
         "# [telemetry]",
         "# [server.env]",
     ] {
@@ -479,12 +481,12 @@ fn the_example_configuration_parses_and_validates() {
          which is the difference between limiting a client and limiting nginx",
         path.display()
     );
-    // And the sentence a deployment needs *before* it decides to skip `[metrics]`: that skipping
+    // And the sentence a deployment needs *before* it decides to skip `[status.metrics]`: that skipping
     // it means nothing drains the worker-metric queue. It was a real leak, and the fix (a cap) is
     // a backstop rather than the intended reason to have the table.
     assert!(
         text.contains("NOTHING DRAINS THE QUEUE"),
-        "{} no longer says that a deployment without [metrics] never drains the worker-metric \
+        "{} no longer says that a deployment without [status.metrics] never drains the worker-metric \
          queue, which is the fact that made the queue a leak",
         path.display()
     );
@@ -497,18 +499,18 @@ fn the_example_configuration_parses_and_validates() {
          work rather than silently detach the log",
         path.display()
     );
-    // And the mutation switch, whose *off* default is the whole safety of the feature: a
+    // And the worker grant, whose *absent* default is the whole safety of the feature: a
     // deployment that configured `[status]` for an orchestrator must be able to read that it has
     // not also gained a way to recycle its workers.
     assert!(
-        text.contains("# allow_worker_reset = true"),
-        "{} no longer documents the [status] allow_worker_reset switch",
+        text.contains("# allow = [\"workers.list\"]"),
+        "{} no longer documents the [status.workers] allow list",
         path.display()
     );
     assert!(
         text.contains("There is no authentication"),
         "{} no longer says that the worker routes are unauthenticated, which is the reason the \
-         flag is off by default",
+         grant is absent by default",
         path.display()
     );
     // And the file driver, whose two facts a reader must find *before* choosing it: that a
