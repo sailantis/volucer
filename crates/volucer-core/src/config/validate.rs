@@ -209,14 +209,23 @@ impl Config {
                 }
                 let mut mutating = false;
                 for method in &workers.allow {
-                    match method.as_str() {
-                        // The two routes this listener has, by the names the call plane uses, so one
-                        // vocabulary describes both surfaces.
-                        "workers.list" => {}
-                        "workers.reset" => mutating = true,
-                        other => {
+                    // Checked against the same catalogue a backend's `services` is, so the two
+                    // surfaces cannot drift about what a method is called — and so a method the call
+                    // plane gained without a route here is refused rather than silently published as
+                    // a name this listener does not serve. The routes this listener has are the
+                    // `workers` namespace's methods, which is the intersection that matters.
+                    match Grant::parse(method) {
+                        Some(Grant::Method { namespace, verb })
+                            if namespace == "workers"
+                                && Method::verbs_of("workers").contains(&verb.as_str()) =>
+                        {
+                            if verb == "reset" {
+                                mutating = true;
+                            }
+                        }
+                        _ => {
                             return Err(Error::Config(format!(
-                                "status.workers.allow contains {other:?}, which is not a route this \
+                                "status.workers.allow contains {method:?}, which is not a route this \
                                  listener serves; the two are \"workers.list\" (GET /workers) and \
                                  \"workers.reset\" (POST /workers/{{index}}/reset)"
                             )));

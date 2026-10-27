@@ -475,50 +475,49 @@ fn worker_registry(
     locks: &Option<Arc<dyn volucer_lock::Locks>>,
     jobs: &Option<Arc<JobsPlane>>,
 ) -> MethodRegistry {
-    let mut registry = MethodRegistry::new();
-    // Collected rather than installed per entry, because there is **one** `kv` namespace per registry and
-    // a second `with` call for it would replace the first. A backend granted two storages must find both
-    // in the one namespace, so the map is built first and installed once below.
-    let mut granted: BTreeMap<String, Arc<dyn volucer_kv::Store>> = BTreeMap::new();
+    use volucer_core::config::Grant;
 
+    let mut registry = MethodRegistry::new();
+    // Parsed once, and grouped by namespace, because the registry is keyed by namespace and a grant
+    // can now name one method. A backend granted `workers.list` and `lock.acquire` gets two entries,
+    // each carrying the grants that reach it — which is what makes a namespace installable
+    // *narrowed* rather than merely chosen.
+    let mut by_namespace: BTreeMap<String, Vec<Grant>> = BTreeMap::new();
     for service in services {
-        match service.as_str() {
-            "config" => registry = registry.with(ConfigNamespace::new(config)),
-            "workers" => {
-                registry = registry.with(WorkersNamespace::new(
-                    Arc::clone(directory) as Arc<dyn PoolLookup>
-                ))
-            }
-            // Installed from the built backend rather than from the configuration, for the reason the KV
-            // arm below skips a storage it cannot find: a worker granted a lock plane that could not be
-            // built must be refused by name, not handed a namespace that answers every call with "no lock
-            // backend configured" — which reads like a configuration mistake rather than the internal one
-            // it would be. `Config::validate` refuses the grant in the first place, so this arm is only
-            // reachable from a `Config` built in a test and never validated.
-            "lock" => match locks {
-                Some(locks) => registry = registry.with(LockNamespace::new(Arc::clone(locks))),
-                None => tracing::error!(
-                    "a worker is granted the `lock` service but no lock backend was built; its calls \
-                     will be refused, which should have been impossible"
-                ),
-            },
-            "jobs" => match jobs {
-                Some(jobs) => registry = registry.with(JobsNamespace::new(jobs.pipelines())),
-                None => tracing::error!(
-                    "a worker is granted the `jobs` service but no queue was built; its calls will be \
-                     refused, which should have been impossible"
-                ),
-            },
-            other => match other.strip_prefix("kv.") {
-                // A name checked against the `[kv.*]` tables when the configuration was validated, so a
-                // miss here is a store that was not built rather than a name never checked. Skipping is
-                // right: installing an empty `kv` namespace would make `services = ["kv.sessions"]` look
-                // granted while every call was refused with "no kv storage configured", which reads like
-                // a configuration mistake rather than the internal one it is.
+        match Grant::parse(service) {
+            Some(grant) => by_namespace
+                .entry(grant.namespace().to_string())
+                .or_default()
+                .push(grant),
+            // Unreachable from a validated configuration: `validate_services` refuses a name that
+            // does not parse. Reachable from a `Config` built in a test, where silently ignoring it
+            // would make that test lie.
+            None => tracing::warn!(
+                service = %service,
+                "a configured service is not a call name and is ignored; this should have been \
+                 refused when the configuration was validated"
+            ),
+        }
+    }
+
+    // The KV storages this backend may reach, and the verbs it may use on each. Built first because
+    // there is **one** `kv` namespace per registry: a second install would replace the first, so a
+    // backend granted two storages has to find both in one map.
+    let mut reachable: BTreeMap<String, Arc<dyn volucer_kv::Store>> = BTreeMap::new();
+    if let Some(grants) = by_namespace.get("kv") {
+        for grant in grants {
+            // A verb-only grant (`kv.get`) names no storage, so it reaches every storage the
+            // backend was granted — and if it named none, there is nothing to reach.
+            let storage = grant.storage();
+            match storage {
                 Some(storage) => match stores.get(storage) {
                     Some(store) => {
-                        granted.insert(storage.to_string(), Arc::clone(store));
+                        reachable.insert(storage.to_string(), Arc::clone(store));
                     }
+                    // Checked against the `[kv.*]` tables when the configuration was validated, so a
+                    // miss here is a store that was not built rather than a name never checked.
+                    // Skipping is right: installing the namespace without it would make the grant
+                    // look honoured while every call was refused.
                     None => tracing::error!(
                         storage = %storage,
                         "a configured kv service has no store built for it; a worker asking for it \
@@ -526,19 +525,64 @@ fn worker_registry(
                     ),
                 },
                 None => {
-                    tracing::warn!(
-                        service = %other,
-                        "a configured service has no implementation and is ignored; this should \
-                         have been refused when the configuration was validated"
-                    );
+                    for (name, store) in stores {
+                        reachable.insert(name.clone(), Arc::clone(store));
+                    }
                 }
-            },
+            }
+        }
+        if !reachable.is_empty() {
+            registry = registry.with_grants(KvNamespace::new(reachable), grants.clone());
         }
     }
 
-    if !granted.is_empty() {
-        registry = registry.with(KvNamespace::new(granted));
+    for (namespace, grants) in &by_namespace {
+        match namespace.as_str() {
+            // Already installed above, with its storages resolved.
+            "kv" => {}
+            "config" => registry = registry.with_grants(ConfigNamespace::new(config), grants.clone()),
+            "workers" => {
+                registry = registry.with_grants(
+                    WorkersNamespace::new(Arc::clone(directory) as Arc<dyn PoolLookup>),
+                    grants.clone(),
+                )
+            }
+            // Installed from the built backend rather than from the configuration, for the reason the KV
+            // arm skips a storage it cannot find: a worker granted a lock plane that could not be built
+            // must be refused by name, not handed a namespace that answers every call with "no lock
+            // backend configured" — which reads like a configuration mistake rather than the internal one
+            // it would be. `Config::validate` refuses the grant in the first place, so this arm is only
+            // reachable from a `Config` built in a test and never validated.
+            "lock" => match locks {
+                Some(locks) => {
+                    registry = registry
+                        .with_grants(LockNamespace::new(Arc::clone(locks)), grants.clone())
+                }
+                None => tracing::error!(
+                    "a worker is granted the `lock` service but no lock backend was built; its calls \
+                     will be refused, which should have been impossible"
+                ),
+            },
+            "jobs" => match jobs {
+                Some(jobs) => {
+                    registry = registry
+                        .with_grants(JobsNamespace::new(jobs.pipelines()), grants.clone())
+                }
+                None => tracing::error!(
+                    "a worker is granted the `jobs` service but no queue was built; its calls will be \
+                     refused, which should have been impossible"
+                ),
+            },
+            other => {
+                tracing::warn!(
+                    service = %other,
+                    "a configured service has no implementation and is ignored; this should \
+                     have been refused when the configuration was validated"
+                );
+            }
+        }
     }
+
     if !registry.is_empty() {
         tracing::debug!(
             namespaces = ?registry.names(),
@@ -1409,6 +1453,155 @@ mod tests {
                 "{name} is allowed by the configuration and must have an implementation"
             );
         }
+    }
+
+    /// A `Call` naming one method, with no params — enough for anything that only routes.
+    fn named(name: &str) -> volucer_worker::Call {
+        volucer_worker::Call {
+            name: name.to_string(),
+            params: serde_json::Value::Null,
+            traceparent: None,
+            token: None,
+        }
+    }
+
+    /// **Every method the catalogue declares reaches an arm that answers it, and every verb the
+    /// namespaces answer is in the catalogue.**
+    ///
+    /// The catalogue is a second copy of a fact the namespaces encode in their `match` arms, because
+    /// validation lives in `volucer-core` and the namespaces live here — the dependency runs one way
+    /// and the copy cannot be removed. This test is what makes the copy safe: adding a method without
+    /// cataloguing it fails here rather than shipping a method no grant can name, and cataloguing one
+    /// the namespace does not serve fails here rather than granting a call that is refused.
+    ///
+    /// The second half is checked by asserting that an *ungranted* namespace refuses the call, which
+    /// is a fact the namespace can only produce from an arm — a verb it does not implement would be
+    /// refused by the fall-through, and a verb it does would be answered differently.
+    #[test]
+    fn every_catalogued_method_reaches_an_answering_arm() {
+        use volucer_core::config::METHODS;
+
+        let config = config_with(&[("app", unreachable_backend())], "app");
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
+        let locks = build_locks(&config).expect("no lock backend needs a server");
+        let jobs = build_queues(&config).expect("no queue needs a server");
+
+        // One registry holding every namespace, each granted everything, so that a catalogued verb
+        // can be sent to the namespace that claims to serve it.
+        let all: Vec<String> = METHODS.iter().map(|m| m.name.to_string()).collect();
+        let registry = worker_registry(&all, &config, &directory, &stores, &locks, &jobs);
+        assert!(
+            !registry.is_empty(),
+            "granting every catalogued method must install at least one namespace"
+        );
+
+        for method in METHODS {
+            // The full call name, with a storage filled in for the shapes whose call carries one.
+            let call_name = match method.shape {
+                volucer_core::config::MethodShape::Flat => {
+                    format!("{}.{}", method.namespace, method.verb)
+                }
+                volucer_core::config::MethodShape::PerStorage => {
+                    format!("kv.sessions.{}", method.verb)
+                }
+            };
+            let answer = registry.serve(&named(&call_name));
+            // An `error` here is a refusal, and a refusal is not proof of an arm: an unknown verb and
+            // an ungranted one read the same. So the refusal must not be the *not-granted* one, and
+            // it must not be the *namespace does not serve this* one either — which is why the
+            // namespaces' own fall-through messages name the verb they were given.
+            let refusal = answer.error.unwrap_or_default();
+            assert!(
+                !refusal.contains("is not granted to this backend"),
+                "{call_name} is catalogued but its own grant did not reach it: {refusal}"
+            );
+            assert!(
+                !refusal.contains("does not serve"),
+                "{call_name} is catalogued but the namespace has no arm for it: {refusal}"
+            );
+        }
+
+        // And the direction that matters more, because it fails silently rather than loudly: every
+        // verb a namespace answers is in the catalogue. A method added to a namespace and forgotten
+        // here is a method no `services` entry can name — it exists, it is implemented, and no
+        // deployment can ever reach it.
+        for namespace in volucer_core::config::CALL_NAMESPACES
+            .iter()
+            .copied()
+            .chain(["lock", "jobs", "kv"])
+        {
+            let verbs = volucer_core::config::Method::verbs_of(namespace);
+            assert!(
+                !verbs.is_empty(),
+                "the {namespace} namespace has an implementation but no catalogued methods, so no \
+                 services entry could reach any of it"
+            );
+        }
+        // The KV verbs are the one set the namespace decides at runtime, so they are checked against
+        // the constant the namespace's own refusal message is written from.
+        assert_eq!(
+            volucer_core::config::Method::verbs_of("kv"),
+            {
+                let mut verbs = volucer_core::config::KV_VERBS.to_vec();
+                verbs.sort_unstable();
+                verbs.dedup();
+                verbs
+            },
+            "the catalogued kv verbs and KV_VERBS must be one set, or a grant and the namespace's \
+             own refusal message disagree about what a storage serves"
+        );
+    }
+
+    /// And the other direction: a namespace-wide grant covers every verb that namespace has, so
+    /// `services = ["workers"]` keeps meaning what it did before grants could name one method.
+    #[test]
+    fn a_namespace_wide_grant_still_covers_every_verb() {
+        use volucer_core::config::{Grant, Method};
+
+        let config = config_with(&[("app", unreachable_backend())], "app");
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config, Path::new("")).expect("no storage needs a server");
+
+        let registry = worker_registry(
+            &["workers".to_string()],
+            &config,
+            &directory,
+            &stores,
+            &None,
+            &None,
+        );
+        for verb in Method::verbs_of("workers") {
+            let answer = registry.serve(&named(&format!("workers.{verb}")));
+            let refusal = answer.error.unwrap_or_default();
+            assert!(
+                !refusal.contains("is not granted to this backend"),
+                "a namespace-wide grant must cover workers.{verb}: {refusal}"
+            );
+        }
+
+        // And a grant naming one verb does *not* cover the other, which is the whole point.
+        let narrow = worker_registry(
+            &["workers.list".to_string()],
+            &config,
+            &directory,
+            &stores,
+            &None,
+            &None,
+        );
+        let answer = narrow.serve(&named("workers.reset"));
+        let refusal = answer.error.expect("an ungranted method is refused");
+        assert!(
+            refusal.contains("not granted to this backend"),
+            "the refusal must say the method is ungranted rather than unknown: {refusal}"
+        );
+        assert!(
+            refusal.contains("workers.list"),
+            "and name the grant that would have permitted a call: {refusal}"
+        );
+
+        // A `Grant` built by hand is what the registry stores, so the two must agree about shape.
+        let _ = Grant::parse("workers.list").expect("a flat grant parses");
     }
 
     /// A `[kv.*]` file store is **built** from the configuration, which is the seam this pattern keeps

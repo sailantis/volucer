@@ -3730,6 +3730,24 @@ fn check(
             "      per-request reset: {}",
             backend.request_scope().describe()
         );
+        // What this backend's application may call, spelled as the file spells it. Printed for every
+        // kind rather than only for those that reach `[rpc]`, because a `worker`'s grants are the
+        // same list and were previously invisible in `check`: the one question a `services` key
+        // raises — "did my narrow grant reach the method I meant" — could only be answered by
+        // reading the source.
+        let services = services_of(backend);
+        if services.is_empty() {
+            println!("      services:          none (this backend may call nothing)");
+        } else {
+            println!("      services:          {}", services.join(", "));
+            // The expansions, so a narrow grant can be compared with what the application will
+            // actually be able to do. A namespace-wide name covers a set, and the set is the thing
+            // an operator is deciding about when they write one.
+            let expanded = expand_services(services);
+            if expanded != *services {
+                println!("      expands to:        {}", expanded.join(", "));
+            }
+        }
         // Concurrency, because it is the first thing an operator tunes and the one place where
         // the answer differs between kinds for a reason that is invisible in the configuration.
         // `external` has no `workers` key at all, and saying so is more useful than leaving the
@@ -4387,6 +4405,67 @@ fn check(
 /// after a child has been forked to serve the connection (1.5 s after start on the bench host),
 /// so on the accept path this would trade a reliable queue for an unreliable gauge. The two
 /// numbers are reported, never acted on.
+/// One backend's `services` list, whichever kind it is.
+///
+/// A free function because `check` prints this for every kind and the list lives in a different field
+/// on each — the same reason [`backend_env_names`] exists rather than a method.
+fn services_of(backend: &volucer_core::config::BackendConfig) -> &[String] {
+    use volucer_core::config::BackendConfig;
+    match backend {
+        BackendConfig::Worker(worker) => &worker.services,
+        BackendConfig::Attach(attach) => &attach.services,
+        BackendConfig::External(external) => &external.services,
+        BackendConfig::SpawnCgi(cgi) => &cgi.services,
+        BackendConfig::Upstream(upstream) => &upstream.services,
+    }
+}
+
+/// What each `services` entry actually permits, method by method.
+///
+/// Printed after the raw list whenever the two differ, which is whenever a namespace-wide or
+/// storage-wide name was used: `"workers"` is one word covering two methods, and the two are exactly
+/// what an operator is deciding about when they write it. A narrow grant expands to itself, so the
+/// line is absent and the display stays quiet for the common case.
+fn expand_services(services: &[String]) -> Vec<String> {
+    use volucer_core::config::{Grant, Method};
+
+    let mut expanded: Vec<String> = Vec::new();
+    for service in services {
+        let Some(grant) = Grant::parse(service) else {
+            expanded.push(service.clone());
+            continue;
+        };
+        match &grant {
+            // `"workers"` — every method the namespace has.
+            Grant::Namespace { namespace } => {
+                let methods: Vec<String> = Method::namespace_wide(namespace)
+                    .map(|method| method.name.to_string())
+                    .collect();
+                if methods.is_empty() {
+                    expanded.push(service.clone());
+                } else {
+                    expanded.extend(methods);
+                }
+            }
+            // `"kv.cache"` — every verb, on that storage. The verbs are shared, so they come from
+            // the constant rather than from a per-storage table that does not exist.
+            Grant::Storage { storage } => {
+                expanded.extend(
+                    volucer_core::config::KV_VERBS
+                        .iter()
+                        .map(|verb| format!("kv.{storage}.{verb}")),
+                );
+            }
+            Grant::Method { .. } | Grant::StorageMethod { .. } => expanded.push(service.clone()),
+        }
+    }
+    // A `services` list cannot repeat a name — validation refuses a duplicate — but an expansion can
+    // arrive at one twice, e.g. `["workers", "workers.list"]`.
+    expanded.sort();
+    expanded.dedup();
+    expanded
+}
+
 /// The variable names a backend's processes receive: `[server.env]` merged with its own `env`.
 ///
 /// Names only, deliberately. The values are the half that must not be printed — an operator pastes

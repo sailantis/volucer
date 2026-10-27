@@ -780,7 +780,7 @@ pub(super) fn validate_redis(
 }
 
 impl Config {
-    /// Whether a name in a backend's `services` list is one this configuration can honour.
+    /// Whether a grant parsed from a backend's `services` list is one this configuration can honour.
     ///
     /// Two shapes, and the second is the one worth explaining: a fixed namespace is always
     /// available (the server's own machinery, [`CALL_NAMESPACES`]), while a KV storage is
@@ -799,22 +799,40 @@ impl Config {
     /// presence of the table, which is why it is not in [`CALL_NAMESPACES`] — a backend granted `"lock"`
     /// with no `[lock]` is a worker that boots, serves traffic, and cannot reach a lock it was told it
     /// had, which is exactly the silent failure the KV case is checked for.
-    pub fn is_a_call_service(&self, service: &str) -> bool {
-        if CALL_NAMESPACES.contains(&service) {
+    ///
+    /// A *verb* grant asks the same question as the namespace it narrows: `"kv.sessions.get"` needs
+    /// the `[kv.sessions]` table just as `"kv.sessions"` does, and `"workers.list"` needs nothing,
+    /// because the pools are the process's rather than the file's.
+    pub fn is_a_call_service(&self, grant: &Grant) -> bool {
+        match grant {
+            Grant::Namespace { namespace } | Grant::Method { namespace, .. } => {
+                self.namespace_is_available(namespace)
+            }
+            Grant::Storage { storage } | Grant::StorageMethod { storage, .. } => {
+                self.kv.contains_key(storage)
+            }
+        }
+    }
+
+    /// Whether the deployment has the machinery one namespace names.
+    ///
+    /// Separated from [`Config::is_a_call_service`] so that a grant's *shape* and the *existence* of
+    /// what it reaches are two questions with two answers, which is what lets the refusal for each
+    /// be different.
+    fn namespace_is_available(&self, namespace: &str) -> bool {
+        if CALL_NAMESPACES.contains(&namespace) {
             return true;
         }
-        if service == "lock" {
+        if namespace == "lock" {
             return self.lock.is_some();
         }
         // `jobs` is a fixed name — a producer names the *pipeline* in the call, not the service — so it is
         // checked against the table's presence for the same reason `lock` is: a worker granted a queue the
         // deployment never configured would boot, serve traffic, and be unable to push anything.
-        if service == "jobs" {
+        if namespace == "jobs" {
             return self.jobs.is_some();
         }
-        match service.strip_prefix("kv.") {
-            Some(storage) => self.kv.contains_key(storage),
-            None => false,
-        }
+        // `kv` on its own names no storage, which is refused rather than resolved — see the doc above.
+        false
     }
 }

@@ -9,6 +9,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`services` can name a method, not only a namespace.** A grant used to hand over a whole
+  namespace: `"workers"` gave a worker both `workers.list` and `workers.reset`, and `"kv.cache"`
+  gave it `get` along with `clear`. Both spellings still work, and a namespace name still grants
+  everything in it, but a backend may now be granted one method:
+
+  ```toml
+  services = ["kv.cache.get", "kv.cache.has", "workers.list"]   # read a cache and see a pool
+  ```
+
+  `volucer check` prints what the list expands to, because a wide name is a decision about a set:
+  `services: workers, kv.cache` beside `expands to: kv.cache.clear, …, workers.reset`. The
+  vocabulary is the one `[status.workers] allow` already uses, so the HTTP routes and the call
+  plane are named the same way. `volucer-core` keeps the catalogue of every method — name,
+  namespace, verb, whether it mutates — and a test in `volucer-server` asserts it agrees with the
+  namespaces' own `match` arms in both directions, so a method added to a namespace without being
+  catalogued fails the build rather than shipping a method no grant can name.
+- **`workers.reset` is refused on a backend that owns no pool.** A reset acts on a pool slot by
+  index, and only a `worker` or an `attach` backend has a pool; an `external`, `spawn_cgi` or
+  `upstream` application has none. The grant was accepted and documented as "an answer nobody
+  wants" — it passed `check`, the application dialled the call plane, and the call could only
+  ever fail. It is now a startup refusal naming the kinds that can take it. `workers.list` is
+  still grantable there and still answers `[]`, because it is a fact about the process rather
+  than a lever on it.
+- **A verb no namespace serves is refused by name, and the message lists the real ones.** This
+  is what caught `lock.steal` — a method the documentation offered and no namespace implemented.
+  A misspelled verb and a version that lacks the feature read identically otherwise, so the
+  refusal names every verb the namespace does have.
+- **`attach` backends now validate their `services` list.** They have one and their registry is
+  built from it, but nothing checked the names, so `services = ["workes"]` passed `check` and
+  granted nothing at all — on the one kind whose workers do get a channel.
+- **`volucer check` prints each backend's `services`.** The list was invisible for a `worker` or
+  `attach` backend, so the question a narrow grant raises — did it reach the method I meant — could
+  only be answered by reading the source.
 - **`[metrics]` and `[status]` are now one table, `[status]`, on one listener.** The old shape had
   two top-level tables that each named an address for the same socket, which is two settings for one
   fact — and the server could only reconcile them by *refusing* a file where they disagreed. It did,

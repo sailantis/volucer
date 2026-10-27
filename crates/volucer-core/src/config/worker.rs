@@ -355,20 +355,45 @@ pub const CALL_NAMESPACES: &[&str] = &[
 ///
 /// **One function for all five backend kinds**, because the rule is one rule and a second copy of
 /// this message is how a fix reaches a `worker` and not an `external`. What differs between the
-/// kinds is only *where the list lives* and which kinds consult it at all — a `worker`'s workers
-/// reach the same namespaces over their channel, and a FastCGI backend's application reaches them
-/// over `[rpc]`.
+/// kinds is *where the list lives*, which kinds consult it at all — a `worker`'s workers reach the
+/// same namespaces over their channel, and a FastCGI backend's application reaches them over
+/// `[rpc]` — and whether the backend owns a **worker pool**, which is the one capability that is not
+/// about configuration at all.
+///
+/// # Three refusals, and the third is why this takes a kind
+///
+/// A name can be wrong in three ways, and they want different sentences: it is not a spelling
+/// any grant has (`"kv..get"`), it is a method this server does not serve (`"workers.restart"`), or
+/// it is a real method that **this backend can never honour**. The third is `workers.reset` on a
+/// backend that owns no pool: only a `worker` or an `attach` backend has one, so a `spawn_cgi`
+/// application granted a reset was a grant documented as useless rather than refused. It is refused
+/// now, by name, and the message says which kinds can take it — because the fix is either to drop
+/// the method from the list or to change the backend's kind, and an operator should not have to
+/// discover that from the source.
 ///
 /// The message names every namespace the deployment actually has, rather than only the rule,
 /// because the failure it prevents is the quiet one: `services = ["kv.session"]` against a
 /// `[kv.sessions]` table is a worker that boots, serves traffic, and cannot reach a cache it was
 /// told it had.
-pub(super) fn validate_services(config: &Config, backend: &str, services: &[String]) -> Result<()> {
+pub(super) fn validate_services(
+    config: &Config,
+    backend: &str,
+    kind: &str,
+    services: &[String],
+) -> Result<()> {
+    let owns_a_pool = owns_a_worker_pool(kind);
     let mut seen = std::collections::BTreeSet::new();
-    for namespace in services {
-        if !config.is_a_call_service(namespace) {
+    for service in services {
+        let Some(grant) = Grant::parse(service) else {
             return Err(Error::Config(format!(
-                "backends.{backend}: services contains {namespace:?}, which is not a namespace the \
+                "backends.{backend}: services contains {service:?}, which is not a call name; \
+                 write a namespace (\"workers\"), a method (\"workers.list\"), a KV storage \
+                 (\"kv.sessions\") or a KV method (\"kv.sessions.get\")"
+            )));
+        };
+        if !config.is_a_call_service(&grant) {
+            return Err(Error::Config(format!(
+                "backends.{backend}: services contains {service:?}, which is not a namespace the \
                  server implements; known namespaces are {known}, a KV storage is named \
                  \"kv.<name>\" — {storages} — locks are reached as \"lock\", which {lock}, and the \
                  queues are reached as \"jobs\", which {jobs}",
@@ -402,13 +427,57 @@ pub(super) fn validate_services(config: &Config, backend: &str, services: &[Stri
                 }
             )));
         }
-        if !seen.insert(namespace) {
+        // A method a *namespace* does not serve at all, which is a spelling mistake rather than a
+        // grant this backend cannot honour. Named separately so the message can list the verbs,
+        // which is the thing an operator needs and cannot guess: `lock.steal` reads like a method
+        // and was documented as one while no namespace implemented it.
+        if let Some(verb) = grant.verb() {
+            let known = Method::verbs_of(grant.namespace());
+            if !known.contains(&verb) {
+                return Err(Error::Config(format!(
+                    "backends.{backend}: services contains {service:?}, and the {namespace} \
+                     namespace does not serve {verb:?}; it serves {known}",
+                    namespace = grant.namespace(),
+                    known = known
+                        .iter()
+                        .map(|verb| format!("\"{verb}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        // And the one capability that is a property of the backend rather than of the file: a pool
+        // to index. Refused rather than documented, because a grant nothing can honour is the
+        // failure this whole allow-list exists to prevent.
+        if !owns_a_pool && grant.covers("workers.reset") {
             return Err(Error::Config(format!(
-                "backends.{backend}: services names {namespace:?} twice"
+                "backends.{backend}: services contains {service:?}, but a `{kind}` backend has no \
+                 worker pool, so `workers.reset` has no index to act on; only a `worker` or an \
+                 `attach` backend owns one. Drop the grant, or grant \"workers.list\" alone if the \
+                 application only needs to see the pools"
+            )));
+        }
+        if !seen.insert(service) {
+            return Err(Error::Config(format!(
+                "backends.{backend}: services names {service:?} twice"
             )));
         }
     }
     Ok(())
+}
+
+/// Whether a backend kind owns a worker pool that `workers.reset` can index.
+///
+/// Only two do, and the reason is the process's shape rather than a preference: `WorkerPool` is what
+/// `Worker` and `Attach` build, because those are the kinds that speak the framed protocol over a
+/// pipe and hold a channel. `external`, `spawn_cgi` and `upstream` hold a FastCGI client pool, a CGI
+/// process pool and a hyper client respectively, and none of them can be told to restart a slot.
+///
+/// This is the same set [`crate::preflight`] uses to warn that `[status.workers]` has nothing behind
+/// it, kept here so the call plane and the status routes cannot disagree about which backends have
+/// a pool.
+pub fn owns_a_worker_pool(kind: &str) -> bool {
+    matches!(kind, "worker" | "attach")
 }
 
 /// How strictly the worker protocol's per-frame `crc32c` is enforced.

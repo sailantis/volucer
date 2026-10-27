@@ -516,7 +516,7 @@ command = "php worker.php"
 | `max_requests` | integer | absent | Recycle a worker after this many requests. |
 | `working_dir` | path | absent | The working directory for the worker. |
 | `env` | table | empty | Extra environment variables for the worker, merged over `[server.env]`. |
-| `services` | array of strings | empty | The services this backend's workers may call. |
+| `services` | array of strings | empty | What this backend's workers may call: a namespace (`"kv.cache"`, `"workers"`), a method (`"workers.list"`, `"kv.cache.get"`) or a verb across storages (`"kv.get"`). See [Services](08-SERVICES.md). |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
 | `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
@@ -548,7 +548,7 @@ instead of starting worker processes.
 | `relay` | string | absent | The relay address. Falls back to `VOLUCER_RELAY_SOCKET`. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
-| `services` | array of strings | empty | The services this backend's workers may call. |
+| `services` | array of strings | empty | What this backend's workers may call: a namespace (`"kv.cache"`, `"workers"`), a method (`"workers.list"`, `"kv.cache.get"`) or a verb across storages (`"kv.get"`). See [Services](08-SERVICES.md). |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
 | `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
@@ -561,7 +561,7 @@ Connect to an already-running FastCGI server, such as `php-fpm`.
 |---|---|---|---|
 | `socket` | string | **required** | The FastCGI address, e.g. `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`. |
 | `max_connections` | integer | absent | How many connections to keep open to the pool. |
-| `services` | array of strings | empty | What this backend's application may reach over `[rpc]`. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
+| `services` | array of strings | empty | What this backend's application may reach over `[rpc]`, by namespace or by method. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
 
 There is no `workers` setting for `external`: the pool is managed separately. Configure
 its size where that server is configured, for example with `pm.max_children` or
@@ -591,7 +591,7 @@ Exactly one of `binary` and `command`:
 | `socket` | string | absent | A socket prefix instead of TCP ports. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
 | `env` | table | empty | Extra environment variables for every slot. |
-| `services` | array of strings | empty | What this backend's application may reach over `[rpc]`. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
+| `services` | array of strings | empty | What this backend's application may reach over `[rpc]`, by namespace or by method. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
 
 Setting `children > 0` enables prefork. For the same concurrency, prefork uses about
 4.5× the memory: child processes inherit the listening socket and OPcache segment, so
@@ -740,6 +740,10 @@ A deployment that wants to *see* a pool should not have to arm a `POST` to do it
 `workers.list` alone publishes the list and answers `404` to a reset. Naming both adds the recycle.
 An empty `allow` is refused: a table that grants nothing is a block an operator wrote expecting an
 endpoint.
+
+These are the same names a backend's `services` list uses, so one vocabulary describes both
+surfaces: `services = ["workers.list"]` gives an application the call and this table gives an
+operator the route.
 
 **Neither route authenticates.** What protects the recycle is that it does not exist until the file
 grants it, and until then `/workers/{i}/reset` answers `405` — not `403`, because an endpoint that

@@ -21,7 +21,7 @@ impl Config {
                 // becoming a worker that boots, serves traffic, and is silently unable to call
                 // anything. A duplicate is refused for the same reason a duplicate key would be:
                 // it means two lines disagree and only one of them is read.
-                validate_services(self, name, &w.services)?;
+                validate_services(self, name, "worker", &w.services)?;
 
                 // The gRPC side of the same rule, in the other direction: a name here decides what
                 // may be *delivered* to this backend's workers. Checked against protobuf's own
@@ -110,7 +110,7 @@ impl Config {
                 // same call plane reached a different way: an `external` backend's application
                 // dials the listener and asks for a namespace by name, and a name this file cannot
                 // honour is a call that would be refused at runtime with no line saying why.
-                validate_services(self, name, &e.services)?;
+                validate_services(self, name, "external", &e.services)?;
                 // `0` is refused rather than read as "unlimited". `max_connections` is an
                 // `Option`, so absent is how "no cap" is spelled; a zero would otherwise be a
                 // backend that can never serve anything, and it would be discovered on the first
@@ -130,6 +130,12 @@ impl Config {
                 // would make the two processes' start order a configuration requirement.
                 // `preflight` warns about a missing path instead.
                 a.validate(name).map_err(Error::Config)?;
+                // **This was missing.** An `attach` backend has a `services` list and its registry is
+                // built from it, but nothing validated the names — so `services = ["workes"]` on the
+                // one kind whose workers do get a channel passed `check` and granted nothing at all,
+                // which is the quiet failure this allow-list exists to prevent. `attach` owns a pool,
+                // like `worker`, so `workers.reset` is grantable here.
+                validate_services(self, name, "attach", &a.services)?;
             }
             BackendConfig::SpawnCgi(c) => {
                 // One call, because the rules are about this table alone: which driver is in
@@ -137,12 +143,12 @@ impl Config {
                 // whether a `socket` is a shape the driver can bind. Kept on the type rather
                 // than here so `spawn_cgi`'s rules are not split across two files.
                 c.validate(name).map_err(Error::Config)?;
-                validate_services(self, name, &c.services)?;
+                validate_services(self, name, "spawn_cgi", &c.services)?;
             }
             BackendConfig::Upstream(u) => {
                 crate::env::check_env_table(&format!("backends.{name}.env"), &u.env)
                     .map_err(Error::Config)?;
-                validate_services(self, name, &u.services)?;
+                validate_services(self, name, "upstream", &u.services)?;
                 // Parsing is also the validation of the `[backends.<n>.tls]` table: the origin and
                 // the table are only meaningful together, so `OriginSpec::parse` takes the table and
                 // refuses one that has no handshake to describe.

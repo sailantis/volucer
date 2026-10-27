@@ -21,13 +21,35 @@ through the worker channel.
 
 ### The names
 
+A grant either names a whole namespace or one method in it. Both spellings work, and a
+method grant is the narrower of the two:
+
 | Name | What it grants |
 |---|---|
-| `kv.<storage>` | One named key-value storage, e.g. `kv.cache` |
-| `lock` | The lock backend |
-| `jobs` | Every queue pipeline |
-| `config` | The deployment's own description, redacted |
-| `workers` | The worker list and the reset call |
+| `kv.<storage>` | Every verb, on one named key-value storage |
+| `kv.<storage>.<verb>` | One verb, on one named storage — e.g. `kv.cache.get` |
+| `kv.<verb>` | One verb, on every storage this backend was granted |
+| `lock` | Every lock method |
+| `lock.<verb>` | One lock method — e.g. `lock.acquire` |
+| `jobs` | Every queue pipeline, producer side |
+| `jobs.<verb>` | One method — e.g. `jobs.push` |
+| `config` | The deployment's own description, redacted. One method: `config.describe` |
+| `workers` | The worker list and the reset |
+| `workers.list` | The list alone |
+| `workers.reset` | The reset alone |
+
+Naming a whole namespace grants every method in it, so `services = ["workers"]` still means
+what it always did. Naming one method grants only that method, which is what makes a
+read-only grant possible: `services = ["kv.cache.get", "kv.cache.has"]` reads a cache
+without the ability to `clear` it.
+
+`volucer check` prints both the list as written and, when the two differ, what it expands to:
+
+```text
+services:          workers, kv.cache
+expands to:        kv.cache.clear, kv.cache.delete, kv.cache.get, kv.cache.getMultiple, ...
+                   workers.list, workers.reset
+```
 
 Key-value access is granted per storage, allowing a deployment to use separate stores for
 different purposes. The lock backend is a single service; individual locks are identified
@@ -38,28 +60,38 @@ over their channel; an `external`, `spawn_cgi` or `upstream` backend reaches the
 `[rpc]`, if one is configured. A backend whose list is empty is granted nothing, and a
 backend that grants nothing is handed no address to dial.
 
-**`config` and `workers` name machinery, not storage, and a deployment without worker pools
-answers them anyway.** `services = ["workers"]` on a CGI backend is accepted by `check`, and
-`workers.list` then *succeeds*, returning `[]` — the call reads the process's pool directory,
-which exists whether or not it holds a pool. Only `workers.reset` can never work there, because
-no index exists to reset. The same is true of `config`, which describes the deployment whatever
-its backends are. So the grant is not an error; it is a grant of an answer nobody wants, and
-`[status.workers]` is the surface to reach for when the goal is to *see* a pool rather than to
-give an application a call plane.
+**`config` and `workers.list` name machinery, not storage, and a deployment without worker
+pools answers them anyway.** `services = ["workers.list"]` on a CGI backend is accepted by
+`check`, and the call then succeeds, returning `[]` — it reads the process's pool directory,
+which exists whether or not it holds a pool. `config.describe` likewise describes the
+deployment whatever its backends are.
+
+**`workers.reset` is a different matter: it is refused on such a backend.** A reset acts on a
+pool slot by index, and only a `worker` or an `attach` backend owns a pool — an `external`,
+`spawn_cgi` or `upstream` application has none, so a reset granted there could never succeed.
+That was previously accepted and documented as a grant of an answer nobody wants; it is now a
+startup refusal naming the kinds that can take it. If the goal is to *see* a pool rather than
+to give an application a call plane, `[status.workers]` is the surface to reach for.
 
 ### Read, and read-write
 
-A namespace is one capability, so `services` grants every method in it. `workers` is the
-pair to know: `workers.list` is an answer, and `workers.reset` kills worker *N* and waits for
-the replacement to finish its handshake. Both arrive together, which is why an application
-that only wants to display a pool should not be granted `workers` at all — and why
-`[status.workers] allow = ["workers.list"]` exists as the narrower way to ask.
+Granting a namespace grants every method in it, which is why the method form exists. `workers`
+is the pair to know: `workers.list` is an answer, and `workers.reset` kills worker *N* and
+waits for the replacement to finish its handshake. `services = ["workers"]` hands over both;
+`services = ["workers.list"]` hands over the first. The same distinction is available to the
+HTTP routes as `[status.workers] allow`, which names the same methods.
 
 The same split runs through the others. `kv` reads with `get`, `has`, `ttl` and `getMultiple`,
 and writes with `set`, `setIfAbsent`, `delete`, `clear` and `setMultiple` — `clear` wiping the
 storage. `lock` answers with `exists` and `holders`, and mutates with `acquire`, `try_acquire`,
 `release`, `release_all` and `update_ttl`. `jobs` reads with `size` and `pipelines`, and writes
 with `push` and `push_batch`.
+
+A method name is checked against a catalogue when the file is read, so a verb no namespace
+serves is a startup failure that lists the verbs that exist — which is the difference between a
+typo and a version that lacks the feature. A call that reaches a namespace but not a granted
+method is refused at call time, and the refusal names the grant the deployment wrote, so an
+application can tell "not granted" from "no such method".
 
 ## The call plane
 

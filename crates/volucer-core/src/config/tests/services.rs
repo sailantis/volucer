@@ -533,3 +533,193 @@ pool_size = 0
     assert!(message.contains("kv.cache.pool_size"), "{message}");
     assert!(message.contains("16"), "and quote the default: {message}");
 }
+
+/// A `services` entry may name a **method**, and the verbs are checked against the catalogue.
+///
+/// The narrow grant is the point of the catalogue: a backend that only needs to read a cache should
+/// not be handed `delete` and `clear` along with `get`. The catalogue is also where a verb no
+/// namespace serves is caught — `lock.steal` reads like a method, was documented as one, and is
+/// implemented nowhere, so a message that lists the real verbs is the difference between a typo and
+/// a missing feature.
+#[test]
+fn a_services_entry_may_name_one_method_and_is_checked_against_the_catalogue() {
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "memory"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["kv.cache.get", "kv.cache.has", "workers.list"]
+"#;
+    Config::from_toml(text)
+        .expect("the file parses")
+        .validate()
+        .expect("verb grants on a table that exists are honoured");
+
+    // A verb no storage serves, which is the `lock.steal` class of mistake.
+    let bad_verb = text.replace("\"kv.cache.get\"", "\"kv.cache.frobnicate\"");
+    let err = Config::from_toml(&bad_verb)
+        .expect("the file still parses")
+        .validate()
+        .expect_err("a verb no namespace serves must be refused");
+    let message = err.to_string();
+    assert!(message.contains("frobnicate"), "{message}");
+    assert!(
+        message.contains("\"get\""),
+        "and list the verbs that do exist, because a typo and a missing feature read the \
+         same otherwise: {message}"
+    );
+
+    // A verb a namespace does not have, on the fixed side. `lock.steal` is the name that was in the
+    // documentation while nothing implemented it.
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[lock]
+driver = "memory"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["lock.steal"]
+"#;
+    let err = Config::from_toml(text)
+        .expect("the file parses")
+        .validate()
+        .expect_err("lock.steal is not a method");
+    let message = err.to_string();
+    assert!(message.contains("steal"), "{message}");
+    assert!(
+        message.contains("release_all"),
+        "and name a verb that does exist: {message}"
+    );
+}
+
+/// **A `workers.reset` grant on a backend with no pool is refused, not documented.**
+///
+/// Only a `worker` or an `attach` backend owns a `WorkerPool`, so a FastCGI application granted a
+/// reset was a grant nothing could honour — it passed `check`, the application dialled the call
+/// plane, and the call could only ever fail. The refusal names the kinds that can take it, because
+/// the fix is either to drop the grant or to change the backend's kind.
+#[test]
+fn a_workers_reset_grant_is_refused_on_a_backend_with_no_pool() {
+    for kind in ["external", "spawn_cgi", "upstream"] {
+        let text = format!(
+            r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[rpc]
+listen = "127.0.0.1:22080"
+[backends.app]
+kind = "{kind}"
+services = ["workers.reset"]
+"#
+        );
+        // Each kind needs its own required key; the grant is what is under test, so the file is
+        // completed only enough for parsing to reach `validate`.
+        let text = match kind {
+            "external" => format!("{text}socket = \"127.0.0.1:9000\"\n"),
+            "spawn_cgi" => format!("{text}command = \"php-cgi\"\n"),
+            _ => format!("{text}origin = \"http://127.0.0.1:3000\"\n"),
+        };
+        let config =
+            Config::from_toml(&text).unwrap_or_else(|err| panic!("the {kind} file parses: {err}"));
+        let message = match config.validate() {
+            Ok(()) => panic!("a {kind} backend must refuse workers.reset"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("no worker pool"),
+            "the {kind} refusal must say why: {message}"
+        );
+        assert!(
+            message.contains("workers.list"),
+            "and name the grant that does work there: {message}"
+        );
+    }
+
+    // And the same grant on a kind that does own a pool is accepted, so the rule follows the
+    // capability rather than the table. No `[rpc]` here: a worker reaches its registry over its own
+    // channel, and `[rpc]` refuses a file where no backend dials it — a rule that is about the
+    // listener rather than about the grant.
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["workers.reset"]
+"#;
+    Config::from_toml(text)
+        .expect("the file parses")
+        .validate()
+        .expect("a worker backend owns a pool, so a reset is grantable");
+}
+
+/// A grant is spelled in one of four ways, and anything else is refused as a spelling rather than
+/// as a namespace that does not exist.
+///
+/// The distinction matters for the message: `"kv..get"` is a typo, while `"workes"` is a name for
+/// something this server does not have, and an operator should be told which mistake they made.
+#[test]
+fn a_grant_is_parsed_into_one_of_four_shapes_or_refused() {
+    use super::super::{is_a_grant_spelling, Grant};
+
+    assert!(is_a_grant_spelling("workers"));
+    assert!(is_a_grant_spelling("workers.list"));
+    assert!(is_a_grant_spelling("kv.sessions"));
+    assert!(is_a_grant_spelling("kv.sessions.get"));
+    assert!(is_a_grant_spelling("kv.get"));
+    assert!(!is_a_grant_spelling(""));
+    assert!(!is_a_grant_spelling("kv..get"));
+    assert!(!is_a_grant_spelling("kv.sessions.get.extra"));
+
+    // `kv.get` is a verb across storages; `kv.sessions` is a storage. The fixed verb set is what
+    // tells them apart, and the alternative — reading `kv.get` as a storage called `get` — is a
+    // grant nobody writes on purpose.
+    assert_eq!(
+        Grant::parse("kv.get"),
+        Some(Grant::Method {
+            namespace: "kv".to_string(),
+            verb: "get".to_string()
+        })
+    );
+    assert_eq!(
+        Grant::parse("kv.sessions"),
+        Some(Grant::Storage {
+            storage: "sessions".to_string()
+        })
+    );
+
+    // And a narrow grant covers its call and not its neighbours, which is the whole reason a grant
+    // is parsed rather than compared as a string.
+    let get = Grant::parse("kv.cache.get").expect("parses");
+    assert!(get.covers("kv.cache.get"));
+    assert!(!get.covers("kv.cache.set"), "read must not imply write");
+    assert!(
+        !get.covers("kv.other.get"),
+        "and must not reach another storage"
+    );
+
+    // The verb-across-storages shape covers `kv.<storage>.<verb>` and nothing longer, so a name that
+    // is not a call at all cannot be reached through it.
+    let any_get = Grant::parse("kv.get").expect("parses");
+    assert!(any_get.covers("kv.cache.get"));
+    assert!(any_get.covers("kv.sessions.get"));
+    assert!(
+        !any_get.covers("kv.cache.get.extra"),
+        "a four-part name is not a kv call, so nothing may cover it"
+    );
+    assert!(!any_get.covers("kv.cache.set"));
+
+    // And a namespace-wide name covers everything in its namespace, which is what keeps
+    // `services = ["workers"]` meaning what it did before grants could name one method.
+    let workers = Grant::parse("workers").expect("parses");
+    assert!(workers.covers("workers.list"));
+    assert!(workers.covers("workers.reset"));
+}

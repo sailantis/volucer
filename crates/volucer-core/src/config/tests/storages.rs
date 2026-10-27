@@ -119,8 +119,10 @@ http = "127.0.0.1:8080"
          work in a deployment that never configured a lock backend, which is the silent grant the \
          allow-list exists to prevent"
     );
-    assert!(!config.is_a_call_service("lock"));
-
+    let namespace = super::Grant::Namespace {
+        namespace: "lock".to_string(),
+    };
+    assert!(!config.is_a_call_service(&namespace));
     // The table's absence is a different thing from the table being there with no driver line, and
     // the second is refused by name rather than read as the default.
     let text = format!("{text}\n[lock]\n");

@@ -57,10 +57,22 @@ pub trait Namespace: Send + Sync {
 }
 
 /// The set of namespaces one backend's workers may call.
-///
 /// A `BTreeMap` rather than a `HashMap`: the keys are read in a deterministic order when the registry
 /// describes itself, and a `HashMap`'s iteration order is not stable — which turns "list the methods a
 /// worker may call" into output that differs between runs.
+///
+/// # A namespace is installed *narrowed*, not merely chosen
+///
+/// The map holds one entry per namespace, and each entry wraps the namespace with the set of methods
+/// this backend was granted. Choosing which namespaces to install was enough while a grant named a
+/// whole namespace; a grant can now name one method (`workers.list`) or one verb on one storage
+/// (`kv.cache.get`), so the filtering has to happen *inside* the namespace — after
+/// [`MethodRegistry::serve`] has routed on the text before the first dot, and before the namespace
+/// sees the call.
+///
+/// The wrapper is where that is decided, rather than in each namespace's `serve`, because a namespace
+/// that had to know about grants would be a namespace that knew about configuration — and the six of
+/// them would each have to get it right.
 #[derive(Clone, Default)]
 pub struct MethodRegistry {
     namespaces: BTreeMap<String, Arc<dyn Namespace>>,
@@ -90,6 +102,27 @@ impl MethodRegistry {
     pub fn with(mut self, namespace: impl Namespace + 'static) -> Self {
         self.namespaces
             .insert(namespace.name().to_string(), Arc::new(namespace));
+        self
+    }
+
+    /// Add a namespace, serving only the calls `grants` permit.
+    ///
+    /// The empty set is legal and means the namespace serves nothing, which is what a grant that
+    /// named only an unknown verb would produce — `Config::validate` refuses that, so an empty set
+    /// here is reachable only from a test-built `Config`. It is not silently widened to "everything",
+    /// because widening is what a mistake would need to *not* do.
+    #[must_use]
+    pub fn with_grants(
+        mut self,
+        namespace: impl Namespace + 'static,
+        grants: Vec<volucer_core::config::Grant>,
+    ) -> Self {
+        let filtered = Filtered {
+            inner: Arc::new(namespace),
+            grants,
+        };
+        self.namespaces
+            .insert(filtered.inner.name().to_string(), Arc::new(filtered));
         self
     }
 
@@ -129,6 +162,60 @@ impl MethodRegistry {
                 namespace, call.name
             )),
         }
+    }
+}
+
+/// A namespace narrowed to the grants a backend was given.
+///
+/// Wraps rather than reimplements: the namespace answers exactly as it always did when the call is
+/// granted, and the refusal for an ungranted one comes from here. That split is what keeps a
+/// namespace from having to know that grants exist — and keeps one implementation of "is this call
+/// granted", rather than six.
+struct Filtered {
+    inner: Arc<dyn Namespace>,
+    /// The parsed `services` entries for this namespace, already filtered to it. Empty means this
+    /// namespace serves nothing.
+    grants: Vec<volucer_core::config::Grant>,
+}
+
+impl Namespace for Filtered {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn serve(&self, call: &Call) -> Return {
+        if self.grants.iter().any(|grant| grant.covers(&call.name)) {
+            return self.inner.serve(call);
+        }
+        // **A refusal that names what is missing, not merely that something is.** An application
+        // told "refused" for a method its deployment chose not to grant has to guess whether the
+        // grant was narrower than it thought or the method was misspelled — and guessing at an
+        // authorisation boundary is the worst place to guess. So the message names the call and the
+        // grants that would have permitted it.
+        Return::refused(format!(
+            "{} is not granted to this backend; its services list names {}",
+            call.name,
+            if self.grants.is_empty() {
+                "nothing in this namespace".to_string()
+            } else {
+                self.grants
+                    .iter()
+                    .map(|grant| format!("{:?}", grant_name(grant)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ))
+    }
+}
+
+/// The spelling a grant would have had in the configuration, for a refusal or a diagnostic.
+fn grant_name(grant: &volucer_core::config::Grant) -> String {
+    use volucer_core::config::Grant;
+    match grant {
+        Grant::Namespace { namespace } => namespace.clone(),
+        Grant::Method { namespace, verb } => format!("{namespace}.{verb}"),
+        Grant::Storage { storage } => format!("kv.{storage}"),
+        Grant::StorageMethod { storage, verb } => format!("kv.{storage}.{verb}"),
     }
 }
 

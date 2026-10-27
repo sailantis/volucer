@@ -27,6 +27,8 @@ impl Namespace for Echo {
     }
 
     fn serve(&self, call: &Call) -> Return {
+        // Answers any verb in the namespace, so a test can tell "the handler ran" from "the grant
+        // refused" without the handler having to enumerate names it does not care about.
         Return::ok(serde_json::json!({ "name": call.name, "params": call.params }))
     }
 }
@@ -41,6 +43,18 @@ fn grants(backends: &[(&str, &[&str])]) -> Arc<RpcGrants> {
         // distinguishable from one that serves the wrong thing.
         if services.contains(&"echo") {
             registry = registry.with(Echo);
+        }
+        if services.contains(&"echo.narrow") {
+            // A namespace installed with a grant set covering one of the two methods it serves, so
+            // the *same* handler answers one call and refuses the others. That is the shape a
+            // deployment gets from `services = ["workers.list"]`.
+            registry = registry.with_grants(
+                Echo,
+                vec![volucer_core::config::Grant::Method {
+                    namespace: "echo".to_string(),
+                    verb: "narrow".to_string(),
+                }],
+            );
         }
         registries.insert((*name).to_string(), Arc::new(registry));
     }
@@ -279,6 +293,52 @@ fn a_token_names_only_what_its_own_backend_grants() {
         "a granted backend is still limited to what it granted"
     );
     assert!(answer.error.expect("a reason").contains("kv"));
+}
+
+#[test]
+fn a_narrowed_grant_answers_one_method_and_refuses_the_others_over_the_wire() {
+    // The runtime half of the method-level catalogue. `services = ["workers.list"]` installs the
+    // `workers` namespace with a grant set covering one of its two methods — so the *same* handler
+    // answers `list` and refuses `reset`, and a caller learns which from the answer rather than by
+    // discovering that a restart it armed months ago has quietly been doing nothing.
+    let running = Running::start(
+        grants(&[("app", &["echo.narrow"]), ("full", &["echo"])]),
+        "127.0.0.1:0",
+    );
+    let mut client = Client::connect(&running.address);
+
+    let mut narrowed = client.token(&token_for("app"));
+    narrowed.name = "echo.narrow".to_string();
+    assert!(
+        client.call(&narrowed).ok,
+        "the granted method is served by the namespace's own handler"
+    );
+
+    // The method the grant did not name. Refused, and the refusal says *why* — an authorisation
+    // boundary is the last place a caller should have to guess between "not granted" and "no such
+    // method", because the two have completely different fixes.
+    let mut ungranted = client.token(&token_for("app"));
+    ungranted.name = "echo.ping".to_string();
+    let answer = client.call(&ungranted);
+    assert!(!answer.ok, "a method the grant did not name is refused");
+    let error = answer.error.expect("a reason");
+    assert!(
+        error.contains("not granted to this backend"),
+        "the refusal must say the method is ungranted rather than unknown: {error}"
+    );
+    assert!(
+        error.contains("echo.narrow"),
+        "and quote the grant that is narrower than the caller assumed: {error}"
+    );
+
+    // And a backend that granted the whole namespace is unaffected, which is what keeps
+    // `services = ["workers"]` meaning what it did before grants could name one method.
+    let mut full = client.token(&token_for("full"));
+    full.name = "echo.ping".to_string();
+    assert!(
+        client.call(&full).ok,
+        "a namespace-wide grant still covers every method in its namespace"
+    );
 }
 
 #[test]

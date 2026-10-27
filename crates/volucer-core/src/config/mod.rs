@@ -19,6 +19,7 @@ use crate::ratelimit::KeyMode;
 
 mod attach;
 mod backend;
+mod catalogue;
 mod grpc;
 mod grpc_proto;
 mod listener;
@@ -43,6 +44,7 @@ mod worker;
 
 pub use attach::*;
 pub use backend::*;
+pub use catalogue::*;
 pub use grpc::*;
 pub use listener::*;
 pub use metrics::*;
