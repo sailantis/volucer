@@ -450,6 +450,83 @@ call leaves the server waiting until its deadline, and a deadline is a kill.
 `CALL` and `RETURN` are correlated, and their ids come from the opposite end of the range to
 request ids, so a call mistaken for a request is a visible correlation failure.
 
+### What a call's params carry
+
+The `name` is `"<namespace>.<verb>"` — `"lock.acquire"`, `"workers.list"` — with one exception that
+matters to anyone writing a client: a **`kv` call is three-part**, `"kv.<storage>.<verb>"`, because
+the deployment chooses the storage names and the store is a capability rather than a setting. A
+client that builds `"kv.get"` gets a refusal naming the storages it may actually reach.
+
+`params` is an object, and **bytes in it are base64**. Which fields those are is decided by the
+namespace, because the JSON codec cannot carry a byte above `0x7f` and an application that caches
+a compressed blob, locks on a hashed resource name or queues a serialized job has such bytes
+constantly:
+
+| Method | Field | Encoding |
+|---|---|---|
+| `kv.<storage>.get` / `.set` / `.setIfAbsent` / `.has` / `.delete` / `.ttl` | `key` | base64 |
+| `kv.<storage>.set` / `.setIfAbsent` | `value` | base64 |
+| `kv.<storage>.getMultiple` | `keys` | a list of base64 strings |
+| `kv.<storage>.getMultiple` | the answer's `values` | a list of base64 strings, **positional** and the same length as `keys`, with `null` for a miss |
+| `kv.<storage>.setMultiple` | `values` | an object, base64 key → base64 value |
+| `kv.<storage>.setMultiple` | `ttl` | a whole number of **seconds** |
+| `jobs.push` | `payload` | base64, optional |
+| `lock.acquire` / `.release` / … | `resource` | plain text — a lock's name is a name, not bytes |
+| `lock.*` | `ttl`, `wait` | whole numbers of **microseconds** |
+
+Everything else is ordinary JSON. A plain-text value where base64 is expected is not reliably
+caught: `"greeting"` is well-formed base64 and decodes to six bytes of noise, so a client that
+forgot to encode looks like a client storing a strange key rather than a client with a bug. `"a"`
+is refused, because its length is not a multiple of four — which is the mistake a test that only
+pins framing will make, and the one reason this table exists.
+
+The two `ttl` units differ and are worth stating twice: a KV TTL is **seconds**, a lock lease and
+wait are **microseconds**. Copying one into the other produces a lock held for a month or a cache
+entry that expires before the response is written.
+
+A lock's `resource` is plain text and is the one string here that is a *name*, so it is read as one.
+Everything else that a client thinks of as a string but the server treats as bytes goes through
+base64.
+
+Results are **objects** rather than bare values — `{"value": …}`, `{"present": true}`,
+`{"acquired": false, "id": null}` — so a field can be added without breaking a client reading the
+one it already knows. A client must not treat "the field is absent" as "the operation failed":
+`acquired: false` is a *successful* `lock.acquire`, because contention is an answer and not an
+error.
+
+### A call over `[rpc]`, for an application that has no channel
+
+Everything above describes a call travelling on a worker's channel. A **FastCGI application has no
+channel**: it exists for the duration of one request, the server drives it, and it can only answer
+the frame it was handed. The same namespaces are therefore also served on a socket the application
+*dials* — `[rpc]` in the configuration — and the frames are identical, so a codec written for one
+transport speaks the other unchanged.
+
+Three things differ, and each is a consequence of the process being recreated per request:
+
+- **There is no handshake.** `HELLO`/`HELLO_ACK` would be paid for on every request of a process
+  that lives for one. Version, checksum policy and identity are therefore settled per connection by
+  the frames themselves, and every frame is checksummed because nothing negotiated it away.
+- **Each `CALL` carries a `token`.** One listener serves every backend that grants services, so
+  "who is calling?" has no answer in the topology the way it does for a worker's own channel. The
+  token is the answer, it travels in the call (`Call::token`), and it is judged per call — which is
+  also why a grant withdrawn by a reload takes effect on the next call rather than at the next
+  reconnect. A call with no token, and a call with a token no backend was issued, are *different*
+  refusals: the first is a backend granted nothing, the second is an application reading the wrong
+  variable, and they are fixed in different files.
+- **A call may fail before it is sent.** A deployment that granted a backend nothing hands it no
+  address at all, so the client has a failure mode a worker never has and must report it as its
+  own rather than as the server's.
+
+The listener accepts `CALL` and `PING` and nothing else. Any other frame type is answered with a
+`RETURN` naming it rather than dropped, for the reason a worker answers a call it cannot serve: a
+caller waiting for an answer that never arrives is a request hanging until the runtime kills it.
+
+**The deadline is the client's.** `[rpc].call_timeout_seconds` (default `10`) governs how long the
+server will spend *writing* an answer; it does not bound how long a caller waits for a
+`lock.acquire` that was asked to wait. A client therefore needs a read deadline of its own, and it
+should be at least as long as the longest wait it intends to request.
+
 ### Telemetry, at any time
 
 `LOG`, `METRIC` and `EVENT` may arrive **during** any of the above, always with `request_id = 0`.

@@ -1506,6 +1506,95 @@ mod tests {
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("redis:6379"), "the host survives: {text}");
     }
+
+    /// A `kv` namespace over one in-memory storage named `"cache"`.
+    ///
+    /// The real driver rather than a stub, for the reason [`locks`] gives: the property under test is
+    /// what the wire encoding means, and a stub would have to reimplement it to be asked about it.
+    fn kv() -> KvNamespace {
+        let store: Arc<dyn volucer_kv::Store> =
+            Arc::new(volucer_kv::MemoryStore::with_max_bytes(1 << 20));
+        KvNamespace::new(BTreeMap::from([("cache".to_string(), store)]))
+    }
+
+    /// A batch call's keys are **base64**, like a single call's key.
+    ///
+    /// This was wrong and nothing caught it: `keys_of` read the list with `string_list` and used each
+    /// string's own bytes as the key, so it looked for a key spelled `"Z3JlZXRpbmc="` — the base64 of
+    /// `"greeting"` rather than `"greeting"` — and the refusal it produced said "needs a \"keys\" list of
+    /// base64-encoded keys", which is the message the code did not implement. A batch was therefore
+    /// usable only by a client that sent *unencoded* keys, which the PHP SDK does not, so every
+    /// `getMultiple` from the released client missed and every `setMultiple` stored under a key no
+    /// single-key `get` could find.
+    ///
+    /// Both directions are checked against one store: what `setMultiple` wrote must be readable by
+    /// `get`, and what `getMultiple` reads must be what `set` wrote. One assertion would pass with both
+    /// sides consistently wrong.
+    #[test]
+    fn a_batch_key_is_base64_in_both_directions() {
+        let namespace = kv();
+        let encoded = |text: &str| crate::params::encode_base64(text.as_bytes());
+
+        let written = namespace.serve(&call_with(
+            "kv.cache.set",
+            serde_json::json!({
+                "key": encoded("greeting"),
+                "value": encoded("hello"),
+            }),
+        ));
+        assert!(written.ok, "the single set must succeed: {written:?}");
+
+        // A batch read of the same key, encoded the way a single call encodes it.
+        let read = namespace.serve(&call_with(
+            "kv.cache.getMultiple",
+            serde_json::json!({ "keys": [encoded("greeting")] }),
+        ));
+        assert!(read.ok, "the batch read must succeed: {read:?}");
+        assert_eq!(
+            read.result.as_ref().and_then(|r| r.get("values")),
+            Some(&serde_json::json!([encoded("hello")])),
+            "the batch must find what the single-key set wrote"
+        );
+
+        // And the other direction: what a batch wrote must be readable by `get`.
+        let batch = namespace.serve(&call_with(
+            "kv.cache.setMultiple",
+            serde_json::json!({
+                "values": { encoded("farewell"): encoded("bye") },
+            }),
+        ));
+        assert!(batch.ok, "the batch write must succeed: {batch:?}");
+
+        let single = namespace.serve(&call_with(
+            "kv.cache.get",
+            serde_json::json!({ "key": encoded("farewell") }),
+        ));
+        assert_eq!(
+            single.result.as_ref().and_then(|r| r.get("value")),
+            Some(&serde_json::json!(encoded("bye"))),
+            "a single-key get must find what the batch wrote"
+        );
+    }
+
+    /// A batch key that is not base64 is refused by name, rather than looked up as literal bytes.
+    ///
+    /// The failure this pins is the quiet one: a client that forgot to encode would previously *succeed*
+    /// at `setMultiple` and store under a key nothing else could address, so the loss showed up later as
+    /// a cache that never hit. A refusal names the key and the reason.
+    #[test]
+    fn a_batch_key_that_is_not_base64_is_refused() {
+        let namespace = kv();
+        let answer = namespace.serve(&call_with(
+            "kv.cache.getMultiple",
+            serde_json::json!({ "keys": ["a"] }),
+        ));
+        assert!(!answer.ok, "a one-character key is not base64: {answer:?}");
+        let error = answer.error.unwrap_or_default();
+        assert!(
+            error.contains("keys[0]") && error.contains("base64"),
+            "the refusal has to name the position and the encoding: {error}"
+        );
+    }
 }
 
 impl ConfigNamespace {
@@ -2074,18 +2163,46 @@ impl KvNamespace {
         )
     }
 
-    /// The keys of a batch call, refusing a parameter that is not a list of non-empty strings.
+    /// The keys of a batch call, refusing a parameter that is not a list of base64 strings.
+    ///
+    /// **Decoded, exactly as a single call's `key` is.** This read the list as plain strings and used
+    /// their literal UTF-8 bytes, while `setMultiple` decoded both halves of its object — so a batch and a
+    /// single key disagreed about what a key *is*, and the refusal below named an encoding the code did
+    /// not apply. The symptom was silent rather than loud: `getMultiple` reported every key as missing,
+    /// and `setMultiple` stored under a name no `get` could produce, which looks like a cache that never
+    /// hits rather than like a bug.
+    ///
+    /// The position is named (`keys[0]`) because a batch is the one place a parameter can be wrong in
+    /// several *equally plausible* ways, and "a key is not base64" would leave a caller re-reading a list
+    /// to find which one.
     fn keys_of(params: &Params, method: &str) -> std::result::Result<Vec<Vec<u8>>, Return> {
-        match params.string_list("keys") {
-            Ok(Some(keys)) if keys.iter().any(String::is_empty) => Err(Return::refused(format!(
-                "{method} was given an empty key, which cannot be stored"
-            ))),
-            Ok(Some(keys)) => Ok(keys.into_iter().map(String::into_bytes).collect()),
-            Ok(None) => Err(Return::refused(format!(
-                "{method} needs a \"keys\" list of base64-encoded keys"
-            ))),
-            Err(err) => Err(Return::refused(format!("{method} was called with {err}"))),
+        let keys = match params.string_list("keys") {
+            Ok(Some(keys)) => keys,
+            Ok(None) => {
+                return Err(Return::refused(format!(
+                    "{method} needs a \"keys\" list of base64-encoded keys"
+                )))
+            }
+            Err(err) => return Err(Return::refused(format!("{method} was called with {err}"))),
+        };
+
+        let mut decoded = Vec::with_capacity(keys.len());
+        for (index, encoded) in keys.into_iter().enumerate() {
+            match decode_base64(&encoded) {
+                // The same rule a single key follows: an empty key cannot be stored, so it is refused
+                // rather than looked up and reported as a miss.
+                Ok(key) if key.is_empty() => {
+                    return Err(Return::refused(format!(
+                        "{method} was given an empty key at keys[{index}], which cannot be stored"
+                    )))
+                }
+                Ok(key) => decoded.push(key),
+                Err(reason) => {
+                    return Err(Return::refused(format!("{method} keys[{index}] {reason}")))
+                }
+            }
         }
+        Ok(decoded)
     }
 }
 

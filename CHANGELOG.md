@@ -105,6 +105,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`kv.getMultiple` and `kv.setMultiple` disagreed with every single-key method about what a key
+  is.** The batch methods read their keys with `string_list` and used each string's literal UTF-8
+  bytes, while `setMultiple` decoded *both* halves of its object and every scalar method decoded its
+  `key`. The two spellings could therefore never address the same entry: a batch read reported every
+  key as missing, and a batch write stored under a name no `get` could produce. Worse than a failure,
+  it was silent — a cache that never hits, and for `setMultiple` writes that exist only to be
+  expired. The refusal `keys_of` emitted said "needs a \"keys\" list of base64-encoded keys", which
+  is what the code did not implement, and nothing tested either batch method. Present since the `kv`
+  namespace was written. The keys are now decoded, a badly encoded one is refused by **position**
+  (`keys[0]`), an empty one is refused as a scalar empty key already was, and two tests check both
+  directions against one store — what a batch wrote must be readable by `get`, and what `set` wrote
+  must be readable by a batch.
 - **A declared metric that had not been counted yet rendered nothing, so `/metrics` could answer
   `200` with an empty body.** `Registry::render` skipped every family with no series, and the comment
   defended it on the grounds that a described-but-absent metric would puzzle a reader — which is
