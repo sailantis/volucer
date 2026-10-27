@@ -57,9 +57,9 @@ that only wants to display a pool should not be granted `workers` at all — and
 
 The same split runs through the others. `kv` reads with `get`, `has`, `ttl` and `getMultiple`,
 and writes with `set`, `setIfAbsent`, `delete`, `clear` and `setMultiple` — `clear` wiping the
-storage. `lock` answers with `exists` and `holders`, and mutates with `acquire`, `release`,
-`release_all` and `steal`. `jobs` reads with `size` and `pipelines`, and writes with `push` and
-`push_batch`.
+storage. `lock` answers with `exists` and `holders`, and mutates with `acquire`, `try_acquire`,
+`release`, `release_all` and `update_ttl`. `jobs` reads with `size` and `pipelines`, and writes
+with `push` and `push_batch`.
 
 ## The call plane
 
