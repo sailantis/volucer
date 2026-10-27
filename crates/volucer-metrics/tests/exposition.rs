@@ -219,15 +219,73 @@ fn the_series_cap_is_enforced_and_counted() {
     );
 }
 
-/// A family with no series is omitted rather than described, so `/metrics` does not advertise a
-/// metric that does not exist.
+/// A family the *server* publishes, with no series, is omitted rather than described — `rr_http_*`
+/// is pool-scoped, so a deployment with no worker pool really has no such metric and `/metrics`
+/// must not advertise ten families about machinery the process does not run.
 #[test]
-fn a_described_but_unused_metric_is_not_rendered() {
+fn a_published_but_unused_metric_is_not_rendered() {
     let registry = Registry::new();
     registry.describe("rr_unused", Kind::Counter, "Nothing writes this");
 
     assert_eq!(registry.render(), "");
     assert_eq!(registry.names(), vec!["rr_unused".to_string()]);
+}
+
+/// The other half, and the reason [`Registry::declare`] exists separately: a name the *deployment*
+/// asked for renders its header even when nothing has counted yet.
+///
+/// Without this a quiet process answers `200` with zero bytes — indistinguishable from an endpoint
+/// that is not wired up at all, and the operator has no way to tell a working declaration from a
+/// lost one. The header is that receipt.
+#[test]
+fn a_declared_but_unused_metric_renders_its_header_and_no_sample() {
+    let registry = Registry::new();
+    registry.declare("app_orders_total", Kind::Counter, "Orders counted");
+
+    assert_eq!(
+        registry.render(),
+        "# HELP app_orders_total Orders counted\n# TYPE app_orders_total counter\n"
+    );
+
+    // And once something writes it, the sample appears under the same header.
+    registry.counter_add("app_orders_total", &[], 3);
+    assert_eq!(
+        registry.render(),
+        "# HELP app_orders_total Orders counted\n# TYPE app_orders_total counter\n\
+         app_orders_total 3\n"
+    );
+}
+
+/// A declared histogram with nothing observed renders its header and `# TYPE`, and no bucket lines:
+/// a bucket with no observations would be a fabricated zero rather than a missing series.
+#[test]
+fn a_declared_but_unused_histogram_renders_no_buckets() {
+    let registry = Registry::new();
+    registry.declare_histogram("app_latency_seconds", "Latency", &[0.1, 1.0]);
+
+    assert_eq!(
+        registry.render(),
+        "# HELP app_latency_seconds Latency\n# TYPE app_latency_seconds histogram\n"
+    );
+}
+
+/// A name is published or declared by the call that registered it, and a second registration cannot
+/// downgrade a declared name out of the page — which is what a `describe` from a publish path would
+/// otherwise do.
+#[test]
+fn a_declared_name_stays_visible_when_it_is_described_again() {
+    let registry = Registry::new();
+    registry.declare("app_orders_total", Kind::Counter, "Orders counted");
+    // The same name and help, registered again by a path that publishes rather than declares.
+    registry.describe("app_orders_total", Kind::Counter, "Orders counted");
+
+    assert!(
+        registry
+            .render()
+            .contains("# TYPE app_orders_total counter"),
+        "a declared name must keep rendering its header: {}",
+        registry.render()
+    );
 }
 
 /// Two scrapes of an unchanged process are byte-identical, which is what makes a diff of two

@@ -248,6 +248,27 @@ because it is applied after parsing.
 
 `buckets` is valid only for histograms. Volucer rejects it for counters and gauges.
 
+### What the page shows before anything is counted
+
+A declared metric appears in the exposition **as soon as the process starts**, with its
+`# HELP` and `# TYPE` lines and no sample:
+
+```text
+# HELP app_requests Application requests handled
+# TYPE app_requests counter
+```
+
+The sample line arrives with the first `emitMetric`, and nothing about the header changes when
+it does. This is deliberate: an empty `/metrics` body cannot be told apart from an endpoint
+that is not wired up at all, and the operator who just wrote `collect` needs to know their
+declaration reached the process. The header is that receipt.
+
+The server's own `rr_http_*` families behave the other way, and the difference is not an
+inconsistency. They describe a worker pool, so a deployment with no pool really has no such
+series, and rendering a dozen headers about machinery the process does not run would put noise
+on every scrape. A name in `collect` is one the deployment asked for; a name in `rr_http_*` is
+one this server publishes only when it applies.
+
 ## Trace context
 
 Volucer parses and continues the W3C `traceparent` header. When a valid header is present,
@@ -383,7 +404,7 @@ losing anything the front-end kept.
 is `2^-56`, which is the resolution of 56 bits of trace id. Values outside `0.0`–`1.0` are
 refused rather than clamped: `1.5` is an arithmetic error, and reading it as "all traces" is how
 a tracing bill gets decided by a typo. `sample_ratio` beside any mode other than `"ratio"` is
-refused too, for the reason `[metrics.collect].buckets` is refused on a counter: a setting read
+refused too, for the reason `[status.metrics.collect].buckets` is refused on a counter: a setting read
 by nothing is worse than one that is absent.
 
 ### What sampling never does

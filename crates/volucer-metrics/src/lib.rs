@@ -189,7 +189,32 @@ struct Family {
     /// Upper bounds for a histogram, empty for every other kind. Set once at registration, so a
     /// series created later cannot disagree with its siblings about what a bucket means.
     bounds: Vec<f64>,
+    /// Whether this name is the server's own or one the deployment declared. Only decides what an
+    /// *empty* family renders as: the server's published set is omitted, the deployment's declared
+    /// set renders its header.
+    origin: Origin,
     series: RwLock<HashMap<Key, Arc<Metric>>>,
+}
+
+/// Who asked for a metric name, which decides what an unwritten family renders as.
+///
+/// Two kinds of name reach one registry and they must not be treated alike when nothing has written
+/// them. A name in the `rr_http_*` set is **pool-scoped**: a deployment with no worker pool genuinely
+/// has no series, and describing 12 families that will never move would make every `/metrics` page
+/// carry a dozen lines about machinery it does not run. A name in `[status.metrics.collect]` is the
+/// opposite — the operator wrote it down, `validate` accepted it, the application is expected to
+/// `emitMetric` into it — so rendering nothing leaves that operator unable to tell a working
+/// declaration from a lost one.
+///
+/// This is a distinction about *provenance*, so it is recorded where the name is registered rather
+/// than inferred from a prefix: `emitMetric` can name anything, and a deployment is free to declare a
+/// metric that happens to start with `rr_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The server describes it as part of a set it publishes; empty means the feature is off.
+    Published,
+    /// The deployment declared it; empty means nothing has counted yet, which is not the same thing.
+    Declared,
 }
 
 /// Why a metric for a name and label set could not be produced.
@@ -284,7 +309,7 @@ impl Registry {
     /// worse outcome than one metric with stale text, and this runs during startup where a panic
     /// would take the server down.
     pub fn describe(&self, name: &str, kind: Kind, help: &str) {
-        self.register(name, kind, help, Vec::new());
+        self.register(name, kind, help, Vec::new(), Origin::Published);
     }
 
     /// Register a histogram and its bucket bounds.
@@ -295,10 +320,35 @@ impl Registry {
     pub fn describe_histogram(&self, name: &str, help: &str, bounds: &[f64]) {
         let mut sorted: Vec<f64> = bounds.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        self.register(name, Kind::Histogram, help, sorted);
+        self.register(name, Kind::Histogram, help, sorted, Origin::Published);
     }
 
-    fn register(&self, name: &str, kind: Kind, help: &str, bounds: Vec<f64>) {
+    /// Register a name the **deployment** asked for rather than one this server publishes.
+    ///
+    /// The difference matters only when nothing has written the metric yet, and it is the whole
+    /// reason this method exists rather than reusing [`Registry::describe`]. A `/metrics` page that
+    /// is empty is indistinguishable from a broken one: the operator declared
+    /// `app_orders_total` here, sees `200` and zero bytes, and has no way to tell "declared
+    /// correctly, nothing counted yet" from "the declaration was lost". The families this server
+    /// publishes do not have that problem — a process with no worker pool really does have no
+    /// `rr_http_` series, and the whole set is documented as pool-scoped — but a name the operator
+    /// wrote down is a promise this process is keeping, and `# HELP`/`# TYPE` is how it says so.
+    ///
+    /// So a declared-but-unwritten name renders its header and no sample. Prometheus reads that as
+    /// "this metric has no series", which is true and is what an operator needs; the alternative,
+    /// omitting it, is the page rendering nothing at all.
+    pub fn declare(&self, name: &str, kind: Kind, help: &str) {
+        self.register(name, kind, help, Vec::new(), Origin::Declared);
+    }
+
+    /// [`Registry::declare`] for a histogram, with its bucket bounds.
+    pub fn declare_histogram(&self, name: &str, help: &str, bounds: &[f64]) {
+        let mut sorted: Vec<f64> = bounds.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.register(name, Kind::Histogram, help, sorted, Origin::Declared);
+    }
+
+    fn register(&self, name: &str, kind: Kind, help: &str, bounds: Vec<f64>, origin: Origin) {
         let mut families = self.families.write().expect("the registry lock");
         if let Some(existing) = families.get(name) {
             if existing.kind != kind || existing.help != help {
@@ -307,6 +357,10 @@ impl Registry {
                     "registered twice with a different kind or help; the first one is kept"
                 );
             }
+            // A name that is both published and declared is published in effect: the deployment
+            // asked for it, and something in this process also writes it, so an omitted-but-unused
+            // family is the pool-scoped case rather than the operator's. Re-registering cannot be
+            // used to downgrade a family out of the operator's sight.
             return;
         }
         families.insert(
@@ -315,6 +369,7 @@ impl Registry {
                 kind,
                 help: help.to_string(),
                 bounds,
+                origin,
                 series: RwLock::new(HashMap::new()),
             }),
         );
@@ -544,6 +599,12 @@ impl Registry {
     /// be better expressed as a metric that is missing. Family names are emitted in sorted order so
     /// that two scrapes of an unchanged process produce byte-identical output, which is what makes
     /// a diff of two scrapes readable and a golden test possible.
+    ///
+    /// **An empty family is rendered or omitted by its origin, not by whether it has series.** Every
+    /// name in the page carries its `# HELP` and `# TYPE` whether or not anything has written it, so
+    /// a scrape answers "what does this process publish" as well as "what are the numbers" — which
+    /// is what lets a declared-but-quiet metric prove its declaration arrived instead of rendering
+    /// an empty page indistinguishable from a broken endpoint.
     pub fn render(&self) -> String {
         let mut families: Vec<(String, Arc<Family>)> = {
             let families = self.families.read().expect("the registry lock");
@@ -557,14 +618,22 @@ impl Registry {
         let mut out = String::new();
         for (name, family) in families {
             let series = family.series.read().expect("the series lock");
-            if series.is_empty() {
-                // A family with no series is omitted entirely rather than printed with a `# TYPE`
-                // and nothing under it. Prometheus would accept it; a human reading the page would
-                // wonder why a metric that does not exist is described.
+            if series.is_empty() && family.origin == Origin::Published {
+                // A family this server publishes, with no series, is a feature this process is not
+                // running: `rr_http_*` is pool-scoped, so a deployment with no worker pool has no
+                // series by definition. Describing ten of them would put ten lines about machinery
+                // the process does not run on every scrape. See `Origin` for the other half.
                 continue;
             }
             let _ = writeln!(out, "# HELP {name} {}", escape_help(&family.help));
             let _ = writeln!(out, "# TYPE {name} {}", family.kind.as_str());
+            if series.is_empty() {
+                // A declared name with nothing written yet: the header above is the operator's
+                // receipt that the declaration reached this process, and there is no sample to print
+                // because nothing has counted. Prometheus reads this as "the metric has no series",
+                // which is exactly true.
+                continue;
+            }
 
             let mut sorted: Vec<(&Key, &Arc<Metric>)> = series.iter().collect();
             sorted.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));

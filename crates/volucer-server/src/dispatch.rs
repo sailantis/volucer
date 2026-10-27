@@ -441,10 +441,10 @@ pub fn describe_collected(
 
     for (name, metric) in &metrics.collect {
         match metric.kind {
-            CollectedKind::Counter => registry.describe(name, Kind::Counter, &metric.help),
-            CollectedKind::Gauge => registry.describe(name, Kind::Gauge, &metric.help),
+            CollectedKind::Counter => registry.declare(name, Kind::Counter, &metric.help),
+            CollectedKind::Gauge => registry.declare(name, Kind::Gauge, &metric.help),
             CollectedKind::Histogram => {
-                registry.describe_histogram(name, &metric.help, &metric.buckets)
+                registry.declare_histogram(name, &metric.help, &metric.buckets)
             }
         }
     }

@@ -72,6 +72,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A declared metric that had not been counted yet rendered nothing, so `/metrics` could answer
+  `200` with an empty body.** `Registry::render` skipped every family with no series, and the comment
+  defended it on the grounds that a described-but-absent metric would puzzle a reader — which is
+  true of the server's own `rr_http_*` set, whose families are pool-scoped and genuinely do not
+  apply to a process with no pool, and false of a name the *deployment* wrote in
+  `[status.metrics.collect]`. A deployment that declared two metrics and started a server with no
+  worker pool got a zero-byte page that could not be told apart from an endpoint that was not wired
+  up. Names now carry their provenance: `Registry::declare` (used by `describe_collected` for
+  `collect` entries) renders `# HELP` and `# TYPE` with no sample until the first `emitMetric`, and
+  `Registry::describe` keeps the old omit-when-empty behaviour. `prefix` and histograms are covered.
 - **`workers.reset` was unreachable from a call, and had been since it was written.** The `workers`
   namespace is registered under that name, and `MethodRegistry::serve` routes on the text before the
   *first* dot — so the method, spelled `worker.reset` (singular), resolved to a `worker` namespace no

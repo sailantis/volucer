@@ -901,12 +901,20 @@ base_port = 19001
 #
 # A worker may also publish its own sample: the PHP SDK's Worker::emitMetric
 # sends a METRIC frame that this server decodes, and the sample lands in this
-# registry under the name the deployment declared in [metrics.collect] below.
-# Those are the only metrics whose cardinality is the application's business.
+# registry under the name the deployment declared in [status.metrics.collect]
+# below. Those are the only metrics whose cardinality is the application's
+# business.
 #
 # A sample whose name is not declared is refused, deliberately -- otherwise an
 # application could widen the published set at runtime. So the table is not an
 # optional extra: without it, emitMetric does nothing that anyone can see.
+#
+# A declared name appears on the page from the moment the process starts, with
+# its # HELP and # TYPE and no sample line until the first emitMetric arrives.
+# That is what makes a quiet deployment checkable: an empty body could not be
+# told apart from an endpoint that was never wired up. The rr_http_* families
+# above behave the other way -- they describe a worker pool, so a process with
+# no pool has no series and no headers for them either.
 #
 # AND WITHOUT THIS TABLE NOTHING DRAINS THE QUEUE. A worker's sample is held in
 # a per-pool queue until a scrape takes it, and `publish_metrics` has exactly one
@@ -1084,7 +1092,7 @@ base_port = 19001
 # this front-end without losing anything this one kept. `0` and `1` are exact,
 # and the smallest non-zero value is 2^-56 -- the resolution of the 56 bits of
 # trace id the decision reads. `sample_ratio` on any other mode is refused
-# rather than ignored, the same rule [metrics.collect].buckets follows.
+# rather than ignored, the same rule [status.metrics.collect].buckets follows.
 #
 # Sampling never touches the access log and never changes the trace id: a
 # dropped trace is still logged with the id to search for.
