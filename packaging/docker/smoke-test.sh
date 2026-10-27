@@ -70,7 +70,7 @@ http = "0.0.0.0:8080"
 document_root = "/"
 
 [status]
-address = "0.0.0.0:9080"
+listen = "0.0.0.0:9080"
 EOF
 chmod 0644 "$work/volucer.toml"
 

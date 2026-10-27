@@ -550,6 +550,58 @@ fn the_example_configuration_parses_and_validates() {
     );
 }
 
+/// The configuration the Docker smoke test writes is parsed and validated here, so that a change
+/// to the configuration's shape is caught by `cargo test` rather than only by CI's `docker` job.
+///
+/// The fixture lives inside a shell heredoc, which nothing else reads: it is a configuration file
+/// an operator never opens, and the only thing that has ever parsed it is a container starting.
+/// That made the suite blind to it. Removing `[status] address` left it writing a key that is
+/// refused by name, and the first thing to notice was a published-image check several minutes
+/// into a workflow — on two jobs at once, with the reason buried in `docker logs`.
+#[test]
+fn the_docker_smoke_test_configuration_parses_and_validates() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("packaging")
+        .join("docker")
+        .join("smoke-test.sh");
+    let script = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("{} is not readable: {err}", path.display()));
+
+    // The heredoc is quoted (`<<'EOF'`), so the body is literal: no shell expansion has to be
+    // undone before it is a TOML file.
+    let body = script
+        .split_once("<<'EOF'\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("{} no longer writes a configuration file", path.display()));
+    let text = body
+        .split_once("\nEOF\n")
+        .map(|(config, _)| config)
+        .unwrap_or_else(|| panic!("{} no longer closes its heredoc with EOF", path.display()));
+
+    let config = Config::from_toml(text).unwrap_or_else(|err| {
+        panic!(
+            "{} writes a configuration that does not parse: {err}",
+            path.display()
+        )
+    });
+    config.validate().unwrap_or_else(|err| {
+        panic!(
+            "{} writes a configuration that does not validate: {err}",
+            path.display()
+        )
+    });
+
+    // The probe reaches the listener through `[status]`, so a fixture without one is a container
+    // whose `HEALTHCHECK` can only fail — which is the failure this test exists to move forward.
+    assert!(
+        config.status.is_some(),
+        "{} no longer configures [status], so `volucer health` has no address to read",
+        path.display()
+    );
+}
+
 /// A `[kv.*]` file store parses, resolves its default bound, and refuses two things.
 ///
 /// The refusals are the interesting half: an empty path would make the store's directory the
