@@ -167,20 +167,41 @@ host; it is not a defence against another host.
 An `upstream` backend that grants services is handled the same way, except that it receives
 the same two values as the request headers `X-Volucer-Rpc` and `X-Volucer-Rpc-Token`.
 
-**`Volucer\Rpc` is that client, in the PHP SDK.** `Kv`, `Lock` and `Jobs` are written against a
-three-method `CallPlane` interface — `call()`, `lastCallError()`, `lastCallWasUnknown()` — which both
-`Worker` and `Rpc` implement, so the storage code is the same over either transport and only the type
-that built it differs:
+**A client for this exists in the PHP and Python SDKs, and not yet in Ruby.** `Volucer\Rpc` in
+PHP and `volucer_worker.Rpc` in Python both reach the same namespaces with the same method names,
+so a method that works over one transport works over the other. In PHP, `Kv`, `Lock` and `Jobs` are
+written against a three-method `CallPlane` interface — `call()`, `lastCallError()`,
+`lastCallWasUnknown()` — which both `Worker` and `Rpc` implement, so the storage code is the same
+over either transport and only the type that built it differs:
 
 ```php
 $kv = $worker->kv('cache');     // inside a worker
 $kv = $rpc->kv('cache');        // inside a FastCGI request
 ```
 
-Two things it does that a worker's channel does not need, and both are worth knowing before relying
-on one. A call has a **deadline** (`Rpc::connect(timeout: …)`, default 10 s, which has to cover a
-`lock()->acquire()` that waits), and `lastCallWasUnknown()` is reachable on a path a worker never has
-— a connection that broke after the call was written may still have been served.
+The Python client is written the same way in spirit but in a Python idiom — a mapping-flavoured
+`Kv`, with `None` for a miss and an exception for a failure — rather than as a transliteration of
+the PHP classes. One difference is not cosmetic and is worth knowing: **a WSGI application has to
+pass its `environ`**, because volucer puts the address in the CGI *request* and the process only
+receives `VOLUCER_FCGI_ADDRESS`:
+
+```python
+def application(environ, start_response):
+    rpc = Rpc.connect(environ=environ)
+    rpc.kv("cache").set("greeting", "hello")
+```
+
+Three things a call over this transport does that a worker's channel does not need, and all are
+worth knowing before relying on one. A call has a **deadline** (`Rpc::connect(timeout: …)` in PHP,
+`Rpc.connect(timeout=…)` in Python, default 10 s, which has to cover a `lock()->acquire()` that
+waits), because this reads a socket where a worker reads a pipe. `lastCallWasUnknown()` is
+reachable on a path a worker never has — a connection that broke after the call was written may
+still have been served. And a call may fail **before it is sent**, when the deployment handed the
+backend no address at all.
+
+A client in another language needs no more than the
+[worker protocol](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md) — the
+frames are identical, and the section on `params` lists which fields are base64.
 
 ## Key-value storage
 

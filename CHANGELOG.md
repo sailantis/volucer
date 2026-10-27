@@ -148,6 +148,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Python SDK now has an `[rpc]` client, so a FastCGI or WSGI application reaches `kv`,
+  `lock` and `jobs` without being a worker.** `volucer_worker.Rpc` is the counterpart of the PHP
+  `Volucer\Rpc` and speaks the same wire: identical frames, the token on every call, no handshake.
+  `connect()` dials nothing until the first call, so a request that never touches a store pays for
+  neither a socket nor a failed connect, and `last_call_was_unknown` separates a refusal from a
+  call that may have been served. The one thing a WSGI application must do differently is pass its
+  `environ`: volucer puts the address in the CGI *request*, and the process only receives
+  `VOLUCER_FCGI_ADDRESS`, so a client reading `os.environ` works for a script started by hand and
+  fails for every real request. Verified end to end against a real server through `spawn_cgi`. The
+  Ruby SDK has no such client yet, and the documentation now says so rather than implying a worker
+  is the only way to reach a store.
 - **`[rpc]` gives a FastCGI or HTTP application the services a worker reaches over its channel.**
   A worker asks for `kv`, `lock` and `jobs` with `CALL` frames on the stream that carries its
   requests; a FastCGI application has no such stream, because it exists for one request and can only

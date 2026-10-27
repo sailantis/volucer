@@ -8,6 +8,10 @@ selected PHP frameworks.
 The SDKs implement the worker side of the [worker protocol](09-WORKER-PROTOCOL.md). Their
 repositories include package-manager manifests and tests for the protocol's wire format.
 
+The PHP and Python SDKs also carry a **client for the `[rpc]` call plane**, which a FastCGI or
+`upstream` application uses to reach `kv`, `lock` and `jobs` without being a worker. The Ruby SDK
+does not have one yet; a worker in Ruby reaches the same namespaces over its channel.
+
 | SDK    | Package                    | Install                                     |
 | ------ | -------------------------- | ------------------------------------------- |
 | PHP    | `sailantis/volucer-worker` | `composer require sailantis/volucer-worker` |
@@ -75,8 +79,21 @@ library. This keeps worker startup independent of optional SDK dependencies.
 For Django and Flask applications, Volucer's `upstream` backend can supervise gunicorn over
 HTTP without a worker SDK. The `spawn_cgi` backend can also run a FastCGI server, such as
 gunicorn's `flup` worker or a `flup-fcgi` process. Use the worker SDK when you need
-worker-channel features such as key-value storage, locks, jobs, metrics, memory-based worker
-recycling, or direct request handling without HTTP between the server and worker.
+worker-channel features such as metrics, memory-based worker recycling, or direct request
+handling without HTTP between the server and worker.
+
+**Key-value storage and locks no longer require the worker channel.** `[rpc]` serves the same
+namespaces on a socket, and `Rpc` in this SDK dials it, so a WSGI application under `spawn_cgi`
+reaches `kv`, `lock` and `jobs` while remaining an ordinary WSGI application:
+
+```python
+from volucer_worker import Rpc
+
+def application(environ, start_response):
+    # `environ` is required: volucer puts the address in the CGI request, not in the process.
+    rpc = Rpc.connect(environ=environ)
+    rpc.kv("cache").set("greeting", "hello")
+```
 
 ### Ruby
 
@@ -251,4 +268,5 @@ as an alternative.
 | An existing PHP framework, on the worker channel | The framework bridge                                                             |
 | An existing app, changed as little as possible   | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md)                       |
 | Any FastCGI server, started and supervised       | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server) |
+| `kv` or `lock` from a FastCGI app, without a worker | `[rpc]` plus `Rpc` in the PHP or Python SDK — see [Services](08-SERVICES.md#an-application-that-is-not-a-worker) |
 | Node, Go or any other HTTP origin                | The `upstream` backend                                                           |
