@@ -229,6 +229,16 @@ while (true) {
 
             return match ($path) {
                 '/health' => Response::json(['status' => 'ok', 'pid' => getmypid()]),
+                // **A route that holds its slot**, for the one test that has to prove two requests
+                // are in flight at once. `/health` answers so fast that a pool with two slots can
+                // serve two *concurrent* callers from one child: the first finishes and releases
+                // the slot before the second asks for it. The pause is inside the script rather
+                // than in the caller, so the slot really is occupied.
+                '/slow' => (static function (): Response {
+                    usleep(400_000);
+
+                    return Response::json(['status' => 'ok', 'pid' => getmypid()]);
+                })(),
                 default => Response::text('attached ' . $request->uri),
             };
         },
@@ -426,19 +436,34 @@ fn each_connection_reaches_a_different_forked_child() {
         "every attached worker reports its own pid: {pids:?}"
     );
 
-    // Both slots really serve. Two requests have to be in flight at once to show that.
+    // Both slots really serve. Two requests have to be in flight at once to show that, so both go
+    // to `/slow` — **not `/health`**, which answers so quickly that one child can serve two
+    // concurrent callers. `Pool::acquire` takes a slot from a LIFO free list, so a request that
+    // finishes before the other one asks hands its own slot straight back and the second request
+    // takes it: modelled with that allocator, an instant route shared one slot in 200 of 200
+    // attempts. On Linux the two threads happened to overlap enough to hide it; on macOS CI they
+    // did not, which is why this failed there and nowhere else.
+    //
+    // Holding the slot fixes it — the same model shared one slot in 0 of 200 attempts with a
+    // 400 ms handler. The barrier is belt and braces: it removes thread-start jitter, which is not
+    // what was observed but is free to remove.
+    let start = std::sync::Barrier::new(2);
     let (a, b) = std::thread::scope(|scope| {
         let first = scope.spawn({
             let pool = std::sync::Arc::clone(&pool);
+            let start = &start;
             move || {
-                pool.request(&get("/health"))
+                start.wait();
+                pool.request(&get("/slow"))
                     .expect("the first worker answered")
             }
         });
         let second = scope.spawn({
             let pool = std::sync::Arc::clone(&pool);
+            let start = &start;
             move || {
-                pool.request(&get("/health"))
+                start.wait();
+                pool.request(&get("/slow"))
                     .expect("the second worker answered")
             }
         });
