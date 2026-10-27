@@ -199,6 +199,28 @@ type = "counter"          # "counter", "gauge" or "histogram"
 help = "Application requests handled"
 ```
 
+The same table of metrics written as an inline table, which TOML 1.1 allows to span lines:
+
+```toml
+[metrics]
+address = "127.0.0.1:2112"
+prefix = "volucer_"
+
+collect = {
+    app_requests = {
+        type = "counter",
+        help = "Application requests handled",
+    },
+    app_queue_depth = { type = "gauge", help = "Jobs waiting" },
+}
+```
+
+The two spellings mean the same thing, and one deployment should use one of them. **An inline
+table is closed in the text that writes it** — a later `[metrics.collect.<name>]` header, or a
+dotted key in the same table, is a parse error — so use headers when the file itself has to
+add to the table in more than one place. `-o metrics.collect.<name>.type=…` works with either,
+because it is applied after parsing.
+
 | Key       | Type            | Default      | What it does                           |
 | --------- | --------------- | ------------ | -------------------------------------- |
 | `address` | string          | **required** | Where the Prometheus endpoint listens. |

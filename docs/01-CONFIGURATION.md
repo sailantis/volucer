@@ -21,6 +21,49 @@ startup instead of being silently ignored.
 
 Any exceptions to this rule are called out in the relevant sections below.
 
+**The file is TOML 1.1.** The one 1.1 feature this matters for is that an inline table may
+span several lines and end with a trailing comma, so a table of application metrics reads as
+one block:
+
+```toml
+[metrics]
+address = "127.0.0.1:2112"
+
+collect = {
+    app_orders_total = {
+        type = "counter",
+        help = "Orders the application counted",
+    },
+    app_queue_depth = { type = "gauge", help = "Jobs waiting" },
+}
+```
+
+rather than one `[metrics.collect.<name>]` header per metric. Both spellings mean the same
+thing, and are freely mixed across files.
+
+**An inline table is closed in the text that writes it.** A `collect = { … }` cannot be
+continued in the same file — neither by a later `[metrics.collect.x]` header nor by a dotted
+key — and the parser says so: "cannot extend value of type inline table". An `-o` override is
+*not* affected: it is laid onto the parsed table, where nothing is inline any more, so
+`-o metrics.collect.x.type=counter` adds an entry either way. Use headers when the file
+itself has to grow the table in more than one place.
+
+**Editor tooling has to be told the version.** Taplo — which backs the *Even Better TOML*
+extension, `taplo lint` and `taplo fmt` — implements TOML 1.0 and reports a multi-line inline
+table as three errors (`newline is not allowed in an inline table`, twice, plus the trailing
+comma). It has no plan to add 1.1: the request is [taplo#839](https://github.com/tamasfe/taplo/issues/839),
+closed pointing at the maintainer's [handover issue](https://github.com/tamasfe/taplo/issues/715).
+Tombi (`tombi-toml.github.io`, and its own VS Code extension) is maintained, tests against
+`toml-test`, and understands 1.1 once its configuration file says so:
+
+```toml
+# tombi.toml at the repository root
+toml-version = "v1.1.0"
+```
+
+That file is for the editor — Volucer does not read it. `volucer check` remains the authority
+on whether a configuration is valid.
+
 ## The command line as a source
 
 Each `-o section.key=value` override adds a value to the configuration table, whether it
@@ -652,6 +695,12 @@ shutdown and is not restarted.
 
 `buckets` is valid only for histograms. Volucer rejects it on counters and gauges rather
 than accepting an unused setting.
+
+`collect` may be written as headers or as one inline table. **The inline form is closed in the
+text that writes it**: a later `[metrics.collect.<name>]` header, or a dotted key inside the
+same table, is a parse error ("cannot extend value of type inline table"). Overrides are not
+affected — `-o metrics.collect.<name>.type=…` is applied after parsing, so it adds an entry to
+either spelling.
 
 ## `[status]`
 

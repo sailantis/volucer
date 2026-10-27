@@ -126,7 +126,21 @@ rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-
 tokio = { version = "1", features = ["net", "fs", "io-util", "rt-multi-thread", "time"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io"] }
-toml = "0.8"
+# `1` is TOML **1.1**, and the sentence is worth reading before pinning it back: 1.1 is what puts
+# newlines and a trailing comma inside an inline table, so a table of application metrics is
+#
+#     collect = {
+#         app_orders_total = { type = "counter", help = "Orders the application counted" },
+#     }
+#
+# rather than five `[metrics.collect.<name>]` headers at four levels of nesting. Nothing in the
+# *code* changed for the bump — `toml::Table`, `Value::Table(..).try_into()` and `de::Error` are
+# the same API — so this is a parser upgrade, not a port. The one thing it is not is free syntax:
+# an inline table is **closed in the text that writes it**, so a `collect = { … }` cannot be
+# continued by a `[metrics.collect.x]` header or a dotted key in the same file. An `-o` override
+# is applied after parsing and is unaffected. Enforced by the parser with "cannot extend value of
+# type inline table", not silently.
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

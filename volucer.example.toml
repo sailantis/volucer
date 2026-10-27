@@ -930,6 +930,12 @@ base_port = 19001
 # prefix = "myapp_"
 # path = "/metrics"
 #
+# The collected metrics are a table, and it may be written two ways. Both mean
+# the same thing. An inline table is closed *in the text that writes it* --
+# a later [metrics.collect.<name>] header, or a dotted key, is refused with
+# "cannot extend value of type inline table". An `-o` override is laid onto the
+# parsed table instead, so it adds an entry to either spelling.
+#
 # [metrics.collect.app_orders_total]
 # type = "counter"          # counter | gauge | histogram
 # help = "Orders the application counted"
@@ -942,6 +948,19 @@ base_port = 19001
 # type = "histogram"
 # help = "Time the application took to answer"
 # buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+#
+# The same three, as an inline table. TOML 1.1 is what allows the newlines and
+# the trailing commas -- the workspace pins `toml = "1"` for exactly this:
+#
+#   collect = {
+#       app_orders_total = { type = "counter", help = "Orders the application counted" },
+#       app_queue_depth = { type = "gauge", help = "Jobs waiting to be consumed" },
+#       app_latency_seconds = {
+#           type = "histogram",
+#           help = "Time the application took to answer",
+#           buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+#       },
+#   }
 #
 # What `type` decides is what a sample *means*, because emitMetric sends a name
 # and a value and the worker does not know what it is counting: a counter's

@@ -1,0 +1,18 @@
+# Tooling for the one TOML file whose syntax this repository owns, not for Volucer.
+#
+# `volucer.example.toml` is written in TOML 1.1, which is what the server parses, and 1.1 is what
+# allows an inline table to span lines and end with a trailing comma. Tombi defaults to 1.0 and
+# reports every such table as errors, so the version is stated here once instead of per editor.
+#
+# Scoped to that file on purpose: the `Cargo.toml` manifests are Cargo's business, and Tombi's
+# `tables-out-of-order` rule disagrees with how they order `[features]` against
+# `[target.'cfg(unix)'.dependencies]` -- a warning about a file this project does not get to
+# restyle.
+#
+# Taplo (the engine behind *Even Better TOML*, `taplo lint` and `taplo fmt`) cannot be configured
+# into this: it implements 1.0 and takes no patches for 1.1. A deployment checking its own file
+# should use `volucer check`, which is the authority.
+toml-version = "v1.1.0"
+
+[files]
+include = ["volucer.example.toml"]

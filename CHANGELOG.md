@@ -7,6 +7,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The configuration parser is now TOML 1.1** (`toml = "1"`, from `0.8` / TOML 1.0). The feature
+  this buys is the one that was most awkward to write by hand: an inline table may now span several
+  lines and end with a trailing comma, so a deployment's own metrics read as one block —
+  `collect = { app_orders_total = { type = "counter", help = "…" }, … }` — instead of one
+  `[metrics.collect.<name>]` header per metric, four levels deep. Nothing in the *code* changed:
+  `toml::Table`, `Value::Table(..).try_into()` and `de::Error` are the same API, and the whole
+  workspace — 1,389 tests — passed without an edit. Three tests pin the new syntax so a silent pin
+  back to `0.8` cannot pass: one asserts the block parses *and* that its entries reach the
+  registry, one asserts the price of the form — an inline table cannot be extended later **in the
+  same text**, by a header or a dotted key — and one asserts the limit of that rule, that an `-o`
+  pair still adds an entry because it is applied after parsing. `volucer.example.toml` and two
+  documentation pages now show both spellings and say when to pick each.
+
 ### Fixed
 
 - **`workers.reset` was unreachable from a call, and had been since it was written.** The `workers`
