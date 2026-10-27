@@ -156,9 +156,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call that may have been served. The one thing a WSGI application must do differently is pass its
   `environ`: volucer puts the address in the CGI *request*, and the process only receives
   `VOLUCER_FCGI_ADDRESS`, so a client reading `os.environ` works for a script started by hand and
-  fails for every real request. Verified end to end against a real server through `spawn_cgi`. The
-  Ruby SDK has no such client yet, and the documentation now says so rather than implying a worker
-  is the only way to reach a store.
+  fails for every real request. Verified end to end against a real server through `spawn_cgi`.
+- **The Ruby SDK has one too, so all three SDKs reach `[rpc]`.** `Volucer::Rpc` reads the call
+  plane from a Rack environment and takes the same `env:` argument the Python client takes its
+  `environ` for, and for the same reason. It is the third implementation of one wire rather than a
+  translation of either neighbour, so the differences are Ruby's: a failure **raises**
+  `ProtocolError` rather than returning `nil` with a recorded reason, and that error answers
+  `unknown?` — the "the call was written and never answered, so retrying may duplicate a side
+  effect" case. **One deadline bounds the whole call, the dial included**, where the PHP client's
+  connect and read budgets are additive; the worst case is therefore the configured timeout rather
+  than twice it. Verified against a real `spawn_cgi` deployment (both the CGI-parameter and the
+  `upstream` header form) as well as a live `[rpc]` listener.
 - **`[rpc]` gives a FastCGI or HTTP application the services a worker reaches over its channel.**
   A worker asks for `kv`, `lock` and `jobs` with `CALL` frames on the stream that carries its
   requests; a FastCGI application has no such stream, because it exists for one request and can only

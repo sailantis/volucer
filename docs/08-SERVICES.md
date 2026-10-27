@@ -167,9 +167,9 @@ host; it is not a defence against another host.
 An `upstream` backend that grants services is handled the same way, except that it receives
 the same two values as the request headers `X-Volucer-Rpc` and `X-Volucer-Rpc-Token`.
 
-**A client for this exists in the PHP and Python SDKs, and not yet in Ruby.** `Volucer\Rpc` in
-PHP and `volucer_worker.Rpc` in Python both reach the same namespaces with the same method names,
-so a method that works over one transport works over the other. In PHP, `Kv`, `Lock` and `Jobs` are
+**A client for this exists in all three SDKs.** `Volucer\Rpc` in PHP, `volucer_worker.Rpc` in
+Python and `Volucer::Rpc` in Ruby all reach the same namespaces with the same method names, so a
+method that works over one transport works over the other. In PHP, `Kv`, `Lock` and `Jobs` are
 written against a three-method `CallPlane` interface — `call()`, `lastCallError()`,
 `lastCallWasUnknown()` — which both `Worker` and `Rpc` implement, so the storage code is the same
 over either transport and only the type that built it differs:
@@ -179,11 +179,10 @@ $kv = $worker->kv('cache');     // inside a worker
 $kv = $rpc->kv('cache');        // inside a FastCGI request
 ```
 
-The Python client is written the same way in spirit but in a Python idiom — a mapping-flavoured
-`Kv`, with `None` for a miss and an exception for a failure — rather than as a transliteration of
-the PHP classes. One difference is not cosmetic and is worth knowing: **a WSGI application has to
-pass its `environ`**, because volucer puts the address in the CGI *request* and the process only
-receives `VOLUCER_FCGI_ADDRESS`:
+The Python and Ruby clients are written the same way in spirit but in each language's own idiom
+rather than as a transliteration of the PHP classes. **Both have to be told where the request's
+environment is**, and that is the one thing a caller gets wrong: volucer puts the address in the
+CGI *request*, not in the process, so the process only receives `VOLUCER_FCGI_ADDRESS`:
 
 ```python
 def application(environ, start_response):
@@ -191,13 +190,22 @@ def application(environ, start_response):
     rpc.kv("cache").set("greeting", "hello")
 ```
 
+```ruby
+def call(env)
+  rpc = Volucer::Rpc.connect(env: env)
+  rpc.kv('cache').set('greeting', 'hello')
+end
+```
+
 Three things a call over this transport does that a worker's channel does not need, and all are
 worth knowing before relying on one. A call has a **deadline** (`Rpc::connect(timeout: …)` in PHP,
-`Rpc.connect(timeout=…)` in Python, default 10 s, which has to cover a `lock()->acquire()` that
-waits), because this reads a socket where a worker reads a pipe. `lastCallWasUnknown()` is
-reachable on a path a worker never has — a connection that broke after the call was written may
-still have been served. And a call may fail **before it is sent**, when the deployment handed the
-backend no address at all.
+`Rpc.connect(timeout=…)` in Python, `Volucer::Rpc.connect(timeout: …)` in Ruby, default 10 s, which
+has to cover a `lock()->acquire()` that waits), because this reads a socket where a worker reads a
+pipe — and in Ruby that one deadline bounds the dial as well as the read, so the worst case of a
+call is 10 s rather than the sum of two budgets. `lastCallWasUnknown()` — `ProtocolError#unknown?`
+in Ruby — is reachable on a path a worker never has: a connection that broke after the call was
+written may still have been served. And a call may fail **before it is sent**, when the deployment
+handed the backend no address at all.
 
 A client in another language needs no more than the
 [worker protocol](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md) — the

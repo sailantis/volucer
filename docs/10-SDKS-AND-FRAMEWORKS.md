@@ -10,7 +10,7 @@ repositories include package-manager manifests and tests for the protocol's wire
 
 The PHP and Python SDKs also carry a **client for the `[rpc]` call plane**, which a FastCGI or
 `upstream` application uses to reach `kv`, `lock` and `jobs` without being a worker. The Ruby SDK
-does not have one yet; a worker in Ruby reaches the same namespaces over its channel.
+carries one too: `Volucer::Rpc`, which reads the call plane from a Rack environment.
 
 | SDK    | Package                    | Install                                     |
 | ------ | -------------------------- | ------------------------------------------- |
@@ -107,6 +107,20 @@ Volucer::Worker.connect.run(&Volucer::Rack.handler(MyApp.new))
 The Rack adapter supports Rack applications, including Rails. `Volucer::Worker.connect`
 uses `VOLUCER_WORKER_SOCKET` when available and otherwise uses stdio. Use
 `Volucer::Worker.create` when providing streams explicitly.
+
+A Rack application that is **not** a worker — a FastCGI or `upstream` backend — reaches the
+same services through `Volucer::Rpc`, passing its own environment:
+
+```ruby
+def call(env)
+  rpc = Volucer::Rpc.connect(env: env)
+  rpc.kv('cache').set('greeting', 'hello')
+  [200, { 'content-type' => 'text/plain' }, ['ok']]
+end
+```
+
+`env:` is not optional there, and the reason is the same one the Python snippet gives: volucer
+puts the address in the *request*, so the process's `ENV` does not carry it.
 
 The SDK requires Ruby 3.1 or later and has no runtime dependencies beyond the standard
 library.
@@ -268,5 +282,5 @@ as an alternative.
 | An existing PHP framework, on the worker channel | The framework bridge                                                             |
 | An existing app, changed as little as possible   | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md)                       |
 | Any FastCGI server, started and supervised       | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server) |
-| `kv` or `lock` from a FastCGI app, without a worker | `[rpc]` plus `Rpc` in the PHP or Python SDK — see [Services](08-SERVICES.md#an-application-that-is-not-a-worker) |
+| `kv` or `lock` from a FastCGI app, without a worker | `[rpc]` plus `Rpc` in the PHP, Python or Ruby SDK — see [Services](08-SERVICES.md#an-application-that-is-not-a-worker) |
 | Node, Go or any other HTTP origin                | The `upstream` backend                                                           |
