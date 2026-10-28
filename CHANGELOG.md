@@ -73,18 +73,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default is still a configuration error, and the message now names the candidates and shows the
   key to write.
 
-- **`default_backend` also accepts a backend *kind*.** With several backends,
-  `default_backend = "worker"` selects the one backend of that kind, so a deployment with `app` (a
-  worker) and `assets` (a `spawn_cgi` pool) says which *role* serves unrouted requests instead of
-  repeating a name a rename would break. It applies to `[sites.<name>].default_backend` too.
-
-  A kind selects only when exactly one backend has it. Two workers and
-  `default_backend = "worker"` is an error that says so, rather than a choice between them. A
-  backend **named** after a kind always wins, which is what makes this safe to add: before it,
-  `default_backend = "worker"` could only mean a backend called `worker`, and it still does.
-  `volucer check` prints `default_backend: worker (a backend kind) resolves to app` so the
-  indirection is never invisible.
-
 - **`services` can name a method, not only a namespace.** A grant used to hand over a whole
   namespace: `"workers"` gave a worker both `workers.list` and `workers.reset`, and `"kv.cache"`
   gave it `get` along with `clear`. Both spellings still work, and a namespace name still grants

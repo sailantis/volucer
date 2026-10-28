@@ -185,73 +185,40 @@ impl Config {
     /// four copies of it would be four chances to answer differently — a default applied on one path
     /// and not another.
     ///
-    /// Four answers, in this order:
+    /// Three answers, in this order:
     ///
-    /// 1. **A backend name**, which always wins. If a deployment has a backend *named* `worker`, then
-    ///    `default_backend = "worker"` means that backend — the kind fallback below must not be able
-    ///    to shadow a name, or introducing it would have silently changed an existing configuration.
-    /// 2. **A backend kind** — `default_backend = "worker"` when exactly one backend is of that kind.
-    ///    This is the useful multi-backend spelling: a deployment with `app` (a worker) and `assets`
-    ///    (a `spawn_cgi` pool) says which kind serves unrouted requests instead of which name, and it
-    ///    keeps working after a pool is renamed.
-    /// 3. **A lone backend**, whatever it is called: with one backend there is nothing to choose.
-    /// 4. **`None`**, which `Config::validate` turns into a refusal naming the candidates.
+    /// 1. **A backend name**, which is simply passed through. Validation reports a name that matches
+    ///    nothing, so this does not test the table — the caller wants the name back either way.
+    /// 2. **A lone backend**, whatever it is called: with exactly one backend there is nothing to
+    ///    choose.
+    /// 3. **`None`**, which `Config::validate` turns into a refusal naming the candidates.
     ///
-    /// Neither 2 nor 3 is order-dependent. [`Config::backends`] is a `BTreeMap`, so file order does
-    /// not survive parsing, and a first-one-wins rule would resolve alphabetically — handing
-    /// unrouted requests to `assets` because it sorts before `app`. "Exactly one of them" has no
-    /// order to get wrong, and an ambiguous kind selects nothing rather than picking.
+    /// **Deliberately not "the first backend".** [`Config::backends`] is a `BTreeMap`, so file order
+    /// does not survive parsing, and a first-one-wins rule would resolve alphabetically — handing
+    /// unrouted requests to `assets` because it sorts before `app`. "Exactly one" has no order to get
+    /// wrong, and it is falsifiable by looking at the file.
+    ///
+    /// **A name, not a backend kind.** A kind was accepted here for a while, so that
+    /// `default_backend = "worker"` could select the one backend of that kind. It was reverted: the
+    /// key reads like a name, and whether a given value is a name or a role depended on a table
+    /// elsewhere in the file. Every other reference to a backend — `routes`, a site's
+    /// `default_backend`, `services` — spells it as a name, and one key accepting a second dialect
+    /// costs more in comprehension than it saves in keystrokes.
     pub fn implied_backend<'a>(&'a self, stated: Option<&'a str>) -> Option<&'a str> {
-        let Some(stated) = stated else {
-            return match self.backends.len() {
+        match stated {
+            Some(name) => Some(name),
+            None => match self.backends.len() {
                 1 => self.backends.keys().next().map(String::as_str),
                 _ => None,
-            };
-        };
-
-        if self.backends.contains_key(stated) {
-            return Some(stated);
+            },
         }
-        // Not a name — so it may be a kind. Resolved only when exactly one backend is of it, which
-        // is what keeps this a statement about the file rather than a guess: two workers and a
-        // `default_backend = "worker"` is ambiguous, and validation says so.
-        if BackendConfig::is_kind(stated) {
-            return self.lone_backend_of_kind(stated);
-        }
-        // Neither. Returned as written so that validation can report the name the operator typed
-        // rather than losing it, and report it as an unknown *name*, which is what they wrote.
-        Some(stated)
-    }
-
-    /// The only backend of `kind`, accepting either `spawn_cgi` or `spawn-cgi`.
-    fn lone_backend_of_kind(&self, kind: &str) -> Option<&str> {
-        let wanted = kind.replace('-', "_").to_ascii_lowercase();
-        let mut matching = self
-            .backends
-            .iter()
-            .filter(|(_, backend)| backend.kind() == wanted);
-        match (matching.next(), matching.next()) {
-            (Some((name, _)), None) => Some(name.as_str()),
-            _ => None,
-        }
-    }
-
-    /// How many backends are of `kind`, for the messages that explain why a kind selected nothing.
-    pub fn count_of_kind(&self, kind: &str) -> usize {
-        let wanted = kind.replace('-', "_").to_ascii_lowercase();
-        self.backends
-            .values()
-            .filter(|backend| backend.kind() == wanted)
-            .count()
     }
 
     /// Whether the default in force was inferred rather than written, and what it is.
     ///
     /// Exists for `volucer check`, which prints a line describing where the default came from. An
     /// operator reading a file with no `default_backend` should be told the server chose one for
-    /// them, rather than left to infer it from the absence of an error. A kind that resolved to a
-    /// name is *not* reported here: the operator wrote the key, so there is nothing they have not
-    /// said — `check` shows the resolved name on the backend's own line instead.
+    /// them, rather than left to infer it from the absence of an error.
     pub fn inferred_default_backend(&self) -> Option<&str> {
         match self.server.default_backend {
             None => self.implied_backend(None),

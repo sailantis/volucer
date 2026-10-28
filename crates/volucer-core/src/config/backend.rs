@@ -119,23 +119,6 @@ impl BackendConfig {
         }
     }
 
-    /// Every spelling of `kind` a configuration file may use, canonically.
-    ///
-    /// Exists because `default_backend` accepts a kind where it used to accept only a name, and that
-    /// means the *parser* has to know the set of kinds in order to tell "a kind that selects nothing"
-    /// from "a name that matches nothing" — two different mistakes with two different sentences.
-    /// A `const` list beside the `match` above would be a second place to forget, so this returns
-    /// the same strings by construction and a test pins the two against each other.
-    pub fn kinds() -> &'static [&'static str] {
-        &["worker", "attach", "external", "spawn_cgi", "upstream"]
-    }
-
-    /// Whether `stated` names a backend kind, accepting the hyphenated spelling `check` prints.
-    pub fn is_kind(stated: &str) -> bool {
-        let normalized = stated.replace('-', "_").to_ascii_lowercase();
-        Self::kinds().contains(&normalized.as_str())
-    }
-
     /// True when the backend resets state per request.
     pub fn resets_per_request(&self) -> bool {
         matches!(self.request_scope(), RequestScope::PerRequest)
