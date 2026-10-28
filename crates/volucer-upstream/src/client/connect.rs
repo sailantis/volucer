@@ -35,7 +35,8 @@ use std::time::Duration;
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -99,7 +100,7 @@ fn client_config(origin: &Origin, tls: &UpstreamTls) -> Result<Arc<ClientConfig>
             let file = std::fs::File::open(path).map_err(|source| named(source.to_string()))?;
             let mut reader = std::io::BufReader::new(file);
             let mut found = 0usize;
-            for certificate in rustls_pemfile::certs(&mut reader) {
+            for certificate in CertificateDer::pem_reader_iter(&mut reader) {
                 let certificate = certificate.map_err(|source| named(source.to_string()))?;
                 roots
                     .add(certificate)

@@ -19,24 +19,18 @@
 
 [advisories]
 # `cargo-deny` 0.20 removed the `vulnerability` / `notice` severity keys: an advisory is now always an
-# error unless explicitly handled here. The two entries below are the `h3` situation and one
-# pre-existing dependency, and each has its reason written beside it — an `ignore` without one is how
-# a suppression outlives the thing it suppressed.
+# error unless explicitly handled here. An `ignore` entry without a reason beside it is how a
+# suppression outlives the thing it suppressed, so the list is empty on purpose rather than by
+# default.
 #
-# **The HTTP/3 entry.** `h3` 0.0.8 carries hyperium/h3#379, an unpatched unbounded
-# `max_field_section_size` amplification. No release carries the fix, so the mitigation is
-# configuration — `[server.http3].max_field_section_size`, 16 KiB by default — and it is tested by
-# `an_oversized_header_section_is_answered_431_and_the_listener_survives`, so a regression fails a
-# test rather than relying on this file. **Delete this entry and upgrade the day a release carries
-# the fix.**
-ignore = [
-    # `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134), not vulnerable: it is a thin wrapper over
-    # `rustls-pki-types` and its reader is what `crates/volucer-http/src/tls.rs` uses to load a
-    # configured certificate. The migration is real work — replace the reader with
-    # `rustls-pki-types`' own PEM parsing and drop the dependency — and it is *not* part of the
-    # HTTP/3 change, so it is recorded rather than smuggled in here.
-    "RUSTSEC-2025-0134",
-]
+# **It has been non-empty twice, and both entries are gone.** The `h3` 0.0.8 amplification
+# (hyperium/h3#379) is mitigated by configuration — `[server.http3].max_field_section_size`, 16 KiB
+# by default, tested by `an_oversized_header_section_is_answered_431_and_the_listener_survives` — and
+# `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) was removed rather than suppressed, by replacing
+# it with `rustls-pki-types`' own PEM parsing. An empty list here means nothing is currently being
+# tolerated; a future `h3` release carrying the fix is still worth taking, but it no longer has a
+# suppression to delete.
+ignore = []
 
 # Which crates the unmaintained check applies to. `workspace` checks this project's own crates,
 # which is the scope that catches a crate nobody is updating; `all` would report the whole graph's

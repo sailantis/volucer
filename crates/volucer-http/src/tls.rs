@@ -35,6 +35,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustls::pki_types::pem::{self, PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -871,13 +872,11 @@ pub fn load_from_pem(
     install_crypto_provider();
 
     let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(std::io::Cursor::new(cert_pem)))
-            .collect::<Result<_, _>>()
-            .map_err(|source| TlsError::Certificate {
-                where_: where_.to_string(),
-                path: "(in memory)".to_string(),
-                source: ChainError::Pem(source),
-            })?;
+        read_certs(std::io::Cursor::new(cert_pem)).map_err(|source| TlsError::Certificate {
+            where_: where_.to_string(),
+            path: "(in memory)".to_string(),
+            source: ChainError::Pem(source),
+        })?;
     if chain.is_empty() {
         return Err(TlsError::Certificate {
             where_: where_.to_string(),
@@ -886,18 +885,17 @@ pub fn load_from_pem(
         });
     }
 
-    let key =
-        rustls_pemfile::private_key(&mut std::io::BufReader::new(std::io::Cursor::new(key_pem)))
-            .map_err(|source| TlsError::Key {
-                where_: where_.to_string(),
-                path: "(in memory)".to_string(),
-                source: KeyError::Pem(source),
-            })?
-            .ok_or(TlsError::Key {
-                where_: where_.to_string(),
-                path: "(in memory)".to_string(),
-                source: KeyError::Empty,
-            })?;
+    let key = read_key(std::io::Cursor::new(key_pem))
+        .map_err(|source| TlsError::Key {
+            where_: where_.to_string(),
+            path: "(in memory)".to_string(),
+            source: KeyError::Pem(source),
+        })?
+        .ok_or(TlsError::Key {
+            where_: where_.to_string(),
+            path: "(in memory)".to_string(),
+            source: KeyError::Empty,
+        })?;
 
     let provider =
         rustls::crypto::CryptoProvider::get_default().ok_or(TlsError::NoCryptoProvider)?;
@@ -943,12 +941,59 @@ fn resolve(config_dir: &Path, path: &Path) -> std::path::PathBuf {
     config_dir.join(path)
 }
 
+/// Read every PEM certificate section, in file order.
+///
+/// `pki_types` has a `PemObject` implementation for `CertificateDer`, so this is one iterator. What
+/// it does *not* have is one for `PrivateKeyDer` — that type is an enum over PKCS#8, PKCS#1 and SEC1,
+/// and a single section kind cannot describe it — which is why [`read_key`] iterates sections itself.
+fn read_certs(reader: impl std::io::Read) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(reader);
+    let mut chain = Vec::new();
+    for certificate in CertificateDer::pem_reader_iter(&mut reader) {
+        let certificate = certificate.map_err(|source| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, source.to_string())
+        })?;
+        chain.push(certificate);
+    }
+    Ok(chain)
+}
+
+/// Read the first PEM private key, accepting PKCS#8, PKCS#1 and SEC1.
+///
+/// `None` when the file holds no private key at all, which [`load_key`] reports as `Empty` rather
+/// than as malformed PEM.
+fn read_key(reader: impl std::io::Read) -> std::io::Result<Option<PrivateKeyDer<'static>>> {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let Some((kind, der)) = pem::from_buf(&mut reader).map_err(|source| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, source.to_string())
+        })?
+        else {
+            return Ok(None);
+        };
+        let key = match kind {
+            SectionKind::PrivateKey => {
+                PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(der))
+            }
+            SectionKind::RsaPrivateKey => {
+                PrivateKeyDer::Pkcs1(rustls::pki_types::PrivatePkcs1KeyDer::from(der))
+            }
+            SectionKind::EcPrivateKey => {
+                PrivateKeyDer::Sec1(rustls::pki_types::PrivateSec1KeyDer::from(der))
+            }
+            // A certificate, CRL, CSR or public key in the same file: skip it and keep looking,
+            // which is what `rustls_pemfile::private_key` did and what lets a combined bundle be
+            // pointed at.
+            _ => continue,
+        };
+        return Ok(Some(key));
+    }
+}
+
 /// Read a PEM certificate chain.
-fn load_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, ChainError> {
+pub fn load_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, ChainError> {
     let file = std::fs::File::open(path).map_err(ChainError::Io)?;
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(file))
-        .collect::<Result<_, _>>()
-        .map_err(ChainError::Pem)?;
+    let chain = read_certs(file).map_err(ChainError::Pem)?;
     if chain.is_empty() {
         return Err(ChainError::Empty);
     }
@@ -961,7 +1006,7 @@ fn load_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, ChainError> {
 /// something an operator should have to think about, and rustls can use all three.
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, KeyError> {
     let file = std::fs::File::open(path).map_err(KeyError::Io)?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))
+    read_key(file)
         .map_err(KeyError::Pem)?
         .ok_or(KeyError::Empty)
 }
@@ -1172,5 +1217,51 @@ document_root = "/srv/app"
             set.sites.is_empty(),
             "and it names no pair of its own, so it contributes no entry at all"
         );
+    }
+
+    /// **Every private-key label a deployment's file may carry is read, and read as the right type.**
+    ///
+    /// `rustls-pemfile::private_key` accepted PKCS#8, PKCS#1 and SEC1, and replacing it with
+    /// `rustls-pki-types` meant writing that dispatch by hand — a label-to-variant `match` that no
+    /// compiler checks. A file of one encoding is genuinely different from a file of another and
+    /// openssl produces all three depending on the subcommand, so this asserts on what came back
+    /// rather than merely that something did.
+    ///
+    /// The DER bodies are arbitrary: this measures the dispatcher, not a curve or a modulus. A wrong
+    /// dispatch would still parse here and only fail later, at the handshake, on a real key.
+    #[test]
+    fn all_three_private_key_encodings_are_read_as_the_type_their_label_names() {
+        for (label, expected) in [
+            ("PRIVATE KEY", "Pkcs8"),
+            ("RSA PRIVATE KEY", "Pkcs1"),
+            ("EC PRIVATE KEY", "Sec1"),
+        ] {
+            let pem = format!("-----BEGIN {label}-----\nQUJD\n-----END {label}-----\n");
+            let key = read_key(pem.as_bytes())
+                .unwrap_or_else(|error| panic!("{label}: {error}"))
+                .unwrap_or_else(|| panic!("{label} is a private key, so one must be found"));
+            let found = match key {
+                PrivateKeyDer::Pkcs8(_) => "Pkcs8",
+                PrivateKeyDer::Pkcs1(_) => "Pkcs1",
+                PrivateKeyDer::Sec1(_) => "Sec1",
+                _ => "some other encoding",
+            };
+            assert_eq!(found, expected, "{label} was read as {found}");
+        }
+    }
+
+    /// A file with no private key in it is `Empty`, not "malformed PEM".
+    ///
+    /// The distinction is the operator's: `Empty` says the file is a certificate, a bundle or the
+    /// wrong path, and the message names the three encodings that would have been accepted. A
+    /// generic parse error would send them looking for a syntax problem that is not there.
+    #[test]
+    fn a_file_without_a_private_key_is_empty_and_not_a_parse_error() {
+        let pem = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
+        assert!(
+            read_key(pem.as_bytes()).expect("valid PEM").is_none(),
+            "a certificate is skipped rather than reported as a key"
+        );
+        assert!(matches!(read_key(&b"not pem at all"[..]), Ok(None),));
     }
 }

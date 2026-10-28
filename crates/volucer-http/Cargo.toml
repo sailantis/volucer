@@ -47,7 +47,6 @@ httpdate.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 thiserror.workspace = true
 # `macros` is what `tokio::select!` needs, and the HTTP/3 connection loop is one `select!` over
 # accept-next-request and reap-finished-request. Additive, so the TCP listener is unaffected; the
