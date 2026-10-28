@@ -2026,30 +2026,65 @@ fn free_origin_port() -> u16 {
     port
 }
 
-/// A `python -m http.server` command that answers `GET /` with a directory listing.
+/// A supervised-origin command that binds the port, answers one request and keeps running.
 ///
-/// Deliberately a *real* server rather than a fixture: the point of this test is that volucer starts
-/// a command it was given and waits for it to answer, so the command has to behave like the thing a
-/// deployment would name. `python -m http.server` is present on every machine this project builds
-/// on, binds a port, and answers a request.
+/// **Not `python -m http.server`, which loses a race with the readiness probe.** `HTTPServer` binds
+/// and *then* calls `socket.getfqdn(host)` before `server_activate()` reaches `listen()`
+/// (`socketserver.TCPServer.__init__` -> `server_bind()` -> `server_activate()`). On macOS that
+/// lookup goes through mDNSResponder and takes seconds, so for that window the port is bound but
+/// refusing connections: every `connect()` in the readiness loop fails for the whole 20 s budget and
+/// the supervisor reports `StartupTimeout` for an origin that was about to be ready. It is
+/// macOS-only and intermittent, which is how it read: one red run in four, only on the runner with
+/// a slow resolver.
 ///
-/// **The interpreter is a parameter rather than the word `python`**, and that is a bug this test had:
-/// the guard resolved `python3` on Linux while the command said `python`, so the test ran and failed
-/// with "the origin command python does not exist" — a fixture that decided whether to run using one
-/// answer and then asked for a different one. The two must be the same value, or the guard is worse
-/// than no guard.
+/// `crates/volucer-server/src/upstream_pool.rs` hit this first and replaced its fixture; this is the
+/// same fix where the failure actually surfaced. The script below does exactly what the readiness
+/// probe needs and nothing else: bind, `listen`, accept, answer one request, close. There is no
+/// `http.server`, so there is no name lookup, and the window between `bind` and `listen` is one
+/// statement rather than a DNS round trip.
 ///
-/// The directory is quoted because `split_command` is deliberately not a shell: a space in the path
-/// would otherwise split into two arguments. The config *literal* it is written into matters too,
-/// and this test found that the hard way — a Windows path in a TOML **basic** string needs its
-/// backslashes doubled, so `command = "…\Temp\x"` is a TOML parse error at `\T`. Single quotes make
-/// it a literal string and leave the path alone, which is the spelling the example configuration
-/// uses for every path for the same reason.
-fn python_http_server(interpreter: &Path, port: u16, dir: &Path) -> String {
+/// It is written to a file beside `served.txt` rather than passed as `-c`, because that argument
+/// would have to survive three layers of quoting at once — TOML's literal string, `split_command`'s
+/// quote grouping, and Python's own source. As a file, the command is a program and one quoted path.
+///
+/// The script locates `served.txt` through `__file__` rather than having the path interpolated into
+/// its source: a Windows path would need its backslashes escaped in the Python string literal and
+/// again in the TOML, and that doubling is where a fixture like this usually breaks.
+fn answering_origin(interpreter: &Path, port: u16, root: &Path) -> String {
+    let script = format!(
+        concat!(
+            "import os, socket, time\n",
+            "here = os.path.dirname(os.path.abspath(__file__))\n",
+            "s = socket.socket()\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "s.bind(('127.0.0.1', {port}))\n",
+            "s.listen(8)\n",
+            // The readiness probe connects and closes without sending, so a connection that ends
+            // before a request line arrives is not the request: close it and keep waiting.
+            "while True:\n",
+            "    c, _ = s.accept()\n",
+            "    if not c.recv(1024):\n",
+            "        c.close()\n",
+            "        continue\n",
+            "    body = open(os.path.join(here, 'served.txt'), 'rb').read()\n",
+            "    c.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n' % len(body) + body)\n",
+            "    c.close()\n",
+            // The listening socket must stay bound after answering, or assertion (3) would be
+            // satisfied by the fixture exiting rather than by shutdown killing it.
+            "    break\n",
+            "time.sleep(60)\n",
+        ),
+        port = port
+    );
+    std::fs::write(root.join("origin.py"), script).expect("write the origin fixture");
+
+    // Double quotes around the path, which is `split_command`'s grouping rather than a shell's. The
+    // config literal around it is single-quoted, so the path must not itself contain one; a
+    // temporary directory never does.
     format!(
-        "{} -m http.server {port} --bind 127.0.0.1 --directory \"{}\"",
+        "{} \"{}\"",
         interpreter.display(),
-        dir.display()
+        root.join("origin.py").display()
     )
 }
 
@@ -2090,7 +2125,7 @@ origin = "http://127.0.0.1:{port}"
 command = '{}'
 ready_timeout_ms = 20000
 "#,
-        python_http_server(&interpreter, port, &root)
+        answering_origin(&interpreter, port, &root)
     );
     let config = Config::from_toml(&text).expect("a supervised origin parses");
     let routing = front_controller_routing();
