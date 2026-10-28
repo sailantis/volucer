@@ -232,6 +232,12 @@ The configuration has three important parts:
   — `volucer check` says so rather than leaving you to notice the key is gone. With two or
   more backends it is required, and the error names them.
 
+  It also accepts a **kind** instead of a name — `default_backend = "worker"` — which selects
+  the one backend of that kind. A kind is only usable this way when exactly one backend has
+  it; with two workers the kind selects nothing and the error says so. A backend *named* after
+  a kind always wins, so an existing `default_backend = "worker"` keeps meaning the backend
+  called `worker`.
+
 This is a complete FastCGI setup: Volucer serves requests to PHP-FPM without requiring
 nginx in front. The same `external` backend can connect to any FastCGI server; change the
 socket to the one used by that application:

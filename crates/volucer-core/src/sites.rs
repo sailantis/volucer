@@ -285,6 +285,7 @@ impl Sites {
 
         for (name, site) in &config.sites {
             let mut resolved = resolve_site(
+                config,
                 name,
                 site,
                 default_front.as_deref(),
@@ -582,6 +583,7 @@ fn is_script_extension(extension: &std::ffi::OsStr) -> bool {
 /// cannot end up with different settings.
 #[allow(clippy::too_many_arguments)]
 fn resolve_site(
+    config: &Config,
     name: &str,
     site: &SiteConfig,
     default_front: Option<&str>,
@@ -653,9 +655,16 @@ fn resolve_site(
             .routes
             .clone()
             .unwrap_or_else(|| default_routes.to_vec()),
+        // Resolved rather than copied: a site may state a *kind* instead of a name, and this is the
+        // point where that becomes the name the dispatcher looks up. Validation has already refused
+        // a value that selects nothing, so falling through here would mean the table was built
+        // without `validate` — and inheriting the server's answer is the direction that cannot
+        // route a request somewhere the file did not say.
         default_backend: site
             .default_backend
-            .clone()
+            .as_deref()
+            .and_then(|stated| config.implied_backend(Some(stated)))
+            .map(str::to_string)
             .or_else(|| default_backend.map(str::to_string)),
         binding,
         protocols: site

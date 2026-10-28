@@ -769,20 +769,15 @@ impl Config {
                     names.sort_unstable();
                     return Err(Error::Config(format!(
                         "backends are defined but default_backend is not set, and there is more \
-                         than one to choose from ({}); name one, e.g. \
-                         `default_backend = \"{}\"` — a single backend needs no such key, several \
-                         always do",
+                         than one to choose from ({}); name one of them or a kind that exactly one \
+                         backend has, e.g. `default_backend = \"{}\"` — a single backend needs no \
+                         such key, several always do",
                         names.join(", "),
                         names[0]
                     )));
                 }
             }
-            Some(name) if !self.backends.contains_key(name) => {
-                return Err(Error::Config(format!(
-                    "default_backend {name:?} does not match any configured backend"
-                )));
-            }
-            Some(_) => {}
+            Some(stated) => self.resolve_default_backend(stated, "default_backend")?,
         }
 
         for (index, route) in self.server.routes.iter().enumerate() {
@@ -797,5 +792,46 @@ impl Config {
         self.validate_http3()?;
 
         Ok(())
+    }
+
+    /// Refuse a `default_backend` that selects no backend, saying which mistake was made.
+    ///
+    /// One helper rather than a rule per table, because `[server]` and every `[sites.<name>]` ask the
+    /// same question and the interesting part is the *diagnosis*: a value that names nothing, a kind
+    /// no backend has, and a kind several backends have are three different fixes, and a single
+    /// "does not match" would leave the operator to work out which one they made. Since a backend
+    /// may legitimately be *named* after a kind, the order of the checks is the rule from
+    /// [`Config::implied_backend`] and is not re-decided here.
+    ///
+    /// `key` is the configuration path that was written, so the message points at the line.
+    pub(super) fn resolve_default_backend(&self, stated: &str, key: &str) -> Result<()> {
+        if self.backends.contains_key(stated) {
+            return Ok(());
+        }
+        if !BackendConfig::is_kind(stated) {
+            return Err(Error::Config(format!(
+                "{key} {stated:?} does not match any configured backend"
+            )));
+        }
+
+        match self.count_of_kind(stated) {
+            0 => {
+                let mut kinds: Vec<&str> =
+                    self.backends.values().map(BackendConfig::kind).collect();
+                kinds.sort_unstable();
+                kinds.dedup();
+                Err(Error::Config(format!(
+                    "{key} {stated:?} is a backend kind, but no configured backend has that kind — \
+                     this deployment has {}; name one of them instead",
+                    kinds.join(", ")
+                )))
+            }
+            1 => Ok(()),
+            count => Err(Error::Config(format!(
+                "{key} {stated:?} is a backend kind, and {count} backends are of it, so it selects \
+                 nothing — it may only be used as a default when exactly one backend has that kind; \
+                 name the one you mean"
+            ))),
+        }
     }
 }

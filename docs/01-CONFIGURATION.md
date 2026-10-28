@@ -195,7 +195,7 @@ its certificate or ACME settings.
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
-| `default_backend` | string | — | The backend used when a request matches no route. Optional when there is exactly one backend, which is then used; required once there are several. |
+| `default_backend` | string | — | The backend used when a request matches no route. Accepts a backend name, or a kind when exactly one backend has that kind. Optional when there is exactly one backend, which is then used; required otherwise. |
 | `routes` | array of tables | empty | The routing rules for the unnamed site. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `env` | table | empty | Environment variables every started process inherits. |
 | `tls` | table | absent | TLS configuration. Presence enables it. |
@@ -485,7 +485,7 @@ If you specify `addresses`, `hosts` becomes optional.
 | `document_root` | path | **required** | Where this site's files live. |
 | `front_controller` | string | inherited | This site's front controller. |
 | `script_extensions` | array of strings | inherited | This site's executed extensions. |
-| `default_backend` | string | inherited | This site's default backend. |
+| `default_backend` | string | inherited | This site's default backend. A name, or a kind when exactly one backend has it. |
 | `routes` | array of tables | inherited | This site's routes. **Replaces** the global list; it is not merged. |
 | `static_files` | table | inherited | This site's static file settings. |
 | `compression` | table | inherited | This site's compression settings. |

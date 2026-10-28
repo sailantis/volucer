@@ -197,6 +197,210 @@ serve_only = "static"
     assert_eq!(config.inferred_default_backend(), None);
 }
 
+/// **A kind names the one backend of that kind**, which is the useful multi-backend spelling.
+///
+/// `app` and `assets` are different kinds, so `default_backend = "worker"` selects `app` without
+/// repeating a name that a rename would break.
+#[test]
+fn a_kind_selects_the_one_backend_of_that_kind() {
+    let text = r#"
+[server]
+default_backend = "worker"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[backends.assets]
+kind = "spawn_cgi"
+binary = "php-cgi"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config
+        .validate()
+        .expect("one worker makes the kind unambiguous");
+    assert_eq!(config.implied_backend(Some("worker")), Some("app"));
+
+    let sites = crate::sites::Sites::from_config(&config, Path::new("/srv/app"));
+    assert_eq!(
+        sites.default_site().default_backend.as_deref(),
+        Some("app"),
+        "the resolved site carries the name, not the kind the file wrote"
+    );
+}
+
+/// The hyphenated spelling works too, because `check` prints kinds that way.
+#[test]
+fn a_kind_accepts_the_hyphenated_spelling_check_prints() {
+    let text = r#"
+[server]
+default_backend = "spawn-cgi"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[backends.assets]
+kind = "spawn_cgi"
+binary = "php-cgi"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config
+        .validate()
+        .expect("`spawn-cgi` names the same kind as `spawn_cgi`");
+    assert_eq!(config.implied_backend(Some("spawn-cgi")), Some("assets"));
+}
+
+/// **A backend named after a kind wins over the kind.**
+///
+/// This is the compatibility guarantee that makes the feature safe to add: before it existed,
+/// `default_backend = "worker"` could only mean a backend *named* `worker`. If a kind took
+/// precedence, adding this feature would have silently re-pointed that deployment's unrouted
+/// requests at a different backend — a change nothing in the file records.
+#[test]
+fn a_backend_named_after_a_kind_is_not_shadowed_by_the_kind() {
+    let text = r#"
+[server]
+default_backend = "worker"
+http = "127.0.0.1:8080"
+[backends.worker]
+kind = "spawn_cgi"
+binary = "php-cgi"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config
+        .validate()
+        .expect("the name exists, so it is not a kind lookup");
+    assert_eq!(
+        config.implied_backend(Some("worker")),
+        Some("worker"),
+        "the name must win: the file said a backend name, and `app` is merely of that kind"
+    );
+}
+
+/// A kind that several backends share selects nothing, and is refused rather than guessed.
+#[test]
+fn a_kind_that_two_backends_share_is_refused() {
+    let text = r#"
+[server]
+default_backend = "worker"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[backends.admin]
+kind = "worker"
+command = "php admin.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config
+        .validate()
+        .expect_err("an ambiguous kind must be refused");
+    let message = err.to_string();
+    assert!(message.contains("2 backends are of it"), "{message}");
+    assert!(message.contains("name the one you mean"), "{message}");
+    assert_eq!(config.implied_backend(Some("worker")), None);
+}
+
+/// A kind nothing has is reported as a kind, not as a missing name.
+///
+/// The distinction is the operator's fix: one is a typo in a name, the other is a kind they invented
+/// or a deployment that is all `external`.
+#[test]
+fn a_kind_no_backend_has_names_the_kinds_that_are_present() {
+    let text = r#"
+[server]
+default_backend = "upstream"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("no upstream exists");
+    let message = err.to_string();
+    assert!(message.contains("is a backend kind"), "{message}");
+    assert!(message.contains("this deployment has worker"), "{message}");
+}
+
+/// The site rule reads the same way, and resolves to a name.
+#[test]
+fn a_site_may_also_state_a_kind() {
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[sites.admin]
+hosts = ["admin.test"]
+document_root = "/srv/admin"
+default_backend = "spawn_cgi"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[backends.admin]
+kind = "spawn_cgi"
+binary = "php-cgi"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config
+        .validate()
+        .expect("the site's kind is unambiguous too");
+
+    let sites = crate::sites::Sites::from_config(&config, Path::new("/srv/app"));
+    let admin = sites.named().get("admin").expect("the site resolves");
+    assert_eq!(admin.default_backend.as_deref(), Some("admin"));
+}
+
+/// The kind list and `kind()` cannot drift apart.
+///
+/// `Config::validate` tells "a kind that selects nothing" from "a name that matches nothing" using
+/// [`BackendConfig::is_kind`], which reads a literal list. If a variant were added without that
+/// list, its kind would be reported as an unknown *name* — accurate-looking and misleading.
+#[test]
+fn the_kind_list_matches_what_the_variants_report() {
+    // Parsed rather than constructed, because the `*Config` structs have no `Default` and inventing
+    // one would be a fixture that could disagree with what the file parser accepts.
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[backends.w]
+kind = "worker"
+command = "php worker.php"
+[backends.a]
+kind = "attach"
+relay = "unix:/run/app/workers.sock"
+workers = 4
+[backends.e]
+kind = "external"
+socket = "127.0.0.1:9102"
+[backends.c]
+kind = "spawn_cgi"
+binary = "php-cgi"
+[backends.u]
+kind = "upstream"
+origin = "http://127.0.0.1:9103"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+
+    let mut reported: Vec<&str> = config.backends.values().map(BackendConfig::kind).collect();
+    reported.sort_unstable();
+    let mut known: Vec<&str> = BackendConfig::kinds().to_vec();
+    known.sort_unstable();
+
+    assert_eq!(
+        reported, known,
+        "`kind()` and `kinds()` must describe the same set: one is what a file may say, the other \
+         is what a variant answers, and validation uses the second to explain the first"
+    );
+    for kind in &reported {
+        assert!(
+            BackendConfig::is_kind(kind),
+            "`{kind}` is reported by `kind()` but `is_kind` does not accept it"
+        );
+    }
+}
+
 #[test]
 fn rejects_non_loopback_php_cgi_bind() {
     let text = r#"

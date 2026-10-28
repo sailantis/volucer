@@ -3821,15 +3821,27 @@ fn check(
     if config.backends.is_empty() {
         println!("    (none)");
     }
-    // Printed because an inferred default is otherwise invisible: the file has no
-    // `default_backend`, `check` exits zero, and the only way to know which backend answers an
-    // unrouted request would be to read this program's source. Spelled out only when it *was*
-    // inferred, so a file that states one reads exactly as it did before.
-    if let Some(inferred) = config.inferred_default_backend() {
-        println!(
-            "    default_backend: {inferred} (inferred — it is the only backend; write \
-             `default_backend = \"{inferred}\"` to state it, which several backends require)"
-        );
+    // Where the default came from, when the file does not state a name plainly. Both cases are
+    // otherwise invisible: the file has no `default_backend`, or has one that is a kind, and
+    // `check` exits zero either way — so which backend answers an unrouted request would only be
+    // discoverable by reading this program's source.
+    match config.server.default_backend.as_deref() {
+        // Written but not a name, so it is a kind that resolved to one member of a set.
+        Some(stated) if !config.backends.contains_key(stated) => {
+            if let Some(resolved) = config.implied_backend(Some(stated)) {
+                println!("    default_backend: {stated} (a backend kind) resolves to {resolved}");
+            }
+        }
+        // Not written at all, and there was exactly one backend to use.
+        None => {
+            if let Some(inferred) = config.inferred_default_backend() {
+                println!(
+                    "    default_backend: {inferred} (inferred — it is the only backend; write \
+                     `default_backend = \"{inferred}\"` to state it, which several backends require)"
+                );
+            }
+        }
+        Some(_) => {}
     }
     for (name, backend) in &config.backends {
         let default = if config.implied_backend(config.server.default_backend.as_deref())

@@ -137,12 +137,7 @@ impl Config {
             }
 
             if let Some(backend) = &site.default_backend {
-                if !self.backends.contains_key(backend) {
-                    return Err(Error::Config(format!(
-                        "sites.{name}.default_backend {backend:?} does not match any configured \
-                         backend"
-                    )));
-                }
+                self.resolve_default_backend(backend, &format!("sites.{name}.default_backend"))?;
             }
 
             if let Some(statics) = &site.static_files {
