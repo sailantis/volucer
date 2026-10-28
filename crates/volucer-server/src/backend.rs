@@ -277,7 +277,16 @@ pub enum Backend {
     },
     /// A pool of FastCGI processes that volucer starts and supervises: `php-cgi`, or any
     /// command that serves FastCGI on the address it is given.
-    SpawnCgi { name: String, pool: CgiPool },
+    ///
+    /// The pool is boxed, and that is a measurement rather than a preference: inline it is the
+    /// largest variant by a wide margin — `CgiPool` carries a `Vec<Mutex<Slot>>`, a
+    /// `Vec<SlotPermits>`, a `BTreeMap` environment and a `LifecycleGuard`, which is a `HANDLE` on
+    /// Windows and empty elsewhere. That last difference is why the box is not cosmetic: on Windows
+    /// the variant is 304 bytes against `External`'s 96, and `clippy::large_enum_variant` fires
+    /// there while a Linux CI run stays quiet. Boxing makes the size the same everywhere and drops
+    /// the enum to `External`'s width. A `Backend` is reached through `&self` on the request path,
+    /// so the box is one indirection on a path that then does a syscall.
+    SpawnCgi { name: String, pool: Box<CgiPool> },
     /// A pool of persistent PHP workers speaking volucer's own protocol.
     ///
     /// The application boots once and stays resident, so PHP does *not* reset
@@ -370,7 +379,7 @@ impl Backend {
             }
             BackendConfig::SpawnCgi(cgi) => Ok(Backend::SpawnCgi {
                 name: name.to_string(),
-                pool: CgiPool::start(name, cgi)?,
+                pool: Box::new(CgiPool::start(name, cgi)?),
             }),
             BackendConfig::Worker(worker) => Ok(Backend::Worker {
                 name: name.to_string(),

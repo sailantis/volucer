@@ -24,12 +24,12 @@ impl Config {
         #[cfg(not(feature = "http3"))]
         {
             let _ = http3;
-            return Err(Error::Config(
+            Err(Error::Config(
                 "server.http3 is set, but this build of volucer was compiled without the `http3` \
                  feature; rebuild with `--features http3` (a published release carries it) or \
                  remove the table"
                     .to_string(),
-            ));
+            ))
         }
 
         #[cfg(feature = "http3")]
