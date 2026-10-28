@@ -7,6 +7,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **HTTP/3 over QUIC, behind the `http3` cargo feature and a `[server.http3]` table.** It is a
+  second transport rather than a second server: site resolution, the rate limit, routing, static
+  files, the dispatcher, the access log and the metrics are the same code that serves HTTP/1.1 and
+  HTTP/2, and the only new module is the listener that turns a QUIC stream into a request. The
+  certificate resolver is the TCP listener's own, so per-site certificates, ACME issuance and a
+  certificate reload reach it unchanged.
+
+  ```toml
+  [server.http3]
+  listen = "0.0.0.0:443"     # UDP; the same port number as `http` is fine
+  ```
+
+  `Alt-Svc` is sent automatically on every TLS answer when the table is present, naming the port
+  that actually bound — without it no browser ever discovers the endpoint, so it is not an optional
+  extra. It is never sent over cleartext, where no browser acts on it.
+
+  Three things about the feature are worth stating rather than discovering:
+
+  * **The request body is buffered**, up to `max_body_bytes`. A QUIC request stream is read by the
+    application, so it cannot be handed across the blocking boundary the CGI path needs. Responses
+    still stream, so SSE and large downloads are unaffected. This is the one behavioural difference
+    from the TCP path and it is documented in `docs/05-TLS-AND-ACME.md`.
+  * **The QUIC TLS configuration is built TLS-1.3-only, in its own function.** Reusing
+    `tls::server_config` would be the obvious implementation and is a crash:
+    `QuicServerConfig::try_from` accepts a config that permits TLS 1.2 (it only checks for an
+    AES-128-GCM suite), and `quinn-proto` then `unwrap`s the version check inside `start_session`.
+    Since `min_version` defaults to `"1.2"`, that mistake binds the socket and then panics a
+    runtime worker on *every* handshake. `Http3Listener::bind` asserts the invariant eagerly, so a
+    regression is a startup refusal rather than a per-connection panic.
+  * **`max_field_section_size` defaults to 16 KiB, deliberately.** `h3` 0.0.8 defaults it to
+    `VarInt::MAX`, which is hyperium/h3#379 — a remotely triggerable amplification, and the reason
+    `deny.toml` and its job exist. The cap is a security setting rather than a tuning knob; see the
+    security entry below.
+
+  A build without the feature refuses `[server.http3]` **by name**, naming `--features http3`,
+  rather than reporting an unknown field. Published releases and the Docker images are built with
+  it.
+
 ### Changed
 
 - **`services` can name a method, not only a namespace.** A grant used to hand over a whole
@@ -102,6 +142,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   header or a dotted key — and one asserts the limit of that rule, that an `-o` pair still adds an
   entry because it is applied after parsing. `volucer.example.toml` and two documentation pages now
   show both spellings and say when to pick each.
+
+### Security
+
+- **Three vulnerabilities in the dependency graph, found by adding `cargo-deny` and fixed by
+  upgrade rather than suppression.** `rustls-webpki` (RUSTSEC-2026-0382) could accept a certificate
+  path containing distrusted emSign intermediates, `webpki-roots` (RUSTSEC-2026-0381) bundled one of
+  those roots, and `tokio` (RUSTSEC-2026-0386) had an I/O-safety unsoundness in `AsyncFd::new`.
+  All three are patch upgrades — 0.103.16, 1.0.11, 1.54.1 — with no API change. Nothing in this
+  repository was reading the advisory database, so they had been in the tree unnoticed; the `deny`
+  CI job is what found them and what keeps the next one from arriving quietly.
+- **`h3` 0.0.8 carries an unpatched amplification (hyperium/h3#379), mitigated by configuration.**
+  Its `max_field_section_size` defaults to `VarInt::MAX`, so a `HEADERS` frame of one-byte
+  static-table references decodes into a `HeaderMap` with thousands of entries. `[server.http3]
+  max_field_section_size` (16 KiB) is what bounds it: RFC 9114 §4.2.2 charges each decoded field at
+  least 32 bytes, and `qpack::decode_stateless` rejects the section *before* the fields are
+  materialised. **No release carries the upstream fix**, so the mitigation is configuration and is
+  pinned by `an_oversized_header_section_is_answered_431_and_the_listener_survives` — which asserts
+  the server answers 431 *and* serves the next request, and which fails if the cap is returned to
+  the crate's default. `deny.toml` records the advisory rather than hiding it.
+- **`rustls-pemfile` is unmaintained (RUSTSEC-2025-0134), recorded rather than migrated here.** It
+  is a thin wrapper over `rustls-pki-types` and is not vulnerable; the migration is to use
+  `rustls-pki-types`' own PEM parsing and drop the dependency. `deny.toml` ignores the advisory with
+  that reason beside it, because it is not part of the HTTP/3 change.
 
 ### Fixed
 

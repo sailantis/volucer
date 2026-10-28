@@ -35,7 +35,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::header::{
-    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    HeaderName, HeaderValue, ALT_SVC, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
     STRICT_TRANSPORT_SECURITY, VARY,
 };
 use hyper::service::service_fn;
@@ -72,6 +72,42 @@ pub fn body_of(bytes: Bytes) -> ResponseBody {
     Full::new(bytes)
         .map_err(|never: std::convert::Infallible| match never {})
         .boxed_unsync()
+}
+
+/// A request body, in whichever shape the transport that accepted it delivered it.
+///
+/// Two shapes, because two transports deliver it in two shapes. `hyper` hands over an
+/// [`Incoming`] stream, which must stay a stream for the upstream path to forward it without
+/// holding it. The HTTP/3 front-end has already drained its body into memory by the time it can
+/// build a request — a QUIC request stream is a thing the application reads, not a
+/// `hyper` body — so what it has is bytes.
+///
+/// **One enum rather than a type parameter on every function below.** [`handle`], [`prepare`],
+/// [`upstream`] and [`read_body`] are each entered once per request from either transport, so a
+/// `B: Body` parameter would monomorphise the whole request path twice to express a difference
+/// that is one match arm in [`read_body`] and one in [`Payload::into_upstream`]. It also keeps
+/// the `spawn_blocking` closure from capturing a second type parameter it cannot name.
+pub enum Payload {
+    /// A body still on the wire, forwarded without being buffered.
+    Streamed(Incoming),
+    /// A body the transport has already read.
+    Buffered(Bytes),
+}
+
+impl Payload {
+    /// The body as the type the upstream dispatcher accepts.
+    ///
+    /// `UpstreamBody` and [`ResponseBody`] are the same type spelled twice — an
+    /// `UnsyncBoxBody<Bytes, io::Error>` — which is why the buffered arm needs no conversion
+    /// beyond [`body_of`]'s boxing. The streamed arm is handed to
+    /// `volucer_upstream::incoming_body` rather than mapping its error here, so a transport's
+    /// error type is translated in one place.
+    fn into_upstream(self) -> volucer_upstream::UpstreamBody {
+        match self {
+            Payload::Streamed(body) => volucer_upstream::incoming_body(body),
+            Payload::Buffered(bytes) => body_of(bytes),
+        }
+    }
 }
 
 /// How long an idle keep-alive connection may sit before it is closed.
@@ -134,6 +170,27 @@ pub struct HttpStats {
     /// Only possible with `[server.tls].plain`, which is off by default and logged at startup.
     /// Counted so a deployment can see it happening rather than inferring it.
     pub plaintext_on_tls_port: AtomicUsize,
+    /// QUIC handshakes that completed. Zero unless `[server.http3]` is configured.
+    ///
+    /// Separate from [`Self::handshakes`] because the two are different protocols over different
+    /// sockets: one counter would make "the TLS listener is failing" and "the QUIC listener is
+    /// failing" the same number, which is the one thing an operator has to be able to tell apart.
+    ///
+    /// The names these are exposed under are `volucer_http3_*` rather than `rr_http_*`: the
+    /// `rr_` set is an interface with dashboards that already exist and is asserted literally in
+    /// `volucer-metrics`, so a new counter cannot join it without breaking that test — and an
+    /// HTTP/3 counter is this project's decision, not RoadRunner's.
+    pub h3_connections: AtomicUsize,
+    /// Requests served over HTTP/3.
+    pub h3_requests: AtomicUsize,
+    /// QUIC handshakes that failed.
+    pub h3_handshake_failures: AtomicUsize,
+    /// Requests whose header section exceeded `[server.http3].max_field_section_size`.
+    ///
+    /// **The counter that makes the amplification mitigation observable.** `h3` answers a
+    /// too-large section with a 431 by itself, so without a count a deployment being probed looks
+    /// exactly like one that is not — the client gets a refusal and the log says nothing.
+    pub h3_oversized_headers: AtomicUsize,
 }
 
 impl HttpStats {
@@ -155,6 +212,29 @@ impl HttpStats {
             self.plaintext_on_tls_port.load(Ordering::Relaxed),
         )
     }
+
+    /// The HTTP/3 counters, for logging at shutdown.
+    ///
+    /// A named tuple rather than a fourth positional one: there are four of them, they are all
+    /// `usize`, and a caller that transposed `h3_requests` and `h3_connections` would be a log line
+    /// nobody could check. See [`H3Counters`].
+    pub fn h3_snapshot(&self) -> H3Counters {
+        H3Counters {
+            connections: self.h3_connections.load(Ordering::Relaxed),
+            requests: self.h3_requests.load(Ordering::Relaxed),
+            handshake_failures: self.h3_handshake_failures.load(Ordering::Relaxed),
+            oversized_headers: self.h3_oversized_headers.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The HTTP/3 counters, named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct H3Counters {
+    pub connections: usize,
+    pub requests: usize,
+    pub handshake_failures: usize,
+    pub oversized_headers: usize,
 }
 
 /// TLS settings for a listener, borrowed from the configuration.
@@ -184,6 +264,14 @@ pub struct ListenerSettings<'a> {
     /// redirect needs — this port, and whether the connection arrived over TLS — because those are
     /// properties of the socket rather than of any site.
     pub https_port: Option<u16>,
+    /// The HTTP/3 endpoint this listener should advertise in `Alt-Svc`, when one is configured.
+    ///
+    /// The **port** the UDP listener is bound on, which is why it is passed in rather than read
+    /// from `[server.http3].listen`: a deployment that asked for port 0 has a port only that
+    /// socket knows, and the value goes into a header a browser acts on. `None` on a deployment
+    /// with no `[server.http3]`, and `None` on the HTTP/3 listener itself — a response arriving
+    /// over QUIC must not advertise the connection it is already using.
+    pub alt_svc_port: Option<u16>,
 }
 
 /// Stops the listener from another thread.
@@ -206,7 +294,12 @@ impl HttpShutdown {
 }
 
 /// Everything one connection needs, shared across tasks.
-struct FrontEnd {
+///
+/// `pub(crate)` because the HTTP/3 listener is a sibling module that must hand a request to the
+/// same request path: a second copy of the fields there is a second `HttpStats` and therefore two
+/// sets of counters for one process. The fields stay private to the module, and what the sibling
+/// needs is reached through the accessors in `impl FrontEnd` below.
+pub(crate) struct FrontEnd {
     /// Shared without a lock of its own: the dispatcher and its backends
     /// synchronise internally, per backend slot, so requests to different
     /// workers genuinely run at the same time.
@@ -271,9 +364,62 @@ struct FrontEnd {
     /// — see [`ReloadHandles::rate_limit`]. The load is one pointer read, which is the same cost the
     /// `None` check had.
     rate_limit: Arc<RateLimitCell>,
+    /// The `Alt-Svc` header value that advertises this process's HTTP/3 endpoint, if there is one.
+    ///
+    /// **Without this header no browser ever finds the UDP listener.** A page served over
+    /// TCP returns normally and the browser has no reason to try QUIC; `Alt-Svc` is the only
+    /// mechanism that says "this name is also reachable at that address, over that protocol, for
+    /// this long". So a `[server.http3]` table without it is a listener that exists and is never
+    /// used — "supported" rather than "used".
+    ///
+    /// `None` on every deployment without `[server.http3]`, and on the HTTP/3 listener itself (a
+    /// response over QUIC must not advertise the connection the client is already using).
+    ///
+    /// Stored as a rendered [`HeaderValue`] rather than as a port and a lifetime, because the value
+    /// is written on every response and formatting it per request would allocate on the hot path
+    /// for a string that never changes.
+    alt_svc: Option<HeaderValue>,
 }
 
 impl FrontEnd {
+    /// Everything one listener needs, assembled in one place.
+    ///
+    /// A constructor rather than a struct literal because there are now two listeners — TCP and
+    /// QUIC — and a literal in each would let one be given the other's port, or a field be added
+    /// to one and forgotten in the other. The two differences that *should* exist are arguments
+    /// here: `https_port` is `None` on QUIC (a redirect is a cleartext answer and QUIC has no
+    /// cleartext), and `tls` is always `Some` there (QUIC is TLS 1.3 by definition).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        dispatcher: Arc<Dispatcher>,
+        registry: Arc<Registry>,
+        state: Arc<Swappable<Reloaded>>,
+        tls: Option<Arc<crate::tls::SniResolver>>,
+        limits: HttpLimits,
+        server_port: u16,
+        https_port: Option<u16>,
+        observe: Arc<volucer_observe::Observability>,
+        client_ip: Arc<volucer_core::ClientIpPolicy>,
+        rate_limit: Arc<RateLimitCell>,
+        alt_svc: Option<HeaderValue>,
+    ) -> Self {
+        FrontEnd {
+            dispatcher,
+            registry,
+            state,
+            tls,
+            limits,
+            stats: Arc::new(HttpStats::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            server_port,
+            https_port,
+            observe,
+            client_ip,
+            rate_limit,
+            alt_svc,
+        }
+    }
+
     /// A snapshot of the reloadable state, taken once per request.
     ///
     /// The single load is the point: everything downstream — site resolution, the routing
@@ -283,6 +429,35 @@ impl FrontEnd {
     /// explained to an operator.
     fn state(&self) -> Arc<Reloaded> {
         self.state.load()
+    }
+
+    /// The statistics handle, shared with the accept loops.
+    ///
+    /// An `Arc` rather than a `&HttpStats` because both accept loops hand a clone to the per-
+    /// connection task, and the HTTP/3 listener keeps one to report at shutdown.
+    #[cfg(feature = "http3")]
+    pub(crate) fn stats(&self) -> Arc<HttpStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// The connection counter, for the accept loops to increment and decrement.
+    #[cfg(feature = "http3")]
+    pub(crate) fn connections(&self) -> &AtomicUsize {
+        &self.stats.connections
+    }
+
+    /// The refused-connection counter.
+    #[cfg(feature = "http3")]
+    pub(crate) fn rejected(&self) -> &AtomicUsize {
+        &self.stats.rejected
+    }
+
+    /// A stop handle for this front-end, so a second listener shares the process's one signal.
+    #[cfg(feature = "http3")]
+    pub(crate) fn shutdown_handle(&self) -> HttpShutdown {
+        HttpShutdown {
+            flag: Arc::clone(&self.shutdown),
+        }
     }
 }
 
@@ -775,6 +950,16 @@ impl HttpListener {
         let requested_https_port = settings.https_port;
         let resolver = handles.tls.clone();
 
+        // The `Alt-Svc` value, rendered once here rather than per response. `None` when this
+        // process serves no HTTP/3, or when this *is* the HTTP/3 listener.
+        //
+        // The `ma=` lifetime comes from `[server.http3].alt_svc_ma_seconds`; the port from the
+        // caller, because only a bound socket knows which port it got.
+        let alt_svc = settings.alt_svc_port.and_then(|port| {
+            let http3 = settings.tls?.config.server.http3.as_ref()?;
+            HeaderValue::from_str(&http3.alt_svc_value(port)).ok()
+        });
+
         if resolver.is_some() && settings.tls.is_none() {
             return Err(HttpError::Tls {
                 reason: "a certificate resolver was given to a listener with no TLS settings, so \
@@ -908,20 +1093,19 @@ impl HttpListener {
 
         Ok(HttpListener {
             listener,
-            front_end: Arc::new(FrontEnd {
+            front_end: Arc::new(FrontEnd::new(
                 dispatcher,
-                registry: Arc::clone(&handles.registry),
+                Arc::clone(&handles.registry),
                 state,
-                tls: resolver,
+                resolver,
                 limits,
-                stats: Arc::new(HttpStats::default()),
-                shutdown: Arc::new(AtomicBool::new(false)),
-                server_port: port,
-                https_port: Some(https_port),
-                observe: Arc::clone(&handles.observe),
-                client_ip: Arc::clone(&handles.client_ip),
-                rate_limit: Arc::clone(&handles.rate_limit),
-            }),
+                port,
+                Some(https_port),
+                Arc::clone(&handles.observe),
+                Arc::clone(&handles.client_ip),
+                Arc::clone(&handles.rate_limit),
+                alt_svc,
+            )),
             tls: acceptor,
             accept_plain,
         })
@@ -1158,12 +1342,15 @@ where
                 .client_ip
                 .resolve(peer_ip, &HttpHeaders(request.headers()));
             let remote_addr = resolved.to_string();
+            // The one place this transport's body is named. `hyper`'s server accepts any body
+            // type, so `Incoming` reaching `handle` would have been fine too — it is wrapped so
+            // that the request path below has exactly one body type to be written against.
+            let request = request.map(Payload::Streamed);
             Ok::<_, Infallible>(
                 handle(request, front_end, remote_addr, resolved, local, cleartext).await,
             )
         }
     });
-
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     // A connection that sends a partial request and stops must not hold a slot
     // for ever. This is the timeout `hyper` offers for HTTP/1; a fully idle
@@ -1186,9 +1373,37 @@ where
         .map_err(|source| HttpError::BadGateway(format!("connection failed: {source}")))
 }
 
+/// Serve one request that arrived over a transport whose body is already in memory.
+///
+/// The HTTP/3 entry point, and the reason it exists rather than `http3.rs` calling [`handle`]:
+/// [`handle`] is `hyper`-shaped — it takes the peer address the accept loop already had — while a
+/// QUIC connection's remote address belongs to the connection, not to the request stream. So the
+/// address is passed in here and the client-IP policy is applied at exactly the same point it is
+/// applied for TCP: **once, from the request's own headers**, so `REMOTE_ADDR` and the access
+/// log's `peer` cannot disagree.
+///
+/// `cleartext` is `false` and is not a parameter: QUIC has no cleartext mode, so a
+/// `[server.redirect_to_https]` site must not redirect an HTTP/3 request — that would send the
+/// client from a secure transport to the same name over TCP, which is a downgrade dressed as a
+/// policy. The site table still sees `SiteProtocol::Https`, which is what its `protocols` list
+/// should be matched against.
+#[cfg(feature = "http3")]
+pub(crate) async fn handle_http3(
+    request: Request<Payload>,
+    front_end: Arc<FrontEnd>,
+    peer: SocketAddr,
+    local: Option<std::net::IpAddr>,
+) -> Response<ResponseBody> {
+    let resolved = front_end
+        .client_ip
+        .resolve(peer.ip(), &HttpHeaders(request.headers()));
+    let remote_addr = resolved.to_string();
+    handle(request, front_end, remote_addr, resolved, local, false).await
+}
+
 /// Serve one request, mapping any failure to an error page.
 async fn handle(
-    request: Request<Incoming>,
+    request: Request<Payload>,
     front_end: Arc<FrontEnd>,
     remote_addr: String,
     resolved_peer: std::net::IpAddr,
@@ -1272,6 +1487,24 @@ async fn handle(
             response
                 .headers_mut()
                 .insert(STRICT_TRANSPORT_SECURITY, value);
+        }
+    }
+
+    // **`Alt-Svc`, so a browser learns the HTTP/3 endpoint exists.** Written here for the same
+    // reason `Strict-Transport-Security` is: this is the one point every response passes through,
+    // including the error pages `error_response` built from an `Err`.
+    //
+    // Two conditions, and both are requirements rather than preferences. **Only over a secure
+    // transport**: a browser ignores `Alt-Svc` from a cleartext response, so writing it there is a
+    // header that costs bytes and teaches nobody. **Only when `[server.http3]` is configured** —
+    // `alt_svc` is `None` otherwise, and a deployment that does not serve HTTP/3 must not tell
+    // clients to look for it, because a failed QUIC attempt is a visible delay for every visitor.
+    if let Some(value) = &front_end.alt_svc {
+        if !cleartext {
+            response
+                .headers_mut()
+                .entry(ALT_SVC)
+                .or_insert_with(|| value.clone());
         }
     }
 
@@ -1463,7 +1696,7 @@ impl From<HttpError> for BackendFailure {
 /// Read the body, build the CGI environment, dispatch, and translate the answer.
 #[allow(clippy::too_many_arguments)]
 async fn prepare(
-    request: Request<Incoming>,
+    request: Request<Payload>,
     front_end: &Arc<FrontEnd>,
     remote_addr: String,
     resolved_peer: std::net::IpAddr,
@@ -1803,21 +2036,25 @@ async fn prepare(
 
 /// Send a request to an HTTP origin and turn its answer into this front-end's response.
 ///
-/// **Nothing here blocks and nothing is buffered.** The request body is `Incoming`, passed straight
-/// through to the client, and the response body comes back unread — which is what makes a large
-/// upload, a streamed download and an SSE feed work without a byte of either being held. The CGI
-/// path is the opposite on both counts by necessity, so the two must not share a body type and do
-/// not.
+/// **Nothing here blocks, and nothing is buffered that arrived unbuffered.** The body is a
+/// [`Payload`] and is handed to the origin in whatever shape it arrived in: a `hyper` request's
+/// `Incoming` is passed straight through, which is what makes a large upload, a streamed download
+/// and an SSE feed work without a byte of either being held. The HTTP/3 front-end has already read
+/// its body into memory (it must, to have a request at all), so its `Buffered` arm re-boxes bytes
+/// it already owns. The CGI path buffers unconditionally by necessity, so the two must not share a
+/// body type and do not.
 ///
-/// The body cap is deliberately *not* applied. An upstream is strictly more capable than worker
+/// The body cap is deliberately *not* applied here. An upstream is strictly more capable than worker
 /// mode, and a reverse proxy silently imposing a limit its own client never set is a bug report
 /// waiting; the limit to configure is the origin's. That is a real change in this server's exposure
-/// and it is stated in the README beside the limit rather than only here.
+/// and it is stated in the README beside the limit rather than only here — with one exception that
+/// is stated where it happens: the HTTP/3 transport has no choice but to buffer, so its own
+/// `max_body_bytes` does apply there, and `http3.rs` says so.
 async fn upstream(
     front_end: &Arc<FrontEnd>,
     backend: &str,
     parts: hyper::http::request::Parts,
-    body: Incoming,
+    body: Payload,
     remote_addr: &str,
     cleartext: bool,
     outbound_traceparent: Option<String>,
@@ -1877,10 +2114,11 @@ async fn upstream(
         parts.method,
         uri,
         parts.version,
-        // Boxed as the *upstream* crate's body type, not `http_body_util::BodyExt::boxed`, which
-        // would give `BoxBody<Bytes, hyper::Error>` — a different type from the one the dispatcher's
-        // client accepts, and one that could not be `Sync` anyway.
-        volucer_upstream::incoming_body(body),
+        // The *upstream* crate's body type, not `http_body_util::BodyExt::boxed`, which would give
+        // `BoxBody<Bytes, hyper::Error>` — a different type from the one the dispatcher's client
+        // accepts, and one that could not be `Sync` anyway. `Payload::into_upstream` is where the
+        // two shapes meet, so this call site does not branch on the transport.
+        body.into_upstream(),
         peer,
         cleartext,
     );
@@ -1919,9 +2157,37 @@ async fn upstream(
 
 /// Read the request body, refusing anything over the limit.
 ///
-/// The frames are counted as they arrive rather than checked afterwards, so an
-/// oversized upload is refused without being buffered first.
-async fn read_body(body: Incoming, limit: usize) -> Result<Vec<u8>> {
+/// Both shapes are checked against the same limit, and a `Buffered` body is checked rather than
+/// trusted: the transport that buffered it applied its own cap, but a body that arrives here is
+/// about to be handed to a backend with its length in `CONTENT_LENGTH`, and "somebody upstream
+/// already checked" is the kind of invariant that is true until a second transport is added. The
+/// check is a comparison, not a copy.
+///
+/// The frames of a `Streamed` body are counted as they arrive rather than checked afterwards, so
+/// an oversized upload is refused without being buffered first.
+async fn read_body(body: Payload, limit: usize) -> Result<Vec<u8>> {
+    match body {
+        Payload::Streamed(body) => drain(body, limit).await,
+        Payload::Buffered(bytes) => {
+            if bytes.len() > limit {
+                Err(HttpError::BodyTooLarge { limit })
+            } else {
+                Ok(bytes.to_vec())
+            }
+        }
+    }
+}
+
+/// The counting half of [`read_body`], over any `hyper` body.
+///
+/// Separate from `read_body` so the frame loop can be driven from a test with a `Full<Bytes>`
+/// rather than needing a live connection to produce an [`Incoming`]: an upload limit that only
+/// a socket can exercise is a limit whose off-by-one nobody checks.
+async fn drain<B>(body: B, limit: usize) -> Result<Vec<u8>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let mut body = body;
     let mut out: Vec<u8> = Vec::new();
 
@@ -2777,6 +3043,78 @@ mod tests {
         assert_eq!(protocol_name(hyper::Version::HTTP_10), "HTTP/1.0");
         assert_eq!(protocol_name(hyper::Version::HTTP_11), "HTTP/1.1");
         assert_eq!(protocol_name(hyper::Version::HTTP_2), "HTTP/2.0");
+    }
+
+    /// A body the transport already read is passed on, and counted against the same limit.
+    ///
+    /// The buffered arm exists for HTTP/3, which cannot hand over a stream. The risk it carries is
+    /// that the limit is skipped because "the transport already capped it" — so this asserts the
+    /// cap is applied here, by this function, whatever the caller did.
+    #[tokio::test]
+    async fn a_buffered_body_is_returned_whole_and_refused_over_the_limit() {
+        let body = read_body(Payload::Buffered(Bytes::from_static(b"name=value")), 32)
+            .await
+            .expect("a body under the limit");
+        assert_eq!(body, b"name=value");
+
+        let err = read_body(Payload::Buffered(Bytes::from_static(b"0123456789")), 9)
+            .await
+            .expect_err("one byte over the limit");
+        assert_eq!(err.status(), 413);
+    }
+
+    /// The boundary is inclusive, and it is asserted rather than assumed: a limit that refused a
+    /// body of exactly `max_body_bytes` would break every upload sized to the documented maximum.
+    #[tokio::test]
+    async fn a_buffered_body_of_exactly_the_limit_is_accepted() {
+        let body = read_body(Payload::Buffered(Bytes::from_static(b"0123456789")), 10)
+            .await
+            .expect("a body of exactly the limit");
+        assert_eq!(body.len(), 10);
+    }
+
+    /// The streamed arm's counting loop, driven with a body a test can build.
+    ///
+    /// `read_body` cannot be reached with a real `Incoming` outside a connection, so the loop is
+    /// exercised through `drain` — the same code, given a body that yields frames on demand. Two
+    /// frames rather than one, because the bug this guards against is a limit checked per-frame
+    /// instead of cumulatively, which a single frame cannot tell apart from a correct check.
+    #[tokio::test]
+    async fn a_streamed_body_is_refused_when_the_frames_exceed_the_limit_together() {
+        let body = Full::new(Bytes::from_static(b"12345"));
+        assert_eq!(drain(body, 5).await.expect("exactly the limit"), b"12345");
+
+        let body = Frames(vec![b"123".as_slice().into(), b"456".as_slice().into()]);
+        let err = drain(body, 5)
+            .await
+            .expect_err("six bytes over a limit of five");
+        assert_eq!(err.status(), 413);
+    }
+
+    /// A body made of the frames it was given, for the tests above.
+    ///
+    /// Written here rather than taken from `http-body-util` because the only thing needed is "yield
+    /// these data frames in order", and a dependency added for three lines of test scaffolding is a
+    /// dependency in every future audit.
+    struct Frames(Vec<Bytes>);
+
+    impl Body for Frames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, Self::Error>>>
+        {
+            let this = &mut *self;
+            std::task::Poll::Ready(if this.0.is_empty() {
+                None
+            } else {
+                let data = this.0.remove(0);
+                Some(Ok(hyper::body::Frame::data(data)))
+            })
+        }
     }
 }
 

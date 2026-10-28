@@ -7,6 +7,7 @@ mod acme;
 mod endpoints;
 mod grpc;
 mod grpc_proto;
+mod http3;
 mod metrics;
 mod parse;
 mod relay;

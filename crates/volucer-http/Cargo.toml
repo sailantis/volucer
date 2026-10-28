@@ -49,7 +49,10 @@ hyper-util.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# `macros` is what `tokio::select!` needs, and the HTTP/3 connection loop is one `select!` over
+# accept-next-request and reap-finished-request. Additive, so the TCP listener is unaffected; the
+# TCP path already uses `tokio::spawn` and `timeout`, which the workspace feature set covers.
+tokio = { workspace = true, features = ["macros"] }
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -57,12 +60,35 @@ rustls-acme.workspace = true
 # For the generated placeholder a `[server.tls]` without a certificate gets. A real dependency
 # rather than a dev one because the *server* generates it, not a test.
 rcgen = "0.13"
+# HTTP/3. `optional = true` behind the `http3` feature so a build that does not ask for it links
+# none of this — see the feature's comment in `[features]` below and the workspace manifest for why
+# `quinn` must be taken without its defaults.
+quinn = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+# HTTP/3 over QUIC: the listener in `src/http3.rs` and the `[server.http3]` table that configures it.
+#
+# Off by default, and that is the decision rather than an oversight. `h3` is 0.0.8 and calls itself
+# "still very experimental", so a deployment opts in knowing that; the alternative — on for
+# everyone — would ship a pre-1.0 protocol stack to every existing user because one of them might
+# want it.
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:futures-util", "volucer-core/http3"]
 
 [dev-dependencies]
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["custom-provider"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-rustls = "0.26"
+# The HTTP/3 tests speak real QUIC at a real listener, so they need a client. Named here rather
+# than made non-optional above: nothing in the *library* needs `h3`'s client half, and a build
+# without `http3` must not compile it.
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+bytes.workspace = true
 # For the composition test: building a real `AcmeState` so `ChallengeResolver` can be exercised
 # against the dependency's own exact-ALPN rule rather than against a stub that reimplements it.
 rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }

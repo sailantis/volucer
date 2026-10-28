@@ -2170,17 +2170,9 @@ fn serve(
     // split deployment names the `https` port with *no* acceptor, and giving it one would turn it
     // into a TLS port that no cleartext client could reach. Which sites actually redirect comes
     // from the site table, so this key is only the target's port.
-    let http_settings = volucer_http::ListenerSettings {
-        tls: if tls_on_http {
-            Some(volucer_http::TlsSettings {
-                config: &config,
-                config_dir,
-            })
-        } else {
-            None
-        },
-        https_port,
-    };
+    //
+    // Built **after** the HTTP/3 listener binds, because `alt_svc_port` names the UDP socket's own
+    // port and only a bound socket knows it. See the `http3` block below.
 
     // The certificate table is built **once for the process**, before any port is bound, and
     // handed to every TLS-speaking listener.
@@ -2420,6 +2412,69 @@ fn serve(
         );
     }
 
+    // **HTTP/3 binds first**, before the TCP listeners, and that order is a consequence rather than
+    // a preference: the `Alt-Svc` header the TCP listeners write names the UDP port, and a
+    // deployment that asked for port 0 has a port only the bound socket knows. Binding afterwards
+    // would mean either advertising nothing or guessing.
+    //
+    // It is also the listener whose failure matters most to report early: `[server.http3]` requires
+    // a working TLS 1.3 configuration, and a mistake there is otherwise a panic inside `quinn` on
+    // the first handshake rather than a message at startup.
+    #[cfg(feature = "http3")]
+    let http3 = match &config.server.http3 {
+        Some(http3_config) => {
+            let running = volucer_http::RunningHttp3::start(
+                &http3_config.listen,
+                Arc::clone(&dispatcher),
+                handles_for(true),
+                HttpLimits {
+                    max_connections: http3_config.max_connections,
+                    max_body_bytes: config.server.max_body_bytes(),
+                },
+                volucer_http::ListenerSettings {
+                    tls: Some(volucer_http::TlsSettings {
+                        config: &config,
+                        config_dir,
+                    }),
+                    https_port: None,
+                    alt_svc_port: None,
+                },
+            )
+            .map_err(|err| ServerError::Listener {
+                reason: err.to_string(),
+            })?;
+            println!(
+                "  http3:            {} (udp, alt-svc {})",
+                running.local_addr(),
+                running.alt_svc()
+            );
+            Some(running)
+        }
+        None => None,
+    };
+
+    // The port the TCP listeners advertise in `Alt-Svc`, taken from the socket that just bound.
+    #[cfg(feature = "http3")]
+    let alt_svc_port = http3.as_ref().map(volucer_http::RunningHttp3::port);
+    // Without the feature the table is refused by `Config::validate`, so this is unreachable — and
+    // it is written as `None` rather than `unreachable!()` so that removing the refusal could never
+    // become a panic in the startup path.
+    #[cfg(not(feature = "http3"))]
+    let alt_svc_port: Option<u16> = None;
+
+    let http_settings = volucer_http::ListenerSettings {
+        tls: if tls_on_http {
+            Some(volucer_http::TlsSettings {
+                config: &config,
+                config_dir,
+            })
+        } else {
+            None
+        },
+        https_port,
+        alt_svc_port,
+    };
+
     let http = match &http_address {
         Some(address) => {
             let running = RunningHttp::start_with_tls(
@@ -2466,6 +2521,7 @@ fn serve(
                         config_dir,
                     }),
                     https_port,
+                    alt_svc_port,
                 },
             )
             .map_err(|err| ServerError::Listener {
@@ -2639,6 +2695,22 @@ fn serve(
         let (_, requests, _, failed) = stats.snapshot();
         println!("https: {requests} request(s), {failed} failed");
         report_tls(&stats);
+    }
+
+    // The HTTP/3 listener, stopped after the TCP ones: a client that learned the UDP endpoint from
+    // an `Alt-Svc` header on a TCP response should still find it open while its in-flight requests
+    // finish. Its counters are printed even at zero, because "configured and never used" is the
+    // state an operator most needs to see — it means the `Alt-Svc` header is not reaching anyone.
+    #[cfg(feature = "http3")]
+    if let Some(http3) = http3 {
+        let stats = Arc::clone(&http3.stats());
+        http3.stop();
+        let h3 = stats.h3_snapshot();
+        println!(
+            "http3: {} request(s) on {} connection(s), {} handshake failure(s), \
+             {} oversized header section(s)",
+            h3.requests, h3.connections, h3.handshake_failures, h3.oversized_headers
+        );
     }
 
     // Stopped last, after the request listeners have gone: a scraper that reads a pool count while
@@ -3263,6 +3335,7 @@ pub fn restart_only() -> Vec<&'static str> {
         "a reload does not change: backends, their commands and worker counts (the processes are running)",
         "a reload does not change: [server.env] and a backend's env (the processes are already running with the old values, so a reload would leave a replacement worker on the new ones and its siblings on the old)",
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
+        "a reload does not change: [server.http3] listen, idle_timeout_ms and max_field_section_size (the QUIC endpoint and the h3 settings are built once, so a new address, timeout or header cap is a new socket)",
         "a reload does not change: [server.proxy] (whose forwarded headers are believed is a statement about this deployment's topology, not about a request)",
         "a reload does not change: [server.access_log] path, format and request_id_header (SIGHUP closes and reopens the log a rotation moved, but the destination is chosen at startup)",
         "a reload does not change: [status] listen (the listener is bound, so a new address is a new socket)",
@@ -3545,6 +3618,35 @@ fn check(
             }
         }
         (None, false) => println!("  tls:              (disabled)"),
+    }
+    // HTTP/3, printed beside the TLS block because it is the same certificate answering a different
+    // protocol — and its `alpn:` line names `h3` explicitly rather than leaving it implied. Without
+    // that, "negotiated over TCP" and "served over UDP" are the same line and a reader cannot tell
+    // which of the two a deployment actually does.
+    match &config.server.http3 {
+        Some(http3) => {
+            println!("  http3:");
+            println!("    listen:           {} (udp)", http3.listen);
+            println!("    alpn:             h3 (fixed by the protocol; not [server.tls].alpn)");
+            println!("    max connections:  {}", http3.max_connections);
+            println!("    idle timeout:     {} ms", http3.idle_timeout_ms);
+            println!(
+                "    max field section: {} bytes{}",
+                http3.max_field_section_size,
+                if http3.max_field_section_size
+                    == volucer_core::config::DEFAULT_HTTP3_MAX_FIELD_SECTION_SIZE
+                {
+                    " (default)"
+                } else {
+                    " (configured)"
+                }
+            );
+            println!(
+                "    alt-svc:          h3=\":<bound port>\"; ma={} (sent over TLS only)",
+                http3.alt_svc_ma_seconds
+            );
+        }
+        None => println!("  http3:            (disabled)"),
     }
     // A site's certificate is printed only when the site states one, for the same reason the
     // site table prints only stated keys: listing the inherited value per site would read as
@@ -5337,6 +5439,7 @@ document_root = "/from/file"
             "backends",
             "server.env",
             "min_version",
+            "server.http3",
             "server.proxy",
             "server.access_log",
             "status] listen",

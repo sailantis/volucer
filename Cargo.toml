@@ -126,6 +126,24 @@ rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-
 tokio = { version = "1", features = ["net", "fs", "io-util", "rt-multi-thread", "time"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io"] }
+# HTTP/3, behind the `http3` feature and only reachable from `volucer-http`.
+#
+# `h3` is 0.0.8 — pre-1.0 and explicitly experimental — so it is pinned to the minor version and
+# isolated behind one module. `h3-quinn` is its `quinn` adapter and is pinned in lockstep: it
+# requires `h3 = "^0.0.8"`, which is why a same-version `[patch]` of `h3` alone resolves through it.
+#
+# **`default-features = false` on `quinn` is load-bearing, not tidiness.** Its default set is
+# `["log", "platform-verifier", "runtime-tokio", "rustls-ring", "bloom"]`, so leaving it on pulls
+# `ring` in beside the `aws-lc-rs` provider `rustls-acme` selects — two crypto providers in one
+# binary, which `crates/volucer-http/tests/one_rustls.rs` exists to refuse. `rustls-aws-lc-rs` is
+# named so the one `rustls` in the graph is the one that test counts.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "log",
+] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 # `1` is TOML **1.1**, and the sentence is worth reading before pinning it back: 1.1 is what puts
 # newlines and a trailing comma inside an inline table, so a table of application metrics is
 #

@@ -180,6 +180,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
 
+    /// HTTP/3 over QUIC, on its own UDP listener. **Presence of this table is what turns it on.**
+    ///
+    /// Absent by default, and absent is the same behaviour as every release before this key
+    /// existed: `hyper` has no HTTP/3, so a deployment that says nothing serves HTTP/1.1 and
+    /// HTTP/2 exactly as it did.
+    ///
+    /// **It needs a build with the `http3` feature.** The key parses either way, and a build
+    /// without the feature refuses it *by name* rather than reporting an unknown field — see
+    /// [`Http3Config`] and `validate_http3` for why that distinction is worth a field.
+    #[serde(default)]
+    pub http3: Option<Http3Config>,
+
     /// Answer cleartext requests on `http` with a `301` to the `https://` equivalent.
     ///
     /// Off by default: it changes what an existing cleartext deployment does, and a

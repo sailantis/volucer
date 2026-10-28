@@ -20,3 +20,8 @@ default = []
 # cannot be built. The feature carries no dependency of its own — the driver itself lives in
 # `volucer-kv` — so this only widens the enum.
 redis = []
+# Enables `[server.http3]` *in the configuration model*, on the same rule: a build without the
+# listener refuses the table by name instead of accepting a block nothing will bind. The table's
+# fields are declared either way, so a `volucer.toml` written for a release build still parses
+# under a build without the feature and is refused with a sentence rather than an unknown field.
+http3 = []

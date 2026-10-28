@@ -780,6 +780,10 @@ impl Config {
         self.validate_sites()?;
         self.validate_acme()?;
 
+        // Last, because two of its rules read the answers above: a `[server.http3]` refused for
+        // having no `[server.tls]` must not be reported before a TLS table that is itself broken.
+        self.validate_http3()?;
+
         Ok(())
     }
 }

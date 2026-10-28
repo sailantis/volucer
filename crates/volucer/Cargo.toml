@@ -49,6 +49,11 @@ default = []
 # Redis — and without it, `volucer check` refuses that table by name instead of starting a server whose
 # every `kv.*` call would fail. The feature carries the driver crates up through the tree.
 redis = ["volucer-server/redis", "volucer-core/redis"]
+# HTTP/3 over QUIC, following the `redis` precedent: the feature carries the listener up through the
+# tree, so `cargo install volucer --features http3` produces a server that can serve a
+# `[server.http3]` table — and without it, `volucer check` refuses that table by name instead of
+# starting a server with a UDP port nothing binds.
+http3 = ["volucer-http/http3", "volucer-core/http3"]
 
 # Signals are split by platform because the *mechanism* is, not the behaviour.
 #

@@ -34,8 +34,13 @@
 //! the crate doc used to claim both paths. Both halves are now pinned by tests rather than by
 //! this paragraph — `alpn_h2_negotiates_a_real_http_2_connection`, which asserts a SETTINGS
 //! frame actually arrives, and `an_upgrade_h2c_offer_is_answered_in_http_1_1`, which asserts
-//! the offer is *not* taken — so the gap is a decision rather than an accident. HTTP/3 is
-//! `quinn` plus `h3`, not `hyper`.
+//! the offer is *not* taken — so the gap is a decision rather than an accident.
+//!
+//! **HTTP/3 is [`http3`], and it is `quinn` plus `h3` rather than `hyper`** — HTTP/3 is QUIC, a
+//! different transport, not a newer framing layer. It is behind the non-default `http3` feature
+//! and reachable only through [`Http3Listener`], which hands requests to the same `prepare`,
+//! `upstream` and `to_cgi` this crate already had. Nothing below the listener knows which
+//! transport a request arrived on.
 //!
 //! A SETTINGS frame is **not** enough to say the `h2` path works, and that was learned the hard
 //! way: `h2` carries the host name in `:authority` and sends no `Host`, so every `h2` request
@@ -46,15 +51,20 @@
 
 pub mod compress;
 pub mod error;
+#[cfg(feature = "http3")]
+pub mod http3;
 pub mod listener;
 pub mod static_files;
 pub mod status;
 pub mod tls;
 
 pub use error::HttpError;
+#[cfg(feature = "http3")]
+pub use http3::{Http3Listener, RunningHttp3};
 pub use listener::{
-    to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, ListenerSettings,
-    ReloadHandle, ReloadHandles, Reloaded, Resolved, RunningHttp, TlsSettings,
+    to_cgi, to_cgi_routed, H3Counters, HttpLimits, HttpListener, HttpShutdown, HttpStats,
+    ListenerSettings, Payload, ReloadHandle, ReloadHandles, Reloaded, Resolved, RunningHttp,
+    TlsSettings,
 };
 pub use status::{
     AlwaysReady, MetricsSource, Readiness, RunningStatus, StatusServices, StatusShutdown,
