@@ -8,6 +8,7 @@ mod endpoints;
 mod grpc;
 mod grpc_proto;
 mod http3;
+mod includes;
 mod metrics;
 mod parse;
 mod relay;

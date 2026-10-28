@@ -2100,6 +2100,250 @@ default_backend = "cgi"
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A configuration spread across files is a configuration an operator can find their way around:
+/// `check` names every file it merged, in merge order, and reports the values the *last* of them
+/// left in force.
+///
+/// Asserted through the binary rather than through the loader because three things have to line
+/// up and only two of them are in the loader: the merge, the report, and the fact that `check` and
+/// `serve` load a file through the same path — a `check` that understood includes while `serve` did
+/// not would report a deployment it would not start.
+#[test]
+fn check_names_the_files_it_merged() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-check-includes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("conf.d")).expect("create the drop-in directory");
+    std::fs::write(root.join("index.html"), "hello").expect("write a document");
+
+    let document_root = toml_string(&root.display().to_string());
+    // The base file holds the listener the drop-in overrides, so the *reported* value proves the
+    // drop-in was read after it rather than merely read.
+    std::fs::write(
+        root.join("conf.d/10-base.toml"),
+        "[server]\nhttp = \"127.0.0.1:1111\"\n",
+    )
+    .expect("write the base file");
+    std::fs::write(
+        root.join("conf.d/50-server.toml"),
+        "[server]\nhttp = \"127.0.0.1:8080\"\n",
+    )
+    .expect("write the drop-in");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "include = [\"conf.d\"]\n[server]\ndocument_root = {document_root}\n\
+             [backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"\n"
+        ),
+    )
+    .expect("write the config");
+
+    let output = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the check command runs");
+    assert!(
+        output.status.success(),
+        "check must accept an included configuration: {output:?}"
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // Every file, in merge order: the drop-in wins over the base, and the main file wins over both.
+    let base = text
+        .lines()
+        .position(|line| line.contains("10-base.toml"))
+        .unwrap_or_else(|| panic!("the base file must be named: {text}"));
+    let drop_in = text
+        .lines()
+        .position(|line| line.contains("50-server.toml"))
+        .unwrap_or_else(|| panic!("the drop-in must be named: {text}"));
+    let main = text
+        .lines()
+        .position(|line| line.contains("volucer.toml (this file)"))
+        .unwrap_or_else(|| panic!("the naming file must be marked: {text}"));
+    assert!(
+        base < drop_in && drop_in < main,
+        "the files must be listed in the order they are merged: {text}"
+    );
+    assert!(
+        text.contains("http:    127.0.0.1:8080"),
+        "the last file to set the listener must be the one in force: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A single-file deployment's report is unchanged: no file list, because there is nothing to list.
+///
+/// The negative half of the test above, and worth stating: `check` is the command an operator runs
+/// after every edit, and a new block of output on every deployment would be noise.
+#[test]
+fn check_prints_no_file_list_for_one_file() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-check-one-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    std::fs::write(root.join("index.html"), "hello").expect("write a document");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nhttp = \"127.0.0.1:8080\"\ndocument_root = {}\n",
+            toml_string(&root.display().to_string())
+        ),
+    )
+    .expect("write the config");
+
+    let output = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the check command runs");
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !text.contains("files (in merge order"),
+        "a one-file deployment has no merge order to print: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A cycle is refused by `check` and by `serve` alike, because they share the loader — and the
+/// message names the chain rather than one file.
+#[test]
+fn check_refuses_an_include_cycle() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-check-cycle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(&config_path, "include = [\"volucer.toml\"]\n").expect("write the config");
+
+    let output = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the check command runs");
+    assert!(
+        !output.status.success(),
+        "a cycle must be an error: {output:?}"
+    );
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("returns to a file"),
+        "the message must name the cycle: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A running server serves a configuration assembled from includes, and a `SIGHUP` picks up an
+/// edit to an **included** file.
+///
+/// The reload half is the one worth asserting: reading the files once at startup and never again
+/// would make `conf.d` a directory whose contents are frozen when the process starts, which is the
+/// opposite of why anyone puts files there. Unix-only for the same reason every reload test here
+/// is: the mechanism is a signal.
+#[cfg(unix)]
+#[test]
+fn serve_and_reload_follow_includes() {
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-serve-includes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("conf.d")).expect("create the drop-in directory");
+    let first = root.join("first");
+    let second = root.join("second");
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir).expect("create a document root");
+    }
+    std::fs::write(first.join("whoami.txt"), "first").expect("write the marker");
+    std::fs::write(second.join("whoami.txt"), "second").expect("write the marker");
+
+    // The document root lives in the *included* file, so what the server serves is evidence that
+    // the include was read rather than evidence of a default.
+    let drop_in = root.join("conf.d/50-server.toml");
+    let drop_in_for = |dir: &Path| {
+        format!(
+            "[server]\ndocument_root = {}\n\n[server.static_files]\nenabled = true\n",
+            toml_string(&dir.display().to_string())
+        )
+    };
+    std::fs::write(&drop_in, drop_in_for(&first)).expect("write the drop-in");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        "include = [\"conf.d\"]\n\n[server]\nhttp = \"127.0.0.1:0\"\n",
+    )
+    .expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    assert_eq!(
+        http_get(&address, "/whoami.txt").text(),
+        "first",
+        "the document root must come from the included file"
+    );
+
+    // Edit the drop-in and reload: the new root has to be read from disk, which is what makes
+    // `conf.d` worth having.
+    std::fs::write(&drop_in, drop_in_for(&second)).expect("rewrite the drop-in");
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        return;
+    };
+
+    // Polled rather than slept on, like every other reload test here: the signal is delivered
+    // asynchronously, and the answer *is* the observable.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut answer = String::new();
+    while Instant::now() < deadline {
+        answer = http_get(&address, "/whoami.txt").text();
+        if answer == "second" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        answer, "second",
+        "a reload must re-read an included file, on the same listener"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An upstream route skips the `stat`, and the per-request-reset line describes it honestly.
 ///
 /// Both are *silent* failures: neither is a compile error, and each is a place the new backend

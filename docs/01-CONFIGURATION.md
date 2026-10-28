@@ -102,10 +102,134 @@ in an inline array of tables, separate each key from its value with `=`.
 real files,” but TOML treats an empty string as a missing value for this key. Use
 `volucer serve --front-controller ''` instead.
 
-**Relative paths.** `server.tls.certificate`, `server.tls.key`, `[server.acme].cache`,
-a file KV store's `path`, and `[server.access_log].path` resolve relative to the
-configuration file's directory. Without a file, they resolve relative to the working
-directory. `volucer check` prints each resolved path.
+**Relative paths.** `include` resolves relative to the directory of the file that names it.
+`server.tls.certificate`, `server.tls.key`, `[server.acme].cache`, a file KV store's `path`, and
+`[server.access_log].path` resolve relative to the **main** configuration file's directory — the one
+named on the command line, even when the key itself was written in a drop-in. Without a file, all of
+them resolve relative to the working directory.
+
+`document_root` follows neither rule: it is relative to the process's **working directory**, always.
+That is deliberate — `SCRIPT_FILENAME` is built from it, and a persistent `php-cgi` pool `chdir`s
+between requests, so a root that moved with a config file would break on the second request. Start
+the server from the directory you mean, or write an absolute path.
+
+`volucer check` prints each resolved path.
+
+### Paths on Windows
+
+**Forward slashes work everywhere** — `document_root = "C:/srv/app/public"`,
+`include = ["conf.d"]`, `include = ["conf.d/base.toml"]`, `access_log.path = "logs/access.log"`.
+Every path is split by the standard library, which accepts `/` as a separator on Windows, so a
+configuration written for Linux usually needs no change beyond the drive.
+
+Four things are Windows-specific and worth knowing:
+
+| Written | Resolves to | Why |
+|---|---|---|
+| `"public"` | `<working directory>\public` | Relative — the working directory, never the config file's directory. |
+| `"/srv/app"` | `C:\srv\app` on drive `C:` | **Drive-relative**: a root with no drive joins the *current drive*. Not the working directory. |
+| `"C:/srv/app"` | `C:\srv\app` | Absolute. Forward slashes are fine. |
+| `"C:\srv\app"` | **a parse error** | In a TOML basic string `\s` is an escape and `\U` starts a Unicode escape. |
+
+So on Windows, **write forward slashes** — `document_root = "C:/srv/app/public"` — or use a TOML
+*literal* string, which has no escapes: `document_root = 'C:\srv\app\public'`. A backslash path in
+double quotes fails at parse with a message about a Unicode escape, which says nothing about the
+path.
+
+`volucer check` reports which of these happened: a missing root written without a drive is reported
+as *drive-relative*, and a missing root written relatively is reported as resolved against the
+working directory.
+
+## Splitting the file with `include`
+
+One deployment's configuration is often several files: a base everybody shares, a drop-in per
+site, a TLS block that only the production image has. One top-level key reads the rest of it.
+
+```toml
+# /etc/volucer/volucer.toml
+include = ["base.toml", "conf.d", "sites/example.toml"]
+
+[server]
+http = "0.0.0.0:8080"
+```
+
+An included file is ordinary TOML — the same keys, the same strict validation, and the same
+`${...}` expansion.
+
+**Each entry is a file or a directory, decided by what the name resolves to**, and the list is read
+**in the order written**. `["base.toml", "conf.d", "late.toml"]` reads `base.toml`, then every
+`*.toml` of `conf.d` in byte order, then `late.toml`. MariaDB needs two directives —
+`!include` and `!includedir` — because a line in an option file has nowhere to say "this one is a
+directory"; a list does, so one key says everything and there is no precedence rule between two
+kinds for a reader to learn.
+
+An entry that is neither a file nor a directory is refused, and so is `include_dir`, named in the
+message with the list that replaces it — an operator arriving from `my.cnf` should be told where the
+key went, not that a key they have used for years is unknown.
+
+**Position does not matter.** `include` is read from wherever it is written — the top of the file,
+after the last table, or inside `[server]` — because it is removed from the parsed table before it is
+merged. This matches MariaDB, whose option files splice `!include` as a *line*: their documentation
+writes it inside `[mariadb]`, and a group header on either side of it changes nothing. In TOML a
+`[table]` header *is* a scope, so a bare key written under one becomes `server.include` — the key is
+extracted before that can happen, and no table in the model has an `include` field, so the name
+cannot be a real setting.
+
+```toml
+[server]
+http = "0.0.0.0:8080"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+include = ["conf.d"]     # read here, merged as if it were at the top
+```
+
+| Key | Type | What it does |
+|---|---|---|
+| `include` | list of paths | Files and directories to read, **in the order written**. |
+
+`include` is written **once per file**, in one place. A second list is refused rather than ordered,
+naming both places — any order would be the parser's alphabetical one, which no operator wrote.
+
+**Precedence: the naming file wins.** Everything it includes is a *base* it amends. Within the
+includes, later entries win over earlier ones, so `50-server.toml` overrides `10-base.toml` — which
+is why the numeric prefixes MariaDB's packaged files carry work here unchanged. `-o` overrides still
+beat all of them, and the command line remains the last word.
+
+```text
+include = [...]  ->  this file  ->  -o overrides
+```
+
+Two rules follow from TOML rather than from inheritance:
+
+- **A table is merged key by key**, so a drop-in can add `[server.tls]` without restating
+  `[server] http`. A key that is set twice is taken from the file read later.
+- **An array is replaced, never concatenated.** Two files that both list `[[server.routes]]`
+  cannot be merged element-wise — there is no key to match them on — so the later list is the
+  list.
+
+Behaviour worth knowing:
+
+- **A directory entry is one level deep**, and reads `*.toml` only. A `README`, an editor backup,
+  and a subdirectory are ignored. `.TOML` is matched case-insensitively.
+- **An entry that resolves to neither a file nor a directory is an error.** A typo must not quietly
+  produce a deployment missing every drop-in; the message says which include named it.
+- **A cycle is an error**, named by the chain that closes it. The same file reached by two
+  spellings counts as one file.
+- **A chain may be ten files deep**, the same limit MySQL's option files enforce. Beyond that the
+  effective values exist in no file a reader can open.
+- **Runtime paths inside an included file are not re-based.** The merge produces one configuration
+  and one configuration has one directory, so `[server.access_log] path` in a drop-in resolves
+  against the *main* configuration file's directory, not the drop-in's. Only `include` is relative
+  to the file that writes it — see [Relative paths](#the-command-line-as-a-source).
+- **The directive may be written anywhere**, including after the last table or inside one — see
+  [position does not matter](#splitting-the-file-with-include). It may be given only once per file,
+  and the second place is refused by name.
+- **`volucer check` lists every file it merged**, in merge order, with the last marked as the one
+  named on the command line. With more than one file that list is the fastest answer to "why is my
+  edit being overridden".
 
 ## Environment variables in the file
 
@@ -148,6 +272,7 @@ expansion, so it reports the configuration Volucer would actually use.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
+| `include` | list of paths | empty | Files and directories to read first, in the order written. See [Splitting the file](#splitting-the-file-with-include). |
 | `backends` | table of tables | empty | The named backends. See [Backends](02-BACKENDS.md). |
 | `sites` | table of tables | empty | Per-host applications. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `server` | table | all defaults | Listeners, paths and HTTP behaviour. |

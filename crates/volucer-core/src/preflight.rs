@@ -89,7 +89,7 @@ pub fn inspect_with_front_controller(
     if !document_root.exists() {
         warnings.push(Warning::with_hint(
             format!("document root {} does not exist", document_root.display()),
-            "create it, or point server.document_root somewhere else",
+            document_root_hint(config.server.document_root.as_deref(), document_root),
         ));
     } else if !document_root.is_dir() {
         warnings.push(Warning::with_hint(
@@ -185,13 +185,21 @@ pub fn inspect_with_front_controller(
     for (name, site) in &config.sites {
         let root = &site.document_root;
         if !root.is_dir() {
+            // The same rule as the default site's, and the same three cases — see
+            // [`document_root_hint`]. A site's root is **not** absolutised by any caller (unlike
+            // the default site's, which the command line resolves), so the effective path is
+            // computed here: that is what the operating system will actually look at, and the hint
+            // is worth nothing if it names a path the operator cannot find.
+            let hint = document_root_hint(Some(root), &effective(root)).replace(
+                "create it, or point server.document_root somewhere else",
+                "create it, or point this site's document_root somewhere else",
+            );
             warnings.push(Warning::with_hint(
                 format!(
                     "sites.{name}: document root {} does not exist",
-                    root.display()
+                    effective(root).display()
                 ),
-                "create it, or point this site's document_root somewhere else — every request \
-                 to this site's hosts will fail meanwhile",
+                format!("{hint} — every request to this site's hosts fails meanwhile"),
             ));
             continue;
         }
@@ -317,6 +325,63 @@ fn inspect_hsts(config: &Config, warnings: &mut Vec<Warning>) {
             }
         }
     }
+}
+
+/// The path the operating system would look at, for a path written in a configuration.
+///
+/// The same answer [`Path::join`] gives the OS: a relative path resolves against the working
+/// directory, and Windows adds the current drive to one that has a root but none of its own.
+/// Kept here rather than in the caller because it describes the *rule* the hint is explaining.
+fn effective(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Why a document root is not where the operator probably meant, when it is not.
+///
+/// Three answers, because a path on Windows can be relative in two different ways and the fix
+/// differs between them:
+///
+/// * **Written absolute** — the file said `C:/srv/app` or `/srv/app` on Unix and it is simply not
+///   there. The working directory cannot have moved it, so mentioning it would be noise.
+/// * **Drive-relative** — `/srv/app` on Windows has a root but no drive, so it resolves to
+///   `C:/srv/app`: the *current drive*, not the working directory. Naming the working directory
+///   here would send an operator to a fix that does not work.
+/// * **Relative** — `public` resolves against the process's working directory, which is not the
+///   configuration file's directory and is where a drop-in written for another machine goes wrong.
+///
+/// The first test is `written != resolved` rather than `is_relative`, because Rust's
+/// `Path::is_relative` calls `/srv/app` relative on Windows — true, and not the rule that moved it.
+fn document_root_hint(written: Option<&Path>, resolved: &Path) -> String {
+    let Some(written) = written else {
+        return "create it, or point server.document_root somewhere else".to_string();
+    };
+    if written == resolved {
+        return "create it, or point server.document_root somewhere else".to_string();
+    }
+
+    // Has a root but no drive: the current drive, not the working directory.
+    if written.has_root() && !written.is_absolute() {
+        return format!(
+            "{:?} has no drive, so Windows resolved it against the current drive — giving {}. \
+             Write the drive ({:?}), or use forward slashes with one: \"C:/srv/app\"",
+            written.display(),
+            resolved.display(),
+            format!("C:{}", written.display())
+        );
+    }
+
+    format!(
+        "document_root is relative to the process's working directory, not to the configuration \
+         file — so {:?} resolved to {}; start the server from the directory you mean, or write an \
+         absolute path",
+        written.display(),
+        resolved.display()
+    )
 }
 
 /// Report TLS settings whose files are missing or unusable.
@@ -713,6 +778,21 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
 mod tests {
     use super::*;
 
+    /// A path as a TOML basic string, so a Windows path's backslashes survive.
+    fn toml_string(path: &Path) -> String {
+        let mut out = String::with_capacity(path.as_os_str().len() + 2);
+        out.push('"');
+        for character in path.display().to_string().chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+        out
+    }
+
     fn config() -> Config {
         // The worker command names a program that certainly exists, so these
         // tests stay about the document root. `inspect` now also reports a
@@ -1093,6 +1173,155 @@ http = "127.0.0.1:8080"
             warnings[1].message.contains("static_files is enabled"),
             "the static layer's own consequence must be stated: {warnings:?}"
         );
+    }
+
+    /// A root written **relative** is reported with the rule that resolved it, not just the fact
+    /// that it is missing.
+    ///
+    /// This is the warning a `conf.d` layout makes necessary: a drop-in saying
+    /// `document_root = "public"` reads as "beside this file" and resolves against the working
+    /// directory, so the operator gets a path they never wrote and no statement of why. Asserting
+    /// the *rule* rather than the path is deliberate — the path depends on where the test runs.
+    #[test]
+    fn a_relative_document_root_names_the_working_directory_rule() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "public"
+[backends.app]
+kind = "external"
+socket = "unix:/run/php.sock"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        // Resolved the way `serve` resolves it: against the working directory.
+        let resolved = std::env::current_dir()
+            .expect("a working directory")
+            .join("public");
+        let warnings = inspect(&config, &resolved);
+
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.message.contains("does not exist"))
+            .unwrap_or_else(|| panic!("the missing root must be reported: {warnings:?}"));
+        let hint = warning.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("working directory"),
+            "the hint must name the rule that resolved it: {hint}"
+        );
+        assert!(
+            hint.contains("not to the configuration file"),
+            "and must say what it is *not* relative to, which is the mistake: {hint}"
+        );
+        assert!(hint.contains("absolute"), "and must offer the fix: {hint}");
+    }
+
+    /// An **absolute** root gets the plain hint: the working-directory rule cannot have moved a
+    /// path the operator wrote in full, so mentioning it would be noise.
+    ///
+    /// The path is built from a real absolute prefix rather than written as `/definitely/not/here`:
+    /// on Windows that string has no drive and is a *relative* path, so the test would assert the
+    /// opposite of its name on the platform the CI also runs on.
+    #[test]
+    fn an_absolute_document_root_does_not_mention_the_working_directory() {
+        let root = Fixture::new("absolute-root");
+        let absolute = root.path().join("not-created-yet");
+        assert!(absolute.is_absolute(), "{} ", absolute.display());
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = {}
+[backends.app]
+kind = "external"
+socket = "unix:/run/php.sock"
+"#,
+            toml_string(&absolute)
+        );
+        let config = Config::from_toml(&text).expect("parses");
+        let warnings = inspect(&config, &absolute);
+
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.message.contains("does not exist"))
+            .unwrap_or_else(|| panic!("the missing root must be reported: {warnings:?}"));
+        let hint = warning.hint.as_deref().unwrap_or_default();
+        assert!(
+            !hint.contains("working directory"),
+            "an absolute path was not moved by the working directory, so the rule is irrelevant: \
+             {hint}"
+        );
+    }
+
+    /// A root with a root slash but **no drive** is a third case, and naming the working directory
+    /// for it would be wrong: Windows resolves `/srv/app` against the *current drive*, not the
+    /// working directory.
+    ///
+    /// Asserted on Windows only, because it is a Windows-only spelling: on Unix `/srv/app` is a
+    /// perfectly good absolute path, and the branch must not fire there.
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_relative_document_root_names_the_current_drive() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app/public"
+[backends.app]
+kind = "external"
+socket = "unix:/run/php.sock"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        // The path the OS builds: the current drive plus the written path — *not* the working
+        // directory plus it, which is the whole distinction this test is about.
+        let drive = std::env::current_dir()
+            .expect("a working directory")
+            .components()
+            .next()
+            .expect("a drive prefix")
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        let resolved = PathBuf::from(format!("{drive}/srv/app/public"));
+        let warnings = inspect(&config, &resolved);
+
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.message.contains("does not exist"))
+            .unwrap_or_else(|| panic!("the missing root must be reported: {warnings:?}"));
+        let hint = warning.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("no drive"),
+            "the hint must name the drive, which is what moved this path: {hint}"
+        );
+        assert!(
+            !hint.contains("working directory"),
+            "and must not blame the working directory, which did not: {hint}"
+        );
+    }
+
+    /// A **site's** relative root gets the same rule. A site is where a relative root is most
+    /// likely to be written, and its warning is a different branch of the same function.
+    #[test]
+    fn a_sites_relative_document_root_names_the_working_directory_rule() {
+        let root = Fixture::new("site-relative-root");
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "external"
+socket = "unix:/run/php.sock"
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "shop"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let warnings = inspect(&config, root.path());
+
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.message.contains("sites.shop"))
+            .unwrap_or_else(|| panic!("the site's missing root must be reported: {warnings:?}"));
+        let hint = warning.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("working directory"), "{hint}");
     }
 
     #[test]

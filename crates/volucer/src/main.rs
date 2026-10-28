@@ -1040,8 +1040,24 @@ impl Source {
     /// set that resolves to nothing. Both leave the running configuration untouched on a reload,
     /// which is the same whole-or-nothing rule the rest of them follow.
     fn load(&self) -> Result<Config, ServerError> {
+        Ok(self.load_with_files()?.0)
+    }
+
+    /// [`Source::load`], plus the files the configuration was read from, in **merge order**.
+    ///
+    /// Included files first, then the file named on the command line — so the last entry is the
+    /// one whose keys win. `check` prints these: with `include` a deployment's effective
+    /// values can be spread across a dozen files, and an operator editing the file they were told
+    /// to edit would find their change keeps being overridden, with nothing to say by what.
+    fn load_with_files(&self) -> Result<(Config, Vec<PathBuf>), ServerError> {
+        let mut files = Vec::new();
         let mut table = match &self.path {
-            Some(path) => Config::table_from_path(path)?,
+            Some(path) => {
+                let loaded = Config::load_from_path(path)?;
+                files.extend(loaded.included);
+                files.push(path.clone());
+                loaded.table
+            }
             None => toml::Table::new(),
         };
         for pair in &self.pairs {
@@ -1050,8 +1066,8 @@ impl Source {
         let mut config = Config::from_table(table)?;
         config.validate()?;
         config.expand_grpc_proto(&self.dir())?;
-        tracing::info!(source = %self.describe(), "configuration loaded");
-        Ok(config)
+        tracing::info!(source = %self.describe(), files = files.len(), "configuration loaded");
+        Ok((config, files))
     }
 
     /// The directory relative paths resolve against.
@@ -1285,6 +1301,21 @@ fn apply_override(table: &mut toml::Table, pair: &str) -> Result<(), ServerError
     if key.is_empty() {
         return Err(invalid_override(format!(
             "--override {pair:?} names no key; write it as KEY=VALUE"
+        )));
+    }
+    // An include is a statement about *files*, and by the time a pair is laid on the table the
+    // files have already been read. Accepting the pair would leave a key in the table that
+    // `Config` has no field for, so `-o include=base.toml` would be refused with "unknown field
+    // `include`" — a message about a key that exists in every other file. Refused here, by name,
+    // with the answer: the include belongs in the file.
+    //
+    // `include_dir` is refused with the same words rather than a second message about a second
+    // spelling: on the command line both are one mistake, and the file is the answer to both.
+    if key == "include" || key == "include_dir" || key.starts_with("include.") {
+        return Err(invalid_override(format!(
+            "--override {key} cannot add an include: the files are read before the overrides are \
+             applied, so the key would describe files nothing read. Write it in the configuration \
+             file instead"
         )));
     }
 
@@ -3474,7 +3505,7 @@ fn check(
     front_controller_flag: Option<&str>,
     extra_php_dirs: &[PathBuf],
 ) -> Result<(), ServerError> {
-    let config = source.load()?;
+    let (config, files) = source.load_with_files()?;
 
     // The same resolution `serve` performs, so this reports the deployment that
     // would actually start rather than the one written in the file.
@@ -3491,6 +3522,19 @@ fn check(
     // and "which of these two is my server running" is the first question a `check` report has to
     // answer when the same binary can be started either way.
     println!("configuration: {}", source.describe());
+    // Only when there is more than one file. A single-file deployment's report is unchanged — and
+    // the list is exactly what an operator needs when an edit to the file they opened keeps being
+    // overridden: the files after the first are the ones read *before* it.
+    if files.len() > 1 {
+        println!("  files (in merge order; later wins):");
+        for (position, file) in files.iter().enumerate() {
+            if position == files.len() - 1 {
+                println!("    {} (this file)", file.display());
+            } else {
+                println!("    {}", file.display());
+            }
+        }
+    }
     println!("  listeners:");
     match &config.server.http {
         Some(http) => println!("    http:    {http}"),
@@ -4885,6 +4929,32 @@ mod tests {
                 "the message must say it is an override that is wrong: {err}"
             );
         }
+    }
+
+    /// An include cannot be added from the command line, and the refusal says where it can.
+    ///
+    /// The pair would otherwise land on a table whose files have already been read, and be refused
+    /// as `unknown field 'include'` — a message about a key that exists in every other file. This
+    /// is the one place a documented key is refused, so it gets its own test.
+    #[test]
+    fn an_override_cannot_add_an_include() {
+        let mut table = toml::Table::new();
+        for pair in ["include=base.toml", "include_dir=conf.d", "include.0=x"] {
+            let err = apply_override(&mut table, pair).expect_err("an include is refused");
+            assert!(
+                err.to_string().contains("cannot add an include"),
+                "the message must say what the key cannot do: {err}"
+            );
+            assert!(
+                err.to_string().contains("configuration file"),
+                "and where it can be written instead: {err}"
+            );
+        }
+        assert!(table.is_empty(), "a refused pair must leave no key behind");
+
+        // And a key that merely starts with `include` is not swept up by the refusal.
+        apply_override(&mut table, "server.include_timeout=5")
+            .expect("only the directive names are refused");
     }
 
     /// `--listen` becomes a quoted `server.http` pair, placed before every `-o`.

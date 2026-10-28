@@ -396,6 +396,7 @@ fn the_example_configuration_parses_and_validates() {
         "# [status.workers]",
         "# [telemetry]",
         "# [server.env]",
+        "# include = [",
     ] {
         assert!(
             text.contains(table),

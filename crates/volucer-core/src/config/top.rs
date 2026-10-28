@@ -150,32 +150,27 @@ impl Config {
         Ok(toml::Value::Table(table).try_into()?)
     }
 
-    /// Read and expand a configuration file into its raw table.
+    /// Read and expand a configuration file into its raw table, following its includes.
     ///
     /// The mergeable form of a file, for a caller that has overrides to lay on top of it. Kept
     /// beside [`Self::load`] so the read and the expansion happen in one place: two reads with two
     /// `${...}` rules is how `serve` and a reload would come to disagree about the same file.
     pub fn table_from_path(path: &Path) -> Result<toml::Table> {
-        Ok(toml::from_str(&Self::expanded_text(path)?)?)
+        Ok(Self::load_from_path(path)?.table)
     }
 
-    /// The file's text with `${...}` expanded, still as TOML.
+    /// [`Self::table_from_path`], plus every file it read to produce it.
     ///
-    /// Expansion happens on the **text**, before parsing, so `${...}` works in a number, port or
-    /// listener position as well as in a string — see [`crate::env`] for why that is the only form
-    /// that can. A reference to an unset variable with no `${NAME:-default}` is an error rather
-    /// than an empty string.
-    fn expanded_text(path: &Path) -> Result<String> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        crate::env::expand(&text).map_err(Error::Config)
+    /// The list exists for `volucer check`: a configuration assembled from `conf.d` has effective
+    /// values that appear in no single file, so a report naming only the file on the command line
+    /// would leave an operator editing the wrong one.
+    pub fn load_from_path(path: &Path) -> Result<Loaded> {
+        includes::load(path)
     }
 
-    /// Read, expand and parse a configuration file.
+    /// Read, expand and parse a configuration file, following its includes.
     pub fn load(path: &Path) -> Result<Self> {
-        Self::from_toml(&Self::expanded_text(path)?)
+        Self::from_table(Self::table_from_path(path)?)
     }
 
     /// The backend the unnamed site falls back to, given the configured default; else `None`.

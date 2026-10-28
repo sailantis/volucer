@@ -9,6 +9,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A configuration can be split across files with `include`**, the way MariaDB's `!include` and
+  `!includedir` split `my.cnf` — in one list where MariaDB needs two directives:
+
+  ```toml
+  include = ["base.toml", "conf.d", "sites.d", "sites/example.toml"]
+  ```
+
+  **Each entry is a file or a directory**, decided by what the name resolves to, and the list is
+  read **in the order written**: `base.toml`, then every `*.toml` of `conf.d` in the **byte order of
+  their names** — so the numeric prefixes packaged configuration uses (`10-base.toml`,
+  `50-server.toml`) order the merge — then `sites.d`, then the file. MariaDB keeps `!include` and
+  `!includedir` apart because a line in an option file has nowhere to say "this one is a
+  directory"; a list does, so one key says everything and there is no precedence rule between two
+  kinds to learn. `include_dir` is refused by name with the list that replaces it.
+
+  A chain may be ten files deep — MySQL's own limit — and a cycle is refused by the chain that
+  closes it.
+
+  **The directive may be written anywhere in the file** — top, after the last table, or inside one.
+  The key is removed from the parsed table before it is merged, so position says nothing about
+  meaning. That recovers the property MariaDB's format has for free (their `!include` is a line, and
+  their documentation writes it inside `[mariadb]`) and that TOML otherwise cannot express, because
+  a `[table]` header *is* a scope. It is safe because no table in the model has an `include` field.
+  A bare directive used to be read as a key of whatever table preceded it and reach the reader as
+  `unknown field 'include'`; it is now the directive it reads as.
+
+  It may be given **once per file**: a second list is refused naming both places, because any merge
+  order would be the parser's alphabetical one and no operator wrote it.
+
+  **The naming file wins over what it includes**, and later entries win over earlier ones, which is
+  what makes a drop-in a base to be amended rather than an override laid on top. `-o` still beats
+  all of them: `include` → the file → overrides.
+
+  Two rules differ from MariaDB's, because TOML asks a question its format never does:
+
+  * **The merge is of parsed tables, not of lines.** A second `[server]` header in one TOML
+    document is a parse error, so splicing text would refuse the ordinary layout — a base file
+    with `[server]`, a drop-in adding `[server.tls]`. Tables are merged key by key instead, and a
+    drop-in adds to `[server]` without restating it.
+  * **An array is replaced, never concatenated.** Two files that both list `[[server.routes]]`
+    have no key to match elements on, and concatenating would make the result depend on which
+    file was read first.
+
+  Each file is expanded (`${...}`) and parsed on its own, so an unset variable or a syntax error
+  names the file it was written in rather than the one on the command line. `volucer check` prints
+  every file it merged, in merge order — the fastest answer to "why is my edit being overridden".
+  A reload rereads them all, so editing a drop-in takes effect on the next `SIGHUP`.
+
 - **HTTP/3 over QUIC, behind the `http3` cargo feature and a `[server.http3]` table.** It is a
   second transport rather than a second server: site resolution, the rate limit, routing, static
   files, the dispatcher, the access log and the metrics are the same code that serves HTTP/1.1 and

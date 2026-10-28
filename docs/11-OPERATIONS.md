@@ -55,6 +55,11 @@ with the previous configuration. It does not apply a partially valid configurati
 Files named by `grpc_proto` are read as part of configuration loading. An unreadable file or
 a set of files that resolves to no services also causes the reload to fail.
 
+Files named by `include` are reread on every reload, so
+a drop-in edited in place takes effect on the next `SIGHUP` without touching the main
+configuration file. A missing file, an unreadable directory, or a cycle fails the reload and
+leaves the previous configuration serving — the same whole-or-nothing rule.
+
 The site table and certificate table are applied independently, with sites applied first.
 If a certificate cannot be read, valid site changes can still take effect.
 

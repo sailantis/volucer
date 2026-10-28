@@ -15,6 +15,32 @@
 # An unset variable without a `:-default` stops the server and names the line,
 # because an empty listener address is a server that binds nothing for a reason
 # nothing logs. See docs/01-CONFIGURATION.md.
+#
+# A configuration can be split across files instead of one large file, the way
+# MariaDB's my.cnf does it -- with one list where MariaDB needs two directives:
+#
+#   include = ["base.toml", "conf.d", "sites.d", "sites/example.toml"]
+#
+# Each entry is a file or a directory, and is read IN THE ORDER WRITTEN: base.toml,
+# then every *.toml of conf.d in byte order of name, then sites.d, then the file.
+# MariaDB splits !include from !includedir because a line has nowhere to say
+# "this one is a directory"; a list does, by what the name resolves to.
+#
+# Everything included is a BASE that THIS file amends, so the file you are
+# reading wins over what it includes, and 50-server.toml wins over 10-base.toml.
+# Tables are merged key by key -- a drop-in can add `[server.tls]` without
+# restating `[server] http` -- and an array is replaced rather than concatenated.
+# A missing entry, a cycle, or a chain deeper than ten files stops the server.
+# `volucer check` lists every file it merged, in merge order.
+#
+# The key may sit ANYWHERE -- at the top, after the last [table], or inside one.
+# It is read out of the parsed file before it is merged, so position says nothing
+# about meaning (MariaDB's !include is a line, and works the same way).
+#
+# include = ["conf.d"]
+#
+# On Windows, write forward slashes (C:/srv/app/public) or a literal string
+# ('C:\srv\app'): a backslash in a double-quoted TOML string is an escape.
 
 # The backend used when a request matches no route. It belongs to `[server]`, which is the
 # unnamed site: `[sites.<name>]` overrides it for one host, exactly as it overrides
