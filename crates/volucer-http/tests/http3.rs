@@ -215,6 +215,17 @@ impl Client {
     }
 
     /// Send one request and read the whole answer: status, headers, body.
+    ///
+    /// **Sending is allowed to fail; receiving is not.** A server that answers early — a 413 for a
+    /// body over the limit, a 431 for a header section past the ceiling — then declines the rest of
+    /// that body, and RFC 9114 lets it do so with `STOP_SENDING`. `h3` reports that as
+    /// `RemoteTerminate` on the *send* half, so `send_data` and `finish` can both fail for a request
+    /// the server handled correctly.
+    ///
+    /// This was a flake rather than a theory: the assertion is on the 413, but the helper panicked
+    /// on `finish` whenever the server's answer arrived before the client finished writing. On Linux
+    /// and macOS the client won that race; on Windows it did not, so one platform went red at
+    /// random.
     async fn request(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> Answer {
         let mut stream = self
             .send_request
@@ -228,15 +239,24 @@ impl Client {
             .await
             .expect("send the request head");
 
+        // Kept rather than discarded: if no response head arrives either, this is the only thing
+        // that explains why, and a bare "a response head" would send a reader looking in the wrong
+        // place.
+        let mut send_error: Option<String> = None;
         if let Some(body) = body {
-            stream
-                .send_data(bytes::Bytes::copy_from_slice(body))
-                .await
-                .expect("send the body");
+            if let Err(err) = stream.send_data(bytes::Bytes::copy_from_slice(body)).await {
+                send_error = Some(format!("send the body: {err}"));
+            }
         }
-        stream.finish().await.expect("finish the request");
+        if send_error.is_none() {
+            if let Err(err) = stream.finish().await {
+                send_error = Some(format!("finish the request: {err}"));
+            }
+        }
 
-        let response = stream.recv_response().await.expect("a response head");
+        let response = stream.recv_response().await.unwrap_or_else(|err| {
+            panic!("no response head ({err}); the send half had {send_error:?}")
+        });
 
         let mut collected = Vec::new();
         while let Some(mut chunk) = stream.recv_data().await.expect("a data frame") {
