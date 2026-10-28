@@ -72,7 +72,12 @@ jobs:
           echo "AR_x86_64_unknown_linux_musl=ar" >> $GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p volucer
+        # **`--features http3` is not optional here.** This is the artifact an operator installs, so
+        # a release built without the feature ships a binary whose `[server.http3]` table is refused
+        # by name — HTTP/3 "supported" in the docs and absent from every download. The feature is
+        # off by default because `h3` is pre-1.0; that is a reason for `cargo build` to omit it by
+        # default, not for the published release to.
+        run: cargo build --release --target ${{ matrix.target }} -p volucer --features http3
 
       - name: Stage the archive
         shell: bash

@@ -55,7 +55,13 @@ jobs:
       # so this is a build prerequisite rather than a linting detail. See the README's
       # "Build prerequisites".
       - run: sudo apt-get update && sudo apt-get install -y nasm
+      # **Two passes, and the second is the load-bearing one.** The default build is what a
+      # deployment gets, so it must lint clean; `--features http3` is the half that is otherwise
+      # never compiled by CI at all, and a feature nothing builds is a feature that rots. Both are
+      # required rather than `--all-features`, because `redis` needs a server the job does not have
+      # and the point is HTTP/3 specifically.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features http3 -- -D warnings
 
   # `rust-version` is a promise about what a clean machine needs, and an unverified promise is how
   # this one came to be wrong: the manifest said 1.85 while a transitive dependency required 1.88.
@@ -69,6 +75,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo +1.88.0 check --workspace --all-targets
+      # The HTTP/3 dependencies have their own floors — `quinn` 0.11 needs 1.85 — and a feature
+      # whose MSRV is unverified is the same broken promise one level down.
+      - run: cargo +1.88.0 check --workspace --all-targets --features http3
+
+  # Advisories, licences and sources. **This job exists because of the HTTP/3 work and would have
+  # caught its central risk**: `h3` 0.0.8 carries an unpatched amplification advisory
+  # (hyperium/h3#379), and nothing in this repository was reading the advisory database. It also
+  # turned up three unrelated pre-existing vulnerabilities in the graph, which were fixed by patch
+  # upgrade rather than suppressed.
+  #
+  # Runs against `--all-features` so the HTTP/3 dependencies are in scope at all: the default graph
+  # does not contain `h3`, `quinn` or `h3-quinn`, so a check on it would report on a subset of what a
+  # release actually ships.
+  deny:
+    name: Deny (advisories, licences, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          # `--locked` in spirit: the action reads `Cargo.lock` from the checkout, and the lockfile
+          # is committed, so what is checked is what ships.
 
   test:
     name: Test (${{ matrix.os }})
@@ -134,6 +165,16 @@ jobs:
           VOLUCER_E2E: '1'
           VOLUCER_SDK_DIR: ${{ github.workspace }}/volucer-php-sdk
         run: cargo test --workspace
+
+      # **The HTTP/3 suite, and it has to be a separate run.** These tests bind real UDP sockets
+      # and drive a real QUIC client, so they only exist when the feature is on — and with the
+      # default feature set they compile to nothing, which is a `0 passed` that reads as green.
+      # Running them here is what makes `http3.rs` a test rather than a file.
+      - name: Test (http3)
+        env:
+          VOLUCER_E2E: '1'
+          VOLUCER_SDK_DIR: ${{ github.workspace }}/volucer-php-sdk
+        run: cargo test --workspace --features http3
 
   # The installers are the first thing an operator runs and the last thing anyone tests, and both
   # of them are shell scripts with a security property: verify before extracting. A `curl | sh`

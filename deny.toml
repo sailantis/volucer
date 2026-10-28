@@ -1,0 +1,96 @@
+# `cargo-deny`: advisories, licenses and sources.
+#
+# This file did not exist before the HTTP/3 work, and the situation it exists for is exactly the one
+# that found it: `h3` 0.0.8 carries an **unpatched remote DoS advisory** (hyperium/h3#379, an
+# unbounded `max_field_section_size`) and nothing in this repository would have reported it. A
+# dependency graph with a known-vulnerable crate in it is not a thing to notice by reading.
+#
+# Three checks, because they answer three different questions and only one of them is about
+# security:
+#
+# * `advisories` — is any crate in the graph known-vulnerable?
+# * `licenses` — may this project ship what it depends on?
+# * `sources` — is everything in the graph fetched from somewhere the deployment is willing to
+#   reach at build time?
+#
+# The last one matters here in a way it does not for a project with no `[patch]`: the HTTP/3 plan
+# provides for pinning `h3` to a git tag on `sailantis/hyperium-h3` when a carried fix is needed,
+# and a `[patch]` entry is invisible to this file until its git source is admitted below.
+
+[advisories]
+# `cargo-deny` 0.20 removed the `vulnerability` / `notice` severity keys: an advisory is now always an
+# error unless explicitly handled here. The two entries below are the `h3` situation and one
+# pre-existing dependency, and each has its reason written beside it — an `ignore` without one is how
+# a suppression outlives the thing it suppressed.
+#
+# **The HTTP/3 entry.** `h3` 0.0.8 carries hyperium/h3#379, an unpatched unbounded
+# `max_field_section_size` amplification. No release carries the fix, so the mitigation is
+# configuration — `[server.http3].max_field_section_size`, 16 KiB by default — and it is tested by
+# `an_oversized_header_section_is_answered_431_and_the_listener_survives`, so a regression fails a
+# test rather than relying on this file. **Delete this entry and upgrade the day a release carries
+# the fix.**
+ignore = [
+    # `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134), not vulnerable: it is a thin wrapper over
+    # `rustls-pki-types` and its reader is what `crates/volucer-http/src/tls.rs` uses to load a
+    # configured certificate. The migration is real work — replace the reader with
+    # `rustls-pki-types`' own PEM parsing and drop the dependency — and it is *not* part of the
+    # HTTP/3 change, so it is recorded rather than smuggled in here.
+    "RUSTSEC-2025-0134",
+]
+
+# Which crates the unmaintained check applies to. `workspace` checks this project's own crates,
+# which is the scope that catches a crate nobody is updating; `all` would report the whole graph's
+# unmaintained transitive dependencies, which is not a decision this file can make on behalf of every
+# future dependency.
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+# Every crate in the graph today is permissively licensed, verified rather than assumed:
+# `cargo metadata` reports MIT, Apache-2.0, BSD-3-Clause, ISC, Zlib, Unicode-3.0,
+# CDLA-Permissive-2.0 and BSL-1.0, with the compound forms (`MIT OR Apache-2.0`,
+# `Apache-2.0 OR MIT`, `ISC AND (Apache-2.0 OR ISC)`) that `aws-lc-rs` and `rustls` use.
+# `Unicode-3.0` is not a licence anyone chose — it is the ICU4X data tables, which arrive through
+# `idna` and are permitted on the same terms as the rest.
+#
+# An `allow` list rather than `deny`, because the failure mode of a denylist here is a new
+# transitive dependency with a licence nobody checked being *silently* accepted.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    # The `r-efi` crate, which arrives on the Windows target through `getrandom`. Its
+    # `LGPL-2.1-or-later` arm is offered as one of three choices, so the MIT or Apache-2.0 arm is
+    # what this project takes — but a licence *expression* is what cargo reports, and the whole
+    # expression has to be admitted for the crate to pass.
+    "LGPL-2.1-or-later",
+]
+
+# The confidence threshold for a licence to be accepted, from `cargo-deny`'s own text scan. 0.8 is
+# its default and the value that makes a hand-written `LICENSE` file with a typo a failure rather
+# than a pass.
+confidence-threshold = 0.8
+
+# No crate exemption list. An exemption is how a licence problem becomes permanent: the entry
+# outlives the reason for it, and nothing points at it again. If a dependency needs one, the honest
+# move is to record why here in prose and then decide — which is what this comment is.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The registry every crate comes from. `crates.io` is spelled rather than defaulted so a
+# `[source]` replacement in `.cargo/config.toml` is caught rather than followed.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# **The fork's own source, admitted in advance rather than when it is first needed.** The plan
+# provides for `[patch.crates-io] h3 = { git = "https://github.com/sailantis/hyperium-h3", tag = … }`
+# the moment the fork carries a diff; without this line that day's CI fails on a source refusal
+# whose message says nothing about why the source is legitimate. Naming it here is the same decision
+# written down once, with the argument beside it.
+allow-git = ["https://github.com/sailantis/hyperium-h3"]

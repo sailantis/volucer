@@ -10,7 +10,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release --locked -p volucer
+RUN cargo build --release --locked -p volucer --features http3
 
 
 # A glibc image, which is the one that matches the host distribution's libc.
@@ -36,8 +36,21 @@ WORKDIR /var/lib/volucer
 
 EXPOSE 8080 9080
 
-# Two ports are exposed and only one of them is content: 8080 is `server.http` in the example
-# configuration and 9080 is `[status]`, which is where `/health` and `/ready` live.
+# Two **TCP** ports are exposed and only one of them is content: 8080 is `server.http` in the
+# example configuration and 9080 is `[status]`, which is where `/health` and `/ready` live.
+#
+# **UDP is not exposed here, deliberately.** `[server.http3]` names its own UDP address and this
+# image has no opinion about it, because the port has to match whatever `Alt-Svc` advertises — and
+# a fixed `EXPOSE` would be a lie for every deployment that chose a different one. Publish it
+# explicitly:
+#
+#     docker run -p 443:443/tcp -p 443:443/udp -v ./volucer.toml:/etc/volucer/volucer.toml volucer
+#
+# A `-p 443:443` without `/udp` is the mistake to expect: TCP works, `Alt-Svc` advertises the QUIC
+# endpoint, and every browser's QUIC attempt is dropped by the container's network layer, so it
+# silently falls back to TCP after a retry delay. The `http3` listener is compiled in (see the
+# `cargo build` lines above), so the only thing standing between a deployment and HTTP/3 is that
+# one flag.
 #
 # The probe is the binary itself, because this image has no `curl` — `packaging/docker` is a
 # debian image but the check has to work unchanged in the `scratch` one, and the difference between
@@ -95,7 +108,7 @@ RUN set -eu; \
         *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     rustup target add "${triple}" >/dev/null; \
-    cargo build --release --locked -p volucer --target "${triple}"; \
+    cargo build --release --locked -p volucer --features http3 --target "${triple}"; \
     cp "target/${triple}/release/volucer" /volucer
 
 
@@ -111,6 +124,9 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8080 9080
 
+# UDP is not exposed for the reason the glibc stage's comment gives: `[server.http3]` names its own
+# address, and a fixed `EXPOSE` would be wrong for a deployment that chose another port.
+#
 # The same probe as the glibc image, and the reason it is the binary rather than `curl`: a `scratch`
 # image has no shell and no HTTP client, so `HEALTHCHECK CMD curl -f ...` would be a line that never
 # executes. Docker does not report that as a broken check — it reports the container as `unhealthy`
