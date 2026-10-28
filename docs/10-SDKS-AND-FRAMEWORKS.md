@@ -120,7 +120,7 @@ end
 ```
 
 `env:` is not optional there, and the reason is the same one the Python snippet gives: volucer
-puts the address in the *request*, so the process's `ENV` does not carry it.
+puts the address in the _request_, so the process's `ENV` does not carry it.
 
 The SDK requires Ruby 3.1 or later and has no runtime dependencies beyond the standard
 library.
@@ -226,7 +226,6 @@ Configure a `worker` backend to launch the entry point provided by the package:
 http = "0.0.0.0:8001"
 document_root = "/srv/app/public"
 front_controller = "index.php"
-default_backend = "app"
 
 [backends.app]
 kind = "worker"
@@ -274,13 +273,13 @@ as an alternative.
 
 ## Which one should I use?
 
-| If you want                                      | Use                                                                              |
-| ------------------------------------------------ | -------------------------------------------------------------------------------- |
-| The simplest path, and a running server now      | The [install scripts](00-GETTING-STARTED.md#install)                             |
-| PHP on the worker channel                        | `sailantis/volucer-worker`                                                       |
-| Django, Flask or Rails on the worker channel     | The Python or Ruby SDK                                                           |
-| An existing PHP framework, on the worker channel | The framework bridge                                                             |
-| An existing app, changed as little as possible   | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md)                       |
-| Any FastCGI server, started and supervised       | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server) |
+| If you want                                         | Use                                                                                                                    |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| The simplest path, and a running server now         | The [install scripts](00-GETTING-STARTED.md#install)                                                                   |
+| PHP on the worker channel                           | `sailantis/volucer-worker`                                                                                             |
+| Django, Flask or Rails on the worker channel        | The Python or Ruby SDK                                                                                                 |
+| An existing PHP framework, on the worker channel    | The framework bridge                                                                                                   |
+| An existing app, changed as little as possible      | `external` or `spawn_cgi` — see [Backends](02-BACKENDS.md)                                                             |
+| Any FastCGI server, started and supervised          | `spawn_cgi` with a `command` — see [Backends](02-BACKENDS.md#any-fastcgi-server)                                       |
 | `kv` or `lock` from a FastCGI app, without a worker | `[rpc]` plus `Rpc` in the PHP, Python or Ruby SDK — see [Services](08-SERVICES.md#an-application-that-is-not-a-worker) |
-| Node, Go or any other HTTP origin                | The `upstream` backend                                                           |
+| Node, Go or any other HTTP origin                   | The `upstream` backend                                                                                                 |
