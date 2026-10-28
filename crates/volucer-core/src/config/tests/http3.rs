@@ -204,11 +204,48 @@ listen = "0.0.0.0:443"
             "the error must name the key and the advisory: {message}"
         );
 
-        // A larger-than-default value under the ceiling is accepted: one MiB is a real deployment's
-        // enormous cookies, and refusing it would make the key unable to express the case it exists
-        // for.
-        let config = http3_config("max_field_section_size = 1048576\n");
-        config.validate().expect("one MiB is allowed");
+        // The ceiling itself is accepted, because a value *at* the limit is not past it — and
+        // refusing the default plus a generous margin would make the key unable to express the
+        // case it exists for.
+        let config = http3_config(&format!(
+            "max_field_section_size = {MAX_HTTP3_FIELD_SECTION_SIZE}\n"
+        ));
+        config.validate().expect("the ceiling itself is allowed");
+    }
+
+    /// **The ceiling must not admit a field count that panics `HeaderMap`.**
+    ///
+    /// `h3` 0.0.8 builds the request's header map with `HeaderMap::with_capacity(fields.len())`,
+    /// and that **panics** above `http`'s limit — measured: `with_capacity(24_576)` succeeds,
+    /// `with_capacity(24_577)` aborts with `size overflows MAX_SIZE`. The budget is what bounds the
+    /// count, because RFC 9114 §4.2.2 charges each field at least
+    /// `QpackField::ESTIMATED_OVERHEAD_BYTES` (32) bytes of it.
+    ///
+    /// So this asserts the arithmetic between two numbers that live in different crates: if an
+    /// `http` upgrade lowers `MAX_SIZE`, or somebody raises the ceiling for roundness, this fails
+    /// here rather than as a panic in a deployment. An earlier draft of the ceiling was one MiB,
+    /// which admits 32 768 fields — the exact crash it was supposed to prevent, which is why the
+    /// derivation is a test rather than a comment.
+    #[test]
+    fn the_ceiling_cannot_admit_a_panicking_field_count() {
+        // `QpackField::ESTIMATED_OVERHEAD_BYTES`, mirrored because `h3` does not export it.
+        const MIN_BYTES_PER_FIELD: u32 = 32;
+
+        let worst_case_fields = MAX_HTTP3_FIELD_SECTION_SIZE / MIN_BYTES_PER_FIELD;
+        assert!(
+            worst_case_fields < HEADER_MAP_MAX_FIELDS,
+            "a ceiling of {MAX_HTTP3_FIELD_SECTION_SIZE} bytes admits {worst_case_fields} fields at \
+             {MIN_BYTES_PER_FIELD} bytes each, and `HeaderMap::with_capacity` panics above \
+             {HEADER_MAP_MAX_FIELDS}"
+        );
+
+        // And the margin is real rather than one field. A ceiling that only just squeaked under
+        // would be re-broken by any small change to either number.
+        assert!(
+            HEADER_MAP_MAX_FIELDS - worst_case_fields >= 4_096,
+            "only {} fields of headroom; raise the margin or lower the ceiling",
+            HEADER_MAP_MAX_FIELDS - worst_case_fields
+        );
     }
 
     #[test]

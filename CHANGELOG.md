@@ -38,7 +38,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Since `min_version` defaults to `"1.2"`, that mistake binds the socket and then panics a
     runtime worker on *every* handshake. `Http3Listener::bind` asserts the invariant eagerly, so a
     regression is a startup refusal rather than a per-connection panic.
-  * **`max_field_section_size` defaults to 16 KiB, deliberately.** `h3` 0.0.8 defaults it to
+  * **`max_field_section_size` defaults to 16 KiB, deliberately, and the ceiling above it is
+    derived from a panic rather than chosen for roundness.** `h3` 0.0.8 defaults the setting to
     `VarInt::MAX`, which is hyperium/h3#379 — a remotely triggerable amplification, and the reason
     `deny.toml` and its job exist. The cap is a security setting rather than a tuning knob; see the
     security entry below.
@@ -157,10 +158,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   static-table references decodes into a `HeaderMap` with thousands of entries. `[server.http3]
   max_field_section_size` (16 KiB) is what bounds it: RFC 9114 §4.2.2 charges each decoded field at
   least 32 bytes, and `qpack::decode_stateless` rejects the section *before* the fields are
-  materialised. **No release carries the upstream fix**, so the mitigation is configuration and is
-  pinned by `an_oversized_header_section_is_answered_431_and_the_listener_survives` — which asserts
-  the server answers 431 *and* serves the next request, and which fails if the cap is returned to
-  the crate's default. `deny.toml` records the advisory rather than hiding it.
+  materialised. **No release carries the upstream fix** — h3 0.0.8 is still the newest, and
+  hyperium/h3#378 (which replaces the panicking pre-allocation) is open and unmerged — so the
+  mitigation is configuration and is pinned by
+  `an_oversized_header_section_is_answered_431_and_the_listener_survives` — which asserts the
+  server answers 431 *and* serves the next request, and which fails if the cap is returned to the
+  crate's default. `deny.toml` records the advisory rather than hiding it.
+
+  The **ceiling** above the default is part of the mitigation rather than a guard rail on it: `h3`
+  builds the request's header map with `HeaderMap::with_capacity(fields.len())`, which panics above
+  24 576 fields (measured: 24 576 succeeds, 24 577 aborts with `size overflows MAX_SIZE`). Since
+  the budget bounds the field count at 32 bytes each, a ceiling above 786 432 bytes would admit
+  the very crash it existed to prevent — so it is 512 KiB, and
+  `the_ceiling_cannot_admit_a_panicking_field_count` pins the arithmetic between two constants
+  that live in different crates.
 - **`rustls-pemfile` is unmaintained (RUSTSEC-2025-0134), recorded rather than migrated here.** It
   is a thin wrapper over `rustls-pki-types` and is not vulnerable; the migration is to use
   `rustls-pki-types`' own PEM parsing and drop the dependency. `deny.toml` ignores the advisory with

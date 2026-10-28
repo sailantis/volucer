@@ -30,11 +30,34 @@ pub const DEFAULT_HTTP3_MAX_FIELD_SECTION_SIZE: u32 = 16 * 1024;
 
 /// The largest `max_field_section_size` this server accepts, in bytes.
 ///
-/// Not a protocol limit — a QUIC varint reaches far higher — but the point past which the setting
-/// stops bounding the `HeaderMap` allocation it exists to bound. 1 MiB admits a deployment with
-/// genuinely enormous cookies (roughly 32 000 fields, against `HeaderMap`'s 32768 slots) while
-/// refusing a value that would restore the crate's unbounded default.
-pub const MAX_HTTP3_FIELD_SECTION_SIZE: u32 = 1024 * 1024;
+/// **Derived from a panic, not chosen for roundness.** The budget bounds the field *count* through
+/// the RFC 9114 §4.2.2 rule that each decoded field costs at least
+/// `QpackField::ESTIMATED_OVERHEAD_BYTES` (32) bytes of it — a minimum, because `h3` computes
+/// `name.len() + value.len() + 32`. So a budget of `B` admits at most `B / 32` fields.
+///
+/// `h3` 0.0.8 then builds the request's header map with
+/// `HeaderMap::with_capacity(fields.len())`, and that call **panics** above `http`'s
+/// `MAX_SIZE` — measured, not inferred: `with_capacity(24_576)` succeeds and
+/// `with_capacity(24_577)` panics with `size overflows MAX_SIZE`. (`MAX_SIZE` is `1 << 15` *raw*
+/// slots, and `to_raw_capacity(n)` is `n + n/3`, so the logical limit is 24 576, not 32 768.)
+///
+/// 24 576 fields × 32 bytes = 786 432, so a ceiling above that is a configuration value that
+/// restores the panic it is supposed to prevent. 512 KiB keeps the worst case at 16 384 fields —
+/// a third below the panic threshold — while still being 32 times the default and far beyond any
+/// request carrying real cookies. **`a_ceiling_cannot_admit_a_panicking_field_count` pins the
+/// relationship**, so an `http` upgrade that lowers `MAX_SIZE` fails a test rather than a
+/// deployment.
+///
+/// Raised when hyperium/h3#378 lands: it replaces the panicking pre-allocation with
+/// `try_with_capacity`, which is the real fix.
+pub const MAX_HTTP3_FIELD_SECTION_SIZE: u32 = 512 * 1024;
+
+/// `http`'s logical `HeaderMap` limit, measured rather than assumed.
+///
+/// The largest capacity `HeaderMap::with_capacity` accepts: one above it panics in
+/// `to_raw_capacity`. Named here because the ceiling above is derived from it and a test asserts
+/// the derivation — a number that only exists inside a comment is a number nobody re-checks.
+pub const HEADER_MAP_MAX_FIELDS: u32 = 24_576;
 
 /// HTTP/3 over QUIC: the listener's own address, and the three limits QUIC needs stated.
 ///

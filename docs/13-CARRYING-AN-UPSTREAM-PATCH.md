@@ -83,6 +83,28 @@ the next request. If that test is deleted, the mitigation is a comment.
 When upstream ships the fix, the sequence is: bump `h3`, delete anything left of the patch, and
 delete the corresponding paragraph here and in `FORK.md`.
 
+## Status as of 2026-10-28: no patch, and why
+
+Checked rather than assumed, because "we forked for this" is easy to remember wrongly:
+
+* **hyperium/h3#378 is open and unmerged** (`REVIEW_REQUIRED`, last updated 2026-10-22). It is
+  somebody else's PR: it defaults `max_field_section_size` to 64 KiB with incremental enforcement,
+  and replaces the panicking `HeaderMap::with_capacity` with `try_with_capacity`.
+* **`h3` 0.0.8 is still the newest published version**, so there is no release to adopt and
+  nothing for the fork to carry.
+
+A `[patch]` pointing at a fork with no diff would be a false statement in the manifest, which is
+the rule this page opens with. So the fork exists, is prepared, and carries nothing.
+
+**`sailantis/hyperium-h3` and upstream `master` are the only things a patch could pin**, and
+neither contains the fix — only the contributor's branch does. That is why the rule is *"never pin
+a contributor's PR branch"*: it would mean depending on a force-push. When #378 merges, the fix
+arrives by version bump, and this page has nothing left to describe.
+
+**Do not pre-emptively fork the PR's commit.** It is a live branch that can be rebased, and the
+mitigation above already covers the vulnerability; adopting an unreviewed commit would trade a
+tested configuration for an untested dependency.
+
 ## Where this is recorded
 
 - `sailantis/hyperium-h3/FORK.md` — the fork's own rules and its baseline tag.

@@ -171,7 +171,7 @@ fastcgi = "127.0.0.1:9080"
 # `max_field_section_size` bounds the request header section and is a security
 # setting, not a tuning knob: `h3` 0.0.8 defaults it to unbounded, which is a
 # remotely triggerable amplification (hyperium/h3#379). 16 KiB caps a section at
-# roughly 512 fields. Do not raise it above the 1 MiB ceiling.
+# roughly 512 fields. Do not raise it above the 512 KiB ceiling.
 #
 # `idle_timeout_ms` is QUIC's own recommendation (RFC 9308, 30 s), which bounds
 # idleness on a connection a browser multiplexes over -- not a request, so the

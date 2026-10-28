@@ -257,10 +257,20 @@ small request allocates a large one. RFC 9114 §4.2.2 charges each decoded field
 bytes against this budget, so the 16 KiB default caps a section at roughly 512 fields and
 the section is rejected *before* the fields are materialised.
 
-Do not raise it above the 1 MiB ceiling that validation enforces. Do not return it to the
+Do not raise it above the 512 KiB ceiling that validation enforces. Do not return it to the
 crate's default. The test
 `an_oversized_header_section_is_answered_431_and_the_listener_survives` is what makes the
 mitigation a mitigation rather than a comment.
+
+**The ceiling is derived from a panic, not chosen for roundness.** `h3` 0.0.8 builds the
+request's header map with `HeaderMap::with_capacity(fields.len())`, and that call panics above
+`http`'s limit — measured, not assumed: `with_capacity(24576)` succeeds and
+`with_capacity(24577)` aborts with `size overflows MAX_SIZE`. Because the budget bounds the
+*field count* at 32 bytes each, a ceiling above 786 432 bytes would admit the very crash it
+exists to prevent. 512 KiB caps the worst case at 16 384 fields, a third below the threshold.
+`the_ceiling_cannot_admit_a_panicking_field_count` pins the arithmetic, so an `http` upgrade
+that lowers the limit fails a test instead of a deployment. The real fix is hyperium/h3#378,
+which replaces the panicking pre-allocation with `try_with_capacity`.
 
 ### What differs from the TCP path
 

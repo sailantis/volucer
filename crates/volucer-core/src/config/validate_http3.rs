@@ -143,12 +143,22 @@ impl Config {
             ));
         }
         if http3.max_field_section_size > MAX_HTTP3_FIELD_SECTION_SIZE {
+            // The reason is a **panic**, not a slowdown, and the message says so with the
+            // arithmetic: `h3` builds the request's header map with
+            // `HeaderMap::with_capacity(fields.len())`, which aborts above 24 576 fields. The
+            // budget is what bounds that count, at 32 bytes per field. A message that said
+            // "amplification" would be describing this project's opinion; this one describes the
+            // crash, which is the thing an operator raising the value would cause.
+            let fields = u64::from(http3.max_field_section_size) / 32;
             return Err(Error::Config(format!(
                 "server.http3.max_field_section_size is {} bytes, above the \
-                 {MAX_HTTP3_FIELD_SECTION_SIZE}-byte ceiling: a header section is decoded into a \
-                 `HeaderMap`, and RFC 9114 §4.2.2 charges each field at least 32 bytes, so a \
-                 section this large is the amplification described by hyperium/h3#379. Raise it \
-                 only with that in mind",
+                 {MAX_HTTP3_FIELD_SECTION_SIZE}-byte ceiling: at the RFC 9114 §4.2.2 minimum of 32 \
+                 bytes per field that admits {fields} fields, and `h3` 0.0.8 builds the header map \
+                 with `HeaderMap::with_capacity`, which panics above \
+                 {HEADER_MAP_MAX_FIELDS}. A value this large would re-create the crash the ceiling \
+                 exists to prevent (see hyperium/h3#379) — leave it at the 16 KiB default unless \
+                 you need genuinely enormous cookies, and not above \
+                 {MAX_HTTP3_FIELD_SECTION_SIZE}",
                 http3.max_field_section_size
             )));
         }
