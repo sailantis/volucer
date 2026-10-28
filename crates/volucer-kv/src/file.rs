@@ -35,14 +35,22 @@
 //! # The file's own format, and why it is text
 //!
 //! ```text
-//! expiry: 1767225600
+//! expiry: 1767225600123
 //!
 //! <the value's bytes>
 //! ```
 //!
 //! A five-word header line, then the raw value. `expiry:` is the absolute deadline as a Unix
-//! timestamp in seconds, or `never`. It is **absolute and wall-clock**, not a remaining duration:
-//! a duration read from disk after a restart has no way to know how long it has been lying there.
+//! timestamp in **milliseconds**, or `never`. It is **absolute and wall-clock**, not a remaining
+//! duration: a duration read from disk after a restart has no way to know how long it has been
+//! lying there.
+//!
+//! Milliseconds rather than the obvious seconds, because a `Duration` is not whole seconds and
+//! truncating is not a rounding this driver may do on the caller's behalf. `Duration::from_millis(900)`
+//! truncated to seconds is a deadline of *now*, so the value is deleted in the same call that stored
+//! it — the caller asks for a 900 ms cache entry and gets a miss, with nothing to say why. The Redis
+//! driver settled the same question the same way (`PX`, not `EX`) for the same reason, and the two
+//! stores have to agree about what a caller's `Duration` means.
 //!
 //! Text rather than a binary header, because this file is something an operator will look at with
 //! `cat` when a cache behaves oddly, and because a two-line format has no endianness. The one cost
@@ -111,9 +119,9 @@ const SEPARATOR: &[u8] = b"\n\n";
 
 /// How many bytes of a file are read to find its header.
 ///
-/// `"expiry: "` plus a twenty-digit `u64` is 28 bytes, so 128 is four times what any header this
-/// driver writes could need, and small enough that a sweep's cost per file is the syscall rather than
-/// the buffer. A file whose separator is not within this many bytes is not one of ours.
+/// `"expiry: "` plus a thirteen-digit millisecond timestamp is 21 bytes, so 128 is six times what any
+/// header this driver writes could need, and small enough that a sweep's cost per file is the syscall
+/// rather than the buffer. A file whose separator is not within this many bytes is not one of ours.
 const HEADER_PROBE: usize = 128;
 
 /// The permission bits every file this driver writes gets.
@@ -365,7 +373,7 @@ impl Store for FileStore {
             return Ok(());
         }
         let ttl = clamp_ttl(ttl);
-        let expires = ttl.map(|ttl| unix_now() + ttl.as_secs());
+        let expires = ttl.map(deadline_for);
 
         let path = self.path_for(key);
         // The *old* file's size is what the accounting gives back, not the value the caller is
@@ -425,7 +433,7 @@ impl Store for FileStore {
             });
         }
         let ttl = clamp_ttl(ttl);
-        let expires = ttl.map(|ttl| unix_now() + ttl.as_secs());
+        let expires = ttl.map(deadline_for);
 
         let path = self.path_for(key);
         let mut body = Vec::with_capacity(value.len() + 32);
@@ -636,8 +644,10 @@ fn read_header(path: &Path) -> Header {
         Ok(Some(deadline)) => {
             let now = unix_now();
             if deadline > now {
+                // Saturating rather than subtracting: a deadline a millisecond away minus a
+                // millisecond of clock leaves zero, and the caller's `Ttl::In` must not wrap.
                 Header::Live {
-                    expires_in: Some(Duration::from_secs(deadline - now)),
+                    expires_in: Some(Duration::from_millis(deadline.saturating_sub(now))),
                 }
             } else {
                 Header::Expired
@@ -661,7 +671,7 @@ fn split(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 
 /// Read just the header of a file, so a sweep costs one `read` per *file* rather than per byte.
 ///
-/// The header is at most `"expiry: "` + twenty digits, so [`HEADER_PROBE`] bytes is comfortably more
+/// The header is at most `"expiry: "` + thirteen digits, so [`HEADER_PROBE`] bytes is comfortably more
 /// than one; a file whose separator is not in the first that many bytes cannot be one of ours.
 ///
 /// The probe is a real optimisation rather than tidiness: a sweep before a refusal is what a full
@@ -686,7 +696,7 @@ fn read_header_bytes(path: &Path) -> std::result::Result<Vec<u8>, std::io::Error
     Ok(probe)
 }
 
-/// Parse `expiry: <unix seconds>` or `expiry: never`.
+/// Parse `expiry: <unix millis>` or `expiry: never`.
 ///
 /// Returns `Ok(None)` for no expiry, `Ok(Some(deadline))` for a deadline, and `Err(())` for anything
 /// else — a `Result` rather than an `Option` so that "no expiry" and "unparseable" are different
@@ -793,7 +803,11 @@ fn reclaim_expired(path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// The wall clock, in seconds since the Unix epoch.
+/// The wall clock, in milliseconds since the Unix epoch.
+///
+/// Milliseconds, not seconds, because a `Duration` TTL is not whole seconds and truncating it is the
+/// caller losing a value they asked to keep: `Duration::from_millis(900)` in seconds is a deadline of
+/// now, so `set` writes a file that every later lookup reads as expired. See the module documentation.
 ///
 /// Wall-clock rather than monotonic, and the choice is forced: a deadline that is *stored* has to
 /// survive a restart, and an `Instant` has no meaning across one. The cost is that the file store's
@@ -806,8 +820,21 @@ fn reclaim_expired(path: &Path) -> std::io::Result<bool> {
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
+        .map(|since| since.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The deadline a TTL reaches from now, in the milliseconds the header stores.
+///
+/// Rounded **up**, so a TTL is never shortened. The rounding has to go somewhere — the header holds
+/// an integer — and the two directions differ for a reader: down turns 1.5 ms into 1 ms, and up turns
+/// it into 2 ms, which is the direction that cannot make a caller's value disappear early. A duration
+/// shorter than a millisecond becomes 1, which is the smallest deadline that is not "already past".
+fn deadline_for(ttl: Duration) -> u64 {
+    unix_now()
+        + u64::try_from(ttl.as_micros().div_ceil(1000))
+            .unwrap_or(u64::MAX)
+            .max(1)
 }
 
 /// A key's digest, as the file's name.
@@ -941,6 +968,11 @@ mod tests {
         assert_eq!(count, 6, "every key is its own file, with nothing escaping");
     }
 
+    /// A zero TTL deletes, and a deadline that has passed is a miss.
+    ///
+    /// The expired case is written **by hand** rather than slept for: a deadline is an absolute
+    /// number in the file, so planting one in the past tests the same code path as waiting, and it
+    /// does not turn a busy machine into a failing build.
     #[test]
     fn a_zero_ttl_deletes_and_an_expired_value_is_a_miss() {
         let fixture = Fixture::new("ttl");
@@ -950,16 +982,96 @@ mod tests {
             .expect("set succeeds");
         assert_eq!(store.get(b"gone").expect("get"), None);
 
+        // A short TTL that is *not* zero is a value, not a delete. 500 ms is generous next to the
+        // header's resolution, so this asserts the unit rather than the machine's scheduling.
         store
-            .set(b"brief", b"v".to_vec(), Some(Duration::from_secs(1)))
+            .set(b"brief", b"v".to_vec(), Some(Duration::from_millis(500)))
             .expect("set succeeds");
-        assert!(store.ttl(b"brief").expect("ttl").is_present());
-        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            store.ttl(b"brief").expect("ttl").is_present(),
+            "500 ms is a TTL, not an expiry; a driver storing whole seconds would have deleted this \
+             in the same call that wrote it"
+        );
+
+        // Plant a deadline a second in the past, which is what a long sleep would have produced.
+        let path = fixture.0.join(hex(digest(b"brief")));
+        fs::write(
+            &path,
+            format!("{EXPIRY}{}\n\nv", unix_now().saturating_sub(1_000)),
+        )
+        .expect("write an already-expired file");
         assert_eq!(
             store.get(b"brief").expect("get"),
             None,
             "a value whose deadline has passed must be a miss, not a hit"
         );
+    }
+
+    /// A TTL below one second survives, which is the bug a whole-second header has.
+    ///
+    /// The deadline is stored as an integer, so some unit has to be chosen; seconds make
+    /// `Duration::from_millis(900)` a deadline of *now*, and the value is gone before the caller can
+    /// read it. The Redis driver stores milliseconds for the same reason (`PX`, not `EX`), and two
+    /// stores that disagree about a caller's `Duration` are two stores an application cannot move
+    /// between.
+    ///
+    /// The expiry half is by hand for the reason the test above states: the property is that the
+    /// deadline is *stored* at sub-second precision, which is visible in the file.
+    #[test]
+    fn a_ttl_below_one_second_is_not_an_immediate_expiry() {
+        let fixture = Fixture::new("sub-second");
+        let store = fixture.store(1024 * 1024);
+        store
+            .set(b"k", b"v".to_vec(), Some(Duration::from_millis(500)))
+            .expect("set");
+        assert_eq!(
+            store.get(b"k").expect("get"),
+            Some(b"v".to_vec()),
+            "half a second is a TTL the caller asked for, not a delete"
+        );
+        let path = fixture.0.join(hex(digest(b"k")));
+        let written = fs::read_to_string(&path).expect("read the stored file");
+        let deadline: u64 = written
+            .strip_prefix(EXPIRY)
+            .and_then(|rest| rest.split('\n').next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("the header must hold a millisecond deadline: {written:?}"));
+        assert!(
+            deadline < unix_now() + 1_000,
+            "an absolute deadline of {deadline} is not a millisecond timestamp"
+        );
+
+        // And a passed sub-second deadline is a miss, without a whole second of waiting.
+        fs::write(
+            &path,
+            format!("{EXPIRY}{}\n\nv", unix_now().saturating_sub(1)),
+        )
+        .expect("write an expired file");
+        assert_eq!(store.get(b"k").expect("get"), None);
+    }
+
+    /// The deadline arithmetic rounds **up**, so no TTL is ever shortened.
+    ///
+    /// Asserted as an inequality against the clock read *before* the call, because that is the
+    /// property: whatever the tick does during the call, the stored deadline is at least the time
+    /// asked for. An equality would be a second, hidden assertion that the clock stood still.
+    #[test]
+    fn a_deadline_is_never_sooner_than_the_ttl_asked_for() {
+        for (ttl, least) in [
+            (Duration::from_millis(1), 1),
+            (Duration::from_millis(1500), 1500),
+            // 1.5 ms rounds up to 2: rounding down would shorten the caller's TTL.
+            (Duration::from_micros(1500), 2),
+            // A sub-millisecond TTL still gets the smallest deadline that is not already past.
+            (Duration::from_micros(1), 1),
+        ] {
+            let before = unix_now();
+            let stored = deadline_for(ttl);
+            assert!(
+                stored >= before + least,
+                "a {ttl:?} TTL was stored as {stored}, which is sooner than {least} ms from {before}"
+            );
+        }
     }
 
     #[test]
@@ -1073,19 +1185,29 @@ mod tests {
         store
             .set(b"k", b"v".to_vec(), Some(Duration::from_secs(600)))
             .expect("set");
-        assert_eq!(
-            store.ttl(b"k").expect("ttl"),
-            Ttl::In(Duration::from_secs(600)),
-            "a set value with a TTL reads back as its deadline"
-        );
-
+        // A *range* rather than equality, and the width is the header's own resolution. The deadline
+        // is an integer of milliseconds taken at `set`, so by the time it is read the remaining time
+        // is 600 s minus however long the two calls were apart — a millisecond or two, and asserting
+        // exact equality was the assertion that made this test fail on a loaded machine. The
+        // property under test is that the stored deadline is absolute and survives, not that the
+        // clock stood still between two lines.
+        match store.ttl(b"k").expect("ttl") {
+            Ttl::In(left) => assert!(
+                left <= Duration::from_secs(600) && left > Duration::from_secs(599),
+                "a 600 s TTL must read back as most of that time: {left:?}"
+            ),
+            other => panic!("expected a countable TTL, got {other:?}"),
+        }
         // Rewritten by hand with a deadline in the past, which is what a long sleep would produce
         // without making the test wait. The store is **not** reopened: a reopen would run the
         // startup pass and remove the file, and what this test is about is a deadline being read
         // from disk rather than a duration remembered in memory.
         let path = fixture.0.join(hex(digest(b"k")));
-        fs::write(&path, format!("{EXPIRY}{}\n\nv", unix_now() - 1))
-            .expect("write an already-expired file");
+        fs::write(
+            &path,
+            format!("{EXPIRY}{}\n\nv", unix_now().saturating_sub(1_000)),
+        )
+        .expect("write an already-expired file");
         assert_eq!(
             store.get(b"k").expect("get"),
             None,
@@ -1100,7 +1222,11 @@ mod tests {
         let fixture = Fixture::new("startup-sweep");
         fs::create_dir_all(&fixture.0).expect("create the directory");
         let path = fixture.0.join(hex(digest(b"k")));
-        fs::write(&path, format!("{EXPIRY}{}\n\nv", unix_now() - 1)).expect("write");
+        fs::write(
+            &path,
+            format!("{EXPIRY}{}\n\nv", unix_now().saturating_sub(1_000)),
+        )
+        .expect("write");
 
         let store = fixture.store(1024 * 1024);
         assert!(
@@ -1282,7 +1408,11 @@ mod tests {
         for round in 0..ROUNDS {
             let key = format!("reclaimed-{round}").into_bytes();
             let path = fixture.0.join(hex(digest(&key)));
-            fs::write(&path, format!("{EXPIRY}{}\n\ndead", unix_now() - 1)).expect("plant");
+            fs::write(
+                &path,
+                format!("{EXPIRY}{}\n\ndead", unix_now().saturating_sub(1_000)),
+            )
+            .expect("plant");
         }
 
         let mut threads = Vec::new();
@@ -1326,7 +1456,11 @@ mod tests {
             .expect("set");
         // Rewritten with a deadline in the past, so the test does not wait.
         let path = fixture.0.join(hex(digest(b"k")));
-        fs::write(&path, format!("{EXPIRY}{}\n\nold", unix_now() - 1)).expect("write");
+        fs::write(
+            &path,
+            format!("{EXPIRY}{}\n\nold", unix_now().saturating_sub(1_000)),
+        )
+        .expect("write");
 
         assert!(
             store

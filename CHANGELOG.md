@@ -262,6 +262,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A cache TTL below one second silently deleted the key instead of storing it.** The file KV
+  driver's header holds a deadline as an integer, and it was written in **seconds** with
+  `ttl.as_secs()`. Truncating 900 ms gives 0, so the deadline written was *now* — `set` returned
+  `Ok`, and the very next `get` was a miss. An application asking for a short-lived cache entry got
+  no entry at all, with nothing logged, and the window where it worked was a lucky sub-second
+  boundary. The header now stores **milliseconds**, the same resolution the Redis driver uses
+  (`PX`, not `EX`) and for the same reason, so the two stores agree about what a caller's
+  `Duration` means. Deadlines round **up**, so a TTL is never shortened — 1.5 ms is stored as 2 ms —
+  and a sub-millisecond TTL becomes the smallest deadline that is not already past rather than
+  zero. Asserted by `a_ttl_below_one_second_is_not_an_immediate_expiry`, which fails against the
+  old code, and by `a_deadline_is_never_sooner_than_the_ttl_asked_for`, which pins the rounding
+  direction against the clock read before the call.
+
+  Two tests also asserted things only a stopped clock could satisfy, which is why this first
+  appeared as a flake rather than a failure: `a_ttl_is_absolute_…` demanded
+  `Ttl::In(Duration::from_secs(600))` exactly, which a deadline read one millisecond later cannot
+  produce, and `ttl_distinguishes_…` slept for an expiry it could write by hand. Both now assert
+  the property — a range, or a deadline planted in the file — so a loaded machine is not a red
+  build, and neither test needs a sleep.
 - **Every HTTP/3 request to an `upstream` backend failed as an unreachable origin.** The forward
   path passed the request's inbound HTTP version to the origin client, so a request that arrived
   over QUIC carried `HTTP_3` into `hyper-util`'s pooled client — which accepts HTTP/1.0, 1.1 and 2
