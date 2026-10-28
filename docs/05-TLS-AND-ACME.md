@@ -280,6 +280,20 @@ uses. An HTTP/3 upload therefore meets the same limit a CGI request does, rather
 streaming to an origin unbounded the way an `upstream` request does over TCP. The
 **response** still streams, so SSE and large downloads are unaffected.
 
+**Response trailers cross this hop.** They are read from the response body as frames and
+written with `send_trailers`, so a gRPC call's `grpc-status` reaches a QUIC client exactly as
+it reaches an HTTP/2 one. This is asserted rather than assumed:
+`a_grpc_call_over_http_3_reports_its_status_in_the_trailers` and
+`an_h2c_origins_trailers_reach_an_http_3_client` cover the two ways a trailer section is
+produced — constructed by Volucer from a worker's answer, and passed through from an origin.
+
+**The version stated to an origin is not the version that arrived.** Each hop negotiates its
+own protocol, and the client Volucer uses for an `upstream` backend speaks HTTP/1.0, 1.1 and
+2 only — so a request that arrives over QUIC is forwarded as HTTP/1.1 (or HTTP/2 by the
+connector, if the origin was configured for `h2c` or negotiated `h2` through ALPN). Forwarding
+the inbound `HTTP/3` made every HTTP/3 request to an `upstream` backend fail as an unreachable
+origin.
+
 **0-RTT is not enabled.** It makes replay a property of the application, and an application
 written for a request/response server is not prepared for that.
 

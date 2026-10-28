@@ -415,9 +415,9 @@ prefixes in the route table instead.
 
 ### gRPC
 
-gRPC uses HTTP/2. For an `https://` origin, TLS negotiates HTTP/2 through ALPN, so no
-additional protocol setting is needed. A plaintext or `unix:` origin has no TLS
-handshake; use h2c (HTTP/2 with prior knowledge) instead.
+gRPC uses HTTP/2 **on the hop to the origin**. For an `https://` origin, TLS negotiates HTTP/2
+through ALPN, so no additional protocol setting is needed. A plaintext or `unix:` origin has no
+TLS handshake; use h2c (HTTP/2 with prior knowledge) instead.
 
 ```toml
 [backends.greeter]
@@ -427,9 +427,19 @@ protocol = "h2c"
 command = '/srv/greeter/greeter --listen /run/greeter.sock'
 ```
 
-`protocol = "h2c"` is the only supported value; if omitted, Volucer uses HTTP/1.1.
-Volucer rejects this setting with an `https://` origin because TLS negotiation determines
-the protocol there.
+`protocol = "h2c"` is the only supported value; if omitted, Volucer uses HTTP/1.1, which
+cannot carry a gRPC call. Volucer rejects this setting with an `https://` origin because TLS
+negotiation determines the protocol there.
+
+**That setting, not the client's own version, decides the origin hop.** A gRPC call that arrives
+over HTTP/1.1, HTTP/2 or HTTP/3 reaches an h2c or ALPN-`h2` origin as HTTP/2 and an ordinary
+origin as HTTP/1.1, so a call to an origin that speaks only HTTP/1.1 is a misconfiguration this
+surfaces rather than silently works around.
+
+The **client-facing** hop is independent of that setting and may be HTTP/1.1, HTTP/2 or
+HTTP/3. A gRPC call's outcome travels in the response trailer section on every one of them,
+so `grpc-status` reaches the client whichever transport it chose. `[server.http3]` is
+therefore not a gRPC-specific option; it enables QUIC for all traffic.
 
 Volucer does not parse gRPC messages. It routes by path, forwards the framed bytes, and
 passes the application's `grpc-status` in the response trailers. `.proto` files are not

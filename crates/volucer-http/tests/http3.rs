@@ -21,12 +21,75 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Buf;
+use http_body_util::BodyExt;
 use volucer_core::config::Config;
 use volucer_core::sites::Sites;
 use volucer_http::{
     Http3Listener, HttpLimits, ListenerSettings, ReloadHandles, RunningHttp3, TlsSettings,
 };
 use volucer_server::Dispatcher;
+
+/// Find `php` on `PATH`, for the gRPC fixtures.
+///
+/// The same search `frontend.rs` does, and for the same reason: the gRPC handler in these tests is
+/// the shipped PHP SDK's, so the test skips rather than passing vacuously on a machine without an
+/// interpreter. `VOLUCER_E2E` turns that skip into a failure in CI.
+fn find_php() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let names: &[&str] = &["php.exe", "php"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["php"];
+
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The SDK checkout the example worker lives in, which is a repository of its own.
+fn sdk_dir() -> PathBuf {
+    match std::env::var_os("VOLUCER_SDK_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("volucer-php-sdk"),
+    }
+}
+
+/// Why a gRPC fixture cannot run here, if it cannot.
+fn grpc_skip_reason() -> Option<String> {
+    if find_php().is_none() {
+        return Some("no php on PATH".to_string());
+    }
+    let script = sdk_dir().join("example").join("worker.php");
+    if !script.is_file() {
+        return Some(format!(
+            "the SDK example worker is not at {} — set VOLUCER_SDK_DIR to a \
+             volucer-php-sdk checkout",
+            script.display()
+        ));
+    }
+    None
+}
+
+/// Report that a gRPC fixture cannot run here, and fail if CI said it must.
+///
+/// libtest hides the stderr of a passing test, so a skip is invisible in an ordinary run — which is
+/// the same reasoning, and the same `VOLUCER_E2E` switch, that `frontend.rs` uses.
+fn report_skip(reason: String) {
+    if std::env::var("VOLUCER_E2E").is_ok_and(|value| !value.is_empty() && value != "0") {
+        panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
 
 /// A certificate pair on disk, named after the host it is for. The fixture `tls.rs` uses.
 struct Cert {
@@ -95,6 +158,35 @@ key = "certs/server.key"
 [server.http3]
 listen = "127.0.0.1:0"
 {http3_keys}
+"#,
+        cert.dir().display()
+    );
+    std::fs::write(cert.dir().join("volucer.toml"), &text).expect("write config");
+    let config = Config::from_toml(&text).expect("config parses");
+    config.validate().expect("config validates");
+    config
+}
+
+/// A config with one backend and no `serve_only`, so a request reaching it is dispatched.
+///
+/// A separate fixture rather than a flag on [`write_config`]: `serve_only = "static"` is what makes
+/// the file-serving tests independent of the dispatcher, and a backend fixture that inherited it
+/// would answer 404 for every path and look like a routing bug.
+fn write_dispatching_config(cert: &Cert, backend: &str) -> Config {
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = '{}'
+
+[server.tls]
+certificate = "certs/server.crt"
+key = "certs/server.key"
+
+[server.http3]
+listen = "127.0.0.1:0"
+
+{backend}
 "#,
         cert.dir().display()
     );
@@ -267,10 +359,69 @@ impl Client {
             }
         }
 
+        // Read after the body, and expected to succeed: a response with no trailer section
+        // answers `None`, which is a fact about the response rather than a transport failure.
+        let trailers = stream
+            .recv_trailers()
+            .await
+            .expect("the trailer section to be readable");
+
         Answer {
             status: response.status().as_u16(),
             headers: response.headers().clone(),
             body: collected,
+            trailers,
+        }
+    }
+
+    /// Send one gRPC call: a POST with a framed message, to a method path.
+    ///
+    /// `content-type: application/grpc` is what identifies a call — Volucer has no other test for
+    /// "is this gRPC" — and `te: trailers` is the header gRPC's own protocol requires a server to
+    /// be told, even though HTTP/3 has no hop-by-hop headers to forward.
+    async fn grpc_call(&mut self, path: &str, message: &[u8]) -> Answer {
+        let mut stream = self
+            .send_request
+            .send_request(
+                hyper::Request::builder()
+                    .method("POST")
+                    .uri(format!("https://a.test{path}"))
+                    .header("content-type", "application/grpc+proto")
+                    .header("te", "trailers")
+                    .body(())
+                    .expect("a valid request"),
+            )
+            .await
+            .expect("send the request head");
+
+        stream
+            .send_data(bytes::Bytes::copy_from_slice(message))
+            .await
+            .expect("send the grpc message");
+        stream.finish().await.expect("finish the request");
+
+        let response = stream.recv_response().await.expect("a response head");
+
+        let mut collected = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.expect("a data frame") {
+            while chunk.has_remaining() {
+                let bytes = chunk.chunk().to_vec();
+                collected.extend_from_slice(&bytes);
+                chunk.advance(bytes.len());
+            }
+        }
+        // The trailer section is the whole point of a gRPC response, so this is not optional here
+        // the way it is in `request`: a call that produced no trailers is the failure under test.
+        let trailers = stream
+            .recv_trailers()
+            .await
+            .expect("the trailer section to be readable");
+
+        Answer {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            body: collected,
+            trailers,
         }
     }
 
@@ -285,11 +436,21 @@ struct Answer {
     status: u16,
     headers: hyper::HeaderMap,
     body: Vec<u8>,
+    /// The response's trailer section, when it had one. `None` for an ordinary response.
+    trailers: Option<hyper::HeaderMap>,
 }
 
 impl Answer {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// One trailer field, or `None` if the response carried no trailer section at all.
+    fn trailer(&self, name: &str) -> Option<&str> {
+        self.trailers
+            .as_ref()?
+            .get(name)
+            .map(|value| value.to_str().expect("a printable trailer value"))
     }
 }
 
@@ -587,6 +748,290 @@ fn alt_svc_is_absent_without_an_http3_table() {
             "a deployment with no [server.http3] must not advertise one: {over_tls}"
         );
     });
+}
+
+/// A gRPC call's outcome must arrive in the trailer section over QUIC.
+///
+/// **This is the assertion `temp/plan-h3.md` asked for and the file did not have.** gRPC reports its
+/// result in the trailer section, so a transport that drops trailers turns every call into a
+/// transport error while every other assertion in this file still passes — which is exactly the
+/// shape of a silent regression, since `respond` has a `send_trailers` arm that nothing else
+/// exercises.
+///
+/// The success path, and the two halves are asserted separately: the status is `200` with the
+/// framed message in the body (what a gRPC client reads as a successful call), and `grpc-status: 0`
+/// is in the trailers (what tells it the call *completed*). A body with no trailer section is a
+/// call a client waits on for ever.
+#[test]
+fn a_grpc_call_over_http_3_reports_its_status_in_the_trailers() {
+    let Some(reason) = grpc_skip_reason() else {
+        return a_grpc_call_over_http_3_reports_its_status_in_the_trailers_inner();
+    };
+    report_skip(reason);
+}
+
+fn a_grpc_call_over_http_3_reports_its_status_in_the_trailers_inner() {
+    with_runtime(async {
+        let cert = Cert::new("grpc", "a.test");
+        let php = find_php().expect("checked by `grpc_skip_reason`");
+        let script = sdk_dir().join("example").join("worker.php");
+        let config = write_dispatching_config(
+            &cert,
+            &format!(
+                r#"
+[backends.app]
+kind = "worker"
+command = '{} "{}"'
+workers = 2
+grpc_services = ["greeter.Greeter"]
+"#,
+                php.display(),
+                script.display()
+            ),
+        );
+        // The grant is read by the same code a deployment's file is read by, asserted here so a
+        // fixture that admitted every service could not pass the rest of this test.
+        assert!(config.serves_grpc("app", "/greeter.Greeter/SayHello"));
+
+        let running = start(&config, &cert);
+        let mut client = Client::connect(&cert, running.local_addr()).await;
+
+        // One message, framed: compression flag 0, a big-endian length of 5, then five bytes.
+        // Nothing in volucer parses this, which is the point — the assertion is that the bytes
+        // come back.
+        let answer = client
+            .grpc_call("/greeter.Greeter/SayHello", b"\x00\x00\x00\x00\x05hello")
+            .await;
+
+        assert_eq!(answer.status, 200, "body was {:?}", answer.text());
+        assert_eq!(
+            answer.trailer("grpc-status"),
+            Some("0"),
+            "a gRPC call over QUIC must report OK in the trailer section; a client that gets no \
+             trailers waits for an outcome that never arrives. Headers were {:?}, trailers {:?}",
+            answer.headers,
+            answer.trailers
+        );
+        assert!(
+            answer.text().contains("hello from volucer's gRPC handler"),
+            "the application's framed message must cross the QUIC hop unchanged: {:?}",
+            answer.text()
+        );
+
+        client.close();
+        running.stop();
+    });
+}
+
+/// A gRPC call Volucer refuses must still be `200` with a status in the trailers, over QUIC too.
+///
+/// The other half of the pair, and it takes a *different* code path: a call to a service the backend
+/// was not granted never reaches the application, so the trailer section is built by
+/// `error_response` → `grpc_error` rather than by `grpc_answer`. An HTTP status there — `404`, or
+/// the `403` a naive implementation would choose — is unreadable to a gRPC client, which reports
+/// "unexpected HTTP status" and never retries.
+#[test]
+fn a_refused_grpc_call_over_http_3_is_a_200_with_unimplemented_in_the_trailers() {
+    let Some(reason) = grpc_skip_reason() else {
+        return a_refused_grpc_call_over_http_3_is_a_200_with_unimplemented_in_the_trailers_inner();
+    };
+    report_skip(reason);
+}
+
+fn a_refused_grpc_call_over_http_3_is_a_200_with_unimplemented_in_the_trailers_inner() {
+    with_runtime(async {
+        let cert = Cert::new("grpcRefused", "a.test");
+        let php = find_php().expect("checked by `grpc_skip_reason`");
+        let script = sdk_dir().join("example").join("worker.php");
+        let config = write_dispatching_config(
+            &cert,
+            &format!(
+                r#"
+[backends.app]
+kind = "worker"
+command = '{} "{}"'
+workers = 2
+grpc_services = ["greeter.Greeter"]
+"#,
+                php.display(),
+                script.display()
+            ),
+        );
+
+        let running = start(&config, &cert);
+        let mut client = Client::connect(&cert, running.local_addr()).await;
+        let answer = client
+            .grpc_call("/other.Service/SayHello", b"\x00\x00\x00\x00\x00")
+            .await;
+
+        assert_eq!(
+            answer.status,
+            200,
+            "a gRPC refusal must be HTTP 200, because a client branches on the trailer status and \
+             not on the HTTP one: {:?}",
+            answer.text()
+        );
+        assert_eq!(
+            answer.trailer("grpc-status"),
+            Some("12"),
+            "an ungranted service is UNIMPLEMENTED (12), which is gRPC's own code for a server \
+             that does not implement it. Trailers were {:?}",
+            answer.trailers
+        );
+        assert!(
+            answer.body.is_empty(),
+            "a failed call carries no message: {:?}",
+            answer.text()
+        );
+
+        client.close();
+        running.stop();
+    });
+}
+
+/// The HTTP/3 front-end must carry an h2c origin's trailers through to a QUIC client.
+///
+/// The composition the other two tests do not reach: here the trailer section is produced by an
+/// *origin* speaking HTTP/2 and preserved by `volucer-upstream`, rather than constructed by
+/// `grpc_reply` from a worker's headers. It is the path where a body is passed through untouched, so
+/// a future change that buffered or re-framed it would drop the trailers while the worker tests
+/// stayed green.
+///
+/// The origin is a hand-written h2c server rather than a real gRPC implementation: what is under
+/// test is the proxy's framing, and a fixture that needs no interpreter can be told to send exactly
+/// one trailer pair. The status is `grpc-status: 0` because that is the field a client branches on.
+#[test]
+fn an_h2c_origins_trailers_reach_an_http_3_client() {
+    with_runtime(async {
+        let cert = Cert::new("grpcUpstream", "a.test");
+        let origin = H2cOrigin::spawn();
+        let config = write_dispatching_config(
+            &cert,
+            &format!(
+                r#"
+[backends.greeter]
+kind = "upstream"
+origin = "http://{}"
+protocol = "h2c"
+"#,
+                origin.address()
+            ),
+        );
+
+        let running = start(&config, &cert);
+        let mut client = Client::connect(&cert, running.local_addr()).await;
+        let answer = client
+            .grpc_call("/greeter.Greeter/SayHello", b"\x00\x00\x00\x00\x05hello")
+            .await;
+
+        assert_eq!(answer.status, 200, "body was {:?}", answer.text());
+        assert_eq!(
+            answer.trailer("grpc-status"),
+            Some("0"),
+            "an origin's gRPC status must survive the h2c origin hop *and* the QUIC hop. Trailers \
+             were {:?}",
+            answer.trailers
+        );
+        assert_eq!(
+            answer.text(),
+            "from the h2c origin",
+            "the origin's body must cross both hops unchanged"
+        );
+
+        client.close();
+        running.stop();
+    });
+}
+
+/// A minimal h2c origin that answers one gRPC-shaped request with a body and a trailer section.
+///
+/// `hyper`'s own HTTP/2 server rather than a hand-rolled frame writer: the wire format of HTTP/2 is
+/// not what this test is about, and reimplementing it would make the fixture the thing most likely
+/// to be wrong. It answers every request the same way, because one call is all the test makes.
+struct H2cOrigin {
+    address: SocketAddr,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl H2cOrigin {
+    fn spawn() -> Self {
+        use hyper::service::service_fn;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let address = listener.local_addr().expect("a bound address");
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("origins runtime");
+            runtime.block_on(async move {
+                // **Non-blocking before adoption.** `tokio::net::TcpListener::from_std` documents
+                // that the caller owns this property and does not set it, so a blocking listener
+                // adopted here makes the accept loop spin or stall — and the failure surfaces on
+                // the *other* side of the test as an unreachable origin.
+                listener
+                    .set_nonblocking(true)
+                    .expect("a loopback listener can be made non-blocking");
+                let listener = tokio::net::TcpListener::from_std(listener).expect("adopt listener");
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        // The service builds the answer itself so the trailers are a literal here,
+                        // beside the assertion that reads them.
+                        let service = service_fn(|_request| async {
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert(
+                                hyper::header::HeaderName::from_static("grpc-status"),
+                                hyper::header::HeaderValue::from_static("0"),
+                            );
+                            let body = http_body_util::Full::new(bytes::Bytes::from_static(
+                                b"from the h2c origin",
+                            ))
+                            .map_err(|never: std::convert::Infallible| match never {})
+                            .with_trailers(async move {
+                                Some(Ok::<_, std::convert::Infallible>(trailers))
+                            });
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc")
+                                    .body(body)
+                                    .expect("a valid response"),
+                            )
+                        });
+
+                        let _ = hyper::server::conn::http2::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                    });
+                }
+            });
+        });
+
+        H2cOrigin { address, shutdown }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for H2cOrigin {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Wakes the accept loop, which would otherwise stay parked for the test binary's lifetime.
+        let _ = std::net::TcpStream::connect(self.address);
+    }
 }
 
 /// Start a **TCP** listener advertising an `Alt-Svc` port, which is the half `Alt-Svc` is about.

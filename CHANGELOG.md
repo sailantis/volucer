@@ -48,6 +48,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rather than reporting an unknown field. Published releases and the Docker images are built with
   it.
 
+- **gRPC works over HTTP/3, in both directions of the trailer section.** gRPC reports its outcome in
+  the trailer section, and a transport that dropped trailers would turn every call into a transport
+  error while every other assertion passed. The QUIC response writer forwards trailer frames with
+  `send_trailers`, so a call's `grpc-status` reaches a QUIC client exactly as it reaches an HTTP/2
+  one. Both ways a trailer section is produced are now asserted rather than assumed: constructed by
+  Volucer from a worker's answer
+  (`a_grpc_call_over_http_3_reports_its_status_in_the_trailers`, including the `UNIMPLEMENTED`
+  refusal path that answers `200` with status `12`) and passed through from an h2c origin
+  (`an_h2c_origins_trailers_reach_an_http_3_client`). Nothing in the gRPC implementation needed to
+  change — it lives in the transport-agnostic request path — but the property was untested, so the
+  `send_trailers` arm could have been removed with no test failing.
+
 ### Changed
 
 - **A single backend no longer needs `default_backend`.** With exactly one backend there is nothing
@@ -202,6 +214,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Every HTTP/3 request to an `upstream` backend failed as an unreachable origin.** The forward
+  path passed the request's inbound HTTP version to the origin client, so a request that arrived
+  over QUIC carried `HTTP_3` into `hyper-util`'s pooled client — which accepts HTTP/1.0, 1.1 and 2
+  only and refuses anything else with `UserUnsupportedVersion` **before dialling a connection**.
+  The failure surfaced as `502 … the origin is unreachable`, naming an origin that had never been
+  contacted, so the message pointed at the wrong component; the transport was the cause and the
+  origin was fine. The version is now decided by one helper, `upstream_version`: HTTP/1.0 and
+  HTTP/1.1 pass through, and HTTP/2 or HTTP/3 become HTTP/1.1. It is deliberately *not* a
+  preference — how an origin is spoken to is `protocol = "h2c"` or the ALPN result, both applied
+  by the connector, which sends an HTTP/2 request over an h2c connection whatever this value says.
+  Asserted by `an_h2c_origins_trailers_reach_an_http_3_client`, which drives real QUIC at a real
+  h2c origin and fails against the old code, plus a property unit test that no inbound version
+  produces an outbound one the client refuses.
 - **Every browser request over HTTP/2 was served by the default site.** `h2` converts the
   `:authority` pseudo-header into `Uri::authority` and does **not** synthesise a `Host` header, and
   the request path read the host from `Host` alone. So `resolve_request` saw `None`, fell through

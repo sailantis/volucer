@@ -2113,7 +2113,14 @@ async fn upstream(
         request_headers,
         parts.method,
         uri,
-        parts.version,
+        // **Not `parts.version`, because `HTTP_3` is not a version this client can send.** The
+        // request reached us over QUIC, but the hop to the origin is a different connection with
+        // its own negotiated protocol, and `hyper-util`'s pooled client accepts only HTTP/1.0, 1.1
+        // and 2 on it — an `HTTP_3` request is refused with `UserUnsupportedVersion` *before* a
+        // connection is even dialled, which surfaced as a 502 "could not reach its origin" for
+        // every HTTP/3 request to an `upstream` backend. See `upstream_version` for why the value
+        // is not a protocol *preference*: that is `protocol = "h2c"` and ALPN, already applied.
+        upstream_version(parts.version),
         // The *upstream* crate's body type, not `http_body_util::BodyExt::boxed`, which would give
         // `BoxBody<Bytes, hyper::Error>` — a different type from the one the dispatcher's client
         // accepts, and one that could not be `Sync` anyway. `Payload::into_upstream` is where the
@@ -2153,6 +2160,40 @@ async fn upstream(
     outgoing
         .body(answer.body)
         .map_err(|err| HttpError::BadGateway(err.to_string()))
+}
+
+/// Which HTTP version to state when forwarding a request to an origin.
+///
+/// **The inbound version is not the outbound one.** Each hop negotiates its own protocol, and this
+/// hop's client — `hyper-util`'s pooled `Client` — accepts only HTTP/1.0, HTTP/1.1 and HTTP/2. An
+/// HTTP/3 request forwarded with its own version was refused with `UserUnsupportedVersion` *before*
+/// a connection was dialled, which reached the client as a 502 naming a dead origin: every HTTP/3
+/// request to an `upstream` backend failed, and the message blamed the origin rather than the proxy.
+///
+/// The rule is that only a version this client can *send* is carried through, and everything else
+/// becomes HTTP/1.1:
+///
+/// - **HTTP/1.0 and HTTP/1.1 pass through unchanged.** Rewriting them would change what the
+///   request means rather than how it is framed — `HTTP/1.0` in particular asks an origin for
+///   connection-close semantics.
+/// - **HTTP/2 and HTTP/3 become HTTP/1.1**, and this is deliberately *not* the place to express a
+///   preference. How an origin is spoken to is `[backends.<n>].protocol = "h2c"` or the ALPN result
+///   for an `https:` origin, and both are already decided by the connector before this value is
+///   read: on an h2c or ALPN-`h2` connection `hyper-util` sends an HTTP/1.1-versioned request as
+///   HTTP/2 anyway (measured — `an_h2c_origins_trailers_reach_an_http_3_client` asserts the origin
+///   answers `HTTP/2.0` to a request stated as HTTP/1.1). Letting the inbound version choose would
+///   make an origin's protocol depend on which transport a caller happened to use, which is the
+///   coupling `OriginSpec::protocol` exists to avoid.
+///
+/// gRPC needs no special case here, and that is worth stating because it looks like it should.
+/// gRPC's transport *is* HTTP/2, but it gets there through `protocol = "h2c"` or ALPN like any
+/// other preference — a gRPC call to an origin that speaks only HTTP/1.1 is misconfigured, and
+/// quietly upgrading the request version would hide the misconfiguration instead of surfacing it.
+fn upstream_version(inbound: hyper::Version) -> hyper::Version {
+    match inbound {
+        hyper::Version::HTTP_10 | hyper::Version::HTTP_11 => inbound,
+        _ => hyper::Version::HTTP_11,
+    }
 }
 
 /// Read the request body, refusing anything over the limit.
@@ -2695,6 +2736,64 @@ mod tests {
             forbidden_extensions: vec![".htaccess".to_string()],
             ..Routing::default()
         }
+    }
+
+    /// The outbound version must be one `hyper-util`'s client can send, whatever arrived.
+    ///
+    /// This is the bug this helper was extracted for: an HTTP/3 request forwarded with its own
+    /// version was refused by the pooled client with `UserUnsupportedVersion` *before* a connection
+    /// was dialled, so every HTTP/3 request to an `upstream` backend answered `502` and blamed an
+    /// origin that had never been contacted. The assertion is a property of the whole function
+    /// rather than one case at a time, because a future transport is exactly what would arrive with
+    /// a version nobody thought about.
+    #[test]
+    fn the_version_sent_to_an_origin_is_always_one_the_client_can_send() {
+        for inbound in [
+            hyper::Version::HTTP_10,
+            hyper::Version::HTTP_11,
+            hyper::Version::HTTP_2,
+            hyper::Version::HTTP_3,
+        ] {
+            let outbound = upstream_version(inbound);
+            assert!(
+                matches!(
+                    outbound,
+                    hyper::Version::HTTP_10 | hyper::Version::HTTP_11 | hyper::Version::HTTP_2
+                ),
+                "{inbound:?} produced {outbound:?}, which `hyper-util`'s client refuses before \
+                 dialling — the request would fail as an unreachable origin"
+            );
+        }
+    }
+
+    /// The rule itself: a sendable version passes through, anything else is HTTP/1.1.
+    ///
+    /// Stated separately from the property test above so a rewrite cannot lose the half that says
+    /// which version is *chosen* — that HTTP/2 does not become HTTP/2, and that HTTP/1.0 is not
+    /// silently rounded up to 1.1.
+    #[test]
+    fn a_sendable_version_is_carried_through_and_anything_else_becomes_http_1_1() {
+        // HTTP/1.x is already sendable, and rewriting it would change what the request means:
+        // `HTTP/1.0` asks the origin for connection-close semantics.
+        assert_eq!(
+            upstream_version(hyper::Version::HTTP_10),
+            hyper::Version::HTTP_10
+        );
+        assert_eq!(
+            upstream_version(hyper::Version::HTTP_11),
+            hyper::Version::HTTP_11
+        );
+        // HTTP/2 and HTTP/3 become HTTP/1.1. The outbound hop's protocol is the connector's
+        // decision — `protocol = "h2c"` or ALPN — and `hyper-util` sends an HTTP/2 request over an
+        // h2c connection regardless of this value.
+        assert_eq!(
+            upstream_version(hyper::Version::HTTP_2),
+            hyper::Version::HTTP_11
+        );
+        assert_eq!(
+            upstream_version(hyper::Version::HTTP_3),
+            hyper::Version::HTTP_11
+        );
     }
 
     /// `Parts` as a front-end would produce them, with no `FrontEnd` involved:
