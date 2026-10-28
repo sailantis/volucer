@@ -165,6 +165,7 @@ Some features are enabled by the presence of their table. They do not need an
 | Section | What its presence turns on |
 |---|---|
 | `[server.tls]` | TLS |
+| `[server.http3]` | HTTP/3 over QUIC, on its own UDP listener (needs a build with the `http3` feature) |
 | `[server.acme]` | Automatic certificates (`enabled` inside it defaults to `true`) |
 | `[server.access_log]` | Access logging |
 | `[server.rate_limit]` | Rate limiting |
@@ -362,6 +363,27 @@ Relative certificate and key paths are resolved from the configuration file's di
 not the process's working directory. `volucer check` prints the resolved paths.
 
 See [TLS and ACME](05-TLS-AND-ACME.md) for deployment examples and details about `plain`.
+
+## `[server.http3]`
+
+HTTP/3 over QUIC, on its own UDP listener. It requires `[server.tls]`: QUIC is TLS 1.3 with
+no cleartext mode, so there is no equivalent of `plain`.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | `host:port` | required | The UDP address to bind. |
+| `max_connections` | integer | `512` | Concurrent QUIC connections. |
+| `idle_timeout_ms` | integer | `30000` | Idle timeout (RFC 9308). |
+| `alt_svc_ma_seconds` | integer | `86400` | The `ma=` in `Alt-Svc`. |
+| `max_field_section_size` | integer | `16384` | Largest request header section, in bytes. A security setting. |
+
+`h3` must **not** appear in `[server.tls].alpn`: that list describes the TCP socket, which
+cannot speak HTTP/3, and writing it there is refused rather than ignored.
+
+Requires a build with the `http3` feature. A build without it refuses this table by name.
+
+See [TLS and ACME](05-TLS-AND-ACME.md#http3) for `Alt-Svc`, the header section cap, and what
+differs from the TCP path.
 
 ## `[server.acme]`
 

@@ -192,6 +192,93 @@ then routes the request to the site selected by `Host`.
 Without `[server.tls]`, Volucer does not inspect the connection for TLS or construct TLS
 state. Cleartext requests use the same path as before TLS support was added.
 
+## HTTP/3
+
+HTTP/3 runs over QUIC, which is a different transport rather than a newer framing layer, so
+it gets its own **UDP** listener. Everything above the transport is shared: site resolution,
+the rate limit, static files, routing, the dispatcher, the access log and the metrics are
+the same code that serves HTTP/1.1 and HTTP/2.
+
+```toml
+[server]
+http = "0.0.0.0:443"
+
+[server.tls]
+certificate = "certs/default.crt"
+key = "certs/default.key"
+alpn = ["h2", "http/1.1"]      # the TCP socket's list -- see below
+
+[server.http3]
+listen = "0.0.0.0:443"         # UDP; the same port number as `http` is fine
+```
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | `host:port` | required | UDP address to bind. `unix:` forms are refused. |
+| `max_connections` | integer | `512` | Concurrent QUIC connections. |
+| `idle_timeout_ms` | integer | `30000` | Idle timeout, per RFC 9308. |
+| `alt_svc_ma_seconds` | integer | `86400` | The `ma=` in the `Alt-Svc` header. |
+| `max_field_section_size` | integer | `16384` | Largest request header section, in bytes. |
+
+**It requires a build with the `http3` feature.** Published releases and the Docker images
+carry it; a local build needs `cargo install volucer --features http3`. The configuration
+table parses either way, and a build without the listener refuses it by name rather than
+reporting an unknown field.
+
+**It requires `[server.tls]`.** QUIC is TLS 1.3 with no cleartext mode anywhere in the
+protocol, so there is no equivalent of `plain`. The certificate comes from the same
+resolver, which means per-site certificates, ACME issuance and a certificate reload all
+reach this listener unchanged — only `min_version` and `alpn` are restart-only, and for
+HTTP/3 neither applies: the listener is always TLS 1.3 and its ALPN is `h3`.
+
+**`h3` is not added to `[server.tls].alpn`,** and writing it there is an error. That list
+belongs to the TCP socket, which cannot speak HTTP/3 at all: a client that negotiated `h3`
+over TCP would send a QUIC Initial down a TCP connection. HTTP/3's ALPN is fixed by RFC
+9114 §3.1.
+
+### `Alt-Svc` is not optional
+
+A browser has no way to discover a UDP endpoint. It learns one from `Alt-Svc` on a TCP
+response:
+
+```
+Alt-Svc: h3=":443"; ma=86400
+```
+
+Volucer sends that automatically on every **TLS** answer when `[server.http3]` is present,
+naming the port the socket actually bound. It is never sent on a cleartext answer, because
+no browser acts on it there. Without the header the listener exists and is never used.
+
+### `max_field_section_size` is a security setting
+
+`h3` 0.0.8 defaults this to unbounded, which is hyperium/h3#379: a `HEADERS` frame made of
+one-byte static-table references decodes into a `HeaderMap` with thousands of entries, so a
+small request allocates a large one. RFC 9114 §4.2.2 charges each decoded field at least 32
+bytes against this budget, so the 16 KiB default caps a section at roughly 512 fields and
+the section is rejected *before* the fields are materialised.
+
+Do not raise it above the 1 MiB ceiling that validation enforces. Do not return it to the
+crate's default. The test
+`an_oversized_header_section_is_answered_431_and_the_listener_survives` is what makes the
+mitigation a mitigation rather than a comment.
+
+### What differs from the TCP path
+
+**The request body is buffered, up to `max_body_bytes`.** A QUIC request stream is read by
+the application, so there is no way to hand it across the blocking boundary the CGI path
+uses. An HTTP/3 upload therefore meets the same limit a CGI request does, rather than
+streaming to an origin unbounded the way an `upstream` request does over TCP. The
+**response** still streams, so SSE and large downloads are unaffected.
+
+**0-RTT is not enabled.** It makes replay a property of the application, and an application
+written for a request/response server is not prepared for that.
+
+### Firewall and MTU
+
+The QUIC port is UDP. A TCP-only rule on `:443` means `Alt-Svc` advertises an endpoint that
+nothing can reach, and every browser's QUIC attempt silently falls back to TCP after a
+retry delay — a slow site rather than an error. See `11-OPERATIONS.md`.
+
 ## Automatic certificates
 
 Automatic certificate management is opt-in. Add a `[server.acme]` table to configure it;

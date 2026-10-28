@@ -1,16 +1,16 @@
 ![Volucer](docs/images/volucer-logo-text.svg)
 
-<h3 align="center">A cross-platform application server for PHP, Python, Ruby, and more</h3>
+<h3 align="center">A cross-platform application server for PHP, Python, Ruby and more</h3>
 
 <p align="center">
-Run persistent worker applications with Volucer's PHP, Python, and Ruby SDKs, serve FastCGI applications, or route HTTP traffic to an existing server.
+Run persistent worker applications with Volucer's PHP SDK, serve FastCGI applications, or route HTTP traffic to an existing server.
 </p>
 
 ---
 
-**Volucer** is a single binary that runs and serves applications on Linux, macOS, and Windows. It provides the HTTP listener, host- and path-based routing, static-file serving, TLS with automatic ACME certificates, and process supervision.
+**Volucer** is a single binary that runs and serves applications on Linux, macOS, Windows and Docker. It provides the HTTP listener, host- and path-based routing, static-file serving, TLS with automatic ACME certificates, process supervision, and — built with the `http3` feature, which every published release is — HTTP/3 over QUIC alongside HTTP/1.1 and HTTP/2.
 
-Use a worker SDK to keep a PHP, Python, or Ruby application running between requests. For applications that use FastCGI, Volucer can connect to an existing server such as `php-fpm` or start and supervise a compatible backend such as `php-cgi`, `gunicorn`, or a Rack server. It can also route requests to an HTTP server written in another language, such as Go or Node.js.
+Use a worker SDK to keep a PHP application running between requests. For applications that use FastCGI, Volucer can connect to an existing server such as `php-fpm` or start and supervise a compatible backend such as `php-cgi`, `gunicorn`, or a Rack server. It can also route requests to an HTTP server written in another language, such as Go or Node.js.
 
 ## How requests are handled
 

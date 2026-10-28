@@ -119,7 +119,50 @@ trusted_subnets = ["127.0.0.1"]
 trusted_headers = ["X-Forwarded-For"]
 ```
 
-## systemd
+## HTTP/3: UDP reachability and MTU
+
+HTTP/3 is served on the UDP address in `[server.http3] listen`, and browsers only learn about
+it from the `Alt-Svc` header Volucer sends on TLS responses. Three things therefore have to be
+true at once, and each fails in a different way.
+
+**The UDP port must be reachable.** This is the common one, and it fails silently: the TCP
+listener answers normally, `Alt-Svc` advertises the QUIC endpoint, the browser attempts QUIC,
+its datagrams are dropped, and it falls back to TCP after a retry delay. Nothing errors, and
+the only symptom is a site that feels slow on the first request.
+
+```bash
+# Check the container or host publishes UDP, not only TCP:
+docker run -p 443:443/tcp -p 443:443/udp ...
+
+# Check the firewall:
+sudo ufw allow 443/tcp
+sudo ufw allow 443/udp        # the line that is easy to forget
+
+# From outside, with a client that speaks HTTP/3:
+curl --http3-only -sI https://example.com
+```
+
+If `curl` needs `--http2` to succeed, that is the signature of exactly this problem.
+
+**The path MTU must not black-hole large datagrams.** QUIC sends most of its traffic in
+datagrams near the path MTU, and a link that drops ICMP "fragmentation needed" will carry the
+handshake and then stall. Volucer's `max_body_bytes` is not the relevant limit — the failure
+is in the network. `quinn` does path MTU discovery, so a modern path recovers; a path behind a
+tunnel or a middlebox that filters ICMP does not. Symptoms are HTTP/3 connections that
+complete their handshake and then hang on the first large response.
+
+**`Alt-Svc` has a lifetime.** `alt_svc_ma_seconds` (default one day) is how long a browser
+caches the endpoint. Removing `[server.http3]` from a running deployment therefore does not
+take effect immediately for returning visitors: they will keep attempting the UDP endpoint
+until their cached value expires, and fall back. That is the reason not to lower the default
+carelessly, and the reason a rollback of HTTP/3 is a one-day event rather than an instant one.
+
+`volucer check` prints the `[server.http3]` block, and the listener's shutdown line reports
+requests, connections, handshake failures and oversized header sections — a non-zero
+`handshake failure` count on a port that should be idle is the signal that something between
+the client and the server is interfering with UDP.
+
+## `systemd`
 
 The unit that ships with volucer:
 

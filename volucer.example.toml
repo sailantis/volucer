@@ -149,6 +149,44 @@ fastcgi = "127.0.0.1:9080"
 # alpn = ["h2", "http/1.1"]           # h2 preferred; do NOT drop http/1.1
 # plain = false                       # accept cleartext on the TLS port too
 #
+# HTTP/3 over QUIC, on its own UDP socket. Presence of the table is what turns
+# it on, following [server.tls] and [server.acme]. It needs [server.tls]: QUIC
+# is TLS 1.3 with no cleartext mode anywhere in the protocol, and the
+# certificate comes from the same resolver, so per-site certificates, ACME and
+# a reload all reach this listener unchanged.
+#
+# **It also needs a build with the `http3` feature** (`cargo install volucer
+# --features http3`; the published releases and Docker images carry it). The
+# table parses either way, and a build without the listener refuses it by name
+# rather than reporting an unknown field.
+#
+# `listen` is UDP and separate from `http`/`https`, because QUIC is not a
+# framing layer over TCP. The same port number as `https` is fine -- the two do
+# not collide -- and is the shape `Alt-Svc: h3=":443"` expects.
+#
+# `Alt-Svc` is sent automatically on every TLS answer, naming the *bound* UDP
+# port for `alt_svc_ma_seconds`. Without it no browser ever learns the endpoint
+# exists, so this is not an optional extra.
+#
+# `max_field_section_size` bounds the request header section and is a security
+# setting, not a tuning knob: `h3` 0.0.8 defaults it to unbounded, which is a
+# remotely triggerable amplification (hyperium/h3#379). 16 KiB caps a section at
+# roughly 512 fields. Do not raise it above the 1 MiB ceiling.
+#
+# `idle_timeout_ms` is QUIC's own recommendation (RFC 9308, 30 s), which bounds
+# idleness on a connection a browser multiplexes over -- not a request, so the
+# TCP listener's 15 s keep-alive would be too short.
+#
+# Firewall the UDP port, and watch for MTU black holes: a path that drops large
+# UDP datagrams fails HTTP/3 in a way that looks like a slow site rather than an
+# error. See docs/11-OPERATIONS.md.
+# [server.http3]
+# listen = "0.0.0.0:443"              # UDP
+# max_connections = 512               # same meaning as the TCP listener's limit
+# idle_timeout_ms = 30000             # RFC 9308's recommendation
+# alt_svc_ma_seconds = 86400          # one day
+# max_field_section_size = 16384      # security setting -- see above
+#
 # Answer cleartext requests with a 301 to the https:// equivalent. Off by
 # default: it changes what an existing cleartext deployment does. Needs a
 # plaintext listener to act on -- either a separate `https`, or `plain = true`.

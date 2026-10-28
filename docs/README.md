@@ -49,6 +49,9 @@ This guide explains how to configure, run, and maintain Volucer.
   and the framework integrations built on them.
 - **[Benchmarks](12-BENCHMARKS.md)** — Performance and memory measurements against
   RoadRunner, FrankenPHP, and `nginx` + `php-fpm`, including the test method and results.
+- **[Carrying an upstream patch](13-CARRYING-AN-UPSTREAM-PATCH.md)** — Why a dependency may be
+  pinned to a fork, and what that does and does not protect.
+
 ## Reference
 
 - **[The worker protocol](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md)**
