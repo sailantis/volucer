@@ -255,7 +255,9 @@ impl Sites {
             static_files_suppressed: false,
             compression: default_compression.clone(),
             routes: config.server.routes.clone(),
-            default_backend: config.server.default_backend.clone(),
+            default_backend: config
+                .implied_backend(config.server.default_backend.as_deref())
+                .map(str::to_string),
             // `[server]` is the fallback site and cannot be bound: it is what answers a connection
             // no site claims, so a binding here would be a way to answer nothing at all. A
             // deployment that wants the default site restricted writes a site for it and leaves
@@ -291,7 +293,7 @@ impl Sites {
                 &default_statics,
                 &default_compression,
                 &config.server.routes,
-                config.server.default_backend.as_deref(),
+                config.implied_backend(config.server.default_backend.as_deref()),
                 config.server.redirect_to_https,
                 default.hsts.as_ref(),
             );

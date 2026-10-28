@@ -761,8 +761,8 @@ impl Dispatcher {
         // agree about the file — `check` reports it as a warning, because a server
         // that can answer nothing but static files is usually a configuration
         // still being written rather than a finished one.
-        let default = match config.server.default_backend.clone() {
-            Some(name) => name,
+        let default = match config.implied_backend(config.server.default_backend.as_deref()) {
+            Some(name) => name.to_string(),
             None if backends.is_empty() => String::new(),
             None => {
                 return Err(ServerError::Misconfigured {

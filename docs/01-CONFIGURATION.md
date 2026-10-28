@@ -195,7 +195,7 @@ its certificate or ACME settings.
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
-| `default_backend` | string | — | The backend used when a request matches no route. |
+| `default_backend` | string | — | The backend used when a request matches no route. Optional when there is exactly one backend, which is then used; required once there are several. |
 | `routes` | array of tables | empty | The routing rules for the unnamed site. See [Routing and Sites](03-ROUTING-AND-SITES.md). |
 | `env` | table | empty | Environment variables every started process inherits. |
 | `tls` | table | absent | TLS configuration. Presence enables it. |

@@ -228,7 +228,9 @@ The configuration has three important parts:
 - **`default_backend`** selects the backend for requests that do not match a route. It
   belongs under `[server]` because that table also represents the default, unnamed site.
   A `[sites.<name>]` table can override it for a particular host, along with settings such
-  as `document_root`.
+  as `document_root`. It may be omitted when there is exactly one backend, which is then used
+  — `volucer check` says so rather than leaving you to notice the key is gone. With two or
+  more backends it is required, and the error names them.
 
 This is a complete FastCGI setup: Volucer serves requests to PHP-FPM without requiring
 nginx in front. The same `external` backend can connect to any FastCGI server; change the

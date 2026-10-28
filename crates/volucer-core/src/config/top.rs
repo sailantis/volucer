@@ -177,4 +177,45 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         Self::from_toml(&Self::expanded_text(path)?)
     }
+
+    /// The backend the unnamed site falls back to, given the configured default; else `None`.
+    ///
+    /// This is the **single** place the rule "a lone backend is the default" lives, written once so
+    /// that `validate`, `check`, `Dispatcher` and site resolution cannot disagree about it. They
+    /// each ask this question, and four copies of it would be four chances to answer differently.
+    ///
+    /// The inference is deliberately narrow: it fires only when there is **exactly one** backend.
+    /// Not "the first one" — [`Config::backends`] is a `BTreeMap`, so file order is gone by the time
+    /// anything can read it, and a first-one-wins rule would silently pick `assets` over `app` for
+    /// any deployment that happened to have a second backend sorting earlier. Exactly-one has no
+    /// order to get wrong and is falsifiable by looking at the file.
+    ///
+    /// `stated` is passed in rather than read from `self.server` because sites inherit the
+    /// *server's* answer, and a site that states its own must not be overridden by the inference.
+    /// Ambiguity is a validation error rather than an inference, so a deployment with two backends
+    /// and no default still fails at `check` — see [`Config::validate`].
+    pub fn implied_backend<'a>(&'a self, stated: Option<&'a str>) -> Option<&'a str> {
+        match stated {
+            Some(name) => Some(name),
+            // `next_back` rather than `iter().next()`: it asks the map for its only entry and
+            // `None` when there is more than one, which is the condition being expressed — it does
+            // not mean "the first", which is the rule this deliberately avoids.
+            None => match self.backends.len() {
+                1 => self.backends.keys().next().map(String::as_str),
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether the default in force was inferred rather than written, and what it is.
+    ///
+    /// Exists for `volucer check`, which prints a line describing where the default came from. An
+    /// operator reading a file with no `default_backend` should be told the server chose one for
+    /// them, rather than left to infer it from the absence of an error.
+    pub fn inferred_default_backend(&self) -> Option<&str> {
+        match self.server.default_backend {
+            None => self.implied_backend(None),
+            Some(_) => None,
+        }
+    }
 }

@@ -67,6 +67,136 @@ http = "127.0.0.1:8080"
     assert!(err.to_string().contains("default_backend"), "{err}");
 }
 
+/// **One backend needs no `default_backend`**, because there is nothing to choose between.
+///
+/// The rule is `exactly one`, not `the first one`: `backends` is a `BTreeMap`, so file order does not
+/// survive parsing, and a first-one-wins rule would pick alphabetically — silently handing an
+/// unrouted request to `assets` instead of `app`. Exactly-one has no order to get wrong.
+#[test]
+fn a_lone_backend_is_the_default_without_being_stated() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config.validate().expect("a lone backend needs no default");
+    assert_eq!(
+        config.server.default_backend, None,
+        "the file states none, and nothing may rewrite what the operator wrote"
+    );
+    assert_eq!(config.implied_backend(None), Some("app"));
+    assert_eq!(config.inferred_default_backend(), Some("app"));
+}
+
+/// And it reaches the place a request actually consults.
+///
+/// `implied_backend` being right is not the same as the site carrying it: `[server]` is the unnamed
+/// site, and every named site inherits from it, so an inference that stopped at the accessor would
+/// leave the request path with `None` and fail every unrouted request at runtime.
+#[test]
+fn the_inferred_default_reaches_the_resolved_sites() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[sites.app]
+hosts = ["a.test"]
+document_root = "/srv/app"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config.validate().expect("a lone backend needs no default");
+
+    let sites = crate::sites::Sites::from_config(&config, Path::new("/srv/app"));
+    assert_eq!(
+        sites.default_site().default_backend.as_deref(),
+        Some("app"),
+        "the unnamed site must carry the inferred default, not the literal absence"
+    );
+    let site = sites.named().get("app").expect("the named site resolves");
+    assert_eq!(
+        site.default_backend.as_deref(),
+        Some("app"),
+        "a site that states nothing inherits the server's answer, inferred or written"
+    );
+}
+
+/// **Two backends and no default stays refused**, and the message says how to fix it.
+///
+/// This is the half that must not soften: with several backends a request matching no route has
+/// several possible answers, and choosing one would be a guess presented as a default.
+#[test]
+fn two_backends_without_a_default_are_refused_by_name() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[backends.zeta]
+kind = "worker"
+command = "php worker.php"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("ambiguity must be refused");
+    let message = err.to_string();
+    assert!(message.contains("default_backend"), "{message}");
+    // Both names, sorted, so the operator is shown the choice rather than told it exists.
+    assert!(
+        message.contains("app") && message.contains("zeta"),
+        "{message}"
+    );
+    assert!(
+        message.contains("more than one"),
+        "the message must explain why the inference did not apply: {message}"
+    );
+    assert_eq!(config.implied_backend(None), None);
+}
+
+/// A stated default is used as written, even when it is the only backend.
+#[test]
+fn a_stated_default_is_never_overridden_by_the_inference() {
+    let text = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config.validate().expect("valid");
+    assert_eq!(
+        config.implied_backend(config.server.default_backend.as_deref()),
+        Some("app")
+    );
+    assert_eq!(
+        config.inferred_default_backend(),
+        None,
+        "a stated default is not an inference, and `check` must not claim it was"
+    );
+}
+
+/// No backends at all stays legal: the static-only deployment.
+#[test]
+fn no_backends_is_still_the_static_only_deployment() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+serve_only = "static"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config
+        .validate()
+        .expect("a static-only deployment needs no backend");
+    assert_eq!(config.implied_backend(None), None);
+    assert_eq!(config.inferred_default_backend(), None);
+}
+
 #[test]
 fn rejects_non_loopback_php_cgi_bind() {
     let text = r#"

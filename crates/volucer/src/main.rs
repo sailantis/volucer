@@ -3821,8 +3821,20 @@ fn check(
     if config.backends.is_empty() {
         println!("    (none)");
     }
+    // Printed because an inferred default is otherwise invisible: the file has no
+    // `default_backend`, `check` exits zero, and the only way to know which backend answers an
+    // unrouted request would be to read this program's source. Spelled out only when it *was*
+    // inferred, so a file that states one reads exactly as it did before.
+    if let Some(inferred) = config.inferred_default_backend() {
+        println!(
+            "    default_backend: {inferred} (inferred — it is the only backend; write \
+             `default_backend = \"{inferred}\"` to state it, which several backends require)"
+        );
+    }
     for (name, backend) in &config.backends {
-        let default = if config.server.default_backend.as_deref() == Some(name.as_str()) {
+        let default = if config.implied_backend(config.server.default_backend.as_deref())
+            == Some(name.as_str())
+        {
             " (default)"
         } else {
             ""

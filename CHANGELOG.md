@@ -50,6 +50,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A single backend no longer needs `default_backend`.** With exactly one backend there is nothing
+  to choose, so the key may be omitted and that backend receives every request that matches no
+  route:
+
+  ```toml
+  [server]
+  http = "0.0.0.0:8080"
+
+  [backends.app]
+  kind = "worker"
+  command = "php worker.php"
+  ```
+
+  `volucer check` prints the resolved default and says it was inferred, so a file that relies on
+  this is not quietly asserting something invisible. A stated `default_backend` is always used as
+  written and is never overridden.
+
+  The inference is deliberately `exactly one`, not `the first one`: `backends` is a `BTreeMap`, so
+  file order does not survive parsing, and a first-one-wins rule would resolve alphabetically —
+  handing unrouted requests to `assets` because it sorts before `app`. Two or more backends with no
+  default is still a configuration error, and the message now names the candidates and shows the
+  key to write.
+
 - **`services` can name a method, not only a namespace.** A grant used to hand over a whole
   namespace: `"workers"` gave a worker both `workers.list` and `workers.reset`, and `"kv.cache"`
   gave it `get` along with `clear`. Both spellings still work, and a namespace name still grants

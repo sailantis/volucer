@@ -756,13 +756,25 @@ impl Config {
         }
         match &self.server.default_backend {
             None => {
-                // Backends without a `default_backend` is a typo: nothing could
-                // select them. No backends at all is the static-only deployment,
-                // which `Dispatcher` accepts and the CLI warns about.
-                if !self.backends.is_empty() {
-                    return Err(Error::Config(
-                        "backends are defined but default_backend is not set".to_string(),
-                    ));
+                // Backends without a `default_backend` is a typo *when it is ambiguous*: with one
+                // backend there is nothing to choose and the inference in
+                // `Config::implied_backend` supplies it. With several, nothing could select them
+                // and a guess would be the alphabetical order of a map the file does not show —
+                // so the requirement stays, and the message says how to satisfy it.
+                //
+                // No backends at all is the static-only deployment, which `Dispatcher` accepts and
+                // the CLI warns about.
+                if self.backends.len() > 1 {
+                    let mut names: Vec<&str> = self.backends.keys().map(String::as_str).collect();
+                    names.sort_unstable();
+                    return Err(Error::Config(format!(
+                        "backends are defined but default_backend is not set, and there is more \
+                         than one to choose from ({}); name one, e.g. \
+                         `default_backend = \"{}\"` — a single backend needs no such key, several \
+                         always do",
+                        names.join(", "),
+                        names[0]
+                    )));
                 }
             }
             Some(name) if !self.backends.contains_key(name) => {
