@@ -105,6 +105,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Every browser request over HTTP/2 was served by the default site.** `h2` converts the
+  `:authority` pseudo-header into `Uri::authority` and does **not** synthesise a `Host` header, and
+  the request path read the host from `Host` alone. So `resolve_request` saw `None`, fell through
+  to the `[server]` site, and answered from the wrong document root — a multi-site deployment over
+  TLS served site A's files for a request addressed to site B. The bug is as old as the `h2` path
+  and was invisible because the only assertion on it
+  (`alpn_h2_negotiates_a_real_http_2_connection`) checks that a SETTINGS frame arrives and never
+  sends a request. The host is now `Host` **or** the URI's authority, in one helper
+  (`request_host`) used by the site lookup, the HTTPS redirect and the CGI environment; `Host`
+  still wins when both are present, because that is the name a proxy rewrote. Two consequences
+  beyond the site lookup are fixed with it: `Alt-Svc`/redirect answers and access-log `host` now
+  name the site for an `h2` request rather than logging nothing, and an application receives
+  `HTTP_HOST` — PHP builds absolute URLs from it, and an `h2` request used to reach it with
+  `SERVER_NAME` set and `HTTP_HOST` absent, a state no HTTP/1.1 request can produce. Asserted end
+  to end by `an_http_2_request_with_only_an_authority_serves_the_named_site`, which drives a real
+  `h2` connection with an `:authority` and no `Host` — the shape a browser sends — and which fails
+  against the old code.
 - **`kv.getMultiple` and `kv.setMultiple` disagreed with every single-key method about what a key
   is.** The batch methods read their keys with `string_list` and used each string's literal UTF-8
   bytes, while `setMultiple` decoded *both* halves of its object and every scalar method decoded its

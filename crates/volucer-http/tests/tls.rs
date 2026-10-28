@@ -1283,6 +1283,166 @@ async fn a_resolver_without_tls_settings_is_refused() {
     assert!(err.to_string().contains("no TLS settings"), "{err}");
 }
 
+/// **An HTTP/2 request has no `Host` header, and this server used to serve it the default site.**
+///
+/// `h2` converts `:authority` into `Uri::authority` and does not synthesise `Host`, so the request
+/// path read `None` for the host and `resolve_request` fell through to `default`. Every browser
+/// request over TLS therefore reached the wrong document root, and it was invisible because the
+/// only assertion on this path was `alpn_h2_negotiates_a_real_http_2_connection` — which checks
+/// that a SETTINGS frame arrives and never sends a real request.
+///
+/// Asserted end to end, over a real `h2` connection with no `Host` header at all, because that is
+/// the only way to see the bug: the unit test on `request_host` proves the helper resolves an
+/// authority, not that `prepare` uses it to pick a site.
+#[tokio::test]
+async fn an_http_2_request_with_only_an_authority_serves_the_named_site() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("volucer-h2-site-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for (name, body) in [("named", "site-named"), ("default", "site-default")] {
+        std::fs::create_dir_all(base.join(name)).expect("create a site root");
+        std::fs::write(base.join(name).join("whoami.txt"), body).expect("write the marker");
+    }
+
+    let cert = Cert::new("h2authority", "named.test");
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {default:?}
+static_files = {{ enabled = true }}
+
+[server.tls]
+certificate = "certs/server.crt"
+key = "certs/server.key"
+
+[sites.named]
+hosts = ["named.test"]
+document_root = {named:?}
+static_files = {{ enabled = true }}
+"#,
+        default = base.join("default").to_string_lossy(),
+        named = base.join("named").to_string_lossy(),
+    );
+    std::fs::write(cert.dir().join("volucer.toml"), &text).expect("write config");
+    let config = Config::from_toml(&text).expect("config parses");
+    config.validate().expect("config validates");
+
+    let addr = start(config, cert.dir()).await;
+
+    let body = h2_get_without_host(addr, "named.test", "/whoami.txt")
+        .await
+        .expect("the server must answer an HTTP/2 request");
+
+    assert_eq!(
+        body, "site-named",
+        "an h2 request carries the name in :authority; serving `site-default` is the bug"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Send one `GET` over HTTP/2 with `:authority` and **no `Host` header**, and return the body.
+///
+/// A real client rather than a harness, because the shape being fixed is produced by `h2` itself:
+/// hand-building a request with no `Host` and an authority is the only way to reproduce what a
+/// browser sends. Frames are encoded by hand because `h2` is a server-side dependency here, and a
+/// test-only client crate is a dependency this project does not need to prove one header.
+async fn h2_get_without_host(addr: SocketAddr, authority: &str, path: &str) -> Option<String> {
+    use rustls::pki_types::ServerName;
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let name = ServerName::try_from(authority.to_string()).ok()?;
+    let mut tls = connector.connect(name, stream).await.ok()?;
+
+    tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .ok()?;
+
+    // An empty SETTINGS frame, so the server knows the client is real.
+    tls.write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0]).await.ok()?;
+
+    // A HEADERS frame on stream 1 carrying `:method`, `:scheme`, `:path` and `:authority` — and
+    // deliberately no `host`. All four are literal (never indexed) so no HPACK encoder is needed;
+    // the static-table name references are the standard ones.
+    let mut block = Vec::new();
+    let literal = |name_index: u8, value: &str, block: &mut Vec<u8>| {
+        // 0000xxxx — literal header field without indexing, new name, 4-bit index.
+        if name_index == 0 {
+            block.push(0x00);
+        } else {
+            block.push(name_index);
+        }
+        block.push(value.len() as u8);
+        block.extend_from_slice(value.as_bytes());
+    };
+    // 0x82 `:method GET`, 0x87 `:scheme https`, 0x84 `:path /` — full static-table matches.
+    // Index 2 is GET (index 3 is POST), so 0x82 is the byte that makes this a `GET`.
+    block.push(0x82);
+    block.push(0x87);
+    if path == "/" {
+        block.push(0x84);
+    } else {
+        literal(0x04, path, &mut block);
+    }
+    // `:authority` is static index 1; sent as a literal with a name reference so the value can be
+    // anything the test asks for. 0x01 is the 4-bit index for `:authority`.
+    block.push(0x01);
+    block.push(authority.len() as u8);
+    block.extend_from_slice(authority.as_bytes());
+
+    let mut headers = Vec::new();
+    headers.extend_from_slice(&(block.len() as u32).to_be_bytes()[1..]);
+    headers.push(0x01); // HEADERS
+    headers.push(0x05); // END_HEADERS | END_STREAM
+    headers.extend_from_slice(&[0, 0, 0, 1]); // stream 1
+    headers.extend_from_slice(&block);
+    tls.write_all(&headers).await.ok()?;
+    tls.flush().await.ok()?;
+
+    // Read frames until the response's DATA is complete. The server's SETTINGS arrive first, and
+    // its own HEADERS frame precedes the body, so the loop cannot assume an order.
+    let mut body = Vec::new();
+    let deadline = std::time::Duration::from_secs(5);
+    let read = async {
+        loop {
+            let mut header = [0u8; 9];
+            tls.read_exact(&mut header).await.ok()?;
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let frame_type = header[3];
+            let flags = header[4];
+            let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+            let mut payload = vec![0u8; len];
+            tls.read_exact(&mut payload).await.ok()?;
+
+            // DATA (0x00) on stream 1 carries the body; END_STREAM (0x01) ends it.
+            if frame_type == 0x00 && stream == 1 {
+                body.extend_from_slice(&payload);
+                if flags & 0x01 != 0 {
+                    return Some(());
+                }
+            }
+            // A GOAWAY or a reset means the answer is not coming.
+            if frame_type == 0x07 || frame_type == 0x03 {
+                return None;
+            }
+        }
+    };
+
+    tokio::time::timeout(deadline, read).await.ok()??;
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
 #[tokio::test]
 async fn alpn_h2_negotiates_a_real_http_2_connection() {
     // `alpn_negotiates_http2_then_http11` asserts which protocol ALPN *selected*. This asserts

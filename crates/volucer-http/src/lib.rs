@@ -36,6 +36,13 @@
 //! frame actually arrives, and `an_upgrade_h2c_offer_is_answered_in_http_1_1`, which asserts
 //! the offer is *not* taken — so the gap is a decision rather than an accident. HTTP/3 is
 //! `quinn` plus `h3`, not `hyper`.
+//!
+//! A SETTINGS frame is **not** enough to say the `h2` path works, and that was learned the hard
+//! way: `h2` carries the host name in `:authority` and sends no `Host`, so every `h2` request
+//! reached the site table with no name and was served by the default site. The request path now
+//! reads either (`listener::request_host`), and
+//! `an_http_2_request_with_only_an_authority_serves_the_named_site` sends a real `:authority`
+//! request over `h2` rather than only checking that the connection opens.
 
 pub mod compress;
 pub mod error;

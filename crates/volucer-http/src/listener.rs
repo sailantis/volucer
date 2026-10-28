@@ -35,7 +35,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::header::{
-    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
     STRICT_TRANSPORT_SECURITY, VARY,
 };
 use hyper::service::service_fn;
@@ -1211,7 +1211,9 @@ async fn handle(
         .path_and_query()
         .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
     let protocol = format!("{:?}", request.version());
-    let host = header_str(request.headers(), "host").map(str::to_owned);
+    // Taken from the headers *or* the URI, because an HTTP/2 or HTTP/3 request carries the name
+    // in `:authority` and has no `Host` at all — see [`request_host`].
+    let host = request_host(request.headers(), request.uri()).map(str::to_owned);
     let user_agent = header_str(request.headers(), "user-agent").map(str::to_owned);
     let referer = header_str(request.headers(), "referer").map(str::to_owned);
     let peer: Option<std::net::IpAddr> = remote_addr.parse().ok();
@@ -1340,6 +1342,35 @@ async fn handle(
 /// request id or a trace context, so `None` is the honest answer.
 fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The name this request was addressed to: `Host`, or the URI's authority when there is no
+/// `Host`.
+///
+/// **`Host` alone is not enough, and that was a live bug.** `hyper` gives HTTP/1.1 a `Host`
+/// header, but HTTP/2 and HTTP/3 carry the name in the `:authority` pseudo-header, and `h2`
+/// converts that into [`Uri::authority`] *without* synthesising a `Host`
+/// (`h2/src/server.rs`, `convert_poll_message`). So every browser request over `h2` — which is
+/// every browser request to a TLS listener — read `None` here and fell through to the default
+/// site, serving another site's document root. Invisible until now because the only assertion on
+/// the `h2` path was that a SETTINGS frame arrives.
+///
+/// **`Host` wins when both are present and disagree.** A proxy that rewrites the name a request
+/// is for writes `Host` and leaves the authority alone, so the authority it forwarded is the
+/// proxy's own address rather than the site's. RFC 9113 §8.3.1 says a server *should* treat such
+/// a request as malformed; this server resolves it in favour of `Host` instead, because the
+/// alternative is a 400 for a request every reverse proxy in front of this one is entitled to
+/// produce, and the *site* a request reaches is the security-relevant half. The authority is
+/// still used when there is no `Host`, which is the h2 and h3 case this exists for.
+///
+/// Returned borrowed from the request rather than as an owned `String`: this runs on every
+/// request, and the callers either read it or hand it straight to `select_route`.
+fn request_host<'a>(headers: &'a hyper::HeaderMap, uri: &'a hyper::Uri) -> Option<&'a str> {
+    header_str(headers, "host")
+        .or_else(|| uri.authority().map(hyper::http::uri::Authority::as_str))
+        // An empty `Host` means "no name", not a site called "". `resolve_request` treats the two
+        // the same, but `split_host` would otherwise hand the backend an empty `SERVER_NAME`.
+        .filter(|host| !host.trim().is_empty())
 }
 
 /// Set one CGI parameter on a request that is about to be dispatched, replacing any entry of the
@@ -1504,10 +1535,7 @@ async fn prepare(
     // arrived over TLS has already done what the redirect asks for, so redirecting it would loop
     // the client for ever. That flag is per connection, not per listener, because with
     // `plain = true` one listener carries both.
-    let host = parts
-        .headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok());
+    let host = request_host(&parts.headers, &parts.uri);
     let state = front_end.state();
     // The protocol is decided by the **connection**, not by a header: `cleartext` is the listener's
     // own fact, and `X-Forwarded-Proto` is a client's claim. A site restricted to `https` must not
@@ -1982,14 +2010,11 @@ fn to_cgi_with(
         resolved => resolved,
     };
 
-    let host = parts
-        .headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok());
+    let host = request_host(&parts.headers, &parts.uri);
     let (server_name, server_port) = split_host(host, server_port);
 
     let body_len = body.len();
-    let headers = parts
+    let mut headers: Vec<(String, String)> = parts
         .headers
         .iter()
         .filter(|(name, _)| !is_hop_by_hop(name.as_str()))
@@ -2000,6 +2025,24 @@ fn to_cgi_with(
             )
         })
         .collect();
+
+    // **The authority becomes a synthetic `Host`.** `HTTP_HOST` is not something this crate can
+    // omit: it is what PHP reads (`$_SERVER['HTTP_HOST']`) to build absolute URLs and to decide
+    // which virtual host it is serving, and `sites`/`routes` matching below depends on the name
+    // existing. An `h2` or `h3` request carries no `Host` header at all — the name is in
+    // `:authority` — so without this line such a request reached the application with
+    // `SERVER_NAME` set and `HTTP_HOST` absent, which is a state no HTTP/1.1 request can produce.
+    //
+    // Only when absent: a real `Host` is the name a proxy rewrote and outranks the authority (see
+    // [`request_host`]), so it is never overwritten.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        if let Some(authority) = parts.uri.authority() {
+            headers.push(("Host".to_string(), authority.as_str().to_string()));
+        }
+    }
 
     let info = RequestInfo {
         method: parts.method.as_str().to_string(),
@@ -2376,6 +2419,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::header::HOST;
     use std::path::PathBuf;
 
     fn routing() -> Routing {
@@ -2482,6 +2526,62 @@ mod tests {
         assert_eq!(split_host(Some("[::1]"), 80), ("::1".to_string(), 80));
         assert_eq!(split_host(None, 80), ("localhost".to_string(), 80));
         assert_eq!(split_host(Some(""), 80), ("localhost".to_string(), 80));
+    }
+
+    /// An authority-only request names its site, which is what an `h2` or `h3` request looks like.
+    ///
+    /// `hyper` gives HTTP/1.1 a `Host` header; `h2` puts the name in `:authority` and converts it
+    /// to `Uri::authority` *without* synthesising `Host`. So this is the shape every browser
+    /// request over TLS reaches `prepare` in — and before `request_host` existed it read `None`
+    /// and served the default site.
+    #[test]
+    fn an_authority_resolves_the_host_when_there_is_no_host_header() {
+        let request = parts("GET", "https://a.test/whoami.txt", None);
+        assert_eq!(request_host(&request.headers, &request.uri), Some("a.test"));
+
+        // A port in the authority is kept here and stripped by `strip_port`/`split_host`, which
+        // is where that decision already lives.
+        let request = parts("GET", "https://a.test:8443/x", None);
+        assert_eq!(
+            request_host(&request.headers, &request.uri),
+            Some("a.test:8443")
+        );
+    }
+
+    /// `Host` wins when both are present, because that is the name a proxy rewrote.
+    #[test]
+    fn host_wins_over_the_authority_when_they_disagree() {
+        let request = parts("GET", "https://proxy.internal/x", Some("a.test"));
+        assert_eq!(request_host(&request.headers, &request.uri), Some("a.test"));
+    }
+
+    /// An HTTP/1.1 request with no authority and no `Host` still means "no name".
+    #[test]
+    fn a_request_with_neither_is_none() {
+        let request = parts("GET", "/relative", None);
+        assert_eq!(request_host(&request.headers, &request.uri), None);
+
+        // An empty `Host` is "no name" rather than a site called "".
+        let request = parts("GET", "/relative", Some(""));
+        assert_eq!(request_host(&request.headers, &request.uri), None);
+    }
+
+    /// The backend is told the right `SERVER_NAME` from an authority, which is the bug's
+    /// consequence one layer down: PHP builds URLs from this value.
+    #[test]
+    fn the_cgi_environment_names_the_authority_when_there_is_no_host_header() {
+        let request = to_cgi(
+            &parts("GET", "https://a.test/about", None),
+            Vec::new(),
+            &routing(),
+            443,
+            "10.0.0.5",
+        )
+        .expect("a request that routes");
+
+        assert_eq!(param(&request, "SERVER_NAME"), b"a.test");
+        assert_eq!(param(&request, "SERVER_PORT"), b"443");
+        assert_eq!(param(&request, "HTTP_HOST"), b"a.test");
     }
 
     #[test]
