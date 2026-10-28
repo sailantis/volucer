@@ -94,3 +94,10 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # whose message says nothing about why the source is legitimate. Naming it here is the same decision
 # written down once, with the argument beside it.
 allow-git = ["https://github.com/sailantis/hyperium-h3"]
+# An allowance nothing uses is normally worth a warning, because it is how a permission outlives its
+# reason. This one is the exception the setting exists for: it is deliberate, its reason is the
+# paragraph above, and it is *expected* to be unused until `h3` carries a patch — so on a day when
+# there is nothing to pin, `warn` would print a diagnostic that says "as designed". `deny` would be
+# wrong in the other direction: removing the entry and restoring it the same day would be a rule
+# that has to be broken to be followed.
+unused-allowed-source = "allow"
