@@ -663,6 +663,53 @@ fastcgi = "127.0.0.1:9080"
 # an HTTP 200, not a 403 -- a gRPC client reads its outcome from the trailer
 # section, so an HTTP error status reaches it as "unexpected HTTP status".
 # ---------------------------------------------------------------------------
+# Let a backend answer with a PATH instead of a body: `X-Sendfile` and `X-Accel-Redirect`.
+#
+# A worker, spawn_cgi and external backend buffer their whole response, so a 1 GB
+# download costs the file twice in memory. With this, the backend writes
+#
+#   header('X-Sendfile: /srv/app/storage/exports/report.zip'); exit;
+#
+# and volucer serves the file through the static layer: 64 KiB reads, ranges, ETag,
+# Last-Modified, If-Range, 304 and HEAD all work, for 64 KiB of memory. (`upstream`
+# already streams and does not need this.)
+#
+# ABSENT IS THE DEFAULT AND MEANS OFF, and that is the safe direction: the header
+# names a filesystem path, so honouring it means the application can ask this server
+# to read ANY file the process can read -- /etc/passwd, another site's .env, a TLS
+# key. A backend is trusted code, but it is often the thing that was exploited, and
+# "the application can name any file and the server streams it to an unauthenticated
+# client" turns one bug into a disclosure primitive.
+#
+# roots IS NOT document_root, deliberately. document_root is where request paths
+# resolve and where the application's own sources live; serving from it would make
+# `X-Sendfile: /srv/app/.env` work, which is exactly what a leaky debug endpoint
+# would name. A root is a directory you have decided is PUBLISHABLE.
+#
+# ```toml
+# [server.sendfile]
+# roots = ["storage/exports", "/srv/media"]
+# ```
+#
+#   A relative root is resolved against THIS FILE's directory, so it means the same
+#   thing under systemd and under a shell. A root that does not exist is REFUSED AT
+#   STARTUP rather than skipped: a skipped root is a feature that silently never
+#   works, and the 403 you would then see blames the application for a typo here.
+#
+#   The path is resolved (symlinks and all) before it is compared, so a symlink out
+#   of a root is refused. A path is inside a root when it is the root or begins with
+#   the root FOLLOWED BY A SEPARATOR -- a plain string prefix would treat
+#   /srv/exported as inside /srv/export.
+#
+#   Every refusal is a 403 with one fixed message and the real reason in the log:
+#   whether a path exists, is a directory, is a symlink elsewhere or is simply not
+#   allowed are the same answer to whoever asked.
+#
+#   The header is STRIPPED from every backend response whether or not this table
+#   exists -- a path in a client's address bar is a disclosure, and an application
+#   that believed a proxy in front would honour it would leak the path it meant to
+#   keep internal.
+# ---------------------------------------------------------------------------
 # Persistent worker pool: the process boots the application once and stays
 # resident. volucer talks to it over the child's stdin/stdout pipes using its
 # own framed protocol. State is NOT reset per request, so the application must

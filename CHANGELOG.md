@@ -9,6 +9,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A backend can serve a large file by naming it: `X-Sendfile` / `X-Accel-Redirect`.** A worker,
+  `spawn_cgi` or `external` backend buffers its whole response, so a 1 GB download cost the file twice
+  in memory — once in PHP and once in `from_cgi`'s copy — and a `memory_limit` failure somewhere in
+  the middle. The application now writes one header and Volucer serves the file through the static
+  layer: 64 KiB reads, ranges, `ETag`, `Last-Modified`, `If-Range`, `304` and `HEAD` all work, for
+  64 KiB of memory. `upstream` is unaffected, because it already streams.
+
+  ```toml
+  [server.sendfile]
+  roots = ["storage/exports"]
+  ```
+
+  **The allow-list is the whole design, and it is not `document_root`.** A header that names a
+  filesystem path is a request from the application to read any file this process can read —
+  `/etc/passwd`, another site's `.env`, a TLS private key. A backend is trusted code, but a backend is
+  often the thing that was exploited, and "the application can name any file and the server streams it
+  to an unauthenticated client" turns one bug into a disclosure primitive. `document_root` is where
+  the application's own sources live, so serving from it would make `X-Sendfile: /srv/app/.env` work.
+
+  The path is resolved, symlinks and all, before it is compared against the roots — verified with a
+  symlink out of a root — and a root match is component-wise, so `/srv/exported` is not inside
+  `/srv/export`. Removing the root check makes the disclosure test answer `200` with the other root's
+  file, which is what makes that test worth keeping.
+
+  Every refusal is a `403` with one fixed message and the real reason in the log: whether a path
+  exists, is a directory, is a symlink pointing elsewhere or is simply not allowed are the same answer
+  to whoever asked. A root that does not exist is **refused at startup** rather than skipped, because
+  a skipped root is a feature that silently never works and the `403` then blames the application.
+  The header is stripped from every backend response whether or not the table exists, so a path can
+  never reach a client.
+
 - **A route can answer with a redirect**, which is how a URL is retired without a PHP script that
   exists only to send one header. Every SEO migration needs exactly this and every one of them had to
   be application code.

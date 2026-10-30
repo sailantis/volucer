@@ -2226,6 +2226,23 @@ fn resolve_error_pages(
     resolved
 }
 
+/// Resolve `[server.sendfile]` into the allow-list a front end consults.
+///
+/// A free function beside [`resolve_error_pages`] and for the same reason: `serve` and every reload
+/// must resolve the roots the same way, or a root that worked at startup would stop working after
+/// the first `SIGHUP`.
+///
+/// **A root that does not resolve is a hard error here**, unlike a missing error page. An error page
+/// is cosmetic — the status is the answer and the body is decoration — while a root that silently
+/// does not resolve is the feature off, and the 403 an operator would then see blames the
+/// application rather than the configuration.
+fn resolve_sendfile(
+    config: &Config,
+    config_dir: &Path,
+) -> std::result::Result<Option<volucer_core::SendfilePolicy>, String> {
+    volucer_core::SendfilePolicy::new(config.server.sendfile.as_ref(), config_dir)
+}
+
 fn serve(
     source: &Source,
     document_root_flag: Option<&Path>,
@@ -2451,6 +2468,14 @@ fn serve(
         config
             .server
             .access_policy()
+            .map_err(|reason| ServerError::Listener { reason })?,
+    ));
+
+    // The directories a backend may serve a file from, resolved against the configuration file's
+    // own directory. Built here so a root that does not resolve is a startup failure with the name
+    // in it, rather than a feature that silently never works and a 403 that blames the application.
+    let sendfile = Arc::new(volucer_http::Swappable::new(
+        resolve_sendfile(&config, &source.dir())
             .map_err(|reason| ServerError::Listener { reason })?,
     ));
 
@@ -2711,7 +2736,11 @@ fn serve(
             .with_client_ip(Arc::clone(&client_ip))
             .with_error_pages(resolve_error_pages(&config, &source.dir()))
             .with_rate_limit(Arc::clone(&rate_limit))
-            .with_access(Arc::clone(&access));
+            .with_access(Arc::clone(&access))
+            // The policy resolved above, not a second resolution: a relative root must mean the same
+            // directory for every front-end, and resolving per closure call would be two answers to
+            // one question.
+            .with_resolved_sendfile(sendfile.load().as_ref().clone());
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
             _ => handles,
@@ -2981,6 +3010,7 @@ fn serve(
             observe,
             rate_limit,
             access,
+            sendfile: Arc::clone(&sendfile),
             reset_gate,
             pools: dispatcher.pools(),
         },
@@ -3527,7 +3557,7 @@ struct Reloader {
     /// The rate-limit cell both front-ends consult, so a `SIGHUP` can change the limit.
     ///
     /// **Held as the same `Arc` both front-ends carry**, which is what makes the replacement visible
-    /// to them: the policy lives behind an [`Swappable`](volucer_watch::Swappable) inside this value,
+    /// to them: the policy lives behind an [`Swappable`](volucer_http::Swappable) inside this value,
     /// so replacing it moves the limit every front-end consults rather than installing a second one
     /// they do not read.
     ///
@@ -3542,6 +3572,13 @@ struct Reloader {
     /// lists. Unlike the rate limit there is nothing to carry across a replacement, so this is a
     /// plain swap — an address list is not a running total.
     access: Arc<volucer_http::AccessCell>,
+    /// The sendfile allow-list this process is serving with, so a reload that cannot build a new one
+    /// keeps the old one rather than turning the feature off.
+    ///
+    /// The list itself reaches a request through [`volucer_watch::Reloaded`], like the site table —
+    /// this is the *previous value* a failed reload falls back to, which no front end can answer
+    /// because the generation that failed was never installed.
+    sendfile: Arc<volucer_http::Swappable<Option<volucer_core::SendfilePolicy>>>,
     /// The worker grant, so `[status.workers] allow` can be changed by a
     /// reload.
     ///
@@ -3688,7 +3725,27 @@ impl Reloader {
         // the site one. The paths are resolved here because the directory the file was read from is
         // the only thing a reload knows and a request must not.
         let error_pages = resolve_error_pages(&config, &self.source.dir());
-        let _previous = self.registry.apply(sites, grpc_grants, error_pages);
+        // The sendfile allow-list is resolved independently of the tables above, so a root that no
+        // longer exists leaves the sites, grants and pages reloaded and **keeps the previous list**
+        // rather than turning the feature off as a side effect of an unrelated edit. `None` here
+        // would be exactly that, which is why the failure is reported and not passed through.
+        let sendfile = match resolve_sendfile(&config, &self.source.dir()) {
+            Ok(policy) => policy,
+            Err(reason) => {
+                tracing::error!(
+                    %reason,
+                    "the sendfile allow-list was not replaced; the previous one is still in force"
+                );
+                self.sendfile.load().as_ref().as_ref().cloned()
+            }
+        };
+        let _previous = self.registry.apply_with_sendfile(
+            sites,
+            grpc_grants,
+            error_pages,
+            sendfile.clone(),
+        );
+        let _replaced = self.sendfile.replace(sendfile);
         tracing::info!(
             generation,
             source = %self.source.describe(),
@@ -4119,6 +4176,35 @@ fn check(
         }
         None => println!(
             "    access list: none (server.access is unset; every address is admitted)"
+        ),
+    }
+
+    // The sendfile allow-list. Printed in the off case too, because "a backend cannot send a file"
+    // and "a root I wrote wrongly" both look like a 403 from the application's side.
+    match config.server.sendfile.as_ref() {
+        Some(_) => match resolve_sendfile(&config, &config_dir) {
+            Ok(Some(policy)) => {
+                println!("    sendfile:");
+                println!(
+                    "      roots:    {} (a backend may serve a file from inside one of these)",
+                    policy.roots().len()
+                );
+                for root in policy.roots() {
+                    println!("        {}", root.display());
+                }
+                println!(
+                    "      note:     server.document_root is NOT a root -- an application's own \
+                     sources are not publishable by naming them"
+                );
+            }
+            Ok(None) => println!("    sendfile: none"),
+            // Refused at startup rather than reported, so this is a `check` that is about to fail;
+            // printed first because the reason is the useful part.
+            Err(reason) => println!("    sendfile: {reason}"),
+        },
+        None => println!(
+            "    sendfile: none (server.sendfile is unset; X-Sendfile is refused rather than \
+             honoured)"
         ),
     }
 
@@ -6294,3 +6380,4 @@ document_root = "/from/file"
             "an unmanaged backend says who owns it, because that is the instruction"
         );
     }
+

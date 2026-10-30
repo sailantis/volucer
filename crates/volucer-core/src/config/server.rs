@@ -327,6 +327,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub access: Option<AccessConfig>,
 
+    /// Let a backend serve a file by naming it, instead of by producing its bytes.
+    ///
+    /// **Absent is what turns it off**, and absent is the default for a reason worth stating: this
+    /// header tells the file layer to read a path the application chose, so a table that existed and
+    /// defaulted to something would be one bug away from disclosing the application's own sources.
+    /// Naming roots is a statement that the files under them are publishable.
+    ///
+    /// See [`SendfileConfig`] and `volucer_core::sendfile` for what the allow-list does and why it is
+    /// not `document_root`.
+    #[serde(default)]
+    pub sendfile: Option<crate::sendfile::SendfileConfig>,
+
     /// What happens to the W3C `traceparent` on the way to a backend. Defaults to `extract`.
     ///
     /// # Why this is here rather than in `[telemetry]`

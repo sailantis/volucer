@@ -777,8 +777,21 @@ impl Config {
         if let Err(reason) = self.server.rate_limiter() {
             return Err(Error::Config(reason));
         }
-        // Built here for the same reason the rate limit is: a file `check` accepts is a file a
-        // listener can apply, and the constructor is the thing that parses ranges.
+        // `[server.sendfile]` is checked structurally here and **resolved** by the caller that knows
+        // where the file is: a relative root means "beside this file", and only the loader has that
+        // directory. A table stating no root is refused here because it is a statement that cannot
+        // mean anything — see `resolve_sendfile` for the resolution.
+        if let Some(sendfile) = &self.server.sendfile {
+            if sendfile.roots.is_empty() {
+                return Err(Error::Config(
+                    "server.sendfile.roots is empty: list the directories a backend may serve files \
+                     from, or remove the table to turn the feature off"
+                        .to_string(),
+                ));
+            }
+        }
+        // A `[server.access]` table is validated through the same constructor a listener uses, for
+        // the same reason the rate limit is: a file `check` accepts is a file a listener can apply.
         if let Err(reason) = self.server.access_policy() {
             return Err(Error::Config(reason));
         }

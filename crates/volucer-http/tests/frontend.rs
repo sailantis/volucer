@@ -3271,7 +3271,206 @@ fn a_rate_limited_grpc_call_is_resource_exhausted_rather_than_a_429() {
     );
 }
 
-// ------------------------------------------------------------ access lists
+// ------------------------------------------------------------ sendfile
+//
+// `X-Sendfile` lets a backend answer with a *path* instead of a body. The security boundary is the
+// allow-list, so these tests are mostly about what must be refused: a header naming a path is a
+// request to read any file this process can read, and a backend is often the thing that was
+// exploited. The positive tests use a real FastCGI backend rather than a mock, because the header is
+// read out of a real response payload — a unit test of the parser would not show that.
+
+/// A one-shot FastCGI backend that answers with exactly `response` for its first request.
+///
+/// A real listener rather than a mock: the header has to be found in a real `STDOUT` payload, which
+/// is what `sendfile_header` parses, and a test that handed the parser a `Vec` it built itself would
+/// pass against a parser that could not read a real response.
+fn one_shot_fastcgi_backend(response: &'static str) -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a backend port");
+    let address = listener.local_addr().expect("address").to_string();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        // Read until the request's `STDIN` terminator; the payload's content does not matter, only
+        // that the records arrive, and a read of a fixed size is enough for one small request.
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch);
+        let mut wire = Vec::new();
+        volucer_fcgi::record::append_records(
+            &mut wire,
+            volucer_fcgi::RecordType::Stdout,
+            1,
+            response.as_bytes(),
+            true,
+        );
+        wire.extend_from_slice(
+            &volucer_fcgi::Header::new(volucer_fcgi::RecordType::EndRequest, 1, 8).encode(),
+        );
+        wire.extend_from_slice(
+            &volucer_fcgi::EndRequest {
+                app_status: 0,
+                protocol_status: volucer_fcgi::ProtocolStatus::RequestComplete,
+            }
+            .encode(),
+        );
+        let _ = stream.write_all(&wire);
+        let _ = stream.flush();
+        // Held open long enough for the client to read, then closed.
+        std::thread::sleep(Duration::from_millis(200));
+    });
+    address
+}
+
+/// A server whose only backend is a one-shot FastCGI fixture, with an optional allow-list.
+fn sendfile_server(response: &'static str, roots: Option<Vec<PathBuf>>) -> Option<Server> {
+    let socket = one_shot_fastcgi_backend(response);
+    let mut config = unreachable_config();
+    config.backends.insert(
+        "fpm".to_string(),
+        BackendConfig::External(volucer_core::config::ExternalConfig {
+            socket,
+            max_connections: None,
+            services: Vec::new(),
+        }),
+    );
+
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&config, routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let policy = roots.map(|roots| {
+        volucer_core::SendfilePolicy::new(
+            Some(&volucer_core::SendfileConfig { roots }),
+            &std::env::temp_dir(),
+        )
+        .expect("the test's roots resolve")
+        .expect("a stated table builds a policy")
+    });
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_resolved_sendfile(policy);
+
+    Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+}
+
+/// A directory under the temp root with one file in it, returned with the file's path.
+fn sendfile_root(name: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("volucer-sendfile-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the root");
+    let file = dir.join("report.bin");
+    std::fs::write(&file, b"the file the backend named").expect("write the file");
+    (dir, file)
+}
+
+#[test]
+fn an_allowed_sendfile_serves_the_file_with_ranges_and_validators() {
+    // The whole point: the body is a file, so it gets everything the static layer already does —
+    // `ETag`, `Accept-Ranges`, `Content-Length`, and a conditional request that answers 304 without
+    // a byte. A feature that sent the bytes with no validators would be *almost* this, and the
+    // difference is what a 1 GB download actually needs.
+    let (root, file) = sendfile_root("allowed");
+    let response: &'static str = Box::leak(
+        format!(
+            "Status: 200 OK\r\nContent-Type: application/octet-stream\r\nX-Sendfile: {}\r\n\r\n",
+            file.display()
+        )
+        .into_boxed_str(),
+    );
+
+    let Some(server) = sendfile_server(response, Some(vec![root.clone()])) else {
+        return;
+    };
+
+    let served = get(&server.address, "/download");
+    assert_eq!(served.status, 200, "{served:?}");
+    assert_eq!(
+        served.body, b"the file the backend named",
+        "the body must be the file's bytes, not the backend's"
+    );
+    let header = |name: &str| {
+        served
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert!(header("etag").is_some(), "a file gets a validator: {served:?}");
+    assert_eq!(header("accept-ranges").as_deref(), Some("bytes"));
+    assert!(
+        !header("x-sendfile").is_some_and(|v| !v.is_empty()),
+        "the header must never reach the client: {served:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_sendfile_outside_the_allow_list_is_a_403_and_not_the_file() {
+    // The security test. The path exists and is readable by this process; the only thing refusing it
+    // is the allow-list. Without this assertion the feature is an arbitrary-file-read primitive.
+    let (root, _) = sendfile_root("allowed-only");
+    let (other, secret) = sendfile_root("outside");
+    let response: &'static str = Box::leak(
+        format!(
+            "Status: 200 OK\r\nContent-Type: application/octet-stream\r\nX-Sendfile: {}\r\n\r\n",
+            secret.display()
+        )
+        .into_boxed_str(),
+    );
+
+    let Some(server) = sendfile_server(response, Some(vec![root.clone()])) else {
+        return;
+    };
+
+    let refused = get(&server.address, "/download");
+    assert_eq!(
+        refused.status, 403,
+        "a path outside every root must be refused: {refused:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&refused.body).contains("outside"),
+        "the reason belongs in the log, not in the response: {refused:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
+fn an_unconfigured_sendfile_is_refused_rather_than_ignored() {
+    // The header must not be published even when the feature is off: a filesystem path in a client's
+    // address bar is a disclosure, and an application that believed a proxy in front would honour it
+    // would otherwise leak the path it meant to keep internal. Refused rather than "ignored" because
+    // a silently dropped header plus the backend's own empty body is a 200 with no content, which is
+    // a far worse failure to debug.
+    let (root, file) = sendfile_root("unconfigured");
+    let response: &'static str = Box::leak(
+        format!(
+            "Status: 200 OK\r\nContent-Type: application/octet-stream\r\nX-Sendfile: {}\r\n\r\n",
+            file.display()
+        )
+        .into_boxed_str(),
+    );
+
+    let Some(server) = sendfile_server(response, None) else {
+        return;
+    };
+
+    let refused = get(&server.address, "/download");
+    assert_eq!(refused.status, 403, "{refused:?}");
+    assert!(
+        !String::from_utf8_lossy(&refused.body).contains("report.bin"),
+        "neither the path nor its name may reach the client: {refused:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+
 //
 // `[server.access]` is consulted above the rate limit, and the two are told apart by what a client
 // is meant to do with the answer: a 429 is "come back", a 403 is "not you". These tests pin that

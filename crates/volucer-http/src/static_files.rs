@@ -781,8 +781,45 @@ async fn stream(
         .map_err(|err| HttpError::BadGateway(err.to_string()))
 }
 
-/// The body for a slice of a file.
+/// Serve a file a backend named, through the same paths a static file uses.
 ///
+/// The point of `X-Sendfile` is that the answer is *a file*, so it must get everything the static
+/// layer already does: `ETag`, `Last-Modified`, `If-None-Match`, `If-Range`, ranges, `HEAD`, and the
+/// 64 KiB streamed body. Reimplementing any of that here would be a second answer to the same
+/// questions, and the one that drifted would be the one serving a truncated download.
+///
+/// `resolved` is the path `SendfilePolicy::resolve` returned, **not** the string the backend named:
+/// the file opened is then the file that was checked, which closes the time-of-check/time-of-use gap
+/// a symlink swapped in between would otherwise open.
+///
+/// The layer is consulted even when `static_files` is disabled for the site, and that is deliberate:
+/// `static_files` governs whether a *request path* is answered from disk, which is a routing
+/// decision; this is an answer the application already decided to give. An application-only site
+/// that turns the static layer off is exactly the site most likely to need a large download.
+pub async fn sendfile(
+    request: Request<'_>,
+    files: &StaticFiles,
+    resolved: PathBuf,
+) -> Result<StaticResponse, HttpError> {
+    // One `stat`, and it is the only one: `length` and `modified` are what the validators and the
+    // body both need, and asking `is_file()` first would be a second round trip to learn the same
+    // fact. `resolve` already established it is a regular file, so the error arm is a file that
+    // vanished in between — answered as a 404 rather than a 500, because that is what it now is.
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return Err(HttpError::NotFound(format!(
+                "the file {} named by the application could not be read: {err}",
+                resolved.display()
+            )))
+        }
+    };
+    let length = metadata.len();
+    let modified = metadata.modified().ok();
+    answer(&request, files, resolved, None, length, modified).await
+}
+
+/// The body for a slice of a file.
 /// `File::from_std` is why this is not behind `spawn_blocking`: opening with
 /// `std::fs` is quick, and the handle is handed to a `tokio` file so the reads
 /// themselves run on the blocking pool rather than on a runtime thread.

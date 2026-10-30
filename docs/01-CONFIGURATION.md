@@ -295,6 +295,7 @@ Some features are enabled by the presence of their table. They do not need an
 | `[server.access_log]` | Access logging |
 | `[server.rate_limit]` | Rate limiting |
 | `[server.access]` | IP allow/deny lists |
+| `[server.sendfile]` | `X-Sendfile` / `X-Accel-Redirect` |
 | `[status]` | The status listener, and therefore `/health` and `/ready` |
 | `[status.metrics]` | The Prometheus exposition (`/health` and `/ready` stay as they were) |
 | `[status.workers]` | The worker-control routes |
@@ -335,6 +336,7 @@ its certificate or ACME settings.
 | `proxy` | table | absent | Which peers may assert a client address. |
 | `rate_limit` | table | absent | The rate limiter. Presence enables it. |
 | `access` | table | absent | IP allow/deny rules. Presence enables them. See [`[server.access]`](#serveraccess). |
+| `sendfile` | table | absent | Directories a backend may serve a file from. Presence enables `X-Sendfile`. |
 | `trace_context` | string | `"extract"` | How the client's trace context is handled when setting a backend's `traceparent`: `"ignore"`, `"extract"`, `"inject"` or `"propagate"`. See [Observability](06-OBSERVABILITY.md#trace-context). |
 
 ### `trace_context`
@@ -690,6 +692,58 @@ A refused gRPC call is answered `PERMISSION_DENIED` (code 7) in the trailers wit
 error status reaches it as "unexpected HTTP status" and the refusal is invisible. Code 7 is
 explicitly non-retryable, which is what distinguishes it from the rate limit's
 `RESOURCE_EXHAUSTED` beside it.
+
+## `[server.sendfile]`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `roots` | array of paths | **required** | Directories a backend may serve a file from. A relative path is resolved against the configuration file's directory. |
+
+A backend that has a large file — a report, a media asset, a backup — can answer with a path instead
+of a body:
+
+```php
+header('X-Sendfile: /srv/app/storage/exports/report.zip');
+exit;
+```
+
+`X-Accel-Redirect` is accepted too, because both spellings are already in use and an application
+should not have to know which server it is running behind. Volucer then serves the file itself,
+through the same path a static file takes: **64 KiB reads, ranges, `ETag`, `Last-Modified`,
+`If-Range`, `304` and `HEAD` all work**, so a 1 GB download costs 64 KiB of memory instead of the
+whole file twice. `upstream` is unaffected (it already streams); this is for the `worker`,
+`spawn_cgi` and `external` backends, whose response bodies are otherwise buffered whole.
+
+### The allow-list is the security boundary
+
+**Absent is the default and means the feature is off.** The header names a filesystem path, so
+honouring it means the application can ask this server to read any file the process can read —
+`/etc/passwd`, another site's `.env`, a TLS key. A backend is trusted code, but a backend is often the
+thing that was exploited, and "the application can name any file and the server will stream it to an
+unauthenticated client" turns one bug into a disclosure primitive.
+
+So `roots` is a separate list from `document_root`, deliberately. `document_root` is where *request
+paths* resolve and it is where the application's own sources live; serving from it would make
+`X-Sendfile: /srv/app/.env` work, which is exactly what a leaky debug endpoint would name. A root is
+a directory an operator has decided is **publishable**.
+
+The path is resolved (symlinks and all) before it is compared, so `root/link-to-etc/passwd` is
+refused. A path is inside a root when it is the root or begins with the root **followed by a
+separator** — a plain string prefix would treat `/srv/exported` as inside `/srv/export`.
+
+Every failure is a `403` with one fixed message, and the real reason goes to the log. Whether a path
+exists, is a directory, is a symlink pointing elsewhere, or is simply not allowed are all the same
+answer to whoever asked, and the difference is only useful to somebody probing for shape.
+
+A root that does not exist is **refused at startup** rather than skipped: a skipped root is a feature
+that silently never works, and the `403` an operator then sees blames the application for a typo in
+the server's configuration.
+
+### Two things it does not do
+
+The header is **stripped from every backend response**, whether or not the feature is on. A path in a
+client's address bar is a disclosure, and an application that believed a proxy in front would honour
+it would leak the path it meant to keep internal.
 
 ## `[[server.routes]]`
 

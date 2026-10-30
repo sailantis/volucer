@@ -867,3 +867,87 @@ fn an_absent_error_pages_table_is_empty() {
     assert!(config.server.error_pages.is_empty());
     assert!(config.server.error_pages.codes().is_empty());
 }
+
+// ------------------------------------------------------------ sendfile
+
+#[test]
+fn an_absent_sendfile_table_turns_the_feature_off() {
+    // Absent has to mean off rather than "defaults to the document root": a header naming a path is a
+    // request to read any file this process can read, so a default root would be one bug away from
+    // disclosing the application's own sources.
+    let config = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
+    assert!(config.server.sendfile.is_none());
+    config.validate().expect("an unconfigured deployment validates");
+}
+
+#[test]
+fn a_sendfile_table_with_no_roots_is_refused() {
+    let config = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.sendfile]
+roots = []
+"#,
+    )
+    .expect("parses");
+    let err = config
+        .validate()
+        .expect_err("a table with no root cannot mean anything");
+    let text = err.to_string();
+    assert!(text.contains("server.sendfile.roots"), "{text}");
+    assert!(text.contains("empty"), "{text}");
+}
+
+#[test]
+fn a_sendfile_root_resolves_against_the_configuration_files_directory() {
+    // The resolution is the loader's job, because "beside this file" is the only meaning that does
+    // not depend on where the process was started. A `check` and a `serve` started from different
+    // directories must agree, so this is pinned against a real directory rather than described.
+    let dir = std::env::temp_dir().join(format!("volucer-sendfile-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("exports")).expect("create the root");
+
+    let config = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.sendfile]
+roots = ["exports"]
+"#,
+    )
+    .expect("parses");
+    config.validate().expect("the table is well-formed");
+
+    let resolved = crate::SendfilePolicy::new(config.server.sendfile.as_ref(), &dir)
+        .expect("the root resolves")
+        .expect("a stated table builds a policy");
+    assert_eq!(resolved.roots().len(), 1);
+    assert!(
+        resolved.roots()[0].ends_with("exports"),
+        "a relative root is the configuration's own directory: {:?}",
+        resolved.roots()
+    );
+
+    // And a root that does not exist is refused with its name, rather than skipped: a skipped root is
+    // a feature that silently never works and a 403 that blames the application.
+    let missing = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.sendfile]
+roots = ["nope"]
+"#,
+    )
+    .expect("parses");
+    let err = crate::SendfilePolicy::new(missing.server.sendfile.as_ref(), &dir)
+        .expect_err("a root that does not exist is a typo");
+    assert!(err.contains("nope"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+

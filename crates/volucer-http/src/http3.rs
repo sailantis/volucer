@@ -251,11 +251,12 @@ impl Http3Listener {
             Arc::clone(&handles.grpc_grants)
         };
         let state = Arc::new(volucer_watch::Swappable::new(
-            volucer_watch::Reloaded::from_sites(
+            volucer_watch::Reloaded::from_sites_with_sendfile(
                 handles.shared.sites(),
                 Some(bound.port()),
                 grpc_grants,
                 handles.error_pages.clone(),
+                handles.sendfile.clone(),
             ),
         ));
         handles

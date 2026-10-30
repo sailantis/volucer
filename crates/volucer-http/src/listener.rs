@@ -712,6 +712,12 @@ pub struct ReloadHandles {
     /// Empty by default, so a deployment that wrote no pages costs one `BTreeMap::get` per error
     /// response and nothing per request.
     pub error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+    /// The directories a backend may serve a file from, when the deployment allows it.
+    ///
+    /// On the handles for the reason `error_pages` is: it comes from `[server]`, so a listener builds
+    /// its first generation from this and a reload replaces it. `None` means the feature is off, and
+    /// an `X-Sendfile` is then stripped and logged rather than honoured.
+    pub sendfile: Option<volucer_core::SendfilePolicy>,
 }
 
 impl ReloadHandles {
@@ -727,7 +733,19 @@ impl ReloadHandles {
             access: Arc::new(AccessCell::new(None)),
             grpc_grants: Arc::new(volucer_watch::GrpcGrantsMap::new()),
             error_pages: std::collections::BTreeMap::new(),
+            sendfile: None,
         }
+    }
+
+    /// The same, with the directories a backend may serve a file from.
+    ///
+    /// A builder beside the others, so every existing caller keeps the feature off — which is also
+    /// the correct default: a table that allowed a root by omission would be the disclosure primitive
+    /// `volucer_core::sendfile` exists to prevent.
+    #[must_use]
+    pub fn with_sendfile(mut self, sendfile: Option<volucer_core::SendfilePolicy>) -> Self {
+        self.sendfile = sendfile;
+        self
     }
 
     /// The same, with the error pages the configuration gave.
@@ -738,6 +756,30 @@ impl ReloadHandles {
     ) -> Self {
         self.error_pages = pages;
         self
+    }
+
+    /// The same, applying `[server.sendfile]` through this listener's reload path.
+    ///
+    /// The error-page setter above goes through `apply`; this one does too, so a root added to the
+    /// file reaches the generation a request is served under. `None` keeps the feature off.
+    #[must_use]
+    pub fn with_resolved_sendfile(mut self, sendfile: Option<volucer_core::SendfilePolicy>) -> Self {
+        self.sendfile = sendfile;
+        self
+    }
+
+    /// `[server.sendfile]`, applied through this listener's reload path.
+    ///
+    /// **`Ok(None)` when the table is absent**, which turns the feature off. `Err` carries the reason
+    /// with the offending root named, so `serve` can refuse to start rather than run with a root that
+    /// silently does not resolve.
+    pub fn with_sendfile_from(
+        mut self,
+        config: &volucer_core::config::ServerConfig,
+        config_dir: &std::path::Path,
+    ) -> std::result::Result<Self, String> {
+        self.sendfile = volucer_core::SendfilePolicy::new(config.sendfile.as_ref(), config_dir)?;
+        Ok(self)
     }
 
     /// The same, with the gRPC grants the configuration gave.
@@ -839,6 +881,12 @@ pub struct ReloadHandle {
     /// reason there is one policy rather than one per front-end.
     /// Held so a reload can swap it. See [`RateLimitCell`].
     rate_limit: Arc<RateLimitCell>,
+    /// The sendfile allow-list this listener is serving with, so `apply` can preserve it.
+    ///
+    /// Held on the handle rather than re-read from the registry because a call that only changes the
+    /// site table must leave a working allow-list alone: `None` there would turn the feature off as a
+    /// side effect of reloading routes, which is the kind of coupling a reload is not allowed to have.
+    sendfile: Option<volucer_core::SendfilePolicy>,
 }
 
 impl ReloadHandle {
@@ -892,12 +940,32 @@ impl ReloadHandle {
         grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
         error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
     ) -> Arc<Reloaded> {
-        self.registry.apply(sites, grpc_grants, error_pages).unwrap_or_else(|| {
-            // Unreachable while `bind` registers this listener before handing out a handle, and
-            // expressed as a fresh snapshot rather than a panic so removing that could never
-            // become a crash in a signal handler.
-            self.state.load()
-        })
+        self.apply_with_sendfile(sites, grpc_grants, error_pages, self.sendfile.clone())
+    }
+
+    /// [`HttpListener::apply`] with this generation's sendfile allow-list made explicit.
+    ///
+    /// Separate rather than a fourth argument on `apply`, because `apply` has a dozen call sites that
+    /// serve no files from an allow-list — and a caller that *forgot* the argument would have turned
+    /// the feature off silently. The reload path passes what the configuration resolved; `apply`
+    /// passes whatever this listener last held, which is what makes a call that only changes the site
+    /// table leave a working allow-list alone.
+    #[must_use]
+    pub fn apply_with_sendfile(
+        &self,
+        sites: Sites,
+        grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
+        error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+        sendfile: Option<volucer_core::SendfilePolicy>,
+    ) -> Arc<Reloaded> {
+        self.registry
+            .apply_with_sendfile(sites, grpc_grants, error_pages, sendfile)
+            .unwrap_or_else(|| {
+                // Unreachable while `bind` registers this listener before handing out a handle, and
+                // expressed as a fresh snapshot rather than a panic so removing that could never
+                // become a crash in a signal handler.
+                self.state.load()
+            })
     }
 
     /// Replace the rate limit both front-ends consult.
@@ -1398,11 +1466,12 @@ impl HttpListener {
         } else {
             Arc::clone(&handles.grpc_grants)
         };
-        let state = Arc::new(Swappable::new(Reloaded::from_sites(
+        let state = Arc::new(Swappable::new(Reloaded::from_sites_with_sendfile(
             handles.shared.sites(),
             local.port,
             grpc_grants,
             handles.error_pages.clone(),
+            handles.sendfile.clone(),
         )));
         handles
             .registry
@@ -1445,6 +1514,7 @@ impl HttpListener {
             registry: Arc::clone(&self.front_end.registry),
             tls: self.front_end.tls.clone(),
             rate_limit: Arc::clone(&self.front_end.rate_limit),
+            sendfile: self.front_end.state.load().sendfile().cloned(),
         }
     }
 
@@ -2768,10 +2838,19 @@ async fn prepare(
     // SCRIPT_FILENAME, and the backend reads and writes pipes. Both must happen
     // off the runtime's threads.
     let front_end = Arc::clone(front_end);
+    // The sendfile branch needs the front end *after* the blocking task has taken its own clone, so
+    // the one it uses is a second handle rather than the one moved into the closure.
+    let sendfile_front_end = Arc::clone(&front_end);
     // Taken before `parts` moves into the blocking task: the compression decision needs the
     // request's own `Accept-Encoding`, and a header map is a cheap clone beside the body copy
     // that already happens on this path.
     let request_headers = parts.headers.clone();
+    // The three facts the sendfile branch needs, taken here because `parts` moves into the blocking
+    // task below and a static-file answer depends on the method, the raw path and the `Host` — the
+    // same three the static layer's own `Request` carries.
+    let static_method = parts.method.clone();
+    let static_path = parts.uri.path().to_string();
+    let static_host: Option<String> = request_host(&parts.headers, &parts.uri).map(str::to_string);
     let routing = routing.clone();
     let routes = site.routes.clone();
     let blocking =
@@ -2849,7 +2928,87 @@ async fn prepare(
     if is_grpc {
         return grpc_answer(response);
     }
+
+    // **A backend that named a file instead of producing one**, checked before the body is turned
+    // into a response: the header is stripped either way, and when it is honoured the body the
+    // backend produced is discarded rather than sent. See `volucer_core::sendfile` for why the
+    // allow-list is separate from the document root.
+    //
+    // One `stat` and no dispatch: the file layer answers from here, which is the whole of the
+    // feature — a 1 GB download costs 64 KiB of memory rather than the whole file twice.
+    if let Some((header, named)) = sendfile_header(&response.stdout) {
+        let policy = sendfile_front_end.state().sendfile().cloned();
+        match policy.as_ref().map(|policy| policy.resolve(&named)) {
+            Some(Ok(resolved)) => {
+                // The static layer is consulted even when the *site* turned it off: that setting
+                // governs whether a request path is answered from disk, and this is an answer the
+                // application already decided to give.
+                let files = statics.clone();
+                return static_files::sendfile(
+                    static_files::Request {
+                        method: &static_method,
+                        path: &static_path,
+                        headers: &request_headers,
+                        host: static_host.as_deref(),
+                    },
+                    &files,
+                    resolved,
+                )
+                .await;
+            }
+            Some(Err(refusal)) => {
+                // **The reason goes to the log and not to the client.** Whether a path exists, is a
+                // directory, or is simply not in an allow-list are the same answer to whoever asked,
+                // and the difference is only useful to somebody probing for shape.
+                tracing::warn!(
+                    header,
+                    named = %named,
+                    %refusal,
+                    "a backend asked for a file that server.sendfile does not allow"
+                );
+                return Err(HttpError::Forbidden(
+                    "the application asked for a file this server does not serve".to_string(),
+                ));
+            }
+            None => {
+                // The feature is off, so the header is refused rather than published: a filesystem
+                // path in a client's address bar is a disclosure, and an application that believed
+                // nginx in front would honour it would otherwise leak the path it meant to keep
+                // internal.
+                tracing::warn!(
+                    header,
+                    named = %named,
+                    "a backend asked to send a file, but server.sendfile is not configured"
+                );
+                return Err(HttpError::Forbidden(
+                    "the application asked for a file this server does not serve".to_string(),
+                ));
+            }
+        }
+    }
+
     from_cgi(response, site_compression, &request_headers)
+}
+
+/// The `X-Sendfile`/`X-Accel-Redirect` a backend's response carries, if any.
+///
+/// Read from the raw `STDOUT` rather than from the parsed header list, because that list drops
+/// hop-by-hop headers and `Content-Length` and is not available before `from_cgi` builds it. The
+/// parse here is the same one `parse_response` does, so there is no second implementation of where
+/// the header block ends.
+///
+/// Returns the header's own name so a log line can say which spelling was used — an application
+/// migrating between servers needs to know which one it is relying on.
+fn sendfile_header(stdout: &[u8]) -> Option<(&'static str, String)> {
+    let (_, headers, _) = volucer_fcgi::parse_response(stdout);
+    for (name, value) in headers.iter() {
+        for candidate in volucer_core::SENDFILE_HEADERS {
+            if name.eq_ignore_ascii_case(candidate) {
+                return Some((candidate, value.trim().to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Send a request to an HTTP origin and turn its answer into this front-end's response.

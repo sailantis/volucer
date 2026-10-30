@@ -392,6 +392,12 @@ pub struct Reloaded {
     /// The paths are already resolved against the configuration's directory, because that is the
     /// only thing a reload cannot do at request time.
     error_pages: std::collections::BTreeMap<u16, PathBuf>,
+    /// Which directories a backend may serve a file from, when the deployment allows it.
+    ///
+    /// In `Reloaded` because a root is a file's location and an operator who adds one expects the
+    /// next request to use it. `None` is the default and means the feature is off — every
+    /// `X-Sendfile` is ignored and logged.
+    sendfile: Option<volucer_core::SendfilePolicy>,
 }
 
 impl Reloaded {
@@ -414,6 +420,22 @@ impl Reloaded {
         server_port: Option<u16>,
         grpc_grants: Arc<GrpcGrantsMap>,
         error_pages: std::collections::BTreeMap<u16, PathBuf>,
+    ) -> Self {
+        Self::from_sites_with_sendfile(sites, server_port, grpc_grants, error_pages, None)
+    }
+
+    /// [`Reloaded::from_sites`] with the allow-list a backend may name a file in.
+    ///
+    /// A second constructor rather than a fifth argument, because `from_sites` has fourteen call
+    /// sites — tests and both listeners — and every one of them that does not serve files from an
+    /// allow-list should not have to say so. The one that does is the HTTP front end, and a
+    /// deployment with no `[server.sendfile]` passes `None` through here.
+    pub fn from_sites_with_sendfile(
+        sites: Arc<Sites>,
+        server_port: Option<u16>,
+        grpc_grants: Arc<GrpcGrantsMap>,
+        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+        sendfile: Option<volucer_core::SendfilePolicy>,
     ) -> Self {
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
@@ -450,6 +472,7 @@ impl Reloaded {
             compression,
             grpc_grants,
             error_pages,
+            sendfile,
         }
     }
 
@@ -460,6 +483,16 @@ impl Reloaded {
     #[must_use]
     pub fn error_page(&self, status: u16) -> Option<&std::path::Path> {
         self.error_pages.get(&status).map(PathBuf::as_path)
+    }
+
+    /// The allow-list a backend may name a file in, or `None` when the feature is off.
+    ///
+    /// Read from *this* generation, so a reload that adds a root takes effect on the next response
+    /// rather than the next restart — and a generation that has none ignores every `X-Sendfile`
+    /// rather than admitting one by omission.
+    #[must_use]
+    pub fn sendfile(&self) -> Option<&volucer_core::SendfilePolicy> {
+        self.sendfile.as_ref()
     }
 
     /// The site table this snapshot was built from.
@@ -714,6 +747,24 @@ impl Registry {
         grpc_grants: Arc<GrpcGrantsMap>,
         error_pages: std::collections::BTreeMap<u16, PathBuf>,
     ) -> Option<Arc<Reloaded>> {
+        self.apply_with_sendfile(sites, grpc_grants, error_pages, None)
+    }
+
+    /// [`Registry::apply`] with the sendfile allow-list this generation should use.
+    ///
+    /// A second entry point rather than a fourth argument, for the reason
+    /// [`Reloaded::from_sites_with_sendfile`] is one: most callers have no allow-list and should not
+    /// have to say so. A caller that *does* pass `None` here turns the feature off for this
+    /// generation, which is why the reload path passes what the configuration resolved rather than
+    /// leaving the argument out.
+    #[must_use]
+    pub fn apply_with_sendfile(
+        &self,
+        sites: Sites,
+        grpc_grants: Arc<GrpcGrantsMap>,
+        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+        sendfile: Option<volucer_core::SendfilePolicy>,
+    ) -> Option<Arc<Reloaded>> {
         let _replaced = self.shared.replace(sites);
         // Read back through the handle rather than from the argument: `SharedState::replace`
         // returns the table it *replaced*, so rebuilding from its return value would build the
@@ -730,11 +781,12 @@ impl Registry {
         for front_end in front_ends.iter() {
             // The *front-end's own* port, not the one in the shared table: a redirect has to name
             // the port the client actually reached, and two listeners on two ports share one table.
-            let next = Reloaded::from_sites(
+            let next = Reloaded::from_sites_with_sendfile(
                 Arc::clone(&live),
                 front_end.port,
                 Arc::clone(&grpc_grants),
                 error_pages.clone(),
+                sendfile.clone(),
             );
             let replaced = front_end.state.replace(next);
             previous = previous.or(Some(replaced));
