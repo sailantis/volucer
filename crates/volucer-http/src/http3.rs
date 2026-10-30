@@ -255,6 +255,7 @@ impl Http3Listener {
                 handles.shared.sites(),
                 Some(bound.port()),
                 grpc_grants,
+                handles.error_pages.clone(),
             ),
         ));
         handles

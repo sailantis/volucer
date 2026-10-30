@@ -178,6 +178,37 @@ clients connecting through a proxy.
 
 One policy applies process-wide to both front ends; it does not vary by route or site.
 
+## Error pages
+
+By default an error this server generates — a `502` from a dead backend, a `504` from a timeout, a
+`429` from the rate limit, a `404` from the router — is a single line of plain text. Write a page per
+status when a deployment should send something better:
+
+```toml
+[server.error_pages]
+"404" = "pages/404.html"
+"502" = "pages/502.html"
+"429" = "pages/busy.html"
+```
+
+Paths resolve against the configuration file's directory, like every other path in the file. Only
+`400`–`599` are accepted: a `2xx` or `3xx` page could never be reached, and accepting one is how an
+operator concludes the feature does not work rather than that the code is wrong.
+
+**Only the body is replaced, never the status.** A page for `502` is sent with `502` and
+`Cache-Control: no-store`, so a client can still tell what happened and a cache will not keep it. If
+the page cannot be read — deleted after `check` passed, or pointed at a directory — the plain-text
+body is sent instead and the reason is logged at `warn`: the status is the answer and the body is
+decoration, so a missing page must not turn a `502` into a `500`.
+
+Two things are deliberately **not** affected:
+
+- **A backend's own error response.** A `404` a PHP application produces is the application's page;
+  this server does not rewrite it. These pages cover the statuses *this server* generates.
+- **gRPC.** A failed call reports its outcome in the trailer section, so there is no body to replace.
+
+`volucer check` lists every configured code with the path it resolved, and marks a missing file.
+
 ## The worker-control routes
 
 Worker-control routes are absent by default. To expose them, name the methods under

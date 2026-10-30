@@ -1348,8 +1348,7 @@ static_files = {{ enabled = true }}
     let second = config_for(&after);
     let replaced = server.reload.apply(
         Sites::from_config(&second, &after),
-        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
-    );
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()), std::collections::BTreeMap::new());
 
     // The handle reports what it actually replaced, which is what lets a caller log a change
     // rather than only that a reload was attempted.
@@ -1403,15 +1402,13 @@ static_files = {{ enabled = true }}
     let state = volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(
         first,
         Some(8080),
-        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
-    ));
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()), std::collections::BTreeMap::new()));
     // What a request does: take one snapshot and hold it.
     let in_flight = state.load();
     let previous = state.replace(volucer_http::Reloaded::from_sites(
         Arc::new(config_for("two")),
         Some(8080),
-        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
-    ));
+        std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()), std::collections::BTreeMap::new()));
 
     assert_eq!(
         in_flight.sites().default_site().document_root,
@@ -1558,8 +1555,7 @@ document_root = {app:?}
         std::thread::sleep(Duration::from_millis(100));
         let _replaced = reload.apply(
             Sites::from_config(&config_for(&second), &second),
-            std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
-        );
+            std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()), std::collections::BTreeMap::new());
         std::thread::sleep(Duration::from_millis(100));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     });
@@ -2700,8 +2696,7 @@ grpc_services = [{services}]
     // The reload, through the same handle a `SIGHUP` reaches.
     let _ = server.reload.apply(
         Sites::from_config(&after, &document_root),
-        Arc::new(after.grpc_grants_all()),
-    );
+        Arc::new(after.grpc_grants_all()), std::collections::BTreeMap::new());
 
     let (answer, asked) = reached_a_worker("/other.Service/SayHello");
     assert!(
@@ -3045,8 +3040,7 @@ grpc_proto = [{entries}]
 
     let _ = server.reload.apply(
         Sites::from_config(&after, &document_root),
-        Arc::new(after.grpc_grants_all()),
-    );
+        Arc::new(after.grpc_grants_all()), std::collections::BTreeMap::new());
 
     let (answer, asked) = reached_a_worker("/admin.Admin/SayHello");
     assert!(

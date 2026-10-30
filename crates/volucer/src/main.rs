@@ -2198,6 +2198,34 @@ fn endpoint(running: &RunningHttp) -> String {
     }
 }
 
+/// Resolve `[server.error_pages]` into the map a listener serves from.
+///
+/// A free function used by `serve` and by the reload, so the first generation and every reload
+/// resolve the paths the same way — a reload that resolved against the process's working directory
+/// instead of the file's would make a page work at startup and 404 after the first `SIGHUP`, which
+/// is the class of difference this codebase keeps removing.
+///
+/// A page whose file is missing is **not** a startup failure: the feature is a nicer body for an
+/// error, and refusing to serve because a `404` page is absent would be a deployment that cannot
+/// start for a cosmetic reason. `check` reports it instead, and the renderer falls back to the
+/// plain-text page it always sent.
+fn resolve_error_pages(
+    config: &Config,
+    config_dir: &Path,
+) -> std::collections::BTreeMap<u16, PathBuf> {
+    let pages = &config.server.error_pages;
+    if pages.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let mut resolved = std::collections::BTreeMap::new();
+    for code in pages.codes() {
+        if let Some(page) = pages.page(code) {
+            resolved.insert(code, config_dir.join(page));
+        }
+    }
+    resolved
+}
+
 fn serve(
     source: &Source,
     document_root_flag: Option<&Path>,
@@ -2666,6 +2694,7 @@ fn serve(
         let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry))
             .with_observability(Arc::clone(&observe))
             .with_client_ip(Arc::clone(&client_ip))
+            .with_error_pages(resolve_error_pages(&config, &source.dir()))
             .with_rate_limit(Arc::clone(&rate_limit));
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
@@ -3631,7 +3660,12 @@ impl Reloader {
         // table: a route names a backend and a grant says whether that backend may serve a service,
         // so a reload that installed one without the other would be half-applied by definition.
         let grpc_grants = Arc::new(config.grpc_grants_all());
-        let _previous = self.registry.apply(sites, grpc_grants);
+        // And the error pages, in the same swap for the same reason: a page is chosen by the status
+        // this server answers, so it is part of how a request is answered rather than a table beside
+        // the site one. The paths are resolved here because the directory the file was read from is
+        // the only thing a reload knows and a request must not.
+        let error_pages = resolve_error_pages(&config, &self.source.dir());
+        let _previous = self.registry.apply(sites, grpc_grants, error_pages);
         tracing::info!(
             generation,
             source = %self.source.describe(),
@@ -4742,6 +4776,26 @@ fn check(
             site.name,
             site.document_root.display()
         );
+    }
+
+    // The error pages, reported by code with the path `serve` will read, and a missing file called
+    // out — a page that does not exist falls back to the plain-text body at request time, which is
+    // a deployment answering a bare status where it had written a page. That is the silent-reader
+    // rule: a key an operator sets that no command reports is a key they cannot confirm.
+    if !config.server.error_pages.is_empty() {
+        let resolved = resolve_error_pages(&config, &config_dir);
+        println!("  error pages:");
+        for (code, path) in &resolved {
+            println!(
+                "    {code}: {} {}",
+                path.display(),
+                if path.is_file() {
+                    ""
+                } else {
+                    "(MISSING — the plain-text page is sent instead)"
+                }
+            );
+        }
     }
 
     let mut dirs = extra_php_dirs.to_vec();

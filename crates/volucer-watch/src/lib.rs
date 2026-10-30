@@ -333,6 +333,16 @@ pub struct Reloaded {
     /// answered by one generation. A reload that changed a route *and* a grant moves both at once,
     /// so a call cannot be routed by the new table and admitted by the old grant.
     grpc_grants: Arc<GrpcGrantsMap>,
+    /// The page this server answers an error status with, by code.
+    ///
+    /// In `Reloaded` for the reason everything else here is: a request must be answered by one
+    /// generation. It is also what makes the table **reloadable** — an operator who fixes a broken
+    /// 502 page expects the next request to use it, not the next restart, and a page is a file whose
+    /// *content* is read per request anyway.
+    ///
+    /// The paths are already resolved against the configuration's directory, because that is the
+    /// only thing a reload cannot do at request time.
+    error_pages: std::collections::BTreeMap<u16, PathBuf>,
 }
 
 impl Reloaded {
@@ -354,6 +364,7 @@ impl Reloaded {
         sites: Arc<Sites>,
         server_port: Option<u16>,
         grpc_grants: Arc<GrpcGrantsMap>,
+        error_pages: std::collections::BTreeMap<u16, PathBuf>,
     ) -> Self {
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
@@ -389,7 +400,17 @@ impl Reloaded {
             statics,
             compression,
             grpc_grants,
+            error_pages,
         }
+    }
+
+    /// The page for an error status, if this generation has one.
+    ///
+    /// `None` for a code the deployment did not write, which is the ordinary case: a server answers
+    /// far more error statuses than any deployment writes pages for.
+    #[must_use]
+    pub fn error_page(&self, status: u16) -> Option<&std::path::Path> {
+        self.error_pages.get(&status).map(PathBuf::as_path)
     }
 
     /// The site table this snapshot was built from.
@@ -638,7 +659,12 @@ impl Registry {
     /// between two configurations, which is a question for the caller that has both of them — this
     /// only guarantees both are installed.
     #[must_use]
-    pub fn apply(&self, sites: Sites, grpc_grants: Arc<GrpcGrantsMap>) -> Option<Arc<Reloaded>> {
+    pub fn apply(
+        &self,
+        sites: Sites,
+        grpc_grants: Arc<GrpcGrantsMap>,
+        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+    ) -> Option<Arc<Reloaded>> {
         let _replaced = self.shared.replace(sites);
         // Read back through the handle rather than from the argument: `SharedState::replace`
         // returns the table it *replaced*, so rebuilding from its return value would build the
@@ -655,8 +681,12 @@ impl Registry {
         for front_end in front_ends.iter() {
             // The *front-end's own* port, not the one in the shared table: a redirect has to name
             // the port the client actually reached, and two listeners on two ports share one table.
-            let next =
-                Reloaded::from_sites(Arc::clone(&live), front_end.port, Arc::clone(&grpc_grants));
+            let next = Reloaded::from_sites(
+                Arc::clone(&live),
+                front_end.port,
+                Arc::clone(&grpc_grants),
+                error_pages.clone(),
+            );
             let replaced = front_end.state.replace(next);
             previous = previous.or(Some(replaced));
         }
@@ -854,8 +884,7 @@ mod tests {
     #[test]
     fn one_swap_never_yields_a_partial_generation() {
         let state = Swappable::new(Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080),
-            Arc::new(GrpcGrantsMap::new()),
-        ));
+            Arc::new(GrpcGrantsMap::new()), std::collections::BTreeMap::new()));
 
         let stop = AtomicBool::new(false);
         let mut seen: Vec<PathBuf> = Vec::new();
@@ -887,8 +916,7 @@ mod tests {
                 let _ = state.replace(Reloaded::from_sites(
                     Arc::new(named_sites(root)),
                     Some(8080),
-                    Arc::new(GrpcGrantsMap::new()),
-                ));
+                    Arc::new(GrpcGrantsMap::new()), std::collections::BTreeMap::new()));
             }
             stop.store(true, Ordering::Relaxed);
             seen = reader.join().expect("the reader thread panicked");
@@ -927,9 +955,9 @@ mod tests {
         );
 
         let first =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(before));
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(before), std::collections::BTreeMap::new());
         let second =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(after));
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(after), std::collections::BTreeMap::new());
 
         assert!(first
             .granted_grpc_call("app", "/greeter.Greeter/SayHello")
@@ -964,7 +992,7 @@ mod tests {
         let mut grants = GrpcGrantsMap::new();
         grants.insert("app".to_string(), GrpcGrants::any());
         let state =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(grants));
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(grants), std::collections::BTreeMap::new());
 
         assert!(state
             .granted_grpc_call("app", "/never.Listed/Method")

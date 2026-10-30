@@ -574,6 +574,15 @@ impl FrontEnd {
         self.state.load()
     }
 
+    /// The page this deployment configured for an error status, from the generation being served.
+    ///
+    /// A method rather than a field read at the call site, so the one place that decides which page
+    /// belongs to which status also decides which *generation* it comes from. `None` for a code with
+    /// no page, which is every code on a deployment that wrote none.
+    fn error_page(&self, status: u16) -> Option<std::path::PathBuf> {
+        self.state().error_page(status).map(std::path::PathBuf::from)
+    }
+
     /// The statistics handle, shared with the accept loops.
     ///
     /// An `Arc` rather than a `&HttpStats` because both accept loops hand a clone to the per-
@@ -675,6 +684,18 @@ pub struct ReloadHandles {
     /// writes into: the FastCGI listener holds a clone of this `Arc`, not a copy of the policy, so
     /// replacing it moves both front-ends. See [`RateLimitCell`].
     pub rate_limit: Arc<RateLimitCell>,
+    /// The page this server answers an error status with, by code, already resolved against the
+    /// configuration file's directory.
+    ///
+    /// A plain map rather than the configuration type: this is what a listener needs, and the
+    /// resolution is the reload's job because only it knows where the file was. On the handles
+    /// rather than derived from the site table for the reason `grpc_grants` is — the paths come from
+    /// `[server]` and a `Sites` is built from `[server]` and `[sites.*]`, so a listener builds its
+    /// first snapshot from this and a reload replaces it.
+    ///
+    /// Empty by default, so a deployment that wrote no pages costs one `BTreeMap::get` per error
+    /// response and nothing per request.
+    pub error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
 }
 
 impl ReloadHandles {
@@ -688,7 +709,18 @@ impl ReloadHandles {
             client_ip: Arc::new(volucer_core::ClientIpPolicy::off()),
             rate_limit: Arc::new(RateLimitCell::new(None)),
             grpc_grants: Arc::new(volucer_watch::GrpcGrantsMap::new()),
+            error_pages: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The same, with the error pages the configuration gave.
+    #[must_use]
+    pub fn with_error_pages(
+        mut self,
+        pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+    ) -> Self {
+        self.error_pages = pages;
+        self
     }
 
     /// The same, with the gRPC grants the configuration gave.
@@ -830,8 +862,9 @@ impl ReloadHandle {
         &self,
         sites: Sites,
         grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
+        error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
     ) -> Arc<Reloaded> {
-        self.registry.apply(sites, grpc_grants).unwrap_or_else(|| {
+        self.registry.apply(sites, grpc_grants, error_pages).unwrap_or_else(|| {
             // Unreachable while `bind` registers this listener before handing out a handle, and
             // expressed as a fresh snapshot rather than a panic so removing that could never
             // become a crash in a signal handler.
@@ -1341,6 +1374,7 @@ impl HttpListener {
             handles.shared.sites(),
             local.port,
             grpc_grants,
+            handles.error_pages.clone(),
         )));
         handles
             .registry
@@ -2082,7 +2116,10 @@ async fn handle(
         Err(err) => {
             front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(status = err.status(), %err, "http request failed");
-            error_response(&err)
+            // The page comes from the generation being served, read once here rather than inside
+            // the renderer, so the renderer has no way to consult a different generation.
+            let page = front_end.error_page(err.status());
+            error_response(&err, page.as_deref())
         }
     };
 
@@ -2498,7 +2535,17 @@ async fn prepare(
             host,
         };
         if let Some(answer) = static_files::respond(static_request, statics).await {
-            return answer;
+            // **A configured page replaces the static layer's bare 404 and 403 too**, and this is
+            // the code that matters most in practice: a missing file is the common way a deployment
+            // reaches a 404 at all, and `static_files::respond` answers it with a status and no
+            // body — deliberately, because that layer exists so PHP never sees a request for a file
+            // that is not there. Substituting here rather than inside that layer keeps its contract
+            // (every error it returns is a complete answer) and puts the decision where the
+            // generation being served is in hand.
+            return match answer {
+                Ok(response) => Ok(with_error_page(front_end, response)),
+                Err(err) => Err(err),
+            };
         }
     }
 
@@ -3203,8 +3250,15 @@ fn grpc_answer(response: volucer_fcgi::Response) -> Result<Response<ResponseBody
 /// outcome from the trailer section, so an HTML or plain-text body under a `502` is unreadable to it
 /// — it reports "unexpected HTTP status" and the failure this server is trying to report is lost. So
 /// the one case where the status is in the trailers produces a `200` with a trailer-carrying body,
-/// and everything else produces the page it always did.
-fn error_response(err: &HttpError) -> Response<ResponseBody> {
+/// and everything else produces the page it always did — unless the deployment wrote one for that
+/// status.
+///
+/// **`front_end` is passed for the configured page**, and the reason it is not a parameter of its own
+/// is that the page has to come from the *same* generation the request is being answered under. A
+/// page read from a snapshot taken elsewhere would let a reload land between "which status" and
+/// "which page", which is the two-answers-to-one-question shape the whole `Reloaded` design exists to
+/// prevent.
+fn error_response(err: &HttpError, page: Option<&std::path::Path>) -> Response<ResponseBody> {
     if let HttpError::Grpc { status, .. } = err {
         let (code, headers, body) = volucer_upstream::grpc_error(*status);
         let mut builder = Response::builder().status(code);
@@ -3218,9 +3272,37 @@ fn error_response(err: &HttpError) -> Response<ResponseBody> {
             .expect("a trailer-carrying gRPC failure is a valid response");
     }
 
+    let status = err.status();
+    // A page the deployment wrote for this status, when there is one and it can be read.
+    if let Some(page) = page {
+        match read_error_page(page) {
+            Ok(body) => {
+                return Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                    // `no-store` for the same reason the plain page sets it, and more so: a
+                    // configured 503 page is a page a cache must never keep.
+                    .header(hyper::header::CACHE_CONTROL, "no-store")
+                    .header(CONTENT_LENGTH, body.len())
+                    .body(body_of(body))
+                    .expect("a configured error page is a valid response");
+            }
+            // Reported rather than refused: the status is the answer and the body is decoration, so
+            // a page that cannot be read must not turn a 502 into a 500. The fallback is the page
+            // this server has always sent, which says what happened and nothing about the site's
+            // navigation.
+            Err(err) => tracing::warn!(
+                status,
+                page = %page.display(),
+                %err,
+                "an error page could not be read; the plain-text page is sent instead"
+            ),
+        }
+    }
+
     let body = format!("{}\n", err);
     let mut builder = Response::builder()
-        .status(err.status())
+        .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         // **`no-store`, for the same reason RoadRunner sets it.** A 429 is the one response a cache
         // must never keep: a shared proxy that stored it would serve the refusal to every other
@@ -3236,6 +3318,84 @@ fn error_response(err: &HttpError) -> Response<ResponseBody> {
     builder
         .body(body_of(Bytes::from(body)))
         .expect("a plain-text error page is a valid response")
+}
+
+/// A page the deployment wrote for an error status, read from disk.
+///
+/// **Read per response rather than cached**, which is the honest trade for a page that is served when
+/// something is already wrong: an operator fixes a broken 502 page and the next request uses it. The
+/// cost is one `open`+`read` per error response, and an error response is by definition not the
+/// common path. Caching it would need invalidation on `SIGHUP` *and* on a file edit, and getting that
+/// wrong means the page an operator is looking at is not the one being served.
+///
+/// A cap on the size, because this body is read into memory and an operator could point the key at a
+/// 2 GiB file by mistake. The limit is the same one the request body uses, so a page is bounded by
+/// something a deployment already knows.
+fn read_error_page(page: &std::path::Path) -> std::io::Result<Bytes> {
+    let meta = std::fs::metadata(page)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > volucer_core::config::DEFAULT_MAX_BODY_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} bytes is larger than the {} byte limit an error page may have",
+                meta.len(),
+                volucer_core::config::DEFAULT_MAX_BODY_BYTES
+            ),
+        ));
+    }
+    std::fs::read(page).map(Bytes::from)
+}
+
+/// Replace a bodiless error answer with the page the deployment configured for its status.
+///
+/// The static layer answers a missing file with a status and no body, which is right for the layer
+/// and wrong for the deployment: an operator who wrote `"404" = "pages/404.html"` expects it on the
+/// request that actually 404s, and that is a file that is not there.
+///
+/// **Only for `404` and `403`**, which are the two the static layer produces, and only when it
+/// produced no body. A rule that rewrote any error response would also rewrite a range refusal's
+/// `416` or a byte-range answer's headers, and those carry meaning the page would erase.
+fn with_error_page(
+    front_end: &FrontEnd,
+    response: Response<ResponseBody>,
+) -> Response<ResponseBody> {
+    let status = response.status().as_u16();
+    if !matches!(status, 403 | 404) {
+        return response;
+    }
+    let Some(page) = front_end.error_page(status) else {
+        return response;
+    };
+    match read_error_page(&page) {
+        Ok(body) => {
+            let (mut parts, _) = response.into_parts();
+            parts.headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            parts.headers.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string())
+                    .expect("a length is a valid header value"),
+            );
+            Response::from_parts(parts, body_of(body))
+        }
+        Err(err) => {
+            tracing::warn!(
+                status,
+                page = %page.display(),
+                %err,
+                "an error page could not be read; the bare status is sent instead"
+            );
+            response
+        }
+    }
 }
 
 /// Which HTTP status a dispatch failure deserves.
@@ -3801,12 +3961,103 @@ mod tests {
 
     #[test]
     fn an_error_page_names_its_own_status() {
-        let response = error_response(&HttpError::BadGateway("worker died".to_string()));
+        // `None` for the front-end, which is the case a deployment with no `[server.error_pages]`
+        // has — so this is the assertion that the plain page is unchanged by the feature.
+        let response = error_response(&HttpError::BadGateway("worker died".to_string()), None);
         assert_eq!(response.status(), 502);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).expect("content type"),
             "text/plain; charset=utf-8"
         );
+    }
+
+    /// **A configured page replaces the body of its own status and nothing else.**
+    ///
+    /// The property an operator is buying: their `502` page is what a client sees, with the status
+    /// preserved — a page that answered 200 would be an outage dressed as success — and a status they
+    /// wrote no page for still gets the plain text.
+    #[test]
+    fn a_configured_error_page_replaces_the_body_and_keeps_the_status() {
+        let dir = std::env::temp_dir().join(format!(
+            "volucer-error-page-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        let page = dir.join("502.html");
+        std::fs::write(&page, "<h1>the application is down</h1>").expect("write the page");
+
+        let response = error_response(
+            &HttpError::BadGateway("worker died".to_string()),
+            Some(&page),
+        );
+        assert_eq!(response.status(), 502, "the status must not change");
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "text/html; charset=utf-8",
+            "an operator's page is HTML, and saying text/plain would make a browser show the markup"
+        );
+        assert_eq!(
+            response.headers().get(hyper::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+            "a configured page is still an error a cache must not keep"
+        );
+
+        // **The renderer serves the page it is given, whatever the status.** Choosing *which* page
+        // belongs to a status is `Reloaded::error_page`'s job — one lookup in one generation — and
+        // duplicating it here would be a second place that could disagree. This asserts the split
+        // rather than the lookup.
+        let response = error_response(&HttpError::NotFound("/x".to_string()), Some(&page));
+        assert_eq!(response.status(), 404);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "text/html; charset=utf-8",
+            "the renderer does not second-guess the page it was handed"
+        );
+
+        // And with no page at all — the ordinary case — the plain text body is what is sent.
+        let response = error_response(&HttpError::NotFound("/x".to_string()), None);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "text/plain; charset=utf-8",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A page that cannot be read must not turn a 502 into a 500.**
+    ///
+    /// The status is the answer and the body is decoration: a page deleted after `check` passed, or
+    /// one an operator pointed at a directory, has to fall back to the plain page rather than become
+    /// a second failure on the path that reports the first.
+    #[test]
+    fn an_unreadable_error_page_falls_back_to_the_plain_page() {
+        let missing = std::env::temp_dir().join("volucer-no-such-error-page.html");
+        let _ = std::fs::remove_file(&missing);
+        let response = error_response(&HttpError::Overloaded, Some(&missing));
+        assert_eq!(
+            response.status(),
+            503,
+            "an unreadable page must not change the status the error means"
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "text/plain; charset=utf-8",
+        );
+
+        // A directory is the second shape: it exists, so `metadata` succeeds, but reading it is not
+        // a page. Refused by name rather than read.
+        let dir = std::env::temp_dir().join(format!("volucer-error-dir-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let response = error_response(&HttpError::Overloaded, Some(&dir));
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "text/plain; charset=utf-8",
+            "a directory is not a page"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

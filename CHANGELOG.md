@@ -9,6 +9,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[server.error_pages]` gives an error status a page of its own.** Every `502`, `504`, `429` and
+  router-level `404` was a single line of plain text, which is what a client sees on the worst day
+  the deployment has.
+
+  ```toml
+  [server.error_pages]
+  "404" = "pages/404.html"
+  "502" = "pages/502.html"
+  ```
+
+  **Only the body is replaced, never the status** — a page for `502` is sent with `502` and
+  `Cache-Control: no-store`, so a client can still tell what happened and a cache will not keep it.
+  A page that cannot be read falls back to the plain-text body and logs why, because the status is
+  the answer and the body is decoration: a missing page must not turn a `502` into a `500`. Only
+  `400`–`599` are accepted; a `2xx` page could never be reached.
+
+  Two things are deliberately untouched. A **backend's own error response** is not rewritten — a
+  `404` a PHP application produces is the application's page, and these pages cover the statuses this
+  server generates. And **gRPC** reports its outcome in the trailer section, so there is no body to
+  replace.
+
+  The table lives in `Reloaded` with the site table and the gRPC grants, so a reload applies it in
+  the same swap and a request cannot be answered under one generation's routes and another's pages.
+  The file is read per error response rather than cached: an operator fixes a broken `502` page and
+  the next request uses it, which is the ordering that matters when something is already wrong.
+
 - **`request_timeout_ms` is a per-backend key, and `[server] max_connections` exists.** Both were
   limits that only code knew about.
 

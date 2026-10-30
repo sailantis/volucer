@@ -491,6 +491,7 @@ backend = "{pool}"
     let _replaced = reload.apply(
         Sites::from_config(&after, &roots.join("second")),
         std::sync::Arc::new(volucer_watch::GrpcGrantsMap::new()),
+        std::collections::BTreeMap::new(),
     );
 
     let second = request_on(&mut connection, 2, "any.test", "/probe.php");

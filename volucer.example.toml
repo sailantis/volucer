@@ -119,6 +119,20 @@ fastcgi = "127.0.0.1:9080"
 # could not express it and an operator reading [server] had no way to learn it
 # existed. `0` is the honest spelling of unlimited; the flag still wins.
 # max_connections = 512
+
+# A page per error status, for the errors THIS SERVER generates -- a 502 from a dead
+# backend, a 504 from a timeout, a 429 from the rate limit, a 404 from the router.
+# Paths resolve against this file's directory. Only the BODY is replaced: the status
+# is preserved and `Cache-Control: no-store` is set, so a client can still tell what
+# happened. A page that cannot be read falls back to the plain-text body and logs why,
+# because a missing page must not turn a 502 into a 500. Only 400-599 are accepted.
+#
+# Not covered, deliberately: a backend's own error response (a 404 a PHP application
+# produces is the application's page) and gRPC, whose outcome is in the trailers.
+#
+# [server.error_pages]
+# "404" = "pages/404.html"
+# "502" = "pages/502.html"
 # What a backend is handed as its `traceparent`. The four values are nginx's
 # `otel_trace_context`, with the same meaning:
 #

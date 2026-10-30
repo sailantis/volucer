@@ -653,3 +653,55 @@ fn a_request_timeout_is_configurable_per_backend_and_zero_is_refused() {
         );
     }
 }
+
+/// **A page may be written per error status, and only for a status that can be an error.**
+///
+/// The table is keyed by the code, so an unknown key is a typo. A `2xx` or `3xx` page would be one
+/// nothing could ever reach — and accepting it is how an operator concludes the feature does not work
+/// rather than that the code is wrong, which is the failure mode `check` exists to prevent.
+#[test]
+fn error_pages_are_keyed_by_status_and_only_errors_are_accepted() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.error_pages]
+"404" = "pages/404.html"
+"502" = "pages/502.html"
+"429" = "pages/busy.html"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let pages = &config.server.error_pages;
+    assert_eq!(pages.codes(), vec![404, 429, 502]);
+    assert_eq!(pages.page(502), Some(Path::new("pages/502.html")));
+    assert_eq!(pages.page(500), None, "a code with no page has none");
+
+    // A code that cannot be an error status is refused by name, and the page is the only key.
+    for (key, expected) in [
+        ("\"200\" = \"pages/ok.html\"", "not an error status"),
+        ("\"302\" = \"pages/moved.html\"", "not an error status"),
+        ("\"not-a-code\" = \"x.html\"", "not a status code"),
+    ] {
+        let text = format!(
+            "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.error_pages]\n{key}\n"
+        );
+        let config = Config::from_toml(&text).expect("parses");
+        let err = config.validate().expect_err("must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(expected),
+            "{key}: the refusal has to say {expected:?}: {message}"
+        );
+    }
+}
+
+/// An empty table is the ordinary case and must not be reported as a configured feature.
+#[test]
+fn an_absent_error_pages_table_is_empty() {
+    let text = "[server]\nhttp = \"127.0.0.1:8080\"\n";
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    assert!(config.server.error_pages.is_empty());
+    assert!(config.server.error_pages.codes().is_empty());
+}

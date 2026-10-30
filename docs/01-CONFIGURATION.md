@@ -319,6 +319,7 @@ its certificate or ACME settings.
 | `max_body_bytes` | integer | `33554432` (32 MiB) | The largest request body either front-end accepts. |
 | `shutdown_timeout_ms` | integer | `30000` | How long a stop may spend finishing in-flight requests. `0` means do not wait. See [Operations](11-OPERATIONS.md#systemd). |
 | `max_connections` | integer | `512` | The most concurrent client connections the HTTP front-end accepts. `0` means no ceiling; `--max-connections` overrides it. |
+| `error_pages` | table | absent | A page per error status: `"502" = "pages/502.html"`. Only 400–599 are accepted. |
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |

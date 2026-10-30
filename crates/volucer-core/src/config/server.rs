@@ -117,6 +117,25 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_connections: Option<usize>,
 
+    /// Responses this server generates for an error status, by status code.
+    ///
+    /// **A table per code rather than one template**, because the pages an operator writes are not
+    /// interchangeable: a `404` wants the site's navigation and a `503` wants "we are restarting,
+    /// try in a moment". One template for every error is a page that reads wrong for most of them.
+    ///
+    /// Keyed by the code, so an unknown key is a typo rather than a page nothing serves. A code the
+    /// server never generates is accepted — an operator may write a `418` page for an application
+    /// that returns one through an `upstream` — and the table is consulted for *every* error status
+    /// this server answers, which is the only way a page for a status the front-end did not itself
+    /// produce can ever be reached.
+    ///
+    /// **Only the bodies of `text/html` responses are replaced.** A `403` on a gRPC call, a `429` on
+    /// a JSON API and a `404` on a `HEAD` are all cases where the body is either not HTML or not
+    /// sent at all, and swapping a page in would break the client that asked. See
+    /// [`ErrorPages::body_for`].
+    #[serde(default)]
+    pub error_pages: ErrorPages,
+
     /// Directory that PHP scripts and static files are resolved against.
     ///
     /// A relative path is relative to the process's working directory, not to
@@ -480,6 +499,68 @@ pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
 
 /// The largest request body a backend will be handed, when configuration says nothing.
 ///
+/// The bodies this server sends for an error status, by code.
+///
+/// A newtype over a `BTreeMap<u16, PathBuf>` rather than a bare map, so the two rules that make a
+/// page safe — the code has to be a *client* or server error, and the path is resolved against the
+/// configuration's directory — live with the type rather than at each lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, transparent)]
+pub struct ErrorPages {
+    /// The page per status code, e.g. `502 = "pages/502.html"`.
+    ///
+    /// A TOML key must be a string, so the codes are written as strings: `"502" = "…"`. Parsed
+    /// strictly, because `[server.error_pages.502]` is not a table and a file that wrote a table
+    /// would otherwise be read as no pages at all.
+    pages: std::collections::BTreeMap<String, PathBuf>,
+}
+
+impl ErrorPages {
+    /// The resolved page for a status, if the deployment wrote one.
+    ///
+    /// `resolve` is applied here rather than at load time because the path is relative to the
+    /// configuration's directory, which only the caller knows — the same rule every other path in
+    /// the file follows.
+    #[must_use]
+    pub fn page(&self, status: u16) -> Option<&Path> {
+        self.pages.get(&status.to_string()).map(PathBuf::as_path)
+    }
+
+    /// Whether the table is empty, which is the case an operator did not configure it at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// The codes that have a page, sorted, for `check` to report.
+    #[must_use]
+    pub fn codes(&self) -> Vec<u16> {
+        self.pages
+            .keys()
+            .filter_map(|code| code.parse().ok())
+            .collect()
+    }
+
+    /// Refuse a key that is not a status code, and a code that cannot be an error status.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for code in self.pages.keys() {
+            let Ok(status) = code.parse::<u16>() else {
+                return Err(format!(
+                    "server.error_pages has the key {code:?}, which is not a status code; write                      it quoted, e.g. \"502\" = \"pages/502.html\""
+                ));
+            };
+            // A 2xx or 3xx page would be a page nothing could ever reach, and accepting one is how
+            // an operator concludes the feature does not work rather than that the code is wrong.
+            if !(400..=599).contains(&status) {
+                return Err(format!(
+                    "server.error_pages names {status}, which is not an error status; only 400 to                      599 are ever generated as an error"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The value `HttpLimits::default()` used before [`ServerConfig::max_body_bytes`] existed, kept
 /// deliberately: an unconfigured deployment must not change behaviour because the key was added.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
