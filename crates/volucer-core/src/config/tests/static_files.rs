@@ -485,3 +485,55 @@ document_root = ""
         );
     }
 }
+
+/// The drain budget is resolved once, so both front-ends cannot disagree about it.
+///
+/// Same rule as `max_body_bytes` above, and for the same reason: a stop is one signal, and an HTTP
+/// listener draining for thirty seconds while the FastCGI listener drains for zero would be a
+/// deployment where half the in-flight requests survive the same event.
+#[test]
+fn the_shutdown_budget_is_one_answer_for_both_front_ends() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    assert_eq!(
+        config.server.shutdown_timeout(),
+        std::time::Duration::from_millis(DEFAULT_SHUTDOWN_TIMEOUT_MS)
+    );
+    assert_eq!(DEFAULT_SHUTDOWN_TIMEOUT_MS, 30_000, "docker stop's own default");
+    config.validate().expect("an absent key is valid");
+
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+shutdown_timeout_ms = 2500
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    assert_eq!(
+        config.server.shutdown_timeout(),
+        std::time::Duration::from_millis(2_500)
+    );
+    config.validate().expect("a stated budget is valid");
+}
+
+/// Zero is *accepted* here, unlike every other limit — it is the deliberate "do not wait" opt-out.
+///
+/// The distinction from `max_body_bytes = 0` is worth pinning: a zero body limit is never what was
+/// meant, whereas a zero drain budget is a deployment saying it would rather recycle instantly than
+/// hold a supervisor for thirty seconds. A validator that refused it would take away the only way to
+/// express that.
+#[test]
+fn a_zero_shutdown_budget_is_accepted_as_do_not_wait() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+shutdown_timeout_ms = 0
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    config
+        .validate()
+        .expect("zero means do not wait, which is a valid choice");
+    assert!(config.server.shutdown_timeout().is_zero());
+}

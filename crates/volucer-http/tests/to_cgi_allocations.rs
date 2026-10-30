@@ -121,7 +121,7 @@ fn to_cgi_cost(header_count: usize) -> (usize, usize) {
     let parts = parts(header_count);
     let routing = routing();
     allocations(|| {
-        let request = to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes");
+        let request = to_cgi(&parts, Vec::new(), &routing, Some(8080), Some("10.0.0.5")).expect("routes");
         std::hint::black_box(&request);
     })
 }
@@ -131,7 +131,7 @@ fn to_cgi_with_body(header_count: usize, body: Vec<u8>) -> (usize, usize) {
     let parts = parts(header_count);
     let routing = routing();
     allocations(move || {
-        let request = to_cgi(&parts, body, &routing, 8080, "10.0.0.5").expect("routes");
+        let request = to_cgi(&parts, body, &routing, Some(8080), Some("10.0.0.5")).expect("routes");
         std::hint::black_box(&request);
     })
 }
@@ -157,7 +157,7 @@ fn the_wall_clock_cost_of_a_realistic_request_is_reported_and_loosely_bounded() 
     let routing = routing();
     for _ in 0..200 {
         std::hint::black_box(
-            to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"),
+            to_cgi(&parts, Vec::new(), &routing, Some(8080), Some("10.0.0.5")).expect("routes"),
         );
     }
 
@@ -165,7 +165,7 @@ fn the_wall_clock_cost_of_a_realistic_request_is_reported_and_loosely_bounded() 
     let started = std::time::Instant::now();
     for _ in 0..ITERATIONS {
         std::hint::black_box(
-            to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"),
+            to_cgi(&parts, Vec::new(), &routing, Some(8080), Some("10.0.0.5")).expect("routes"),
         );
     }
     let each = started.elapsed().as_nanos() as f64 / f64::from(ITERATIONS);
@@ -287,7 +287,7 @@ fn building_request_info_is_a_small_share_of_the_translation() {
                 )
             })
             .collect(),
-        remote_addr: "10.0.0.5".to_string(),
+        remote_addr: Some("10.0.0.5".to_string()),
         server_name: "example.test".to_string(),
         server_port: 8080,
         body_len: 0,
@@ -337,7 +337,7 @@ fn building_request_info_is_a_small_share_of_the_translation() {
         let started = std::time::Instant::now();
         for _ in 0..ITERATIONS {
             std::hint::black_box(
-                to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"),
+                to_cgi(&parts, Vec::new(), &routing, Some(8080), Some("10.0.0.5")).expect("routes"),
             );
         }
         let total_ns = started.elapsed().as_nanos() as f64 / f64::from(ITERATIONS);

@@ -26,7 +26,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -204,6 +204,15 @@ impl HttpStats {
         )
     }
 
+    /// How many connections are still open, for the drain to wait on.
+    ///
+    /// `connections` is decremented by the connection task itself, immediately after
+    /// `serve_connection` returns — so this reads zero exactly when the last connection has
+    /// finished writing, which is the condition a drain is waiting for.
+    pub fn open_connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
+    }
+
     /// The TLS counters, for logging at shutdown.
     pub fn tls_snapshot(&self) -> (usize, usize, usize) {
         (
@@ -253,7 +262,7 @@ pub struct TlsSettings<'a> {
 /// own** — it must not build an acceptor — and still carries the redirect. Deriving the
 /// redirect from the presence of a certificate would have made that listener a TLS port, which
 /// is a mistake that only shows up as a client that cannot connect at all.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct ListenerSettings<'a> {
     /// TLS for this listener, or `None` for a plaintext one.
     pub tls: Option<TlsSettings<'a>>,
@@ -272,6 +281,33 @@ pub struct ListenerSettings<'a> {
     /// with no `[server.http3]`, and `None` on the HTTP/3 listener itself — a response arriving
     /// over QUIC must not advertise the connection it is already using.
     pub alt_svc_port: Option<u16>,
+    /// How long a stop may spend finishing in-flight requests.
+    ///
+    /// Taken from the configuration rather than a field of its own, so a `ListenerSettings::default()`
+    /// in a test drains for the documented default instead of for zero — a test that asserts a
+    /// response arrives complete would be flaky in the one direction that matters if its budget
+    /// were absent.
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for ListenerSettings<'_> {
+    /// The defaults a test or a bare `start()` gets: no TLS, no HTTP/3, and the documented drain
+    /// budget rather than zero.
+    ///
+    /// Written out rather than derived, and that is the whole point of removing the derive: a
+    /// derived `Default` would give `shutdown_timeout` a duration of zero, so every connection would
+    /// be abandoned the instant a stop was requested — silently reintroducing the bug the field
+    /// exists to fix, in exactly the tests that would otherwise catch it.
+    fn default() -> Self {
+        ListenerSettings {
+            tls: None,
+            https_port: None,
+            alt_svc_port: None,
+            shutdown_timeout: Duration::from_millis(
+                volucer_core::config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            ),
+        }
+    }
 }
 
 /// Stops the listener from another thread.
@@ -290,6 +326,99 @@ impl HttpShutdown {
 
     pub fn is_shutting_down(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
+    }
+}
+
+/// Every connection this listener is currently serving, and the signal that asks each one to finish.
+///
+/// # Why a registry rather than a `JoinSet`
+///
+/// A `JoinSet` can only be awaited to completion, which is the wrong shape here: a stop has a
+/// **deadline**, so the two things needed are "ask every connection to finish politely" and "how
+/// many are still open", both answerable at any instant. A `JoinSet` answers neither without
+/// consuming the tasks.
+///
+/// # Why a `CancellationToken` per connection
+///
+/// `hyper-util`'s `Connection::graceful_shutdown` is `Pin`-based and must be driven from inside the
+/// task that owns the connection future — it cannot be called from outside, because the future is
+/// owned by the task. So the outside half is a signal the task selects on, and the task itself does
+/// the graceful shutdown when it fires. `tokio_util::sync::CancellationToken` is already in the tree
+/// under `tokio-util`'s `rt` feature, whose `io` half the static layer already uses for
+/// `poll_read_buf`, so this is one workspace entry rather than a new dependency.
+///
+/// # What "graceful" means here, and what it does not
+///
+/// It stops the connection from accepting *new* requests and lets the one in flight finish. It does
+/// **not** close an idle keep-alive connection immediately, which is deliberate: `hyper` finishes an
+/// idle connection as soon as it observes the shutdown, so an idle client costs nothing to drain.
+pub(crate) struct ConnectionRegistry {
+    /// The tokens for connections that are still open, each with the id that identifies it.
+    ///
+    /// A `Mutex<Vec<(u64, CancellationToken)>>` rather than a map: the operations are "push one",
+    /// "remove one" and "cancel all", all of which are O(n) on a `Vec` and all of which happen at
+    /// most once per *connection* rather than once per request. A `HashMap` would allocate an entry
+    /// per connection for no benefit here.
+    ///
+    /// The id exists because `CancellationToken` deliberately implements neither `PartialEq` nor a
+    /// pointer-identity comparison — two tokens are distinct by construction, so there is no
+    /// "same token" test to use. A counter is what makes "forget *this* one" expressible.
+    open: std::sync::Mutex<Vec<(u64, tokio_util::sync::CancellationToken)>>,
+    /// The next connection id. Monotonic and never reused, so a stale id cannot match a live one.
+    next_id: AtomicU64,
+}
+
+impl ConnectionRegistry {
+    fn new() -> Self {
+        ConnectionRegistry {
+            open: std::sync::Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Register a connection, returning its id and the token its task selects on.
+    ///
+    /// The token is cancelled immediately if a stop has already been requested, which is the race
+    /// this has to get right: a connection accepted in the same instant the signal arrives must not
+    /// be admitted to a listener that is draining.
+    fn register(&self, stopping: &AtomicBool) -> (u64, tokio_util::sync::CancellationToken) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let token = tokio_util::sync::CancellationToken::new();
+        if stopping.load(Ordering::SeqCst) {
+            token.cancel();
+        }
+        self.open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((id, token.clone()));
+        (id, token)
+    }
+
+    /// Forget a connection that has finished. Idempotent.
+    fn forget(&self, id: u64) {
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        open.retain(|(held, _)| *held != id);
+    }
+
+    /// Ask every open connection to finish its current request and stop.
+    fn cancel_all(&self) {
+        let open = self
+            .open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (_, token) in open.iter() {
+            token.cancel();
+        }
+    }
+
+    fn open_count(&self) -> usize {
+        self.open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -334,13 +463,17 @@ pub(crate) struct FrontEnd {
     shutdown: Arc<AtomicBool>,
     /// The port this listener is bound to, for `SERVER_PORT` when the client
     /// sends no `Host`.
-    server_port: u16,
+    ///
+    /// `None` on a unix socket listener. See [`LocalAddress`].
+    server_port: Option<u16>,
     /// The port a redirect should name, when it differs from this listener's own.
     ///
     /// Here rather than resolved per request because it is a property of the socket: a redirect
     /// must name the endpoint that actually speaks TLS, and only the listener knows where that is.
     /// Whether any given request *is* redirected is a site's answer, not this one's.
-    https_port: Option<u16>,
+    ///
+    /// **`None` means this listener cannot redirect at all**, which is a unix socket's answer.
+    https_port: Option<Option<u16>>,
     /// Request identity and the access log, shared with the FastCGI front-end.
     ///
     /// One `Arc` for the process rather than one per listener, for the reason the site table is:
@@ -379,6 +512,14 @@ pub(crate) struct FrontEnd {
     /// is written on every response and formatting it per request would allocate on the hot path
     /// for a string that never changes.
     alt_svc: Option<HeaderValue>,
+    /// Every connection this listener is serving, so a stop can ask them to finish.
+    connections: ConnectionRegistry,
+    /// How long a stop may wait for those connections to finish.
+    ///
+    /// Here rather than read from the configuration at stop time, because the configuration a
+    /// listener was built with is the one its drain budget was chosen from — and a reload cannot
+    /// change a shutdown decision, which is the same rule the restart-only list states.
+    shutdown_timeout: Duration,
 }
 
 impl FrontEnd {
@@ -396,12 +537,12 @@ impl FrontEnd {
         state: Arc<Swappable<Reloaded>>,
         tls: Option<Arc<crate::tls::SniResolver>>,
         limits: HttpLimits,
-        server_port: u16,
-        https_port: Option<u16>,
+        local: LocalAddress,
         observe: Arc<volucer_observe::Observability>,
         client_ip: Arc<volucer_core::ClientIpPolicy>,
         rate_limit: Arc<RateLimitCell>,
         alt_svc: Option<HeaderValue>,
+        shutdown_timeout: Duration,
     ) -> Self {
         FrontEnd {
             dispatcher,
@@ -411,12 +552,14 @@ impl FrontEnd {
             limits,
             stats: Arc::new(HttpStats::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
-            server_port,
-            https_port,
+            server_port: local.port,
+            https_port: local.https_port,
             observe,
             client_ip,
             rate_limit,
             alt_svc,
+            connections: ConnectionRegistry::new(),
+            shutdown_timeout,
         }
     }
 
@@ -716,7 +859,10 @@ pub const DEFAULT_SITE_KEY: &str = "<default>";
 
 /// A running HTTP listener.
 pub struct HttpListener {
-    listener: tokio::net::TcpListener,
+    /// The endpoint as configured, for the startup line and for the case a unix socket path
+    /// describes better than any address could.
+    address: String,
+    listener: BoundListener,
     front_end: Arc<FrontEnd>,
     /// TLS, when `[server.tls]` is configured. `None` is a plaintext listener, and that is
     /// the whole of the cost when TLS is off: no accept wrapping, no peek, no TLS type built.
@@ -727,6 +873,97 @@ pub struct HttpListener {
     /// connection takes, which is what nginx's `ssl_preread` does — a TLS record always begins
     /// `0x16`, a plaintext request begins an ASCII method letter.
     accept_plain: bool,
+}
+
+/// The socket an HTTP listener bound, over either transport.
+///
+/// Two shapes and one accept loop: the front-end is reached at `host:port` by a client or at
+/// `unix:/run/volucer.sock` by the reverse proxy it is benchmarked against, and every step after
+/// `accept` — the TLS peek, the drain registry, site resolution, the static layer — is identical. A
+/// second copy of that loop per transport is how a fix lands on a TCP socket and not on a unix one.
+///
+/// The unix arm is absent on Windows, where there is no unix socket to bind. The `Listener` config
+/// type still parses the spelling, because a shared settings file has to be *readable* everywhere;
+/// what changes is that `bind` refuses it here, with the message the operator needs.
+///
+/// `local_addr` is deliberately an `Option` rather than a sentinel: a unix socket has no port and no
+/// IP, and both are read by something that must not see a fake. `sites.addresses`,
+/// `redirect_to_https` and `SERVER_PORT` all derive from the local address, and a listener that
+/// reported `0` would emit `https://host:0` to every client a redirect touched.
+enum BoundListener {
+    Tcp(tokio::net::TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener, std::path::PathBuf),
+}
+
+impl BoundListener {
+    /// Accept one connection, over whichever transport this listener bound.
+    async fn accept(&self) -> std::io::Result<Accepted> {
+        match self {
+            BoundListener::Tcp(listener) => listener
+                .accept()
+                .await
+                .map(|(stream, _peer)| Accepted::from_tcp(stream)),
+            #[cfg(unix)]
+            BoundListener::Unix(listener, _) => listener
+                .accept()
+                .await
+                .map(|(stream, _peer)| Accepted::from_unix(stream)),
+        }
+    }
+
+    /// The port this listener answers on, when it has one.
+    fn port(&self) -> Option<u16> {
+        match self {
+            BoundListener::Tcp(listener) => listener.local_addr().ok().map(|address| address.port()),
+            #[cfg(unix)]
+            BoundListener::Unix(..) => None,
+        }
+    }
+
+    /// The local address, for a caller that asked for port 0 or wants to log where it bound.
+    ///
+    /// `None` for a unix socket. This is the same shape `crates/volucer-server/src/rpc.rs` uses, and
+    /// for the same reason: there is no honest `SocketAddr` to return.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        match self {
+            BoundListener::Tcp(listener) => listener.local_addr().ok(),
+            #[cfg(unix)]
+            BoundListener::Unix(..) => None,
+        }
+    }
+
+    /// Remove the socket file, once nothing is answering on it any more.
+    fn unlink(&self) {
+        #[cfg(unix)]
+        if let BoundListener::Unix(_, path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// What a listener's own socket says about the requests arriving on it.
+///
+/// Grouped rather than passed as three arguments, because the three travel together and one of them
+/// changes shape: a TCP listener has a port and a reachable IP, and a unix socket has neither. A
+/// request served over a socket with no port must not be told a port — `SERVER_PORT` reaching PHP as
+/// an invented number is the kind of value an application builds an absolute URL from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalAddress {
+    /// The port this listener is bound to, for `SERVER_PORT` and for a redirect's authority.
+    ///
+    /// `None` on a unix socket. It is threaded through as an `Option` all the way to
+    /// [`split_host`] rather than defaulted, because the fallback for a request that sent no `Host`
+    /// is `localhost`, and `localhost:` with no port is the truthful answer for a socket that has
+    /// none.
+    pub(crate) port: Option<u16>,
+    /// The port a redirect should name, when it differs from this listener's own.
+    ///
+    /// `None` here means "this listener cannot redirect at all", which is the unix socket's answer:
+    /// there is no `https://` endpoint on a path, so a cleartext request to a site that asks for TLS
+    /// has nowhere to be sent. `Some(None)` would be a third state with no meaning, so the outer
+    /// `Option` is the listener's capability and the inner one is the target port.
+    pub(crate) https_port: Option<Option<u16>>,
 }
 
 /// A running HTTP listener on a dedicated runtime thread.
@@ -743,7 +980,14 @@ pub struct HttpListener {
 pub struct RunningHttp {
     shutdown: HttpShutdown,
     thread: Option<std::thread::JoinHandle<()>>,
-    address: SocketAddr,
+    /// The bound TCP address, or `None` for a unix socket.
+    address: Option<SocketAddr>,
+    /// The endpoint as configured, which is what a unix socket has in place of an address.
+    ///
+    /// Kept rather than derived, because a socket path is not an address: `serve` prints this when
+    /// `address` is absent, and inventing a `SocketAddr` to print instead would name a port that
+    /// does not exist.
+    configured: String,
     stats: Arc<HttpStats>,
     /// What a reload replaces, taken before the listener moved onto its thread.
     reload: ReloadHandle,
@@ -792,7 +1036,11 @@ impl RunningHttp {
         let listener = runtime.block_on(HttpListener::bind_with_resolver(
             address, dispatcher, handles, limits, settings,
         ))?;
-        let bound = listener.local_addr()?;
+        // The configured endpoint, and the bound address beside it: a unix socket has the former and
+        // not the latter, and reporting `(unix:/run/volucer.sock)` where a `SocketAddr` is expected
+        // would be a number nobody could match to their file.
+        let configured = listener.configured_address().to_string();
+        let bound = listener.local_addr();
         let shutdown = listener.shutdown_handle();
         let stats = listener.stats();
         // Before `run` consumes the listener, and that is the only moment it can be taken.
@@ -810,14 +1058,22 @@ impl RunningHttp {
             shutdown,
             thread: Some(thread),
             address: bound,
+            configured,
             stats,
             reload,
         })
     }
 
     /// The address actually bound.
-    pub fn local_addr(&self) -> SocketAddr {
+    ///
+    /// `None` for a unix socket, which has no address. See [`RunningHttp::configured_address`].
+    pub fn local_addr(&self) -> Option<SocketAddr> {
         self.address
+    }
+
+    /// The endpoint as configured, which is what a unix socket has in place of an address.
+    pub fn configured_address(&self) -> &str {
+        &self.configured
     }
 
     /// A handle that replaces what this listener is serving, without a restart.
@@ -1026,26 +1282,25 @@ impl HttpListener {
             }
         };
 
-        let listener = tokio::net::TcpListener::bind(address)
-            .await
-            .map_err(|source| HttpError::Bind {
-                address: address.to_string(),
-                source,
-            })?;
-        let bound = listener.local_addr().map_err(|source| HttpError::Bind {
-            address: address.to_string(),
-            source,
-        })?;
+        let listener = bind_listener(address).await?;
+        // The bound port, which matters when port 0 was requested. The port is needed here rather
+        // than by the caller because only the listener knows what it got, and it is `None` for a
+        // unix socket — which has no port to report and must not be given one to report.
+        let port = listener.port();
 
-        // The bound port, which matters when port 0 was requested. The port is needed
-        // here rather than by the caller because only the listener knows what it got.
-        let port = bound.port();
-        // A redirect names the `https` port when there is a separate one, and this listener's
-        // own port when TLS shares it. `unwrap_or(port)` covers both, because `bind` sets
-        // `https_port` only for the split case — and with TLS on this port, redirecting
-        // cleartext to `https://host:this-port` is a real redirect to a real endpoint, not a
-        // loop, since the client comes back speaking TLS.
-        let https_port = requested_https_port.unwrap_or(port);
+        // A redirect names the `https` port when there is a separate one, and this listener's own
+        // port when TLS shares it. `requested_https_port.unwrap_or(port)` covers both, because
+        // `bind` sets `https_port` only for the split case — and with TLS on this port, redirecting
+        // cleartext to `https://host:this-port` is a real redirect to a real endpoint, not a loop,
+        // since the client comes back speaking TLS.
+        //
+        // `None` for the whole value on a listener with no port: a unix socket cannot be redirected
+        // to an `https://` endpoint, so the capability is absent rather than false. Every reader
+        // below treats that as "no redirect", which is the truthful answer.
+        let local = LocalAddress {
+            port,
+            https_port: port.map(|port| Some(requested_https_port.unwrap_or(port))),
+        };
 
         // Which sites redirect is the *site table's* answer, so the report is derived from the
         // same table the request path reads rather than from a listener flag. A listener only
@@ -1058,7 +1313,7 @@ impl HttpListener {
             .collect();
         if accept_plain && !redirecting.is_empty() {
             tracing::info!(
-                https_port,
+                https_port = ?local.https_port,
                 sites = %redirecting.join(", "),
                 "cleartext requests will be answered with a 301 to https for these sites"
             );
@@ -1084,14 +1339,20 @@ impl HttpListener {
         };
         let state = Arc::new(Swappable::new(Reloaded::from_sites(
             handles.shared.sites(),
-            port,
+            local.port,
             grpc_grants,
         )));
         handles
             .registry
-            .register(RegisteredFrontEnd::new(Arc::clone(&state), port));
+            .register(RegisteredFrontEnd::new(Arc::clone(&state), local.port));
+
+        // The drain budget is a *socket* decision, like the ports above: it belongs to the
+        // listener an operator stopped rather than to any site it serves, so it travels on the
+        // settings rather than on the site table a reload replaces.
+        let shutdown_timeout = settings.shutdown_timeout;
 
         Ok(HttpListener {
+            address: address.to_string(),
             listener,
             front_end: Arc::new(FrontEnd::new(
                 dispatcher,
@@ -1099,12 +1360,12 @@ impl HttpListener {
                 state,
                 resolver,
                 limits,
-                port,
-                Some(https_port),
+                local,
                 Arc::clone(&handles.observe),
                 Arc::clone(&handles.client_ip),
                 Arc::clone(&handles.rate_limit),
                 alt_svc,
+                shutdown_timeout,
             )),
             tls: acceptor,
             accept_plain,
@@ -1135,13 +1396,16 @@ impl HttpListener {
     }
 
     /// The address actually bound, which matters when port 0 was requested.
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|source| HttpError::Bind {
-                address: "<listener>".to_string(),
-                source,
-            })
+    ///
+    /// `None` for a unix socket, which has no address to report. The caller that prints a startup
+    /// line names the configured path in that case — see [`HttpListener::configured_address`].
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// The endpoint as configured, which is what a unix socket has in place of an address.
+    pub fn configured_address(&self) -> &str {
+        &self.address
     }
 
     /// A handle that stops the listener from another thread.
@@ -1170,15 +1434,15 @@ impl HttpListener {
             front_end,
             tls,
             accept_plain,
+            ..
         } = self;
 
         while !front_end.shutdown.load(Ordering::Relaxed) {
-            match tokio::time::timeout(ACCEPT_POLL, listener.accept()).await {
-                Ok(Ok((stream, peer))) => {
+            match tokio::time::timeout(ACCEPT_POLL, listener.accept()).await {                            Ok(Ok(stream)) => {
                     let active = front_end.stats.connections.fetch_add(1, Ordering::Relaxed) + 1;
                     if active > front_end.limits.max_connections {
                         front_end.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(%peer, active, "refusing an HTTP connection: at the limit");
+                    tracing::warn!(active, "refusing an HTTP connection: at the limit");
                         drop(stream);
                         continue;
                     }
@@ -1190,18 +1454,40 @@ impl HttpListener {
                     // tell `135.181.172.123` from `192.168.9.123` on that same socket. Reading it
                     // here rather than in `prepare` keeps it off the request path — it is one
                     // `getsockname` per *connection*, and keep-alive means many requests each.
-                    let local = stream.local_addr().ok().map(|address| address.ip());
+                    //
+                    // `None` on a unix socket, which has no local IP: a site bound to an address
+                    // cannot match it, which is correct — there is no address, so a binding by
+                    // address has nothing to match.
+                    let local = stream.local_addr_ip();
 
                     // Nagle's algorithm is disabled on the raw socket, which is the one place
                     // it can be: the stream is wrapped by TLS from here on, and a `TlsStream`
                     // has no `set_nodelay`.
-                    let _ = stream.set_nodelay(true);
-                    let front_end = Arc::clone(&front_end);
+                    stream.set_nodelay();
+                    let front_end_run = Arc::clone(&front_end);
+                    // Registered **before** the task is spawned, so a stop that arrives between
+                    // these two lines still finds the connection in the registry. The reverse order
+                    // would leave a connection that the drain neither waits for nor cancels — and
+                    // it would be the one accepted at the instant of the signal, which is exactly
+                    // the request a rolling deploy is most likely to lose.
+                    let (connection_id, token) =
+                        front_end.connections.register(&front_end.shutdown);
                     let tls = tls.clone();
                     tokio::spawn(async move {
-                        serve_accepted(stream, tls, accept_plain, front_end.clone(), peer, local)
-                            .await;
-                        front_end.stats.connections.fetch_sub(1, Ordering::Relaxed);
+                        serve_accepted(
+                            stream,
+                            tls,
+                            accept_plain,
+                            Arc::clone(&front_end_run),
+                            local,
+                            token,
+                        )
+                        .await;
+                        front_end_run.connections.forget(connection_id);
+                        front_end_run
+                            .stats
+                            .connections
+                            .fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Ok(Err(source)) => {
@@ -1216,6 +1502,20 @@ impl HttpListener {
             }
         }
 
+        // **Accepting has stopped; the requests that were already running have not.**
+        //
+        // This is the half that was missing: leaving the loop above used to *return*, which dropped
+        // the runtime on the listener thread, which cancelled every spawned connection task — a
+        // stop truncated whatever was in flight, including a response half-written. The drain below
+        // asks each connection to finish its current request, then waits for them, then reports.
+        drain_connections(&front_end).await;
+
+        // **The socket file goes last**, after the drain has finished. A path removed while the
+        // socket is still answering would leave it reachable by the descriptors already open to it
+        // and by nothing else, so a client that had not yet connected would find nothing there
+        // while this process was still serving. TCP listeners have nothing to remove.
+        listener.unlink();
+
         let (connections, requests, rejected, failed) = front_end.stats.snapshot();
         tracing::info!(
             connections,
@@ -1225,6 +1525,79 @@ impl HttpListener {
             "http listener stopped"
         );
         Ok(())
+    }
+}
+
+/// Finish the requests that are already running, then give up on the rest.
+///
+/// Two phases, and the order is the correctness of it:
+///
+/// 1. **Cancel every connection's token.** Each connection task is selecting on it and responds by
+///    calling `hyper`'s `graceful_shutdown`, which stops the connection accepting *new* requests and
+///    lets the one in flight write its whole response. Nothing is closed abruptly in this phase.
+/// 2. **Wait, up to the deadline.** The connection count reaching zero is the signal that the last
+///    response has been written. An idle keep-alive connection also finishes here, because `hyper`
+///    completes an idle connection as soon as it observes the shutdown rather than waiting for the
+///    deadline — so the common case is a drain that takes microseconds, not thirty seconds.
+///
+/// When the deadline expires, whatever is left is *reported and then abandoned*: the caller drops
+/// the runtime, which cancels the remaining tasks. Abandoning silently would make a truncated
+/// response indistinguishable from a fast one; the `warn` is the whole difference.
+///
+/// `shutdown_timeout = 0` skips the wait entirely, which is a deliberate way to say "recycle
+/// instantly and accept the truncation".
+async fn drain_connections(front_end: &FrontEnd) {
+    drain_until(
+        &front_end.connections,
+        front_end.shutdown_timeout,
+    )
+    .await;
+}
+
+/// The drain, over the two things it actually reads.
+///
+/// Split from [`drain_connections`] so it can be driven by a test without a socket, a runtime thread
+/// or an accept loop — the timing that made the first version of this test pass against a listener
+/// with the drain commented out. What is under test is the *rule* (cancel, then wait, then report),
+/// not the plumbing that reaches it.
+async fn drain_until(connections: &ConnectionRegistry, deadline: Duration) {
+    connections.cancel_all();
+
+    if deadline.is_zero() {
+        let open = connections.open_count();
+        if open > 0 {
+            tracing::warn!(
+                open,
+                "shutdown_timeout is zero, so {open} in-flight request(s) were abandoned"
+            );
+        }
+        return;
+    }
+
+    // Polled rather than notified: the count is a `Mutex<Vec<…>>` the connection task shrinks on
+    // its way out, and a notification would need a second piece of state to avoid the lost-wakeup
+    // window between "check the count" and "start waiting". Ten milliseconds is far below the
+    // resolution of the deadline and costs one lock when the registry is already empty.
+    const POLL: Duration = Duration::from_millis(10);
+    let started = tokio::time::Instant::now();
+    loop {
+        let open = connections.open_count();
+        if open == 0 {
+            tracing::debug!(
+                waited_ms = started.elapsed().as_millis() as u64,
+                "in-flight requests drained"
+            );
+            return;
+        }
+        if started.elapsed() >= deadline {
+            tracing::warn!(
+                open,
+                deadline_ms = deadline.as_millis() as u64,
+                "shutdown deadline reached, abandoning {open} in-flight request(s)"
+            );
+            return;
+        }
+        tokio::time::sleep(POLL).await;
     }
 }
 
@@ -1248,27 +1621,28 @@ const TLS_HANDSHAKE_BYTE: u8 = 0x16;
 /// connection goes down one path or the other, and a client that offers TLS and fails the
 /// handshake still fails. There is no retry as cleartext.
 async fn serve_accepted(
-    stream: tokio::net::TcpStream,
+    stream: Accepted,
     tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
     accept_plain: bool,
     front_end: Arc<FrontEnd>,
-    peer: SocketAddr,
     local: Option<std::net::IpAddr>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
+    let peer = stream.peer();
     let Some(acceptor) = tls else {
-        if let Err(err) = serve_connection(stream, front_end, peer, local, true).await {
-            tracing::debug!(%peer, %err, "http connection ended");
+        if let Err(err) = serve_connection(stream, front_end, peer, local, true, stop).await {
+            tracing::debug!(peer = ?peer, %err, "http connection ended");
         }
         return;
     };
 
-    if accept_plain && !starts_with_tls_handshake(&stream).await {
+    if accept_plain && !stream.starts_with_tls_handshake().await {
         front_end
             .stats
             .plaintext_on_tls_port
             .fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = serve_connection(stream, front_end, peer, local, true).await {
-            tracing::debug!(%peer, %err, "http connection ended");
+        if let Err(err) = serve_connection(stream, front_end, peer, local, true, stop).await {
+            tracing::debug!(peer = ?peer, %err, "http connection ended");
         }
         return;
     }
@@ -1277,8 +1651,10 @@ async fn serve_accepted(
         Ok(tls_stream) => {
             front_end.stats.handshakes.fetch_add(1, Ordering::Relaxed);
             // `false`: this connection is already encrypted, so a redirect would loop it.
-            if let Err(err) = serve_connection(tls_stream, front_end, peer, local, false).await {
-                tracing::debug!(%peer, %err, "https connection ended");
+            if let Err(err) =
+                serve_connection(tls_stream, front_end, peer, local, false, stop).await
+            {
+                tracing::debug!(peer = ?peer, %err, "https connection ended");
             }
         }
         // A failed handshake is not an error worth propagating: it is a client that could not
@@ -1289,20 +1665,235 @@ async fn serve_accepted(
                 .stats
                 .handshake_failures
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%peer, %err, "tls handshake failed");
+            tracing::debug!(peer = ?peer, %err, "tls handshake failed");
         }
     }
 }
 
-/// Whether a connection begins with a TLS handshake.
+/// A connection the accept loop produced, over either transport.
 ///
-/// `peek` reads without consuming, so the bytes are still there for whichever path runs next.
-/// A read that fails or returns nothing is *not* a TLS handshake: there is no request to serve
-/// either way, and treating a dead connection as TLS would only turn a clean close into a
-/// handshake error.
-async fn starts_with_tls_handshake(stream: &tokio::net::TcpStream) -> bool {
-    let mut first = [0u8; 1];
-    matches!(stream.peek(&mut first).await, Ok(1) if first[0] == TLS_HANDSHAKE_BYTE)
+/// `peer` is an `Option` because a unix socket has no peer address: the kernel reports none, and a
+/// client on the same host is not reachable at an address in the sense `REMOTE_ADDR` means. `None`
+/// is threaded all the way to the CGI environment rather than filled with a stand-in, because
+/// `0.0.0.0` would tell an application that a request came from a host that cannot exist — the same
+/// reason [`LocalAddress::port`] is absent rather than zero.
+enum Accepted {
+    Tcp(tokio::net::TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl Accepted {
+    /// From whichever socket the listener accepted.
+    fn from_tcp(stream: tokio::net::TcpStream) -> Self {
+        Accepted::Tcp(stream)
+    }
+
+    #[cfg(unix)]
+    fn from_unix(stream: tokio::net::UnixStream) -> Self {
+        Accepted::Unix(stream)
+    }
+
+    /// The peer's address, when the transport has one.
+    fn peer(&self) -> Option<SocketAddr> {
+        match self {
+            Accepted::Tcp(stream) => stream.peer_addr().ok(),
+            // A unix socket peer is unnamed, and there is no address to report. This is not a
+            // failure of `peer_addr` — there is nothing to fail to read.
+            #[cfg(unix)]
+            Accepted::Unix(_) => None,
+        }
+    }
+
+    /// The local IP this connection arrived on, for a site's `addresses` binding.
+    ///
+    /// `None` for a unix socket, which has no IP. A site bound to an address then matches nothing,
+    /// which is the truthful answer: the connection did not arrive on an address.
+    fn local_addr_ip(&self) -> Option<std::net::IpAddr> {
+        match self {
+            Accepted::Tcp(stream) => stream.local_addr().ok().map(|address| address.ip()),
+            #[cfg(unix)]
+            Accepted::Unix(_) => None,
+        }
+    }
+
+    /// `TCP_NODELAY` where there is a TCP stack to set it on.
+    ///
+    /// A unix socket has none, and the option is `ENOPROTOOPT` there. Called before TLS wraps the
+    /// stream, which is the only point it can be: a `TlsStream` has no `set_nodelay`.
+    fn set_nodelay(&self) {
+        // `match` rather than `if let`: on Windows the `Unix` arm is compiled out, so an `if let`
+        // would be an irrefutable pattern there and a warning on every build.
+        match self {
+            Accepted::Tcp(stream) => {
+                let _ = stream.set_nodelay(true);
+            }
+            #[cfg(unix)]
+            Accepted::Unix(_) => {}
+        }
+    }
+
+    /// Whether the first byte is a TLS handshake record, without consuming it.
+    async fn starts_with_tls_handshake(&self) -> bool {
+        let mut first = [0u8; 1];
+        match self {
+            Accepted::Tcp(stream) => {
+                matches!(stream.peek(&mut first).await, Ok(1) if first[0] == TLS_HANDSHAKE_BYTE)
+            }
+            // Refused by `Config::validate` and by `bind_listener` before a socket exists, so this is
+            // unreachable — written as `false` rather than `unreachable!()` so that loosening either
+            // check could never become a panic inside a connection task.
+            #[cfg(unix)]
+            Accepted::Unix(_) => false,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Accepted {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Accepted::Tcp(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            #[cfg(unix)]
+            Accepted::Unix(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Accepted {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Accepted::Tcp(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            #[cfg(unix)]
+            Accepted::Unix(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Accepted::Tcp(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            #[cfg(unix)]
+            Accepted::Unix(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Accepted::Tcp(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            #[cfg(unix)]
+            Accepted::Unix(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Accepted::Tcp(stream) => stream.is_write_vectored(),
+            #[cfg(unix)]
+            Accepted::Unix(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Accepted::Tcp(stream) => std::pin::Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(unix)]
+            Accepted::Unix(stream) => std::pin::Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+}
+
+/// Bind the endpoint a listener was configured with.
+///
+/// A unix path is a *file*: a path left behind by a crash makes the next bind fail with `EADDRINUSE`
+/// and the restarted server could never come up, so it is unlinked first. That is safe because this
+/// process is meant to be the only listener on that path — a live server holds the socket, and the
+/// bind fails rather than two processes sharing one address.
+///
+/// TLS and HTTP/3 refuse `unix:` before this is reached, in `Config::validate`: neither has a
+/// meaningful unix-socket story here, and refusing in the configuration is what keeps `volucer check`
+/// honest.
+async fn bind_listener(address: &str) -> Result<BoundListener> {
+    let parsed = volucer_core::config::parse_listener(address).map_err(|reason| HttpError::Bind {
+        address: address.to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
+    })?;
+    match parsed {
+        volucer_core::config::Listener::Tcp(socket) => tokio::net::TcpListener::bind(socket)
+            .await
+            .map(BoundListener::Tcp)
+            .map_err(|source| HttpError::Bind {
+                address: address.to_string(),
+                source,
+            }),
+        volucer_core::config::Listener::Unix(path) => bind_unix_listener(address, &path).await,
+    }
+}
+
+#[cfg(unix)]
+async fn bind_unix_listener(address: &str, path: &std::path::Path) -> Result<BoundListener> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(HttpError::Bind {
+                address: address.to_string(),
+                source,
+            })
+        }
+    }
+    // The kernel truncates a longer `sun_path` rather than failing, which would bind a path nobody
+    // asked for — so the bound path and the written one would differ and the difference would be
+    // invisible.
+    let length = path.as_os_str().len();
+    if length > volucer_core::config::UNIX_SOCKET_PATH_MAX {
+        return Err(HttpError::Bind {
+            address: address.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "this path is {length} bytes and the platform allows at most {}",
+                    volucer_core::config::UNIX_SOCKET_PATH_MAX
+                ),
+            ),
+        });
+    }
+    tokio::net::UnixListener::bind(path)
+        .map(|listener| BoundListener::Unix(listener, path.to_path_buf()))
+        .map_err(|source| HttpError::Bind {
+            address: address.to_string(),
+            source,
+        })
+}
+
+/// Refuse a unix socket on a platform that has none, naming the alternative.
+#[cfg(not(unix))]
+async fn bind_unix_listener(address: &str, path: &std::path::Path) -> Result<BoundListener> {
+    let _ = path;
+    Err(HttpError::Bind {
+        address: address.to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unix sockets are not available on this platform; use a loopback address such as \
+             127.0.0.1:8080",
+        ),
+    })
 }
 
 /// Serve every request on one connection until it closes.
@@ -1315,9 +1906,10 @@ async fn starts_with_tls_handshake(stream: &tokio::net::TcpStream) -> bool {
 async fn serve_connection<S>(
     stream: S,
     front_end: Arc<FrontEnd>,
-    peer: SocketAddr,
+    peer: Option<SocketAddr>,
     local: Option<std::net::IpAddr>,
     cleartext: bool,
+    stop: tokio_util::sync::CancellationToken,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1327,7 +1919,12 @@ where
     // and not the port: the policy is about the *host*, and the client's port is not sent to the
     // backend at all, so a `REMOTE_PORT` that was really the proxy's is a reader this deliberately
     // does not create.
-    let peer_ip = peer.ip();
+    //
+    // `None` on a unix socket: there is no peer address, so there is no address to trust and no
+    // header to read — the policy resolves to itself, and "itself" does not exist. That is the
+    // honest answer, and it is why the value travels as an `Option` all the way to the CGI
+    // environment instead of being defaulted to a loopback address an application would believe.
+    let peer_ip = peer.map(|peer| peer.ip());
     let service = service_fn(move |request: Request<Incoming>| {
         let front_end = Arc::clone(&front_end);
         // Infallible because a failure is turned into an error page, not
@@ -1338,17 +1935,21 @@ where
             // separately is how the two come to disagree, which is a log that contradicts what the
             // application was told. It is inside the closure rather than outside because the headers
             // are what it reads.
-            let resolved = front_end
-                .client_ip
-                .resolve(peer_ip, &HttpHeaders(request.headers()));
-            let remote_addr = resolved.to_string();
+            //
+            // `Option`: a unix socket has no peer address, so there is nothing to trust and no
+            // forwarded header this server may believe. The policy is only consulted when there is a
+            // peer to consult it about — which is the same answer it would give for an untrusted
+            // peer, arrived at without pretending an address exists.
+            let resolved = peer_ip.map(|peer_ip| {
+                front_end
+                    .client_ip
+                    .resolve(peer_ip, &HttpHeaders(request.headers()))
+            });
             // The one place this transport's body is named. `hyper`'s server accepts any body
             // type, so `Incoming` reaching `handle` would have been fine too — it is wrapped so
             // that the request path below has exactly one body type to be written against.
             let request = request.map(Payload::Streamed);
-            Ok::<_, Infallible>(
-                handle(request, front_end, remote_addr, resolved, local, cleartext).await,
-            )
+            Ok::<_, Infallible>(handle(request, front_end, resolved, local, cleartext).await)
         }
     });
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -1367,10 +1968,33 @@ where
         .keep_alive(true)
         .header_read_timeout(Some(KEEPALIVE_TIMEOUT));
 
-    builder
-        .serve_connection(TokioIo::new(stream), service)
-        .await
-        .map_err(|source| HttpError::BadGateway(format!("connection failed: {source}")))
+    let mut connection = std::pin::pin!(builder.serve_connection(TokioIo::new(stream), service));
+
+    // **The drain, from the inside.** This future is owned by this task, so the graceful shutdown
+    // can only be initiated here — that is why the registry hands out a token rather than cancelling
+    // the connection from outside. `select!` is the whole mechanism: whichever finishes first ends
+    // the connection, and the loop exits normally either way.
+    //
+    // `graceful_shutdown` stops the connection accepting *new* requests and lets the one already
+    // in flight write its entire response. Without this the token would only be a way to notice the
+    // stop, and the response would still be cut — which is the bug this exists to fix.
+    let outcome = {
+        let shutdown = &mut connection;
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                shutdown.as_mut().graceful_shutdown();
+                // Polled to completion *after* asking: a connection whose in-flight response is
+                // already finished resolves on the next poll, and one that is mid-write runs until
+                // the write completes. The outer drain deadline is what bounds this, because the
+                // runtime is dropped when it expires.
+                shutdown.await
+            }
+            outcome = shutdown.as_mut() => outcome,
+        }
+    };
+
+    outcome.map_err(|source| HttpError::BadGateway(format!("connection failed: {source}")))
 }
 
 /// Serve one request that arrived over a transport whose body is already in memory.
@@ -1397,16 +2021,20 @@ pub(crate) async fn handle_http3(
     let resolved = front_end
         .client_ip
         .resolve(peer.ip(), &HttpHeaders(request.headers()));
-    let remote_addr = resolved.to_string();
-    handle(request, front_end, remote_addr, resolved, local, false).await
+    handle(request, front_end, Some(resolved), local, false).await
 }
 
 /// Serve one request, mapping any failure to an error page.
+///
+/// `resolved_peer` is the client's address as `[server.proxy]` resolved it, or `None` when the
+/// transport has no peer address at all — a unix socket. It is an `Option` rather than a sentinel
+/// because three readers use it and each has a different honest answer for its absence: the access
+/// log writes no peer, the rate limiter keys on nothing rather than on a shared bucket, and
+/// `REMOTE_ADDR` is omitted rather than handed an address that cannot exist.
 async fn handle(
     request: Request<Payload>,
     front_end: Arc<FrontEnd>,
-    remote_addr: String,
-    resolved_peer: std::net::IpAddr,
+    resolved_peer: Option<std::net::IpAddr>,
     local: Option<std::net::IpAddr>,
     cleartext: bool,
 ) -> Response<ResponseBody> {
@@ -1431,13 +2059,11 @@ async fn handle(
     let host = request_host(request.headers(), request.uri()).map(str::to_owned);
     let user_agent = header_str(request.headers(), "user-agent").map(str::to_owned);
     let referer = header_str(request.headers(), "referer").map(str::to_owned);
-    let peer: Option<std::net::IpAddr> = remote_addr.parse().ok();
 
     let mut hsts: Option<volucer_core::config::HstsPolicy> = None;
     let mut response = match prepare(
         request,
         &front_end,
-        remote_addr,
         resolved_peer,
         local,
         cleartext,
@@ -1554,7 +2180,7 @@ async fn handle(
                     method: &method,
                     target: &target,
                     protocol: &protocol,
-                    peer,
+                    peer: resolved_peer,
                     host: host.as_deref(),
                     user_agent: user_agent.as_deref(),
                     referer: referer.as_deref(),
@@ -1651,7 +2277,11 @@ impl volucer_core::HeaderLookup for HttpHeaders<'_> {
 /// So the port is replaced rather than kept: the target's own port when one is configured, the
 /// listener's own when TLS shares this port, and none at all when it is the default 443 (a bare
 /// authority is what a browser expects, and `:443` in a URL is noise).
-fn redirect_authority(host: &str, https_port: Option<u16>, own_port: u16) -> String {
+///
+/// `own_port` is `None` on a listener with no port — a unix socket. That cannot be reached here,
+/// because such a listener has no redirect capability at all and `prepare` returns before building
+/// a target; it is `Option` so the arithmetic above cannot be handed a number that does not exist.
+fn redirect_authority(host: &str, https_port: Option<u16>, own_port: Option<u16>) -> String {
     // Everything before the port, so an IPv6 literal's brackets and colons survive.
     let name = match host.rsplit_once(':') {
         Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
@@ -1661,7 +2291,9 @@ fn redirect_authority(host: &str, https_port: Option<u16>, own_port: u16) -> Str
     };
     let name = if name.is_empty() { "localhost" } else { name };
 
-    let port = https_port.unwrap_or(own_port);
+    let Some(port) = https_port.or(own_port) else {
+        return name.to_string();
+    };
     if port == 443 {
         name.to_string()
     } else {
@@ -1698,14 +2330,18 @@ impl From<HttpError> for BackendFailure {
 async fn prepare(
     request: Request<Payload>,
     front_end: &Arc<FrontEnd>,
-    remote_addr: String,
-    resolved_peer: std::net::IpAddr,
+    resolved_peer: Option<std::net::IpAddr>,
     local: Option<std::net::IpAddr>,
     cleartext: bool,
     hsts: &mut Option<volucer_core::config::HstsPolicy>,
     context: &volucer_observe::RequestContext,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
+    // The peer address as the CGI environment and the origin header write it. `None` on a socket with
+    // no peer, and it stays absent all the way down rather than becoming an empty string: an
+    // application reading `REMOTE_ADDR` should see that there is no address, and `""` is a value it
+    // might parse into something.
+    let remote_addr = resolved_peer.map(|address| address.to_string());
 
     // **The rate limit is the first thing consulted, and before anything that costs work.**
     // Before the redirect, before the site table, before the static layer's `stat`, and above all
@@ -1714,23 +2350,28 @@ async fn prepare(
     // spending the server's work, so a check that ran after some of that work would be a limit on
     // the *remainder*.
     //
-    // `resolved_peer` and not `remote_addr`: the identity is the address `[server.proxy]`
+    // `resolved_peer` and not the socket peer: the identity is the address `[server.proxy]`
     // resolved, which is why that table was built before this one. A limit keyed on the socket peer
     // behind nginx would throttle the proxy and could not tell two clients apart.
+    //
+    // With no peer — a unix socket — there is no address to key on, so an IP-keyed limit has no
+    // identity and the request is not counted. The alternative would be one bucket shared by every
+    // caller on the socket, which reads as a working per-caller limit and is a global one.
     if let Some(limit) = front_end.rate_limit.load().as_ref() {
         let identity = match limit.key() {
-            volucer_core::KeyMode::Global => volucer_core::Identity::Global,
-            volucer_core::KeyMode::Ip => volucer_core::Identity::Address(resolved_peer),
-            volucer_core::KeyMode::Header => volucer_core::Identity::Header(
+            volucer_core::KeyMode::Global => Some(volucer_core::Identity::Global),
+            volucer_core::KeyMode::Ip => resolved_peer.map(volucer_core::Identity::Address),
+            volucer_core::KeyMode::Header => Some(volucer_core::Identity::Header(
                 limit
                     .header()
                     .and_then(|name| header_str(&parts.headers, name))
                     .unwrap_or_default(),
-            ),
+            )),
         };
-        if let volucer_core::Verdict::Limited { retry_after, .. } =
-            limit.check(identity, Instant::now())
-        {
+        // An IP-keyed limit with no peer address has no identity, so there is no bucket and no
+        // decision to make. See the comment above.
+        let verdict = identity.map(|identity| (identity, limit.check(identity, Instant::now())));
+        if let Some((_, volucer_core::Verdict::Limited { retry_after, .. })) = verdict {
             // **A limited gRPC call is refused as a gRPC failure, not as an HTTP 429.** The protocol
             // is known here and cannot be recovered later — `error_response` sees only the error,
             // and the request has been consumed by this point — so the branch is decided while the
@@ -1785,11 +2426,22 @@ async fn prepare(
         (resolved.routing, resolved.statics, resolved.compression);
 
     if cleartext && site.redirect_to_https {
-        let authority = redirect_authority(
-            host.unwrap_or_default(),
-            front_end.https_port,
-            front_end.server_port,
-        );
+        // **A listener with no port cannot redirect at all**, and a unix socket is that listener.
+        // There is no `https://host:port` on a path, so there is nowhere to send the client: the
+        // answer is the request as it stands rather than a `Location` naming a port that does not
+        // exist. `None` here is the outer capability, not a missing port.
+        let Some(https_port) = front_end.https_port else {
+            // Refused configuration, not a runtime choice: `validate` refuses `redirect_to_https`
+            // with nothing that serves cleartext, and this listener is cleartext. Reached only if a
+            // site table was built by hand with the key set, so it falls through to serving.
+            return Err(HttpError::BadGateway(
+                "this listener has no port, so it cannot redirect to https; remove \
+                 redirect_to_https for a site served over a unix socket"
+                    .to_string(),
+            ));
+        };
+        let authority =
+            redirect_authority(host.unwrap_or_default(), https_port, front_end.server_port);
         let target = format!(
             "https://{authority}{}",
             parts
@@ -1885,7 +2537,7 @@ async fn prepare(
             &backend,
             parts,
             body,
-            &remote_addr,
+            remote_addr.as_deref(),
             cleartext,
             outbound_traceparent,
         )
@@ -1971,9 +2623,21 @@ async fn prepare(
     let blocking =
         tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
             let mut cgi_request = if skips_stat {
-                to_cgi_routed(&parts, body, &routing, front_end.server_port, &remote_addr)?
+                to_cgi_routed(
+                    &parts,
+                    body,
+                    &routing,
+                    front_end.server_port,
+                    remote_addr.as_deref(),
+                )?
             } else {
-                to_cgi(&parts, body, &routing, front_end.server_port, &remote_addr)?
+                to_cgi(
+                    &parts,
+                    body,
+                    &routing,
+                    front_end.server_port,
+                    remote_addr.as_deref(),
+                )?
             };
             // Replaces whatever `HTTP_TRACEPARENT` the client's own header produced, rather than
             // being added beside it: two `HTTP_TRACEPARENT` entries in one `PARAMS` block is a
@@ -2055,7 +2719,7 @@ async fn upstream(
     backend: &str,
     parts: hyper::http::request::Parts,
     body: Payload,
-    remote_addr: &str,
+    remote_addr: Option<&str>,
     cleartext: bool,
     outbound_traceparent: Option<String>,
 ) -> Result<Response<ResponseBody>> {
@@ -2066,9 +2730,11 @@ async fn upstream(
         .unwrap_or_else(|| "/".parse())
         .map_err(|err| HttpError::BadRequest(format!("the request path is not a URI: {err}")))?;
 
-    // The listener carries the peer's *address* — `remote_addr` is an IP with no port, and the
-    // port of an incoming connection is not part of what this header carries anyway.
-    let peer = remote_addr.parse::<std::net::IpAddr>().ok();
+    // The listener carries the peer's *address* — an IP with no port, and the port of an incoming
+    // connection is not part of what this header carries anyway. `None` on a unix socket, where
+    // there is no client address to forward: an origin told `X-Forwarded-For: ` with an empty value
+    // would resolve the client as the empty string, which is worse than being told nothing.
+    let peer = remote_addr.and_then(|addr| addr.parse::<std::net::IpAddr>().ok());
     // **The header is set before `prepare_request` filters the map**, so the injection goes through
     // the same never-forwarded rule as everything else rather than around it: `traceparent` is not
     // on that list, and a value this server assembled cannot be one a client chose. Replacing rather
@@ -2260,8 +2926,8 @@ pub fn to_cgi(
     parts: &hyper::http::request::Parts,
     body: Vec<u8>,
     routing: &Routing,
-    server_port: u16,
-    remote_addr: &str,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
 ) -> Result<volucer_fcgi::Request> {
     to_cgi_with(parts, body, routing, server_port, remote_addr, false)
 }
@@ -2277,8 +2943,8 @@ pub fn to_cgi_routed(
     parts: &hyper::http::request::Parts,
     body: Vec<u8>,
     routing: &Routing,
-    server_port: u16,
-    remote_addr: &str,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
 ) -> Result<volucer_fcgi::Request> {
     to_cgi_with(parts, body, routing, server_port, remote_addr, true)
 }
@@ -2287,8 +2953,8 @@ fn to_cgi_with(
     parts: &hyper::http::request::Parts,
     body: Vec<u8>,
     routing: &Routing,
-    server_port: u16,
-    remote_addr: &str,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
     allow_no_script: bool,
 ) -> Result<volucer_fcgi::Request> {
     let path = parts.uri.path();
@@ -2357,7 +3023,7 @@ fn to_cgi_with(
         query_string: query.to_string(),
         protocol: protocol_name(parts.version).to_string(),
         headers,
-        remote_addr: remote_addr.to_string(),
+        remote_addr: remote_addr.map(str::to_string),
         server_name,
         server_port,
         body_len,
@@ -2665,13 +3331,18 @@ fn map_cgi_error(err: volucer_fcgi::FcgiError) -> HttpError {
 /// A `Host` without a port is the common case, and an IPv6 literal needs its
 /// brackets stripped before the port can be found, so the naive `rsplit_once`
 /// is not enough on its own.
-fn split_host(host: Option<&str>, fallback_port: u16) -> (String, u16) {
+///
+/// `fallback_port` is `None` on a listener with no port, and the answer is then a bare name rather
+/// than one with an invented number: `SERVER_PORT` becomes `80` (the CGI default, which is what an
+/// application that reads it as a number already expects), while the host stays exactly as the client
+/// wrote it.
+fn split_host(host: Option<&str>, fallback_port: Option<u16>) -> (String, u16) {
     let Some(host) = host else {
-        return ("localhost".to_string(), fallback_port);
+        return ("localhost".to_string(), fallback_port.unwrap_or(80));
     };
     let host = host.trim();
     if host.is_empty() {
-        return ("localhost".to_string(), fallback_port);
+        return ("localhost".to_string(), fallback_port.unwrap_or(80));
     }
 
     if let Some(rest) = host.strip_prefix('[') {
@@ -2680,17 +3351,18 @@ fn split_host(host: Option<&str>, fallback_port: u16) -> (String, u16) {
             let port = tail
                 .strip_prefix(':')
                 .and_then(|port| port.parse().ok())
-                .unwrap_or(fallback_port);
+                .unwrap_or_else(|| fallback_port.unwrap_or(80));
             return (address.to_string(), port);
         }
-        return (host.to_string(), fallback_port);
+        return (host.to_string(), fallback_port.unwrap_or(80));
     }
 
     match host.rsplit_once(':') {
-        Some((name, port)) if !name.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-            (name.to_string(), port.parse().unwrap_or(fallback_port))
-        }
-        _ => (host.to_string(), fallback_port),
+        Some((name, port)) if !name.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => (
+            name.to_string(),
+            port.parse().unwrap_or_else(|_| fallback_port.unwrap_or(80)),
+        ),
+        _ => (host.to_string(), fallback_port.unwrap_or(80)),
     }
 }
 
@@ -2821,8 +3493,8 @@ mod tests {
             &parts("GET", "/about?x=1", Some("example.test")),
             Vec::new(),
             &routing(),
-            8080,
-            "10.0.0.5",
+            Some(8080),
+            Some("10.0.0.5"),
         )
         .expect("a request that routes");
 
@@ -2848,8 +3520,8 @@ mod tests {
             &parts("POST", "/submit", Some("example.test")),
             b"a=1&b=2".to_vec(),
             &routing(),
-            80,
-            "127.0.0.1",
+            Some(80),
+            Some("127.0.0.1"),
         )
         .expect("a request that routes");
 
@@ -2865,8 +3537,8 @@ mod tests {
             &parts("GET", "/", None),
             Vec::new(),
             &routing(),
-            9090,
-            "127.0.0.1",
+            Some(9090),
+            Some("127.0.0.1"),
         )
         .expect("a request that routes");
 
@@ -2877,20 +3549,20 @@ mod tests {
     #[test]
     fn a_host_with_a_port_is_split_into_name_and_port() {
         assert_eq!(
-            split_host(Some("example.test:8443"), 80),
+            split_host(Some("example.test:8443"), Some(80)),
             ("example.test".to_string(), 8443)
         );
         assert_eq!(
-            split_host(Some("example.test"), 80),
+            split_host(Some("example.test"), Some(80)),
             ("example.test".to_string(), 80)
         );
         assert_eq!(
-            split_host(Some("[::1]:8443"), 80),
+            split_host(Some("[::1]:8443"), Some(80)),
             ("::1".to_string(), 8443)
         );
-        assert_eq!(split_host(Some("[::1]"), 80), ("::1".to_string(), 80));
-        assert_eq!(split_host(None, 80), ("localhost".to_string(), 80));
-        assert_eq!(split_host(Some(""), 80), ("localhost".to_string(), 80));
+        assert_eq!(split_host(Some("[::1]"), Some(80)), ("::1".to_string(), 80));
+        assert_eq!(split_host(None, Some(80)), ("localhost".to_string(), 80));
+        assert_eq!(split_host(Some(""), Some(80)), ("localhost".to_string(), 80));
     }
 
     /// An authority-only request names its site, which is what an `h2` or `h3` request looks like.
@@ -2939,8 +3611,8 @@ mod tests {
             &parts("GET", "https://a.test/about", None),
             Vec::new(),
             &routing(),
-            443,
-            "10.0.0.5",
+            Some(443),
+            Some("10.0.0.5"),
         )
         .expect("a request that routes");
 
@@ -2964,7 +3636,7 @@ mod tests {
             .into_parts()
             .0;
 
-        let built = to_cgi(&request, b"{}".to_vec(), &routing(), 80, "127.0.0.1")
+        let built = to_cgi(&request, b"{}".to_vec(), &routing(), Some(80), Some("127.0.0.1"))
             .expect("a request that routes");
 
         assert_eq!(param(&built, "HTTP_X_CUSTOM"), b"yes");
@@ -2993,8 +3665,8 @@ mod tests {
             &parts("GET", "/nope.php", Some("example.test")),
             Vec::new(),
             &routing,
-            80,
-            "127.0.0.1",
+            Some(80),
+            Some("127.0.0.1"),
         )
         .expect_err("no script exists under that root");
 
@@ -3013,8 +3685,8 @@ mod tests {
             &parts("GET", "/.htaccess", Some("example.test")),
             Vec::new(),
             &routing,
-            80,
-            "127.0.0.1",
+            Some(80),
+            Some("127.0.0.1"),
         )
         .expect_err("the path names a forbidden extension");
 
@@ -3230,5 +3902,198 @@ fn the_two_front_ends_default_to_the_same_body_limit() {
     assert_eq!(
         volucer_core::config::DEFAULT_MAX_BODY_BYTES,
         32 * 1024 * 1024
+    );
+}
+
+/// The registry a drain depends on, tested without a socket.
+///
+/// These are the three properties the drain's correctness rests on: a token registered *after* the
+/// stop is asked has already been cancelled (so the race at the accept boundary cannot lose a
+/// connection), forgetting one connection leaves its siblings, and `cancel_all` reaches every one.
+#[test]
+fn a_connection_registered_after_the_stop_is_already_cancelled() {
+    let registry = ConnectionRegistry::new();
+    let stopping = AtomicBool::new(false);
+
+    let (first, first_token) = registry.register(&stopping);
+    assert!(!first_token.is_cancelled());
+
+    // The stop lands between accepting this connection and spawning its task.
+    stopping.store(true, Ordering::SeqCst);
+    let (second, second_token) = registry.register(&stopping);
+
+    assert!(
+        second_token.is_cancelled(),
+        "a connection admitted during a stop must be told to finish immediately, or the drain \
+         waits for a request it will never serve"
+    );
+    assert_eq!(registry.open_count(), 2, "both are tracked whoever stops");
+
+    registry.forget(first);
+    registry.forget(second);
+}
+
+#[test]
+fn forgetting_one_connection_leaves_its_siblings_tracked() {
+    let registry = ConnectionRegistry::new();
+    let stopping = AtomicBool::new(false);
+
+    let (first, _first_token) = registry.register(&stopping);
+    let (_second, _second_token) = registry.register(&stopping);
+    registry.forget(first);
+    registry.forget(first);
+
+    assert_eq!(
+        registry.open_count(),
+        1,
+        "forgetting is idempotent and must not remove a sibling"
+    );
+}
+
+#[test]
+fn cancel_all_reaches_every_open_connection() {
+    let registry = ConnectionRegistry::new();
+    let stopping = AtomicBool::new(false);
+
+    let tokens: Vec<_> = (0..3)
+        .map(|_| registry.register(&stopping).1)
+        .collect();
+    registry.cancel_all();
+
+    for (index, token) in tokens.iter().enumerate() {
+        assert!(token.is_cancelled(), "connection {index} was not cancelled");
+    }
+}
+
+/// The drain budget is a documented default, not an accident of a derived `Default`.
+///
+/// `ListenerSettings` lost its `#[derive(Default)]` for exactly this: a derived default would give
+/// the drain a zero budget, so every connection would be abandoned the instant a stop arrived —
+/// which is the bug the field exists to fix, reintroduced in the tests that should catch it.
+#[test]
+fn a_default_settings_drains_instead_of_abandoning() {
+    assert_eq!(
+        ListenerSettings::default().shutdown_timeout,
+        std::time::Duration::from_millis(volucer_core::config::DEFAULT_SHUTDOWN_TIMEOUT_MS)
+    );
+    assert!(
+        !ListenerSettings::default().shutdown_timeout.is_zero(),
+        "a zero budget means a stop truncates every in-flight response"
+    );
+}
+
+/// The drain waits for a connection that finishes inside its budget.
+///
+/// The registry is shrunk by a second thread after a delay the test controls, which is exactly the
+/// shape of a live connection completing: the drain must still be waiting when it happens, and must
+/// return as soon as the last one goes rather than burning the full budget.
+#[test]
+fn the_drain_returns_as_soon_as_the_last_connection_finishes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+    let registry = Arc::new(ConnectionRegistry::new());
+    let stopping = AtomicBool::new(false);
+    let (id, _token) = registry.register(&stopping);
+
+    let finisher = {
+        let registry = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            registry.forget(id);
+        })
+    };
+
+    let started = std::time::Instant::now();
+    runtime.block_on(drain_until(&registry, Duration::from_secs(30)));
+    let waited = started.elapsed();
+    finisher.join().expect("the finisher thread");
+
+    assert!(
+        waited >= Duration::from_millis(120),
+        "the drain returned before the connection finished: it does not actually wait"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "the drain burned its whole budget after the last connection finished: {waited:?}"
+    );
+    assert_eq!(registry.open_count(), 0, "the connection was forgotten");
+}
+
+/// A drain with nothing to wait for returns immediately, and cancels nothing it does not have.
+#[test]
+fn an_empty_drain_returns_at_once() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+    let registry = ConnectionRegistry::new();
+
+    let started = std::time::Instant::now();
+    runtime.block_on(drain_until(&registry, Duration::from_secs(30)));
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an idle listener must not hold a stop for its whole budget"
+    );
+}
+
+/// A zero budget returns immediately even with a connection still open — the deliberate opt-out.
+///
+/// This is the one case where a truncated response is the chosen outcome, so the assertion is that
+/// the drain does *not* wait: a deployment that asks for an instant recycle and then waits thirty
+/// seconds would have a setting that does nothing.
+#[test]
+fn a_zero_budget_does_not_wait() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+    let registry = ConnectionRegistry::new();
+    let stopping = AtomicBool::new(false);
+    let (_id, _token) = registry.register(&stopping);
+
+    let started = std::time::Instant::now();
+    runtime.block_on(drain_until(&registry, Duration::ZERO));
+
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a zero budget must not wait for connections it has decided to abandon"
+    );
+    assert_eq!(
+        registry.open_count(),
+        1,
+        "the test's own connection is still registered — the drain does not remove entries, the \
+         connection task does"
+    );
+}
+
+/// The deadline is honoured: an unresponsive connection does not hold the stop for ever.
+#[test]
+fn a_connection_that_never_finishes_hits_the_deadline() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+    let registry = ConnectionRegistry::new();
+    let stopping = AtomicBool::new(false);
+    let (_id, token) = registry.register(&stopping);
+
+    let started = std::time::Instant::now();
+    runtime.block_on(drain_until(&registry, Duration::from_millis(150)));
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= Duration::from_millis(150),
+        "the drain gave up before its deadline: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "the drain overran its deadline badly: {waited:?}"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the connection was asked to finish before the deadline was waited out"
     );
 }

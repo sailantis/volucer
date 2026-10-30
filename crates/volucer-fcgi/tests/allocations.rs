@@ -447,7 +447,7 @@ fn request_path_allocations(header_count: usize) -> usize {
         headers: (0..header_count)
             .map(|index| (format!("X-Header-{index}"), format!("value-{index}")))
             .collect(),
-        remote_addr: "127.0.0.1".to_string(),
+        remote_addr: Some("127.0.0.1".to_string()),
         server_name: "localhost".to_string(),
         server_port: 80,
         body_len: 0,

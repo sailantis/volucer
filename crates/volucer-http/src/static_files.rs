@@ -322,16 +322,18 @@ fn resolve_under_root(root: &Path, path: &str) -> Resolution {
 }
 
 /// The `Location` for a directory requested without its trailing slash.
-fn directory_location(owned: &Owned, server_port: u16) -> String {
+fn directory_location(owned: &Owned, server_port: Option<u16>) -> String {
     // `Host` is the client's own, and a client follows the redirect, so it is
     // used verbatim — it already carries a port when there is one to carry.
     match &owned.host {
         Some(host) if !host.is_empty() => format!("//{host}{}/", owned.path),
         _ => {
-            let port = if server_port == 80 {
-                String::new()
-            } else {
-                format!(":{server_port}")
+            // `None` on a listener with no port — a unix socket — and the redirect is then to
+            // `//localhost/…` with no port at all, which is what a client of that socket would
+            // follow. `:0` or `:80` would both name a port the request did not arrive on.
+            let port = match server_port {
+                Some(80) | None => String::new(),
+                Some(port) => format!(":{port}"),
             };
             format!("//localhost{port}{}/", owned.path)
         }
@@ -1051,7 +1053,7 @@ mod tests {
                 ..StaticConfig::default()
             },
             document_root: root.to_path_buf(),
-            server_port: 8080,
+            server_port: Some(8080),
             script_extensions: volucer_core::ScriptExtensions::default(),
         }
     }
@@ -1244,7 +1246,7 @@ mod tests {
                     ..StaticConfig::default()
                 },
                 document_root: root.clone(),
-                server_port: 8080,
+                server_port: Some(8080),
                 script_extensions: volucer_core::ScriptExtensions::default(),
             };
 
@@ -1444,13 +1446,13 @@ mod tests {
     fn a_directory_url_redirects_to_its_trailing_slash() {
         let headers = no_headers();
         let subject = owned("/docs", &headers);
-        assert_eq!(directory_location(&subject, 8080), "//example.test/docs/");
+        assert_eq!(directory_location(&subject, Some(8080)), "//example.test/docs/");
 
         // Without a `Host`, the listener's own port is the honest answer.
         let mut bare = owned("/docs", &headers);
         bare.host = None;
-        assert_eq!(directory_location(&bare, 8080), "//localhost:8080/docs/");
-        assert_eq!(directory_location(&bare, 80), "//localhost/docs/");
+        assert_eq!(directory_location(&bare, Some(8080)), "//localhost:8080/docs/");
+        assert_eq!(directory_location(&bare, Some(80)), "//localhost/docs/");
     }
 
     #[test]
@@ -1665,7 +1667,7 @@ mod tests {
                 ..StaticConfig::default()
             },
             document_root: root.clone(),
-            server_port: 8080,
+            server_port: Some(8080),
             script_extensions: volucer_core::ScriptExtensions::default(),
         };
         let headers = no_headers();
@@ -1819,7 +1821,7 @@ mod tests {
                     ..StaticConfig::default()
                 },
                 document_root: root.clone(),
-                server_port: 8080,
+                server_port: Some(8080),
                 script_extensions: volucer_core::ScriptExtensions::default(),
             };
             let plain = layer(&root, true);
@@ -1882,7 +1884,7 @@ mod tests {
                     ..StaticConfig::default()
                 },
                 document_root: root.clone(),
-                server_port: 8080,
+                server_port: Some(8080),
                 script_extensions: volucer_core::ScriptExtensions::default(),
             };
 

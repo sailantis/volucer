@@ -310,13 +310,14 @@ its certificate or ACME settings.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `http` | string | absent | The cleartext listener address, e.g. `127.0.0.1:8080` or `0.0.0.0:80`. |
-| `https` | string | absent | The TLS listener address. Separate from `http`, so you can serve both. |
-| `fastcgi` | string | absent | The FastCGI listener, for nginx or another web server to forward to. |
+| `http` | string | absent | The cleartext listener endpoint: `host:port`, e.g. `127.0.0.1:8080`, or `unix:/run/volucer/http.sock`. |
+| `https` | string | absent | The TLS listener address — **TCP only**. Separate from `http`, so you can serve both. |
+| `fastcgi` | string | absent | The FastCGI listener, for nginx or another web server to forward to. `host:port` or `unix:/run/volucer/fcgi.sock`. |
 | `document_root` | path | `.` | Where PHP scripts and static files are resolved from. |
 | `front_controller` | string | `index.php` | The script a path that names no file is handed to. |
 | `script_extensions` | array of strings | `["php", "php3", "phtml"]` | Which extensions are executed as PHP. |
 | `max_body_bytes` | integer | `33554432` (32 MiB) | The largest request body either front-end accepts. |
+| `shutdown_timeout_ms` | integer | `30000` | How long a stop may spend finishing in-flight requests. `0` means do not wait. See [Operations](11-OPERATIONS.md#systemd). |
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
@@ -342,6 +343,44 @@ These values correspond to nginx's `otel_trace_context` setting:
 | `"extract"` | yes | no — the default |
 | `"inject"` | no | yes |
 | `"propagate"` | yes | yes |
+
+### Unix-socket listeners
+
+`http` and `fastcgi` accept `unix:/path/to.sock` as well as `host:port`. This is the shape a
+deployment behind nginx wants — `proxy_pass http://unix:/run/volucer/http.sock:/;` and
+`fastcgi_pass unix:/run/volucer/fcgi.sock;` — and it avoids a loopback round trip.
+
+```toml
+[server]
+http = "unix:/run/volucer/http.sock"
+fastcgi = "unix:/run/volucer/fcgi.sock"
+```
+
+A socket is a listener like any other, but it has three properties a TCP port does not, and each is
+a consequence rather than a limitation to work around:
+
+| | On a TCP listener | On a unix socket |
+|---|---|---|
+| The bound endpoint in the startup banner | `127.0.0.1:8080` | the socket path |
+| `SERVER_PORT` when the request sends no `Host` | the bound port | `80` (the CGI default) |
+| `REMOTE_ADDR` | the client's address | **absent** — there is no peer address to report |
+| A rate limit keyed on `key = "ip"` | one bucket per client | no bucket: nothing to key on |
+| `redirect_to_https` | works | **refused at `check`**, because there is no port to name |
+| `sites.*.protocols` / `addresses` binding | matched against the local IP | an address binding cannot match |
+
+Two operational notes:
+
+- **A stale path is replaced, not fatal.** A socket path is a file, and one left by a `SIGKILL`ed
+  process would make the next `bind` fail with `EADDRINUSE`. Volucer unlinks the path before binding
+  and removes it again once the listener has stopped and its connections are drained — so a restart
+  after a crash comes up, and a clean stop leaves nothing behind.
+- **`https` and `[server.http3].listen` refuse `unix:` by name.** A TLS listener exists partly to
+  name the port an `http` redirect points at, and QUIC is UDP with no socket path at all. Both are
+  reported by `volucer check` rather than failing at bind.
+
+Because a socket has no client address, a deployment that needs per-client identity on one should
+put the socket behind nginx and let nginx set `REMOTE_ADDR` (FastCGI) or `X-Forwarded-For` with a
+`[server.proxy]` trust list (HTTP). That is the same rule a TCP listener behind a proxy follows.
 
 With `"extract"`, the client header reaches the backend unchanged; this is the default and
 matches the server's previous behavior. `"inject"` sends Volucer's context without reading

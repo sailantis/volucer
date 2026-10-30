@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// A complete configuration, including a unix FastCGI listener and a unix `external` socket.
+///
+/// **Unix only**, and that is the rule rather than a concession: this fixture names a listener only a
+/// unix host can bind, and `validate` refuses it by name elsewhere so that `check` cannot print a
+/// listener `serve` will reject. Windows coverage of the other spellings is in `parses_listener_forms`
+/// and the `endpoints` tests, which do not need a socket to exist.
+#[cfg(unix)]
 #[test]
 fn parses_a_complete_config() {
     let text = r#"

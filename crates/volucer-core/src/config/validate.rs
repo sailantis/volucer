@@ -11,6 +11,27 @@ use super::services::default_kv_max_bytes;
 use super::services::validate_redis;
 use super::*;
 
+/// Refuse a `unix:` listener on a platform that has no unix sockets.
+///
+/// The same rule `validate_cgi_socket` and `validate_worker_socket` already apply to a pool's socket,
+/// and it belongs here for the same reason it belongs there: **a settings file that validates and
+/// cannot start is the failure `volucer check` exists to prevent.** Without this, `check` printed the
+/// socket path and exited 0 on Windows while `serve` refused it with a bind error — the two halves of
+/// one question disagreeing.
+///
+/// It is not `#[cfg]`-split into two functions, because the *message* is what differs and one message
+/// naming the alternative is what an operator needs on either platform: on Windows it says what to
+/// write instead, and on a unix host it can never fire.
+fn check_listener_platform(key: &str, spec: &str) -> Result<()> {
+    if !cfg!(unix) && spec.trim().starts_with("unix:") {
+        return Err(Error::Config(format!(
+            "{key} is {spec}, and unix sockets are not available on this platform; use a loopback \
+             address such as 127.0.0.1:8080"
+        )));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Reject configurations that cannot work, with actionable messages.
     pub fn validate(&self) -> Result<()> {
@@ -25,13 +46,30 @@ impl Config {
         }
 
         if let Some(http) = &self.server.http {
+            check_listener_platform("server.http", http)?;
             parse_listener(http).map_err(|e| Error::Config(format!("server.http: {e}")))?;
         }
         if let Some(fastcgi) = &self.server.fastcgi {
+            check_listener_platform("server.fastcgi", fastcgi)?;
             parse_listener(fastcgi).map_err(|e| Error::Config(format!("server.fastcgi: {e}")))?;
         }
         if let Some(https) = &self.server.https {
-            parse_listener(https).map_err(|e| Error::Config(format!("server.https: {e}")))?;
+            match parse_listener(https).map_err(|e| Error::Config(format!("server.https: {e}")))? {
+                Listener::Tcp(_) => {}
+                // TLS over a unix socket is possible in principle — rustls reads a byte stream like
+                // any other — but nothing in this tree binds one, and the redirect target this
+                // listener exists to provide is a port a client reaches over TCP. Refused by name
+                // rather than accepted by `parse_listener` and failed at bind, because a settings
+                // file that passes `check` and cannot start is the failure `volucer check` exists
+                // to prevent.
+                Listener::Unix(_) => {
+                    return Err(Error::Config(format!(
+                        "server.https is {https}, and a TLS listener is TCP only — it names the port \
+                         a client reaches over TCP, which is also what an HTTPS redirect points at; \
+                         write a host:port"
+                    )));
+                }
+            }
         }
 
         // The proxy trust list is *validated*, not merely deserialized, and this is the reason it is

@@ -235,6 +235,7 @@ fn start(config: &Config, cert: &Cert) -> RunningHttp3 {
             }),
             https_port: None,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .expect("bind the HTTP/3 listener")
@@ -1061,6 +1062,7 @@ async fn start_tcp_with_alt_svc(
             }),
             https_port: None,
             alt_svc_port,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
@@ -1210,6 +1212,7 @@ fn binding_without_a_certificate_resolver_is_refused() {
             }),
             https_port: None,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     );
     let err = match outcome {

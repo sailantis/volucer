@@ -80,6 +80,23 @@ fastcgi = "127.0.0.1:9080"
 document_root = "/srv/app/public"
 ```
 
+A unix socket works in the same place and saves a loopback round trip — `fastcgi_pass` and
+`proxy_pass` both take one:
+
+```toml
+[server]
+fastcgi = "unix:/run/volucer/fcgi.sock"
+document_root = "/srv/app/public"
+```
+
+Two things differ on a socket, and both are properties of the transport rather than settings: the
+socket has no client address, so `REMOTE_ADDR` on the **HTTP** front-end is absent (on the FastCGI
+front-end the parameter is nginx's to set and is relayed verbatim), and it has no port, so
+`redirect_to_https` is refused for a socket-only listener. See
+[Configuration](01-CONFIGURATION.md#unix-socket-listeners). Both front-ends remove a stale socket
+path before binding and remove it again on a clean stop, so an unclean shutdown does not need
+manual cleanup.
+
 ```nginx
 server {
     listen 80;
@@ -223,8 +240,23 @@ On `SIGHUP`, Volucer reapplies the same command-line overrides. Without a config
 file, there are no file changes to read. Changes to `ExecStart` take effect only after the
 service restarts.
 
-On `SIGTERM`, Volucer stops accepting connections and lets in-flight requests finish. Worker
-processes are stopped with the server.
+On `SIGTERM`, Volucer stops accepting connections immediately, then lets the requests that are
+already running finish before exiting. Worker processes are stopped with the server.
+
+That grace period has a budget: [`server.shutdown_timeout_ms`](01-CONFIGURATION.md#server), thirty
+seconds by default. When it expires, whatever is still in flight is abandoned and the count is
+logged at `warn`, so a truncated response is visible rather than indistinguishable from a fast one.
+
+**The budget must be shorter than whatever waits before killing the process.** `systemd`'s
+`TimeoutStopSec` and a container's `stop_grace_period` both default to thirty seconds, which is why
+the default budget matches them — an operator who has changed neither gets a drain that completes.
+If you raise `shutdown_timeout_ms`, raise the supervisor's timeout above it as well, or `SIGKILL`
+will land mid-drain and truncate exactly what the setting exists to protect.
+
+```toml
+[server]
+shutdown_timeout_ms = 10000     # default 30000; 0 means "do not wait at all"
+```
 
 Store the ACME cache under the systemd state directory and configure the cache path to match
 `StateDirectory`:

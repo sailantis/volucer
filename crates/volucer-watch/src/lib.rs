@@ -269,7 +269,13 @@ pub struct StaticFiles {
     ///
     /// Fixed for the life of a listener — the socket is already bound — so a reload cannot
     /// change it, and it is passed in rather than stored with the table.
-    pub server_port: u16,
+    ///
+    /// **`None` on a unix socket listener**, which has no port. A directory request that arrived
+    /// with no `Host` header is then redirected to `//localhost/…` with no port at all, which is
+    /// what a client of a socket would follow anyway — inventing `:0` would be a URL that cannot
+    /// work and that an operator would read as a bug in the redirect rather than a property of
+    /// the transport.
+    pub server_port: Option<u16>,
     /// The extensions this site treats as scripts, so a file that is one is never served
     /// from disk.
     ///
@@ -337,7 +343,8 @@ impl Reloaded {
     /// there is no constructor that could pair them from two.
     ///
     /// `server_port` is the bound port, which the static layer stamps into generated
-    /// redirects — a reload cannot change it, so it is passed in rather than stored.
+    /// redirects — a reload cannot change it, so it is passed in rather than stored. `None` for a
+    /// listener with no port, which is what a unix socket is.
     ///
     /// The gRPC grants are a *separate* argument rather than derived from the site table, because
     /// they come from `[backends.*]` and a `Sites` is built from `[server]` and `[sites.*]`. The
@@ -345,7 +352,7 @@ impl Reloaded {
     /// snapshot so a request cannot see one generation's grants and another's routes.
     pub fn from_sites(
         sites: Arc<Sites>,
-        server_port: u16,
+        server_port: Option<u16>,
         grpc_grants: Arc<GrpcGrantsMap>,
     ) -> Self {
         let mut routings = BTreeMap::new();
@@ -559,12 +566,16 @@ pub struct RegisteredFrontEnd {
     /// Per front-end rather than one per registry, because two listeners on two ports share one
     /// site table and a generated redirect has to name the port the client actually reached — so
     /// one number for the process would be wrong for whichever listener it was not.
-    port: u16,
+    ///
+    /// `None` for a listener with no port, which is a unix socket: a reload rebuilds this front-end's
+    /// state from the same table, and the port it stamps into a generated redirect has to stay the
+    /// answer the socket gives, not a number invented here.
+    port: Option<u16>,
 }
 
 impl RegisteredFrontEnd {
     /// A front-end, for the registry to rebuild on a reload.
-    pub fn new(state: Arc<Swappable<Reloaded>>, port: u16) -> Self {
+    pub fn new(state: Arc<Swappable<Reloaded>>, port: Option<u16>) -> Self {
         RegisteredFrontEnd { state, port }
     }
 }
@@ -842,9 +853,7 @@ mod tests {
     /// loop *ran* — a sampler that never sampled would "observe no mixture" too.
     #[test]
     fn one_swap_never_yields_a_partial_generation() {
-        let state = Swappable::new(Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
-            8080,
+        let state = Swappable::new(Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080),
             Arc::new(GrpcGrantsMap::new()),
         ));
 
@@ -877,7 +886,7 @@ mod tests {
                 };
                 let _ = state.replace(Reloaded::from_sites(
                     Arc::new(named_sites(root)),
-                    8080,
+                    Some(8080),
                     Arc::new(GrpcGrantsMap::new()),
                 ));
             }
@@ -918,9 +927,9 @@ mod tests {
         );
 
         let first =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), 8080, Arc::new(before));
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(before));
         let second =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), 8080, Arc::new(after));
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(after));
 
         assert!(first
             .granted_grpc_call("app", "/greeter.Greeter/SayHello")
@@ -955,7 +964,7 @@ mod tests {
         let mut grants = GrpcGrantsMap::new();
         grants.insert("app".to_string(), GrpcGrants::any());
         let state =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), 8080, Arc::new(grants));
+            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(grants));
 
         assert!(state
             .granted_grpc_call("app", "/never.Listed/Method")

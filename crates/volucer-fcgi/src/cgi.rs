@@ -394,7 +394,14 @@ pub struct RequestInfo {
     pub query_string: String,
     pub protocol: String,
     pub headers: Vec<(String, String)>,
-    pub remote_addr: String,
+    /// The client's address, or `None` when the transport has no peer address.
+    ///
+    /// `None` on a unix-socket deployment: the kernel reports no peer, and there is no honest
+    /// address to write. `REMOTE_ADDR` is then **omitted** rather than set to `""` or a loopback
+    /// address — an application that parses it sees an absent variable, and the FastCGI listener's
+    /// own identity rule already treats an absent `REMOTE_ADDR` as "no bucket" rather than as one
+    /// caller. A placeholder would be a value an application could act on and would be wrong.
+    pub remote_addr: Option<String>,
     pub server_name: String,
     pub server_port: u16,
     pub body_len: usize,
@@ -409,7 +416,7 @@ impl Default for RequestInfo {
             query_string: String::new(),
             protocol: "HTTP/1.1".to_string(),
             headers: Vec::new(),
-            remote_addr: "127.0.0.1".to_string(),
+            remote_addr: Some("127.0.0.1".to_string()),
             server_name: "localhost".to_string(),
             server_port: 80,
             body_len: 0,
@@ -491,7 +498,13 @@ pub fn build_params_for(
     );
     push_pair(&mut pairs, "SERVER_NAME", &info.server_name);
     push_pair(&mut pairs, "SERVER_PORT", &info.server_port.to_string());
-    push_pair(&mut pairs, "REMOTE_ADDR", &info.remote_addr);
+    // **Omitted when there is no peer address.** A unix-socket deployment has no client address to
+    // report, and `""` or a loopback stand-in would both be values an application could act on. An
+    // absent variable is the truthful answer, and it is the same shape `REMOTE_ADDR` already has
+    // when a front-end forwards raw FastCGI without setting it.
+    if let Some(remote_addr) = &info.remote_addr {
+        push_pair(&mut pairs, "REMOTE_ADDR", remote_addr);
+    }
     push_pair(
         &mut pairs,
         "DOCUMENT_ROOT",

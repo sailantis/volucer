@@ -1940,6 +1940,18 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// HTTP listener needs a `tokio` runtime, so it runs on one of its own. That is
 /// the async boundary made concrete: the runtime exists for the HTTP front-end,
 /// and nothing else in the program depends on it.
+/// The endpoint a listener answers on, for its startup line.
+///
+/// A listener at `unix:/run/volucer.sock` has no address to report, so it reports the path — which is
+/// what an operator matches against their `nginx` `upstream` block. Printing a `SocketAddr` there
+/// would mean printing a port that does not exist.
+fn endpoint(running: &RunningHttp) -> String {
+    match running.local_addr() {
+        Some(address) => address.to_string(),
+        None => running.configured_address().to_string(),
+    }
+}
+
 fn serve(
     source: &Source,
     document_root_flag: Option<&Path>,
@@ -2166,7 +2178,12 @@ fn serve(
             )?
             .with_observability(Arc::clone(&observe))
             .with_rate_limit(Arc::clone(&rate_limit));
-            println!("  fastcgi:          {}", listener.local_addr()?);
+            // The bound address when there is one, and the configured path for a unix socket — which
+            // has no address to report and whose path is what an operator matches against their file.
+            match listener.local_addr() {
+                Some(bound) => println!("  fastcgi:          {bound}"),
+                None => println!("  fastcgi:          {}", listener.configured_address()),
+            }
             Some(listener)
         }
         None => {
@@ -2469,6 +2486,7 @@ fn serve(
                     }),
                     https_port: None,
                     alt_svc_port: None,
+                    shutdown_timeout: config.server.shutdown_timeout(),
                 },
             )
             .map_err(|err| ServerError::Listener {
@@ -2504,6 +2522,7 @@ fn serve(
         },
         https_port,
         alt_svc_port,
+        shutdown_timeout: config.server.shutdown_timeout(),
     };
 
     let http = match &http_address {
@@ -2522,9 +2541,9 @@ fn serve(
                 reason: err.to_string(),
             })?;
             if tls_on_http {
-                println!("  http:             {} (https)", running.local_addr());
+                println!("  http:             {} (https)", endpoint(&running));
             } else {
-                println!("  http:             {}", running.local_addr());
+                println!("  http:             {}", endpoint(&running));
             }
             Some(running)
         }
@@ -2553,12 +2572,13 @@ fn serve(
                     }),
                     https_port,
                     alt_svc_port,
+                    shutdown_timeout: config.server.shutdown_timeout(),
                 },
             )
             .map_err(|err| ServerError::Listener {
                 reason: err.to_string(),
             })?;
-            println!("  https:            {} (https)", running.local_addr());
+            println!("  https:            {} (https)", endpoint(&running));
             Some(running)
         }
         None => {
@@ -3555,6 +3575,13 @@ fn check(
         "    max body: {} ({} MiB; bounds both front-ends, not an upstream)",
         config.server.max_body_bytes(),
         config.server.max_body_bytes() / (1024 * 1024)
+    );
+    // Printed for the same reason the body limit is: a value with no key in the file should still
+    // be visible to an operator, and this one is a *contract with the supervisor* rather than with
+    // a client — a budget longer than `TimeoutStopSec` is a stop that will not finish.
+    println!(
+        "    shutdown: {} ms drain budget (0 = do not wait; must be under the supervisor's kill timeout)",
+        config.server.shutdown_timeout().as_millis()
     );
 
     // The rate limit, or the absence of one stated out loud. The *absence* is what this prints in

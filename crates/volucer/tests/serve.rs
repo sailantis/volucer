@@ -936,13 +936,22 @@ fn http_request(address: &str, method: &str, path: &str, extra: &[(&str, &str)])
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read the response");
 
+    parse_http_response(&raw)
+}
+
+/// Parse one raw HTTP response.
+///
+/// Split out so the unix-socket tests read an answer the same way the TCP ones do: a second parser
+/// would be a second chance to be lenient about framing, and framing is the half of a response a
+/// test should be strict about.
+fn parse_http_response(raw: &[u8]) -> HttpResponse {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .unwrap_or_else(|| {
             panic!(
                 "no header terminator in {:?}",
-                String::from_utf8_lossy(&raw)
+                String::from_utf8_lossy(raw)
             )
         });
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
@@ -5004,6 +5013,212 @@ fn an_https_only_configuration_starts_a_listener() {
     assert!(
         banner.contains("http:             (disabled)"),
         "no plaintext listener was configured, so none should be announced:\n{banner}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+
+// ---------------------------------------------------------------------------
+// Unix-socket listeners.
+//
+// `unix:` used to be accepted by `parse_listener` — so `volucer check` passed — and then failed at
+// bind with `invalid port value`, because both bind paths called `TcpListener::bind`. A settings file
+// that validates and cannot start is the failure `check` exists to prevent, so the two halves are
+// asserted together here: the socket binds, and a request reaches a backend over it.
+//
+// Unix only, because there is no unix socket on Windows. The *configuration* half is asserted on
+// both platforms in `volucer-core`'s own tests, which is the half a Windows deployment can get wrong.
+// ---------------------------------------------------------------------------
+
+/// Send one HTTP request over a unix socket and read the whole answer.
+#[cfg(unix)]
+fn http_get_over_unix(path: &Path, target: &str) -> HttpResponse {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(path).expect("connect to the unix socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read the response");
+    parse_http_response(&raw)
+}
+
+/// **A `unix:` HTTP listener binds, serves a request, and removes its socket on stop.**
+///
+/// The last assertion is the one that makes a restart work: a socket path is a *file*, and one left
+/// behind makes the next bind fail with `EADDRINUSE`. `serve` unlinks it after the drain finishes, so
+/// a stop leaves nothing behind — asserted here rather than assumed, because the opposite is a
+/// server that comes up once and then never again.
+#[cfg(unix)]
+#[test]
+fn a_unix_http_listener_serves_a_request_and_cleans_up_its_socket() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-unix-http-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    std::fs::write(root.join("hello.txt"), "over a unix socket").expect("write the fixture");
+
+    let socket = root.join("http.sock");
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"unix:{socket}\"\\nserve_only = \"static\"\\ndocument_root = {root}\\n",
+        socket = socket.display(),
+        root = toml_string(&root.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server must start with a unix http listener");
+    };
+
+    // The banner names the path, not an address: there is no port to print and inventing one would
+    // be a line an operator could not match to their file.
+    assert!(
+        server.banner().contains(&socket.display().to_string()),
+        "the banner must name the socket path:\n{}",
+        server.banner()
+    );
+    assert!(
+        socket.exists(),
+        "the socket file must exist while the server is up: {}",
+        socket.display()
+    );
+
+    let response = http_get_over_unix(&socket, "/hello.txt");
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(
+        response.text().contains("over a unix socket"),
+        "the request must be answered over the socket: {response:?}"
+    );
+
+    // Drop kills the child and waits; the socket must be gone afterwards, or the next start fails.
+    drop(server);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && socket.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !socket.exists(),
+        "the socket path must be removed on a clean stop, or the next start fails with EADDRINUSE: \
+         {}",
+        socket.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A stale socket path does not prevent a start.** The crash case, which is the one an operator
+/// actually hits: a `SIGKILL`ed server leaves the file behind, and a server that refused to come up
+/// afterwards would need manual intervention on every unclean shutdown.
+#[cfg(unix)]
+#[test]
+fn a_stale_socket_path_is_replaced_rather_than_fatal() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-unix-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    std::fs::write(root.join("hello.txt"), "still here").expect("write the fixture");
+
+    let socket = root.join("http.sock");
+    // A plain file where the socket will go: the strongest form of "something is already there",
+    // and what a crashed process's leftover socket looks like to `bind`.
+    std::fs::write(&socket, "").expect("leave a stale path");
+
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"unix:{socket}\"\\nserve_only = \"static\"\\ndocument_root = {root}\\n",
+        socket = socket.display(),
+        root = toml_string(&root.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("a stale socket path must not stop the server");
+    };
+    let response = http_get_over_unix(&socket, "/hello.txt");
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(
+        response.text().contains("still here"),
+        "the request must be served after replacing the stale path: {response:?}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `unix:` FastCGI listener binds and answers a `GET_VALUES` probe over the socket.
+///
+/// The probe rather than a full request, because it needs no backend: `GET_VALUES` is answered by the
+/// listener itself, so this asserts the transport without needing `php-cgi`.
+#[cfg(unix)]
+#[test]
+fn a_unix_fastcgi_listener_answers_a_get_values_probe() {
+    use std::os::unix::net::UnixStream;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-unix-fcgi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+
+    let socket = root.join("fcgi.sock");
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nfastcgi = \"unix:{socket}\"\\nserve_only = \"static\"\\ndocument_root = {root}\\n",
+        socket = socket.display(),
+        root = toml_string(&root.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server must start with a unix fastcgi listener");
+    };
+
+    let mut stream = UnixStream::connect(&socket).expect("connect to the fastcgi socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+
+    // A `GET_VALUES` probe: the request nginx sends to decide whether the server is usable. It is
+    // answered by the listener with a result record and no END_REQUEST.
+    let payload = nvpair::encode_pairs([(&b"max_connections"[..], &b""[..])]);
+    let mut wire = Vec::new();
+    record::write_records(&mut wire, RecordType::GetValues, 0, &payload, false)
+        .expect("frame the probe");
+    stream.write_all(&wire).expect("write the probe");
+    stream.flush().expect("flush");
+
+    let response = record::read_record(&mut stream)
+        .map_err(io_err)
+        .expect("a reply")
+        .expect("a record");
+    assert_eq!(
+        response.record_type(),
+        RecordType::GetValuesResult,
+        "a probe must be answered with a result over a unix socket, never an END_REQUEST"
+    );
+    let values = nvpair::decode_pairs(&response.content).expect("decode the result");
+    assert!(
+        values.iter().any(|(name, _)| name == b"max_connections"),
+        "the requested value should be present: {values:?}"
     );
 
     drop(server);

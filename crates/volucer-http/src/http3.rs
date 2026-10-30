@@ -251,13 +251,17 @@ impl Http3Listener {
             Arc::clone(&handles.grpc_grants)
         };
         let state = Arc::new(volucer_watch::Swappable::new(
-            volucer_watch::Reloaded::from_sites(handles.shared.sites(), bound.port(), grpc_grants),
+            volucer_watch::Reloaded::from_sites(
+                handles.shared.sites(),
+                Some(bound.port()),
+                grpc_grants,
+            ),
         ));
         handles
             .registry
             .register(volucer_watch::RegisteredFrontEnd::new(
                 Arc::clone(&state),
-                bound.port(),
+                Some(bound.port()),
             ));
 
         let front_end = Arc::new(FrontEnd::new(
@@ -266,17 +270,24 @@ impl Http3Listener {
             state,
             Some(resolver),
             limits,
-            bound.port(),
-            // `None`: a redirect is a cleartext answer and QUIC has no cleartext. The value is
-            // never read on this path, and passing the TCP listener's would be a number with no
-            // meaning here.
-            None,
+            // QUIC always has a port: it is a UDP socket, so `LocalAddress` is fully populated and
+            // the two absences that a unix socket has cannot occur here.
+            crate::listener::LocalAddress {
+                port: Some(bound.port()),
+                // `None`: a redirect is a cleartext answer and QUIC has no cleartext. The value is
+                // never read on this path, and passing the TCP listener's would be a number with no
+                // meaning here.
+                https_port: None,
+            },
             Arc::clone(&handles.observe),
             Arc::clone(&handles.client_ip),
             Arc::clone(&handles.rate_limit),
             // `None`: this listener's own responses must not advertise the endpoint they arrived
             // on. A client already speaking HTTP/3 has nothing to learn from `Alt-Svc`.
             None,
+            // The same budget the TCP listener drains with: a stop is one signal and has one
+            // deadline, whichever transport a given connection arrived on.
+            settings.shutdown_timeout,
         ));
 
         let shutdown = front_end.shutdown_handle();

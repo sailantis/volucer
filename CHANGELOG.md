@@ -9,6 +9,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A stop now finishes the requests that are already running, bounded by
+  `server.shutdown_timeout_ms`.** The listener stops accepting immediately, asks every open
+  connection to complete its current request through `hyper`'s `graceful_shutdown`, and waits up to
+  the budget for them. Thirty seconds by default, matching `docker stop`'s and `systemd`'s own
+  defaults so an operator who has changed neither gets a drain that completes. When the budget
+  expires, the number of abandoned requests is logged at `warn` — a truncated response is now
+  distinguishable from a fast one. `0` is accepted and means "do not wait", for a deployment that
+  would rather recycle instantly.
+
+  This replaces a behaviour that was wrong and documented as right. Leaving the accept loop used to
+  *return*, which dropped the runtime that owned the connection tasks and cancelled every one of
+  them: a stop in the middle of a response truncated it. Measured against the previous binary, a
+  four-second response in flight produced `volucer exited 0 after 0.28s` and a client that received
+  `RemoteDisconnected` with no body; the same request now completes and the process exits 3.03s
+  later, after the bytes are written. The HTTP/3 listener drains by the same budget.
+
+  **The budget must be shorter than `TimeoutStopSec` / `stop_grace_period`**, or `SIGKILL` lands
+  mid-drain and truncates exactly what the setting protects; [Operations](docs/11-OPERATIONS.md#systemd)
+  now says so where an operator will read it.
+
+- **`server.http` and `server.fastcgi` accept a unix socket path.** `unix:/run/volucer/http.sock`
+  is now a listener rather than a spelling that passed `volucer check` and then failed at bind with
+  `invalid port value`, which is what it did before: `parse_listener` accepted the form, both bind
+  paths called `TcpListener::bind`, and only the *outbound* FastCGI client actually supported a
+  socket. This is the shape an nginx deployment wants — `proxy_pass
+  http://unix:/run/volucer/http.sock:/;` and `fastcgi_pass unix:/run/volucer/fcgi.sock;` — and it
+  was the last of the three ways nginx reaches an application server that volucer could not serve.
+
+  The transport is `BoundListener`/`Accepted` on the HTTP side and `Bound`/`Connected` on the FastCGI
+  side, mirroring `[rpc]`'s existing pair: one accept loop and one request path per front-end, so a
+  fix cannot land on a TCP socket and miss a unix one.
+
+  Three consequences are modelled rather than papered over, because each would otherwise be a fake
+  number an application acts on. There is **no port**, so `SERVER_PORT` falls back to the request's
+  `Host` or to `80` and `redirect_to_https` is refused by `check` rather than emitting a `Location`
+  that names a port no client can reach. There is **no peer address**, so `REMOTE_ADDR` is omitted
+  from the CGI environment instead of being set to `0.0.0.0` or a loopback address, and a rate limit
+  keyed on `key = "ip"` applies no bucket rather than one shared by every caller. And a
+  `sites.*.addresses` binding cannot match, because the connection did not arrive on an address.
+
+  `https` and `[server.http3].listen` refuse `unix:` **by name** — a TLS listener exists partly to
+  name the port a redirect points at, and QUIC is UDP with no socket path — so `volucer check`
+  reports it instead of the process failing after the pools are already up. A stale socket path left
+  by a crash is unlinked before binding and removed again once the listener has drained, so an
+  unclean shutdown does not need manual cleanup and a clean one leaves nothing behind.
+
 - **A configuration can be split across files with `include`**, the way MariaDB's `!include` and
   `!includedir` split `my.cnf` — in one list where MariaDB needs two directives:
 

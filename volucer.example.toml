@@ -48,7 +48,17 @@
 [server]
 http = "127.0.0.1:8080"
 default_backend = "app"
-# nginx-facing listener; use a unix socket on Linux/macOS.
+# nginx-facing listener. Both listeners take a `unix:` path as well as `host:port`, which is the
+# shape an nginx deployment wants (`fastcgi_pass unix:/run/volucer/fcgi.sock;`) and avoids a
+# loopback round trip:
+#
+#   http = "unix:/run/volucer/http.sock"
+#   fastcgi = "unix:/run/volucer/fcgi.sock"
+#
+# A socket has no port and no client address, so on the HTTP front-end `REMOTE_ADDR` is absent and
+# `redirect_to_https` is refused for a socket-only listener -- there is no port for a redirect to
+# name. A stale path left by a crash is removed before binding and again on a clean stop.
+# `https` and `[server.http3].listen` are TCP/UDP only and refuse `unix:` by name.
 fastcgi = "127.0.0.1:9080"
 
 # Where the application lives. Both of the next two keys are also `serve`
@@ -87,6 +97,22 @@ fastcgi = "127.0.0.1:9080"
 # Zero is refused rather than read as "unlimited" -- a zero here refuses every
 # request with a body, which is never what was meant.
 # max_body_bytes = 33554432     # 32 MiB
+
+# How long a stop may spend finishing requests that are already in flight.
+#
+# A stop is not an abort: the listener stops accepting at once, then lets each open
+# connection complete the request it is serving. This is the budget for that grace
+# period. When it expires whatever is left is abandoned and the count is logged at
+# `warn`, so a truncated response is visible rather than indistinguishable from a
+# fast one.
+#
+# THIS MUST BE SHORTER THAN WHAT THE SUPERVISOR WAITS. `systemd`'s TimeoutStopSec
+# and a container's stop_grace_period both default to 30s, which is why the default
+# matches them -- an operator who has changed neither gets a drain that completes.
+# Raise both together, or SIGKILL lands mid-drain and truncates what this protects.
+#
+# `0` means "do not wait at all": recycle instantly and accept the truncation.
+# shutdown_timeout_ms = 30000
 # What a backend is handed as its `traceparent`. The four values are nginx's
 # `otel_trace_context`, with the same meaning:
 #

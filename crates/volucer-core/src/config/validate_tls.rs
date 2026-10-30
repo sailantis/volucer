@@ -182,6 +182,35 @@ impl Config {
             ));
         }
 
+        // **A cleartext socket has nowhere to redirect to.** The redirect target is
+        // `https://host:<port>`, and a listener with no port cannot name one — so the answer would
+        // be a `Location` an operator reads as a bug rather than as a property of the transport.
+        // Refused here rather than at bind, for the reason every other listener rule is: a settings
+        // file that passes `check` and cannot serve is what `check` exists to prevent.
+        //
+        // Only the listener that would carry the redirect is examined. A deployment with an `https`
+        // listener is redirecting *from* `http`, and a unix `http` cannot do it either — which is
+        // this same check, since `http` is where the cleartext request arrives.
+        if self.server.redirect_to_https {
+            if let Some(http) = &self.server.http {
+                let cleartext_here = matches!(
+                    parse_listener(http),
+                    Ok(Listener::Unix(_))
+                ) && self
+                    .server
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| self.server.https.is_none() || tls.plain);
+                if cleartext_here {
+                    return Err(Error::Config(format!(
+                        "server.redirect_to_https is set but server.http is {http}, a unix socket, \
+                         which has no port for an https redirect to name; remove \
+                         redirect_to_https, or serve this site over a TCP listener"
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 

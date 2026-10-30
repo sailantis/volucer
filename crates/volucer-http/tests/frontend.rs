@@ -1354,14 +1354,14 @@ static_files = {{ enabled = true }}
     let first = Arc::new(config_for("one"));
     let state = volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(
         first,
-        8080,
+        Some(8080),
         std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
     ));
     // What a request does: take one snapshot and hold it.
     let in_flight = state.load();
     let previous = state.replace(volucer_http::Reloaded::from_sites(
         Arc::new(config_for("two")),
-        8080,
+        Some(8080),
         std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
     ));
 

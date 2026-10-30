@@ -8,11 +8,18 @@ use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// HTTP listener, e.g. `127.0.0.1:8080`.
+    /// HTTP listener, e.g. `127.0.0.1:8080` or `unix:/run/volucer/http.sock`.
     ///
     /// With no `[server.tls]` this listener is plaintext. With `[server.tls]` present and
     /// no `https`, TLS wraps *this* listener, and `[server.tls].plain` decides whether it
     /// also answers cleartext on the same port.
+    ///
+    /// **A unix socket is a real listener, not a spelling this rejects.** It is the shape a
+    /// deployment behind `nginx` uses (`proxy_pass http://unix:/run/volucer/http.sock:/;`), and it
+    /// has three consequences worth knowing: there is no port, so `SERVER_PORT` falls back to the
+    /// request's `Host` or to `80`; there is no peer address, so `REMOTE_ADDR` is omitted and an
+    /// IP-keyed rate limit does not apply; and `redirect_to_https` has nowhere to send a client, so
+    /// `validate` refuses that combination rather than emitting a `Location` that cannot work.
     #[serde(default)]
     pub http: Option<String>,
 
@@ -27,10 +34,18 @@ pub struct ServerConfig {
     /// listener that fails every handshake. Setting it together with `[server.tls].plain`
     /// is also an error — the port is already dedicated, so the same-port sniff would have
     /// nothing to decide.
+    ///
+    /// **TCP only.** `unix:` is refused here by name, because this listener's job includes naming
+    /// the port an `http` redirect points at, and a socket has no port to name.
     #[serde(default)]
     pub https: Option<String>,
 
     /// FastCGI listener, e.g. `127.0.0.1:9000` or `unix:/run/volucer.sock`.
+    ///
+    /// **The unix spelling is the one an `nginx` deployment wants**, since its `fastcgi_pass` takes
+    /// either form and a socket avoids a loopback round trip. A socket has no peer address, so
+    /// `REMOTE_ADDR` is not reported for the connection — but on this front-end the CGI parameter of
+    /// that name is nginx's to set and is relayed verbatim, so the request's identity is unaffected.
     #[serde(default)]
     pub fastcgi: Option<String>,
 
@@ -67,6 +82,28 @@ pub struct ServerConfig {
     /// `static_files.max_multirange_bytes`.
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
+
+    /// How long a stop signal may spend finishing requests that are already in flight.
+    ///
+    /// A stop is not an abort: the listener stops accepting immediately, then lets each open
+    /// connection complete the request it is serving before closing. This is the budget for that
+    /// grace period. When it expires, whatever is still in flight is abandoned and the count is
+    /// logged at `warn`, so an operator can tell "everything finished" from "three requests were
+    /// dropped" — the distinction the previous behaviour could not make at all, because it dropped
+    /// every one of them without saying so.
+    ///
+    /// **This must be shorter than whatever the process manager waits before killing.** A
+    /// `systemd` `TimeoutStopSec` or a container's `stop_grace_period` that expires first means
+    /// `SIGKILL` lands mid-drain, which produces exactly the truncated responses this key exists to
+    /// prevent. The default is thirty seconds, which is the value `docker stop` and
+    /// `systemd`'s `DefaultTimeoutStopSec` both use — so an operator who has not changed either
+    /// gets a drain that completes.
+    ///
+    /// `0` is accepted and means "do not wait at all": a deployment that would rather recycle
+    /// instantly than hold a supervisor for thirty seconds. It is a deliberate setting rather than
+    /// a mistake, so it is not refused the way `max_body_bytes = 0` is.
+    #[serde(default)]
+    pub shutdown_timeout_ms: Option<u64>,
 
     /// Directory that PHP scripts and static files are resolved against.
     ///
@@ -435,6 +472,14 @@ pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
 /// deliberately: an unconfigured deployment must not change behaviour because the key was added.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+/// How long a stop may spend finishing in-flight requests, when configuration says nothing.
+///
+/// Thirty seconds, which is the value `docker stop` sends and `systemd`'s
+/// `DefaultTimeoutStopSec` allows. That coincidence is the point: an operator who has changed
+/// neither gets a drain that completes before the supervisor escalates to `SIGKILL`, so the default
+/// cannot cause the truncation the setting exists to prevent.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+
 /// ALPN protocol names this server understands.
 ///
 /// Checked by name rather than passed through, because an unknown identifier is accepted by
@@ -517,6 +562,17 @@ impl ServerConfig {
     /// that only one of them had an answer at all.
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES)
+    }
+
+    /// How long a stop may spend draining in-flight requests.
+    ///
+    /// Reads through to [`DEFAULT_SHUTDOWN_TIMEOUT_MS`], so the HTTP and FastCGI front-ends cannot
+    /// disagree — the same rule [`Self::max_body_bytes`] follows, and for the same reason.
+    pub fn shutdown_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.shutdown_timeout_ms
+                .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS),
+        )
     }
 
     /// Whether a plaintext listener exists to redirect *from*.

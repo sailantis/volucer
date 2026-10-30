@@ -145,6 +145,7 @@ async fn start_keeping(
 
             https_port: None,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
@@ -186,6 +187,7 @@ async fn start_with_resolver(
 
             https_port: None,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
@@ -776,6 +778,7 @@ async fn start_redirecting_to(
 
             https_port,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
@@ -881,6 +884,7 @@ key = "certs/absent.key"
 
             https_port: None,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
@@ -1093,6 +1097,7 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
 
             https_port: None,
             alt_svc_port: None,
+            shutdown_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await

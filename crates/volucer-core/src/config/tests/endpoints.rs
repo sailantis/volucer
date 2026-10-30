@@ -55,6 +55,106 @@ fn a_status_table_without_a_listen_is_refused() {
     assert!(err.to_string().contains("no `listen`"), "{err}");
 }
 
+/// **A unix `server.http` is accepted where the platform can bind it**, and refused by name where it
+/// cannot — the same answer `validate_cgi_socket` already gives a pool's socket prefix.
+///
+/// The two halves are one rule: a form is accepted exactly where something binds it, and `check`
+/// must say so rather than printing a listener `serve` will refuse. The bug this test exists beside
+/// was exactly that split — `check` accepted a unix listener on Windows and `serve` refused it.
+#[test]
+fn a_unix_http_listener_is_accepted_only_where_it_can_bind() {
+    let text = "[server]\nhttp = \"unix:/run/volucer/http.sock\"\nserve_only = \"static\"\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let outcome = config.validate();
+    if cfg!(unix) {
+        outcome.expect("a unix http listener is a listener like any other on a unix host");
+    } else {
+        let message = outcome
+            .expect_err("a unix socket cannot be bound here, so check must say so")
+            .to_string();
+        assert!(message.contains("server.http"), "{message}");
+        assert!(
+            message.contains("not available on this platform"),
+            "the message has to name the reason: {message}"
+        );
+    }
+}
+
+/// **A unix `server.fastcgi` follows the same rule**, which is the shape an `nginx` deployment uses.
+#[test]
+fn a_unix_fastcgi_listener_is_accepted_only_where_it_can_bind() {
+    let text = "[server]\nhttp = \"127.0.0.1:8080\"\nfastcgi = \"unix:/run/volucer/fcgi.sock\"\n\
+                serve_only = \"static\"\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let outcome = config.validate();
+    if cfg!(unix) {
+        outcome.expect("a unix fastcgi listener is a listener like any other on a unix host");
+    } else {
+        let message = outcome
+            .expect_err("a unix socket cannot be bound here, so check must say so")
+            .to_string();
+        assert!(message.contains("server.fastcgi"), "{message}");
+    }
+}
+
+/// The `https` listener is TCP, and a `unix:` address is refused when the file is read.
+///
+/// The same rule the status listener follows, and for the same reason: `parse_listener` accepts the
+/// form, so without this the value passed `volucer check` and then failed at bind — a settings file
+/// that validates and cannot start.
+#[test]
+fn a_unix_https_listener_is_refused() {
+    let text = "[server]\nhttp = \"127.0.0.1:8080\"\nhttps = \"unix:/tmp/s.sock\"\n\
+                \n[server.tls]\ncertificate = \"c.pem\"\nkey = \"k.pem\"\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("must be refused");
+    let message = err.to_string();
+    assert!(message.contains("server.https"), "{message}");
+    assert!(message.contains("TCP only"), "{message}");
+    assert!(
+        message.contains("host:port"),
+        "the message has to say what to write instead: {message}"
+    );
+}
+
+/// **A redirect cannot name a port a socket does not have.**
+///
+/// `redirect_to_https` answers with `Location: https://host:<port>`, and the port comes from the
+/// listener that received the cleartext request. A unix socket has none, so the only honest answers
+/// are a configuration error or a `Location` with no port — and the second is a URL that silently
+/// goes to 443 and fails, which an operator would read as a bug in the redirect rather than a
+/// property of the transport.
+#[test]
+fn a_cleartext_unix_listener_cannot_redirect_to_https() {
+    // The platform refusal fires first on Windows, and it fires for the *same listener* — so the
+    // assertion is the reason the configuration is refused, whichever rule got there first.
+    if cfg!(not(unix)) {
+        let text = "[server]\nhttp = \"unix:/run/volucer/http.sock\"\nredirect_to_https = true\n\
+                    \n[server.tls]\ncertificate = \"c.pem\"\nkey = \"k.pem\"\nplain = true\n";
+        let config = Config::from_toml(text).expect("config parses");
+        let message = config.validate().expect_err("must be refused").to_string();
+        assert!(
+            message.contains("not available on this platform"),
+            "a unix listener is refused here before its redirect can be: {message}"
+        );
+        return;
+    }
+
+    // `plain = true` so the *earlier* rule — "a redirect needs something that answers cleartext" —
+    // is satisfied, and this test is about the socket rather than about that rule. Without it the
+    // earlier refusal fires first, which is correct and is a different test.
+    let text = "[server]\nhttp = \"unix:/run/volucer/http.sock\"\nredirect_to_https = true\n\
+                \n[server.tls]\ncertificate = \"c.pem\"\nkey = \"k.pem\"\nplain = true\n";
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("must be refused");
+    let message = err.to_string();
+    assert!(message.contains("redirect_to_https"), "{message}");
+    assert!(
+        message.contains("unix:/run/volucer/http.sock"),
+        "the message must name the listener it is about: {message}"
+    );
+}
+
 /// The status listener is TCP, and a `unix:` address is refused when the file is read.
 ///
 /// `parse_listener` accepts the form for every other listener, so without this the value passed

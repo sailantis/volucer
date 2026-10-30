@@ -17,7 +17,6 @@
 //! slots directly, keep the code readable, and avoid an executor in a program
 //! whose real work is process supervision.
 
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -93,7 +92,13 @@ impl Stats {
 
 /// A running FastCGI listener.
 pub struct FastCgiListener {
-    listener: TcpListener,
+    /// The endpoint as configured, for the startup line.
+    ///
+    /// Kept as a string rather than derived from the bound socket, because a unix path has no
+    /// `SocketAddr` to derive it from — and a listener that reported `0.0.0.0:0` instead of the
+    /// socket it actually bound would be a startup line an operator cannot match to their file.
+    address: String,
+    listener: Bound,
     dispatcher: Arc<Dispatcher>,
     /// The site table, shared with the HTTP front-end, so a reload moves both.
     ///
@@ -168,13 +173,10 @@ impl FastCgiListener {
         registry: Arc<Registry>,
         limits: Limits,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(address).map_err(|source| ServerError::Misconfigured {
-            backend: "<listener>".to_string(),
-            reason: format!("cannot bind {address}: {source}"),
-        })?;
-        listener.set_nonblocking(false).map_err(ServerError::Io)?;
-
+        let listener = bind(address)?;
+        listener.set_nonblocking(true).map_err(ServerError::Io)?;
         Ok(FastCgiListener {
+            address: address.to_string(),
             listener,
             dispatcher,
             sites: registry.shared().clone(),
@@ -232,8 +234,16 @@ impl FastCgiListener {
     }
 
     /// The address actually bound, which matters when port 0 was requested.
-    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        self.listener.local_addr().map_err(ServerError::Io)
+    ///
+    /// `None` for a unix socket, which has no address to report — the caller's configured string
+    /// is the answer there, and inventing `0.0.0.0:0` would print a port that does not exist.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// The endpoint as configured, which is what a unix socket has in place of an address.
+    pub fn configured_address(&self) -> &str {
+        &self.address
     }
 
     /// A handle that stops the listener from another thread.
@@ -267,7 +277,6 @@ impl FastCgiListener {
                         drop(stream);
                         continue;
                     }
-
                     let dispatcher = Arc::clone(&self.dispatcher);
                     let sites = self.sites.clone();
                     let stats = Arc::clone(&self.stats);
@@ -305,6 +314,9 @@ impl FastCgiListener {
         for handle in handlers {
             let _ = handle.join();
         }
+        // After the last connection has finished, which is the only point a unix socket path may be
+        // removed: unlinking earlier would make the socket unreachable while it is still answering.
+        self.listener.unlink();
         let (connections, requests, rejected, failed) = self.stats.snapshot();
         tracing::info!(connections, requests, rejected, failed, "listener stopped");
         Ok(())
@@ -325,6 +337,251 @@ impl ShutdownHandle {
     pub fn is_shutting_down(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
+}
+
+/// Who a connection came from.
+///
+/// A unix socket peer has no address — the kernel reports none — so this is two shapes rather than a
+/// `SocketAddr` with a stand-in. `0.0.0.0:0` would read as a real peer in a log, and the whole reason
+/// a deployment puts nginx and volucer on one socket is that they are on one host.
+enum Peer {
+    Address(std::net::SocketAddr),
+    /// A unix socket. Rendered as the transport, because there is no address to name.
+    ///
+    /// Only constructed on a unix host, because only `Bound::Unix` produces one — the variant is
+    /// listed unconditionally so the `Display` impl below matches one shape rather than two.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Unix,
+}
+
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Peer::Address(address) => address.fmt(f),
+            Peer::Unix => f.write_str("unix"),
+        }
+    }
+}
+
+/// The socket this listener bound, over either transport.
+///
+/// Two shapes and one accept loop: the FastCGI front-end is reached at `host:port` by a proxy or at
+/// `unix:/run/volucer.sock` by the same proxy over a path, and every step after `accept` — the record
+/// framing, the keep-alive loop, dispatch, the access log — is identical. A second copy of the loop
+/// per transport is how a fix lands on a TCP socket and not on a unix one.
+///
+/// Deliberately local to this module, like [`crate::rpc`]'s equivalent: it exists to keep *this*
+/// loop's signature honest, not to become a general transport abstraction.
+enum Bound {
+    Tcp(std::net::TcpListener),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixListener, std::path::PathBuf),
+}
+
+/// One accepted connection, over either transport.
+enum Connected {
+    Tcp(std::net::TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl Connected {
+    /// Undo the non-blocking mode an accepted socket inherits from its listener.
+    ///
+    /// On Windows `accept` returns a socket that is non-blocking when the *listener* is, so this must
+    /// be reset explicitly; without it every read returns `WouldBlock` immediately and the connection
+    /// is dropped right after the first record.
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Connected::Tcp(stream) => stream.set_nonblocking(nonblocking),
+            #[cfg(unix)]
+            Connected::Unix(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Connected::Tcp(stream) => stream.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Connected::Unix(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    /// `TCP_NODELAY` where there is a TCP stack to set it on.
+    ///
+    /// A unix socket has none, and the option is `ENOPROTOOPT` there — the same reason
+    /// [`crate::rpc`]'s `Connected` says so about the same option.
+    fn set_nodelay(&self) -> std::io::Result<()> {
+        match self {
+            Connected::Tcp(stream) => stream.set_nodelay(true),
+            #[cfg(unix)]
+            Connected::Unix(_) => Ok(()),
+        }
+    }
+}
+
+impl std::io::Read for Connected {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Connected::Tcp(stream) => stream.read(buf),
+            #[cfg(unix)]
+            Connected::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for Connected {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Connected::Tcp(stream) => stream.write(buf),
+            #[cfg(unix)]
+            Connected::Unix(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Connected::Tcp(stream) => stream.flush(),
+            #[cfg(unix)]
+            Connected::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
+impl Bound {
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Bound::Tcp(listener) => listener.set_nonblocking(nonblocking),
+            #[cfg(unix)]
+            Bound::Unix(listener, _) => listener.set_nonblocking(nonblocking),
+        }
+    }
+
+    fn accept(&self) -> std::io::Result<(Connected, Peer)> {
+        match self {
+            Bound::Tcp(listener) => listener
+                .accept()
+                .map(|(stream, peer)| (Connected::Tcp(stream), Peer::Address(peer))),
+            #[cfg(unix)]
+            Bound::Unix(listener, _) => listener
+                .accept()
+                .map(|(stream, _)| (Connected::Unix(stream), Peer::Unix)),
+        }
+    }
+
+    /// The bound address, for a caller that asked for port 0. `None` for a unix socket, which has no
+    /// `SocketAddr` — the configured path is the answer there.
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Bound::Tcp(listener) => listener.local_addr().ok(),
+            #[cfg(unix)]
+            Bound::Unix(..) => None,
+        }
+    }
+
+    /// Remove the socket file, so a restart does not meet a stale path.
+    ///
+    /// Called once the accept loop has ended *and* every connection thread has been joined: a path
+    /// removed while the socket is still answering would leave the listener reachable by the
+    /// descriptors already open to it and by nothing else.
+    fn unlink(&self) {
+        #[cfg(unix)]
+        if let Bound::Unix(_, path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Bind a `unix:/path` or a `host:port` for the FastCGI front-end.
+///
+/// A unix socket path is a *file*, so a path left behind by a crash makes the next bind fail with
+/// `EADDRINUSE` and the restarted server could never come up. It is unlinked first, which is safe
+/// because this process is meant to be the only listener on that path: a live server would hold the
+/// socket, and the unlink would not disturb it — the bind would fail instead, which is the honest
+/// answer rather than two processes sharing one address.
+fn bind(address: &str) -> Result<Bound> {
+    let listener = volucer_core::config::parse_listener(address)
+        .map_err(|reason| bind_failure(address, reason))?;
+    match listener {
+        volucer_core::config::Listener::Tcp(socket) => {
+            std::net::TcpListener::bind(socket)
+                .map(Bound::Tcp)
+                .map_err(|source| bind_failure(address, source.to_string()))
+        }
+        volucer_core::config::Listener::Unix(path) => bind_unix(address, &path),
+    }
+}
+
+/// The one shape a bind failure takes, so the message always names the endpoint as written.
+fn bind_failure(address: &str, reason: impl std::fmt::Display) -> ServerError {
+    ServerError::Misconfigured {
+        backend: "<listener>".to_string(),
+        reason: format!("cannot bind {address}: {reason}"),
+    }
+}
+
+/// Bind a unix socket path.
+#[cfg(unix)]
+fn bind_unix(address: &str, path: &std::path::Path) -> Result<Bound> {
+    // A stale path is unlinked first, for the reason the worker pool's socket bind documents: a
+    // socket path is a *file*, and binding one that survives a crash fails with `EADDRINUSE`, so a
+    // restarted server could never come up. Safe because this process is meant to be the only
+    // listener on that path — a live server would hold the socket and the bind would fail rather
+    // than two processes sharing an address.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(unlink_failure(path, err)),
+    }
+    check_unix_path_length(address, path)?;
+    std::os::unix::net::UnixListener::bind(path)
+        .map(|listener| Bound::Unix(listener, path.to_path_buf()))
+        .map_err(|source| bind_failure(address, source.to_string()))
+}
+
+/// A unix socket path on a platform without them.
+#[cfg(not(unix))]
+fn bind_unix(address: &str, path: &std::path::Path) -> Result<Bound> {
+    let _ = path;
+    Err(bind_failure(
+        address,
+        "unix sockets are not available on this platform; use a loopback address such as \
+         127.0.0.1:9000",
+    ))
+}
+
+/// Report a path that could not be unlinked before binding, naming what the operator can fix.
+#[cfg(unix)]
+fn unlink_failure(path: &std::path::Path, err: std::io::Error) -> ServerError {
+    ServerError::Misconfigured {
+        backend: "<listener>".to_string(),
+        reason: format!(
+            "cannot remove the stale socket {} before binding it: {err}; the directory must be \
+             writable by the user running volucer",
+            path.display()
+        ),
+    }
+}
+
+/// Refuse a path the kernel would truncate.
+///
+/// The kernel truncates a `sun_path` longer than the platform allows rather than failing, which would
+/// bind a path nobody asked for — so a listener at a path an operator wrote and at one nobody asked
+/// for are indistinguishable afterwards. Checked here as well as in `validate_cgi_socket` because the
+/// two answer different questions: that one bounds a per-slot prefix, this one a finished path.
+#[cfg(unix)]
+fn check_unix_path_length(address: &str, path: &std::path::Path) -> Result<()> {
+    let length = path.as_os_str().len();
+    if length > volucer_core::config::UNIX_SOCKET_PATH_MAX {
+        return Err(bind_failure(
+            address,
+            format!(
+                "this path is {length} bytes, and the platform allows at most {}",
+                volucer_core::config::UNIX_SOCKET_PATH_MAX
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A request's CGI parameter, as text, if it is there and is valid UTF-8.
@@ -458,7 +715,7 @@ struct Shared {
 
 /// Serve requests on one connection until the peer closes or keep-alive ends.
 fn serve_connection(
-    stream: std::net::TcpStream,
+    stream: Connected,
     shared: Shared,
     limits: Limits,
     rate_limit: Option<Arc<volucer_watch::RateLimitCell>>,
@@ -480,14 +737,15 @@ fn serve_connection(
     stream
         .set_read_timeout(Some(KEEPALIVE_TIMEOUT))
         .map_err(ServerError::Io)?;
-    let _ = stream.set_nodelay(true);
+    let _ = stream.set_nodelay();
 
     // Buffered, because every record the front-end sends is a header followed by a content
     // payload and the codec asks for the two separately: unbuffered, a request whose environment
     // arrives as a dozen small records costs about three `read(2)`s each, and every one of them
     // is a syscall the previous one could have answered. Measured: 40 reads for a 12-record
-    // request, 7 for the same request in one record. Writes go through `get_mut`, so a response
-    // still leaves in its records rather than being held back, and the read half stays buffered.
+    // request, 7 for the same request in one record. Writes go to the buffered stream itself, so a
+    // response still leaves in its records rather than being held back, and the read half stays
+    // buffered.
     let mut stream = std::io::BufReader::with_capacity(READ_BUFFER_LEN, stream);
     let max_connections_string = limits.max_connections.to_string();
     let mut requests_string = String::new();
@@ -802,7 +1060,7 @@ mod tests {
 
     #[test]
     fn binding_a_used_port_is_a_misconfiguration_not_a_panic() {
-        let held = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = held.local_addr().expect("address").to_string();
 
         let config = volucer_core::config::Config {
