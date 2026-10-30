@@ -43,10 +43,26 @@ use std::time::{Duration, SystemTime};
 
 pub mod memory;
 
+#[cfg(feature = "amqp")]
+pub mod amqp;
+
 #[cfg(feature = "redis")]
 pub mod redis;
 
 pub use memory::MemoryDriver;
+
+#[cfg(feature = "amqp")]
+pub use amqp::{AmqpDriver, AmqpQueue};
+
+/// The AMQP field-table types, re-exported because they appear in [`AmqpQueue`]'s public fields.
+///
+/// A caller building a queue has to build an [`amqprs`] field table, so without this it would need its own
+/// dependency on the client's companion crate — and two crates naming the same package independently is
+/// how their versions drift apart. Re-exporting is what keeps one version in the tree.
+#[cfg(feature = "amqp")]
+pub mod amqp_types {
+    pub use amqp_serde::types::{FieldName, FieldTable, FieldValue};
+}
 
 #[cfg(feature = "redis")]
 pub use redis::RedisDriver;

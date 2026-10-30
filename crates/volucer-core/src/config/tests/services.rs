@@ -403,6 +403,175 @@ url = "redis://127.0.0.1:6379"
     assert!(message.contains("rediss"), "{message}");
 }
 
+/// An AMQP pipeline is checked for its URL's shape, for a credential on a plaintext connection, for a zero
+/// command deadline and for an empty queue name — the four keys that would each produce a pipeline that
+/// starts and then does nothing useful.
+///
+/// The empty-queue case is the one worth having: RabbitMQ would *accept* `queue = ""` and hand back a
+/// server-named queue, so the symptom is a queue that exists, receives nothing, and reports no error.
+#[cfg(feature = "amqp")]
+#[test]
+fn an_amqp_pipeline_is_checked_for_shape_and_for_an_empty_queue_name() {
+    let with = |url: &str, extra: &str| {
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs.pipelines.emails]
+driver = "amqp"
+url = "{url}"
+{extra}
+"#
+        );
+        Config::from_toml(&text).expect("the file parses").validate()
+    };
+
+    with("amqp://guest:guest@127.0.0.1:5672", "")
+        .expect_err("a credential over plaintext is refused, as it is on every other remote table");
+    with("amqp://127.0.0.1:5672", "")
+        .expect("a plaintext URL with no credential is the ordinary local case");
+    with("amqps://guest:guest@broker.example.com:5671", "")
+        .expect("and a credential over TLS is fine");
+    with("amqp://127.0.0.1:5672", "read_timeout_ms = 250")
+        .expect("the deadline is read rather than ignored");
+
+    let err = with("amqps://broker:5671", "read_timeout_ms = 0")
+        .expect_err("a zero deadline is not a deadline");
+    assert!(err.to_string().contains("read_timeout_ms"), "{err}");
+
+    let err = with("http://127.0.0.1:5672", "").expect_err("that is not an AMQP URL");
+    assert!(err.to_string().contains("amqp://"), "{err}");
+
+    let err = with("amqp://127.0.0.1:5672", "queue = \"  \"")
+        .expect_err("an empty queue name is a server-named queue nothing can route to");
+    let message = err.to_string();
+    assert!(message.contains("queue"), "{message}");
+    assert!(
+        message.contains("server-named"),
+        "the refusal must say what would happen rather than only that it is empty: {message}"
+    );
+}
+
+/// A misspelled AMQP driver is refused by name, and a build without the feature refuses the driver rather
+/// than accepting a table nothing can build.
+///
+/// The two halves in one test because they are one question — what does a file naming a feature-gated
+/// driver do — and the answer must differ by the *build* rather than by the file. `#[cfg]` decides which
+/// assertion runs, not which file is read, so a file that only works in one build cannot be written by
+/// accident. This is the same shape `a_feature_gated_driver_is_refused_by_name_when_the_build_has_no_such_driver`
+/// uses for `redis`.
+#[test]
+fn an_amqp_pipeline_is_refused_by_name_when_the_build_has_no_amqp_driver() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs.pipelines.emails]
+driver = "amqp"
+url = "amqp://127.0.0.1:5672"
+"#;
+    let parsed = Config::from_toml(text);
+    #[cfg(feature = "amqp")]
+    {
+        let config = parsed.expect("the amqp driver is compiled in, so this must parse");
+        config
+            .validate()
+            .expect("a local URL with no credential is a valid configuration");
+        let pipeline = config
+            .jobs
+            .as_ref()
+            .and_then(|jobs| jobs.pipelines.get("emails"))
+            .expect("emails is configured");
+        assert_eq!(pipeline.driver(), "amqp");
+    }
+    #[cfg(not(feature = "amqp"))]
+    {
+        let err = parsed.expect_err("the amqp driver is not compiled in, so this must not parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown variant `amqp`"),
+            "the refusal must name the variant, so the operator knows the driver is unknown rather than \
+             misspelled: {message}"
+        );
+        assert!(
+            message.contains("`memory`"),
+            "and list what this build does have: {message}"
+        );
+    }
+}
+
+/// A queue argument's TOML type reaches the broker's type system, so `x-queue-type = "quorum"` really is a
+/// string and `x-max-priority = 10` really is a number.
+///
+/// Asserted because a field table is untyped at the wire level and a wrong tag is not an error at parse
+/// time: an integer sent as a string is a broker closing the channel with an argument-type complaint. This
+/// is the check that the mapping in `field_value` is not a silent coercion.
+#[cfg(feature = "amqp")]
+#[test]
+fn queue_argument_types_are_kept_rather_than_stringified() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs.pipelines.emails]
+driver = "amqp"
+url = "amqp://127.0.0.1:5672"
+arguments = { "x-queue-type" = "quorum", "x-max-priority" = 10, "x-single-active-consumer" = true, "x-message-ttl" = 60000 }
+"#;
+    let config = Config::from_toml(text).expect("the file parses");
+    config.validate().expect("these are all valid arguments");
+    let pipeline = config
+        .jobs
+        .as_ref()
+        .and_then(|jobs| jobs.pipelines.get("emails"))
+        .expect("emails is configured");
+    let PipelineConfig::Amqp(amqp) = pipeline else {
+        panic!("emails is an amqp pipeline");
+    };
+
+    assert!(
+        matches!(
+            amqp.arguments.get("x-queue-type"),
+            Some(AmqpArgument::Text(text)) if text == "quorum"
+        ),
+        "a string argument stays a string, which is what the broker needs for a queue type"
+    );
+    assert!(
+        matches!(
+            amqp.arguments.get("x-max-priority"),
+            Some(AmqpArgument::Integer(10))
+        ),
+        "and a number stays a number: sending 10 as text is a channel the broker closes"
+    );
+    assert!(matches!(
+        amqp.arguments.get("x-single-active-consumer"),
+        Some(AmqpArgument::Flag(true))
+    ));
+    assert!(matches!(
+        amqp.arguments.get("x-message-ttl"),
+        Some(AmqpArgument::Integer(60000))
+    ));
+}
+
+/// A `[jobs]` table with no `[jobs.pool]` and a non-empty `consume` is refused on the AMQP driver too —
+/// the rule is the pipeline's, not the driver's.
+#[cfg(feature = "amqp")]
+#[test]
+fn an_amqp_pipeline_still_needs_a_consumer_pool_to_be_consumed() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "amqp"
+url = "amqp://127.0.0.1:5672"
+"#;
+    let err = Config::from_toml(text)
+        .expect("the file parses")
+        .validate()
+        .expect_err("a consumer without a command cannot start a consumer");
+    assert!(err.to_string().contains("pool"), "{err}");
+}
+
 /// A `[kv.*]` table whose driver is misspelled is refused, naming the key it did not understand.
 #[test]
 fn an_unknown_kv_driver_is_refused_rather_than_ignored() {
@@ -723,3 +892,4 @@ fn a_grant_is_parsed_into_one_of_four_shapes_or_refused() {
     assert!(workers.covers("workers.list"));
     assert!(workers.covers("workers.reset"));
 }
+

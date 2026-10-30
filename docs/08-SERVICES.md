@@ -353,7 +353,7 @@ processing the next job.
 consume = ["emails"]        # the pipelines this server consumes from
 
 [jobs.pipelines.emails]
-driver = "memory"           # or "redis"
+driver = "memory"           # or "redis", or "amqp"
 
 [jobs.pool]
 command = "php consumer.php"
@@ -367,6 +367,54 @@ Configure `[jobs.pool]` when `consume` is non-empty. `job_lease_seconds` control
 a reserved job remains leased; it is separate from the HTTP request timeout. Choose a lease
 long enough for the job to complete, while ensuring abandoned jobs become available again
 in a reasonable time if a consumer exits unexpectedly.
+
+### The three drivers, and which one to pick
+
+| Driver | The queue lives in | Choose it when |
+|---|---|---|
+| `memory` | This process's heap | The work can be regenerated and one process does both halves |
+| `redis` | Keys this server made | Several volucer servers share a queue |
+| `amqp` | A RabbitMQ broker | **Something that is not volucer** produces or consumes from the same queue |
+
+`memory` loses everything on restart, including jobs handed to a consumer and not yet
+acknowledged. `redis` is the honest multi-node default. `amqp` is the right choice when the
+queue is a shared resource rather than this application's private one — an AMQP queue is an
+object the broker owns, so a Python consumer, another deployment or another team's service
+can use it without knowing anything about volucer.
+
+```toml
+[jobs.pipelines.notifications]
+driver = "amqp"
+url = "amqp://guest:guest@127.0.0.1:5672"   # `amqps://` for TLS
+arguments = { "x-queue-type" = "quorum" }
+```
+
+`arguments` is passed to the broker unchanged, because priority, per-message TTL, delay and
+dead-lettering are RabbitMQ features configured through queue arguments. Volucer has no key
+for any of them: a key called `priority` would be this server's opinion about how priority
+works, and a second application sharing the queue would disagree with it.
+
+#### Two things AMQP does differently, stated rather than discovered
+
+**The attempt count is exact only on a quorum queue.** AMQP gives a consumer one bit —
+`redelivered` — so on a classic queue `attempts` is `1` on the first delivery and `2` on every
+redelivery, however many times the job has actually run. A **quorum** queue makes RabbitMQ
+report `x-acquired-count`, and then `attempts` is the true number. An application whose retry
+policy switches on `attempts` needs `x-queue-type = "quorum"`.
+
+**`job_lease_seconds` does not bound an AMQP reservation.** A job taken from a broker is
+unacknowledged on the driver's channel and comes back when that channel closes — immediately
+if the process is killed, which is *stronger* than a lease. But a consumer that hangs stays
+connected, so its job stays unacked for as long as it lives, which is *weaker*. A deployment
+moving from `redis` should know which of the two it is buying.
+
+`in_flight` is also per process on this driver: AMQP 0-9-1 has no method that reports a
+queue's unacknowledged count, so the number is this server's own reservations. With one
+consumer server that is the truth; with several it under-reports by the others' share.
+
+A push into a queue that does not exist is an **error**, not a silent success. The broker
+returns the message with `312 NO_ROUTE` and then confirms it, so watching for the
+confirmation alone would report a lost job as accepted.
 
 ## gRPC
 

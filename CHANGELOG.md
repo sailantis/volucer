@@ -9,7 +9,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A push into a deleted AMQP queue is an error rather than a silent success.** RabbitMQ returns an
+  unroutable `mandatory` publish with `312 NO_ROUTE` and *then* confirms it, so a driver that watched
+  only for the publisher confirmation would report a lost job as accepted. The AMQP driver treats a
+  return inside its confirm window as a failure.
+
+- **`driver = "amqp"` accepts the URL every other AMQP client documents.** The AMQP URI spec writes the
+  default virtual host as `/`, i.e. `%2f` in a URL, and `amqp://guest:guest@host:5672/%2f` is what
+  RabbitMQ's own documentation shows. The client this server uses takes the path after the slash
+  verbatim, so it read the virtual host as a queue-like name and the broker refused the connection with
+  `530 NOT_ALLOWED - vhost %2f not found`. Both spellings of the default vhost — `%2f` and an empty
+  path — are now reduced to the one form the client parses.
+
 ### Added
+
+- **`driver = "amqp"`: queues in RabbitMQ.** A third job driver, beside `memory` and `redis`, behind a
+  non-default `amqp` cargo feature on the same rule as the others — a build without it refuses the table
+  by naming the driver, rather than accepting a pipeline whose every push would fail.
+
+  It is the right choice when the queue is a **shared** resource rather than this application's private
+  one: an AMQP queue is an object the broker owns, so a non-volucer producer or consumer can use it
+  without knowing anything about this server.
+
+  `arguments` passes queue arguments to the broker unchanged, because priority, per-message TTL, delay
+  and dead-lettering are RabbitMQ features reached that way. There is deliberately no `priority` or
+  `dead_letter` key: each would be this server's opinion about a semantics a second application sharing
+  the queue also has one of.
+
+  Three properties of the protocol are documented rather than papered over, because each is something a
+  deployment migrating from `redis` would otherwise discover the hard way:
+
+  - **`attempts` is exact only on a quorum queue.** A classic queue gives a consumer one bit,
+    `redelivered`, so the count is `1` then `2`, `2`, `2`. A quorum queue makes RabbitMQ report
+    `x-acquired-count`, and then the count is real.
+  - **`job_lease_seconds` does not bound an AMQP reservation.** A killed consumer's connection drops and
+    its job comes back immediately — stronger than a lease. A *hung* consumer stays connected and holds
+    its job indefinitely — weaker.
+  - **`in_flight` is per process**, because AMQP 0-9-1 has no method that reports a queue's
+    unacknowledged count.
+
+  The driver was written with the client chosen by measurement rather than preference: of the three
+  candidates resolved from crates.io, `amiquip` **aborts the process on Windows** (its 2019-era `mio`
+  0.6 panics with `null reference produced`, `STATUS_STACK_BUFFER_OVERRUN`) and `lapin` costs five times
+  the dependency graph and drags in a second TLS stack that `crates/volucer-http/tests/one_rustls.rs`
+  exists to refuse. The tests run against a real RabbitMQ, and `VOLUCER_E2E=1` turns a skip into a
+  failure — which is how the virtual-host defect above was found, after ten tests had been passing by
+  silently skipping.
 
 - **The worker protocol can describe a response whose length is not known.** A worker that generates
   its body as it goes — a CSV export, an SSE feed — could not previously say so: `ResponseHead.body_len`

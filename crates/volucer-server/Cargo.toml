@@ -59,6 +59,9 @@ default = []
 # Enables the `redis` KV driver and the Redis client that serves it — and the lock driver, which
 # shares the client. A build without it links no Redis at all.
 redis = ["volucer-kv/redis", "volucer-core/redis", "volucer-lock/redis", "volucer-jobs/redis"]
+# The AMQP job driver, on the same rule as `redis`: a build without it refuses `driver = "amqp"` by name
+# rather than starting a server whose every push would fail.
+amqp = ["volucer-jobs/amqp", "volucer-core/amqp"]
 [dev-dependencies]
 # An empty request body, so an upstream test needs no listener to make one.
 http-body-util.workspace = true

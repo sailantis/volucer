@@ -9,6 +9,8 @@ use super::rules::{
 use super::services::default_kv_max_bytes;
 #[cfg(feature = "redis")]
 use super::services::validate_redis;
+#[cfg(feature = "amqp")]
+use super::services::validate_amqp;
 use super::*;
 
 /// Refuse a `unix:` listener on a platform that has no unix sockets.
@@ -507,6 +509,10 @@ impl Config {
                              command time out the instant it was sent; leave it out for the default"
                         )));
                     }
+                }
+                #[cfg(feature = "amqp")]
+                if let PipelineConfig::Amqp(amqp) = pipeline {
+                    validate_amqp(&format!("jobs.pipelines.{name}"), amqp)?;
                 }
                 let _ = pipeline.driver();
             }

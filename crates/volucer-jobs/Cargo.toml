@@ -19,6 +19,17 @@ thiserror.workspace = true
 # `sha1_smol` and nothing else, which is what makes it a reasonable ask — the alternative is sending a
 # kilobyte of script text on every reserve.
 redis = { workspace = true, features = ["script"], optional = true }
+# The AMQP client, behind the `amqp` feature. Both the client and the field-table types are optional so
+# a deployment with no AMQP pipeline links neither.
+amqprs = { workspace = true, optional = true }
+amqp_serde = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+# The driver is synchronous and the client is not, so an owned runtime is what turns one into the other.
+# **This is not optional**, because the conversion is not specific to one driver's client: the Redis
+# driver got its blocking client from `redis`'s own blocking wrapper, and there is no blocking AMQP
+# client without the Windows abort `amiquip` demonstrated. So the runtime is a dependency of the
+# `amqp` feature rather than of the crate, and it is the same `tokio` the rest of the tree uses.
+tokio = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -26,9 +37,20 @@ default = []
 # optional dependency rather than through a re-export, for the same reason those two name it separately:
 # a feature that enabled another crate's module would couple the drivers' versions for no reason.
 redis = ["dep:redis"]
+# The AMQP driver, on the same rule: a deployment with no `driver = "amqp"` pipeline links no broker
+# client at all. `tls` is what makes `amqps://` possible and `urispec` is what makes the URL a URL —
+# both are named because `amqprs`'s default set is empty, so a bare dependency would compile a driver
+# that could neither read its own configuration nor reach a TLS broker.
+amqp = ["dep:amqprs", "dep:amqp_serde", "dep:async-trait", "dep:tokio", "amqprs/tls", "amqprs/urispec"]
 
 [dev-dependencies]
 # The integration tests in `tests/redis.rs` drive the driver through the client directly, to check facts
 # about the *server* rather than about this crate's API — that a leaked job's key really expires, and that
 # a reservation is a hash field rather than a promise. Gated through the same feature.
 redis = { workspace = true, features = ["script"] }
+# The same for AMQP: `tests/amqp.rs` deletes its own queue through the client, because the driver
+# deliberately exposes no way to delete a pipeline and adding one for a test's convenience would be an
+# API nobody asked for.
+amqprs = { workspace = true, features = ["tls", "urispec"] }
+amqp_serde.workspace = true
+tokio.workspace = true

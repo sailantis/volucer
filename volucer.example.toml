@@ -1592,6 +1592,41 @@ base_port = 19001
 # queue that silently corrupted an application's bytes would be one that hands a
 # consumer work it cannot possibly interpret.
 #
+# `driver = "amqp"` puts the queue in RabbitMQ. Pick it when the queue is shared
+# with something that is not volucer -- a Python consumer, a service in another
+# deployment, a broker another team owns -- because an AMQP queue is an object the
+# *broker* owns rather than a set of keys this server made:
+#
+# [jobs.pipelines.emails]
+# driver = "amqp"
+# url = "amqp://guest:guest@127.0.0.1:5672"   # `amqps://` for TLS
+# queue = "emails"                   # defaults to the pipeline's own name
+# exchange = ""                      # the default exchange, routing by queue name
+# routing_key = "emails"             # defaults to the queue's name
+# durable = true                     # a transient queue is emptied by a broker restart
+# read_timeout_ms = 5000
+# arguments = { "x-queue-type" = "quorum" }
+#
+# `arguments` is passed to the broker unchanged, and that is deliberate: priority,
+# per-message TTL, delay and dead-lettering are RabbitMQ features configured
+# through queue arguments, and inventing a volucer key for each would make this
+# file a subset of RabbitMQ's documentation that is always one release behind.
+# `x-queue-type = "quorum"` is the one worth choosing deliberately -- see below.
+#
+# **The attempt count is exact only on a quorum queue.** On a classic queue AMQP
+# gives a consumer one bit -- `redelivered` -- so a job's `attempts` is 1 and then
+# 2, 2, 2 however many times it has run. A quorum queue makes RabbitMQ report how
+# many times the message has been acquired, so `attempts` is the real number. An
+# application whose retry policy switches on it needs the quorum queue type.
+#
+# **`job_lease_seconds` does not bound an AMQP reservation.** A message taken by
+# `basic_get` is unacknowledged on the driver's channel and comes back when that
+# channel closes -- immediately, if the process is killed. What the lease cannot
+# do is rescue a consumer that is *stuck*: a hung process keeps its connection, so
+# its message stays unacked for as long as it lives. That is stronger than a lease
+# for a crash and weaker for a hang, and a deployment moving from `redis` should
+# know which one it is buying.
+#
 # jobs.pool configures the consumers. The command is a *consumer*, which is the
 # consumer example in the PHP SDK rather than a request worker: it boots once and
 # keeps whatever it booted -- a connection pool, a container, a warm cache --
@@ -1617,6 +1652,11 @@ base_port = 19001
 #
 # [jobs.pipelines.reports]
 # driver = "memory"                  # configured, pushed to, never polled here
+#
+# [jobs.pipelines.notifications]
+# driver = "amqp"                    # requires a build with the `amqp` feature
+# url = "amqp://guest:guest@127.0.0.1:5672"
+# arguments = { "x-queue-type" = "quorum" }
 #
 # [jobs.pool]
 # command = "php bin/consumer.php"

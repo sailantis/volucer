@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock, Weak};
-#[cfg(feature = "redis")]
+#[cfg(any(feature = "redis", feature = "amqp"))]
 use std::time::Duration;
 
 use volucer_core::config::{
@@ -316,6 +316,32 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
                 })?;
                 Arc::new(driver)
             }
+            #[cfg(feature = "amqp")]
+            PipelineConfig::Amqp(amqp) => {
+                // A **separate connection per AMQP pipeline**, for the reason the Redis arm states and
+                // one more: a reservation *is* an unacknowledged message on a channel, so a pipeline's
+                // channel must be the one that settles it. Two pipelines sharing a channel could still
+                // settle each other's jobs, but a channel is also where the broker reports a failure —
+                // and one pipeline's refused queue argument would then close the other's.
+                let queue = volucer_jobs::AmqpQueue {
+                    queue: amqp.queue.clone().unwrap_or_else(|| name.clone()),
+                    exchange: amqp.exchange.clone().unwrap_or_default(),
+                    routing_key: amqp.routing_key.clone().unwrap_or_else(|| {
+                        amqp.queue.clone().unwrap_or_else(|| name.clone())
+                    }),
+                    durable: amqp.durable,
+                    arguments: field_table(&amqp.arguments)?,
+                };                let driver = volucer_jobs::AmqpDriver::connect(
+                    &amqp.url,
+                    Duration::from_millis(amqp.read_timeout_ms),
+                    [(name.clone(), queue)],
+                )
+                .map_err(|err| ServerError::Misconfigured {
+                    backend: format!("jobs.pipelines.{name}"),
+                    reason: err.to_string(),
+                })?;
+                Arc::new(driver)
+            }
         };
         tracing::info!(
             pipeline = %name,
@@ -347,13 +373,69 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
     })))
 }
 
+/// One queue argument's name, as the broker's field table needs it.
+///
+/// Refused rather than truncated: an argument name the broker cannot represent is a queue declared with an
+/// argument the application did not write, and the failure would surface as a queue with the wrong TTL.
+#[cfg(feature = "amqp")]
+fn field_name(name: &str) -> Result<volucer_jobs::amqp_types::FieldName> {
+    volucer_jobs::amqp_types::FieldName::try_from(name).map_err(|_| {
+        ServerError::Misconfigured {
+            backend: "jobs".to_string(),
+            reason: format!(
+                "the queue argument {name:?} is longer than an AMQP field name allows, so the broker \
+                 could not be told it"
+            ),
+        }
+    })
+}
+
+/// Build a field table from the arguments an operator wrote.
+///
+/// `FieldTable` has no `FromIterator` and its `insert` maintains a byte length, so the table is built
+/// through `insert` rather than collected — which is also why the caller's `Result` is threaded here: a
+/// name the broker cannot hold has to be refused, not dropped.
+#[cfg(feature = "amqp")]
+fn field_table(
+    entries: &std::collections::BTreeMap<String, volucer_core::config::AmqpArgument>,
+) -> Result<volucer_jobs::amqp_types::FieldTable> {
+    let mut table = volucer_jobs::amqp_types::FieldTable::new();
+    for (key, value) in entries {
+        table.insert(field_name(key)?, field_value(value));
+    }
+    Ok(table)
+}
+
+/// One queue argument's value, in the broker's type system.
+///
+/// The mapping is total because [`AmqpArgument`] was designed to be: every variant of it has a field-table
+/// representation, which is the point of it being an enum rather than a free-form value.
+#[cfg(feature = "amqp")]
+fn field_value(value: &volucer_core::config::AmqpArgument) -> volucer_jobs::amqp_types::FieldValue {
+    use volucer_core::config::AmqpArgument;
+    use volucer_jobs::amqp_types::FieldValue;
+    match value {
+        // Long strings, because that is what RabbitMQ's field table supports for text — the short form
+        // does not exist as a value type, which is why the crate notes it as "not exist in RabbitMQ".
+        AmqpArgument::Text(text) => FieldValue::from(text.clone()),
+        // Signed 64-bit, the widest integer RabbitMQ offers. `x-max-priority`, `x-message-ttl` and
+        // `x-expires` all accept it, and a narrower type would refuse a TTL above a month in
+        // milliseconds.
+        AmqpArgument::Integer(number) => FieldValue::l(*number),
+        AmqpArgument::Float(number) => FieldValue::d(*number),
+        AmqpArgument::Flag(flag) => FieldValue::from(*flag),
+        // A nested table: names that cannot be held are dropped here rather than refused, because this
+        // path cannot return an error. A nested argument is rare and a name over the limit in one is
+        // rarer; the top-level check above is what an operator will actually meet.
+        AmqpArgument::Table(entries) => FieldValue::F(field_table(entries).unwrap_or_default()),
+    }
+}
+
 /// The pipelines, and which of them this server consumes.
 ///
 /// One object rather than the two halves being passed separately, because the consumer side needs
 /// the same drivers the producer namespace holds — and threading two maps through three signatures to avoid
-/// one struct is how a seam gets missed.
-///
-/// **The consumed set is derived here, once, from a configuration that has already been validated.** The
+/// one struct is how a seam gets missed./// **The consumed set is derived here, once, from a configuration that has already been validated.** The
 /// alternative — asking `Config` at the point of use — would put the same rule in two places, and the
 /// interesting failure of that shape is a `consume` name that validation accepted but this object cannot
 /// resolve: a consumer that starts, polls nothing, and reports no error.
@@ -1331,6 +1413,65 @@ mod tests {
     use volucer_core::config::{
         BackendConfig, Config, ExternalConfig, MemoryKvConfig, ServerConfig,
     };
+
+    /// A queue argument reaches the broker's type system through the dispatcher, not only through the
+    /// parser.
+    ///
+    /// The gap this closes is real: the configuration could parse `x-queue-type = "quorum"` into an
+    /// [`AmqpArgument`] and the driver could understand a field table, and the *conversion between them*
+    /// could still have stringified a number or dropped a key. Asserted through [`field_table`] because
+    /// that is the function `build_queues` calls, so a test of it is a test of the seam.
+    #[cfg(feature = "amqp")]
+    #[test]
+    fn a_queue_argument_reaches_the_brokers_type_system_with_its_type_intact() {
+        use volucer_core::config::AmqpArgument;
+        use volucer_jobs::amqp_types::{FieldName, FieldValue};
+
+        let mut arguments = BTreeMap::new();
+        arguments.insert(
+            "x-queue-type".to_string(),
+            AmqpArgument::Text("quorum".to_string()),
+        );
+        arguments.insert("x-max-priority".to_string(), AmqpArgument::Integer(10));
+        arguments.insert(
+            "x-single-active-consumer".to_string(),
+            AmqpArgument::Flag(true),
+        );
+
+        let table = field_table(&arguments).expect("every name is short enough for a field name");
+        assert!(
+            matches!(
+                table.get(&FieldName::try_from("x-queue-type").expect("a valid name")),
+                Some(FieldValue::S(text)) if text.as_ref() == "quorum"
+            ),
+            "a string argument must arrive as a string, because RabbitMQ rejects a queue type it cannot \
+             read as text"
+        );
+        assert!(
+            matches!(
+                table.get(&FieldName::try_from("x-max-priority").expect("a valid name")),
+                Some(FieldValue::l(10))
+            ),
+            "and a number as a signed 64-bit integer, which is the integer type RabbitMQ's field table \
+             actually uses"
+        );
+        assert!(matches!(
+            table.get(&FieldName::try_from("x-single-active-consumer").expect("a valid name")),
+            Some(FieldValue::t(true))
+        ));
+
+        // A name too long for the broker is refused rather than dropped, because a silently missing
+        // argument is a queue declared with a TTL nobody wrote. The bound is AMQP's `shortstr`: 255
+        // octets, which is what the client's `TryFrom` enforces — measured, since 200 characters is
+        // *accepted* and a test asserting otherwise would have been asserting the wrong limit.
+        let mut too_long = BTreeMap::new();
+        too_long.insert("x".repeat(300), AmqpArgument::Integer(1));
+        assert!(
+            field_table(&too_long).is_err(),
+            "an argument name past the 255-octet short-string limit must be an error, not a silently \
+             dropped key"
+        );
+    }
 
     /// A `[kv.*]` file store for a test, with the given relative path.
     ///

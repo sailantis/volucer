@@ -492,6 +492,17 @@ pub(super) fn default_redis_pool_size() -> usize {
     16
 }
 
+/// Whether a freshly declared queue is durable. Defaults to true, which is the safe answer.
+///
+/// A transient queue is emptied when the broker restarts, and the failure that produces is a queue that
+/// was working becoming a queue that loses work — the kind of thing an operator discovers during an
+/// incident rather than from a configuration file. So the default is the durable one and the escape is
+/// written explicitly.
+#[cfg(feature = "amqp")]
+fn default_amqp_durable() -> bool {
+    true
+}
+
 fn default_lock_read_timeout_ms() -> u64 {
     // Five seconds, which is what RoadRunner's own Redis lock configuration defaults to and what the
     // worker protocol's request timeout already is — so a lock command cannot outlive the request that
@@ -528,7 +539,7 @@ impl LockConfig {
 /// pushes mail jobs and a worker node that consumes them run the same configuration file, and the only
 /// difference between them is one line here. Consuming by default would make every web node also a
 /// consumer, which is how a job gets handled twice by two servers that both meant to be producers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobsConfig {
     /// Pipelines this server **polls**. Empty means it consumes nothing and only produces.
@@ -560,7 +571,11 @@ pub struct JobsConfig {
 /// A tagged enum, like [`KvStorageConfig`] and [`LockConfig`], so that a misspelled key is a parse error
 /// naming it rather than a key that parses, is ignored, and leaves an operator with a queue on the wrong
 /// driver and nothing in the log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Not `Eq`**, because [`AmqpArgument::Float`] cannot be: two `f64`s that parse from the same TOML text
+/// are equal for every purpose this file has, but the trait genuinely does not hold for `NaN`, and claiming
+/// it would be a lie a future comparison could act on. `PartialEq` is what the tests need.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "driver", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PipelineConfig {
     /// Jobs in this process's memory. Lost on restart — see the driver's documentation.
@@ -573,6 +588,16 @@ pub enum PipelineConfig {
     /// the constraint is the same one: a command that blocks a poller.
     #[cfg(feature = "redis")]
     Redis(RedisPipelineConfig),
+
+    /// Jobs in a RabbitMQ broker, shared between processes **and between deployments**.
+    ///
+    /// A third option rather than a replacement for either of the others, and the difference that matters
+    /// is where the queue lives: a Redis pipeline's queue is a set of keys this server made, while an AMQP
+    /// queue is an object the broker owns — one that a non-volucer producer can push to and that outlives
+    /// every server configured here. That is what makes it the right choice when the queue is shared with
+    /// something else.
+    #[cfg(feature = "amqp")]
+    Amqp(AmqpPipelineConfig),
 }
 
 /// `[jobs.pipelines.<name>] driver = "memory"`.
@@ -606,6 +631,98 @@ pub struct RedisPipelineConfig {
     pub read_timeout_ms: u64,
 }
 
+/// `[jobs.pipelines.<name>] driver = "amqp"`.
+///
+/// # Why this table has queue *arguments* and no priority or delay keys
+///
+/// RabbitMQ gives an application priority, per-message TTL, delay and dead-lettering — all of them through
+/// **queue arguments** the application declares. So this table passes arguments through rather than
+/// inventing a key per feature: a key called `priority` would be this server's opinion about how priority
+/// works, and a second application sharing the queue would disagree with it. The argument name is the
+/// broker's, documented by the broker, and an operator who knows RabbitMQ already knows it.
+///
+/// That is also why there is no `dead_letter` or `delay` key: those are the broker's features reached
+/// through the same table, and re-exporting each one as a typed key would make this file a subset of
+/// RabbitMQ's documentation that is always one release behind.
+#[cfg(feature = "amqp")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmqpPipelineConfig {
+    /// The broker URL, e.g. `amqp://guest:guest@127.0.0.1:5672`.
+    ///
+    /// `amqps://` for TLS. The default virtual host is written `/` — that is, `%2f` in a URL, which is
+    /// what RabbitMQ's own documentation shows — and this server rewrites both spellings to the form its
+    /// client parses, because that client would otherwise read the name literally and refuse the
+    /// connection.
+    pub url: String,
+
+    /// The queue's name. Defaults to the pipeline's own name, which is what makes a push name one thing.
+    #[serde(default)]
+    pub queue: Option<String>,
+
+    /// The exchange to publish to. Absent means the default exchange, which routes by queue name.
+    ///
+    /// A consumer always reads from `queue`; this only affects where a **push** goes. That asymmetry is
+    /// AMQP's rather than this server's: a message reaches a queue by being routed to it, and how it was
+    /// routed is the producer's business.
+    #[serde(default)]
+    pub exchange: Option<String>,
+
+    /// The routing key. Defaults to the queue's name, which is what the default exchange needs.
+    #[serde(default)]
+    pub routing_key: Option<String>,
+
+    /// Whether the queue is declared durable. Defaults to true.
+    #[serde(default = "default_amqp_durable")]
+    pub durable: bool,
+
+    /// The queue arguments, passed to the broker unchanged.
+    ///
+    /// This is where `x-queue-type = "quorum"` goes — and it matters more than it looks: on a **classic**
+    /// queue a consumer can only tell that a message was redelivered, so `attempts` is `1` then `2`, `2`,
+    /// `2`. On a **quorum** queue RabbitMQ reports how many times the message has been acquired, so
+    /// `attempts` is the real count. An application whose retry policy needs the count needs this table
+    /// entry.
+    #[serde(default)]
+    pub arguments: BTreeMap<String, AmqpArgument>,
+
+    /// How long one broker round trip may take before it is treated as failed, in milliseconds.
+    ///
+    /// The same five-second default the Redis pipeline has, and for the same reason: this is a poll-path
+    /// deadline, not a request timeout.
+    #[serde(default = "default_lock_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+}
+
+/// One queue argument's value, as TOML can write it.
+///
+/// # Why this is an enum rather than a `toml::Value`
+///
+/// AMQP's field table has a fixed set of types — strings, signed and unsigned integers up to 64 bits,
+/// booleans, floats and nested tables — and a `toml::Value` can express things that are not among them
+/// (datetimes, arrays of mixed types). Refusing those at parse time gives an operator a message naming the
+/// key rather than a broker closing the channel with a type error that this server then has to relay.
+///
+/// The integers are *signed* because that is what RabbitMQ's field table actually uses: measured, a
+/// quorum queue's `x-acquired-count` arrives as `LongLongInt`. A `x-max-priority` written as `10` lands
+/// in [`AmqpArgument::Integer`] and is stored as the 64-bit signed form, which every AMQP integer field
+/// accepts.
+#[cfg(feature = "amqp")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AmqpArgument {
+    /// A string, e.g. `x-queue-type = "quorum"`.
+    Text(String),
+    /// A signed integer, e.g. `x-max-priority = 10` or `x-message-ttl = 60000`.
+    Integer(i64),
+    /// A float.
+    Float(f64),
+    /// A boolean, e.g. `x-single-active-consumer = true`.
+    Flag(bool),
+    /// A nested table, for the arguments that take one.
+    Table(BTreeMap<String, AmqpArgument>),
+}
+
 impl PipelineConfig {
     /// The driver's name, as it is written in configuration.
     ///
@@ -616,6 +733,8 @@ impl PipelineConfig {
             PipelineConfig::Memory(_) => "memory",
             #[cfg(feature = "redis")]
             PipelineConfig::Redis(_) => "redis",
+            #[cfg(feature = "amqp")]
+            PipelineConfig::Amqp(_) => "amqp",
         }
     }
 }
@@ -775,6 +894,63 @@ pub(super) fn validate_redis(
              default",
             default = default_redis_pool_size()
         )));
+    }
+    Ok(())
+}
+
+/// The AMQP URL and queue rules.
+///
+/// The same shape as [`validate_redis`] and for the same reasons, plus two rules that are this driver's
+/// own:
+///
+/// - **A credential over plaintext `amqp://` is refused.** The Redis rule exists because a password in a
+///   configuration file is the one place nobody is watching a log when the decision is made; the same is
+///   true here, and `amqps://` is the fix.
+/// - **`read_timeout_ms = 0` is refused**, for the reason the Redis pipeline refuses it: a broker command
+///   with no deadline is a poller that hangs on a broker that went away, which is the failure the key
+///   exists to bound.
+///
+/// What is deliberately **not** checked is the queue's existence or its arguments: both need a broker, and
+/// `volucer check` must not require one — a URL that parses is all a configuration can vouch for. A queue
+/// argument the broker rejects is reported at startup by `serve`, from the broker's own words.
+#[cfg(feature = "amqp")]
+pub(super) fn validate_amqp(
+    what: &str,
+    pipeline: &AmqpPipelineConfig,
+) -> std::result::Result<(), Error> {
+    // Checked for the shape a client will accept, not by connecting — the rule every remote service in
+    // this file follows.
+    if !pipeline.url.starts_with("amqp://") && !pipeline.url.starts_with("amqps://") {
+        return Err(Error::Config(format!(
+            "{what}.url is not an AMQP URL; it must start with \"amqp://\" or \"amqps://\", e.g. \
+             \"amqp://guest:guest@127.0.0.1:5672\""
+        )));
+    }
+    // A userinfo component without TLS. The message never repeats the URL, because the URL is the
+    // credential — the same rule the Redis refusal states.
+    if pipeline.url.contains('@') && pipeline.url.starts_with("amqp://") {
+        return Err(Error::Config(format!(
+            "{what}.url carries a credential (it has an \"@\") over a plaintext connection; use \
+             \"amqps://\" to encrypt it, or accept that the password crosses the network in the clear by \
+             making the connection local"
+        )));
+    }
+    if pipeline.read_timeout_ms == 0 {
+        return Err(Error::Config(format!(
+            "{what} sets read_timeout_ms = 0, which would make every broker command time out the instant \
+             it was sent; leave it out for the five-second default"
+        )));
+    }
+    // An empty queue name would declare a **server-named** queue: RabbitMQ would accept it, hand back a
+    // generated name, and every push — which routes by queue name on the default exchange — would go
+    // nowhere. Refused here because the symptom is a queue that exists and never receives anything.
+    if let Some(queue) = &pipeline.queue {
+        if queue.trim().is_empty() {
+            return Err(Error::Config(format!(
+                "{what}.queue is empty, which asks the broker for a server-named queue and leaves every \
+                 push with no route; remove the key to name the queue after the pipeline"
+            )));
+        }
     }
     Ok(())
 }
