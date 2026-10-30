@@ -158,6 +158,7 @@ fn exchange(
     request: &Request,
     take: Option<Client>,
     backend: &str,
+    timeout: Duration,
 ) -> Result<(Response, Client)> {
     // Reuse the connection only when the previous request said it may be
     // reused; a CGI backend may close after every request, and assuming
@@ -169,7 +170,7 @@ fn exchange(
     // that may not even exist under that name.
     let mut client = match take {
         Some(client) if client.is_reusable() => client,
-        _ => Client::connect(endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
+        _ => Client::connect(endpoint, Some(timeout)).map_err(|source| {
             ServerError::Worker {
                 backend: backend.to_string(),
                 source,
@@ -184,9 +185,18 @@ fn exchange(
             // One retry on a transport error: a slot may have recycled between requests
             // without the address changing, and `php-cgi` closes the connection even when
             // keep-alive was requested.
-            Err(err) if attempt == 0 && retryable(&err) => {
+            //
+            // **But not when the deadline expired**, and that condition is not a detail: a timed-out
+            // request has already been waited for once, so retrying it spends a second whole budget
+            // on a worker that is plainly not answering. Measured: a three-second fixture with
+            // `request_timeout_ms = 1000` answered after 2.1 s rather than one second.
+            Err(err)
+                if attempt == 0
+                    && retryable(&err)
+                    && !crate::backend::is_deadline_expired(&err) =>
+            {
                 attempt += 1;
-                client = Client::connect(endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
+                client = Client::connect(endpoint, Some(timeout)).map_err(|source| {
                     ServerError::Worker {
                         backend: backend.to_string(),
                         source,
@@ -194,10 +204,27 @@ fn exchange(
                 })?;
             }
             Err(source) => {
+                // **Named as the deadline it is**, rather than passed through as a socket timeout.
+                // `os error 10060` and "a connection attempt failed" are what the OS says when a
+                // read times out; the operator configured `request_timeout_ms`, and the message has
+                // to say so or the fix is a search for a network problem that does not exist.
+                if crate::backend::is_deadline_expired(&source) {
+                    return Err(ServerError::Worker {
+                        backend: backend.to_string(),
+                        source: volucer_fcgi::FcgiError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "the backend did not answer within {} ms — that is the deadline \
+                                 `request_timeout_ms` sets for this backend, not a network timeout",
+                                timeout.as_millis()
+                            ),
+                        )),
+                    });
+                }
                 return Err(ServerError::Worker {
                     backend: backend.to_string(),
                     source,
-                })
+                });
             }
         }
     }
@@ -573,6 +600,26 @@ fn slot_address_of(endpoint: &Endpoint) -> SlotAddress {
     }
 }
 
+/// A configured `request_timeout_ms`, resolved or refused.
+///
+/// The same rule the worker pool's `Spec` applies, and stated separately because the two crates do
+/// not share a module: `0` is refused rather than read as "no limit". A `php-cgi` with no deadline
+/// holding its slot is indistinguishable from a slow request until the pool runs out of slots, and
+/// by then the cause is gone.
+fn request_timeout_of(configured: Option<u64>, backend: &str) -> Result<Duration> {
+    match configured {
+        None => Ok(REQUEST_TIMEOUT),
+        Some(0) => Err(ServerError::Misconfigured {
+            backend: backend.to_string(),
+            reason: "request_timeout_ms = 0 would give a slot no deadline at all, so a hung \
+                     request could hold it for ever; write the number of milliseconds you mean \
+                     instead"
+                .to_string(),
+        }),
+        Some(millis) => Ok(Duration::from_millis(millis)),
+    }
+}
+
 /// A pool of `php-cgi` processes.
 #[derive(Debug)]
 pub struct CgiPool {
@@ -608,6 +655,13 @@ pub struct CgiPool {
     /// Socket paths this pool bound and therefore must unlink on the way out.
     socket_paths: Vec<PathBuf>,
     max_requests: Option<u64>,
+    /// How long one request may take before the slot's process is treated as gone.
+    ///
+    /// Resolved once at construction from `[backends.<n>].request_timeout_ms`, for the same reason
+    /// `max_requests` is: a deadline is a property of the pool this process built, so a reload does
+    /// not change it — `restart_only` says so, and reading the configuration per request would let
+    /// the two disagree.
+    request_timeout: Duration,
     /// Held for the life of the pool; dropping it reaps every slot.
     _guard: LifecycleGuard,
 }
@@ -705,6 +759,7 @@ impl CgiPool {
             bind_host: config.bind_host.clone(),
             socket_paths: Vec::new(),
             max_requests: config.max_requests,
+            request_timeout: request_timeout_of(config.request_timeout_ms, name)?,
             _guard: guard,
         };
 
@@ -1016,7 +1071,8 @@ impl CgiPool {
             (slot.endpoint.clone(), slot.clients.pop())
         };
 
-        let (response, client) = exchange(&endpoint, request, taken, &self.name)?;
+        let (response, client) =
+            exchange(&endpoint, request, taken, &self.name, self.request_timeout)?;
 
         let served = {
             let mut slot = self.slots[index]
@@ -1424,6 +1480,7 @@ mod tests {
             base_port: 19_001,
             socket: None,
             max_requests: None,
+            request_timeout_ms: None,
             children: 0,
             concurrency: 4,
             working_dir: None,
@@ -1481,6 +1538,7 @@ mod tests {
             base_port: 19_001,
             socket: None,
             max_requests: None,
+            request_timeout_ms: None,
             children: 0,
             concurrency: 2,
             working_dir: None,
@@ -1722,6 +1780,7 @@ mod tests {
             children: 0,
             concurrency: 0,
             max_requests: None,
+            request_timeout_ms: None,
             working_dir: None,
             env: Default::default(),
             legacy_capacity: None,

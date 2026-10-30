@@ -105,6 +105,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub shutdown_timeout_ms: Option<u64>,
 
+    /// Maximum concurrent client connections the HTTP front-end accepts.
+    ///
+    /// **A key as well as a flag**, so every other limit in this file has one too. It used to be
+    /// reachable only as `--max-connections`, which is the single inconsistency of its kind: a
+    /// deployment driven by a systemd unit and a configuration file cannot express it, and an
+    /// operator reading `[server]` has no way to learn it exists.
+    ///
+    /// `0` means "no ceiling", which is the honest spelling of unlimited rather than a number large
+    /// enough to look like one. The flag still wins, so a unit that overrides it keeps working.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+
     /// Directory that PHP scripts and static files are resolved against.
     ///
     /// A relative path is relative to the process's working directory, not to
@@ -480,6 +492,13 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// cannot cause the truncation the setting exists to prevent.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 
+/// How many concurrent client connections the HTTP front-end accepts, when configuration says
+/// nothing.
+///
+/// The value the `--max-connections` flag has always defaulted to, so promoting the limit into
+/// `[server]` changes nothing for a deployment that does not write the key.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
 /// ALPN protocol names this server understands.
 ///
 /// Checked by name rather than passed through, because an unknown identifier is accepted by
@@ -573,6 +592,15 @@ impl ServerConfig {
             self.shutdown_timeout_ms
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS),
         )
+    }
+
+    /// How many concurrent client connections to accept, with the default resolved.
+    ///
+    /// `0` reads through as `0`, which the front-end treats as no ceiling. Resolving the default
+    /// here rather than at the flag is what lets the file be the only source: a flag carrying a
+    /// `default_value` is indistinguishable from one an operator typed.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
     }
 
     /// Whether a plaintext listener exists to redirect *from*.

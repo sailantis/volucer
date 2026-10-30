@@ -163,8 +163,10 @@ enum Command {
         concurrency: Option<u32>,
 
         /// Maximum concurrent client connections.
-        #[arg(long, default_value_t = 512)]
-        max_connections: usize,
+        ///
+        /// Overrides `[server] max_connections`. Without either, 512. `0` means no ceiling.
+        #[arg(long, value_name = "N")]
+        max_connections: Option<usize>,
     },
 
     /// Validate the configuration and report what was found on this host.
@@ -2200,9 +2202,13 @@ fn serve(
     source: &Source,
     document_root_flag: Option<&Path>,
     front_controller_flag: Option<&str>,
-    max_connections: usize,
+    max_connections: Option<usize>,
 ) -> Result<(), ServerError> {
     let config = source.load()?;
+    // **The flag wins, then the file, then the default.** The flag used to carry the default itself,
+    // which made `[server] max_connections` unreachable — a flag with a `default_value` is
+    // indistinguishable from one the operator typed, so the config could never win.
+    let max_connections = max_connections.unwrap_or_else(|| config.server.max_connections());
     let document_root = absolute_document_root(&resolve_document_root(document_root_flag, &config));
     let front_controller = config
         .server
@@ -3948,6 +3954,17 @@ fn check(
         "    shutdown: {} ms drain budget (0 = do not wait; must be under the supervisor's kill timeout)",
         config.server.shutdown_timeout().as_millis()
     );
+    // And the connection ceiling, for the same reason: it used to exist only as a flag, so a
+    // deployment driven by a file could not see that the value was 512 rather than its own.
+    println!(
+        "    max connections:  {}{}",
+        config.server.max_connections(),
+        if config.server.max_connections() == 0 {
+            " (no ceiling)"
+        } else {
+            ""
+        }
+    );
 
     // The rate limit, or the absence of one stated out loud. The *absence* is what this prints in
     // the off case rather than printing nothing, because "no limit" and "a limit I configured
@@ -4303,6 +4320,29 @@ fn check(
         // `external` has no `workers` key at all, and saying so is more useful than leaving the
         // absence to be noticed.
         println!("      concurrency:       {}", backend.concurrency());
+        // The request deadline, because thirty seconds is a limit no file states and a sixty-second
+        // report would hit it. Printed only for the two kinds that have the key — the other three
+        // have no process whose slot a deadline would bound.
+        let timeout = match backend {
+            volucer_core::config::BackendConfig::Worker(w) => w.request_timeout_ms,
+            volucer_core::config::BackendConfig::SpawnCgi(c) => c.request_timeout_ms,
+            _ => None,
+        };
+        if matches!(
+            backend,
+            volucer_core::config::BackendConfig::Worker(_)
+                | volucer_core::config::BackendConfig::SpawnCgi(_)
+        ) {
+            println!(
+                "      request timeout:   {} ms{}",
+                timeout.unwrap_or(30_000),
+                if timeout.is_some() {
+                    ""
+                } else {
+                    " (the default; a request that outlasts it is killed and answered 502)"
+                }
+            );
+        }
         // The relay is the one thing an operator has to look at for an `attach` backend, and it
         // is the one thing volucer does not own: nothing in this process started it, so "is it
         // there" is a question for `preflight` rather than for `check`. Printing the address is

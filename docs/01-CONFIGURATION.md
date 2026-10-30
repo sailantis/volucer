@@ -318,6 +318,7 @@ its certificate or ACME settings.
 | `script_extensions` | array of strings | `["php", "php3", "phtml"]` | Which extensions are executed as PHP. |
 | `max_body_bytes` | integer | `33554432` (32 MiB) | The largest request body either front-end accepts. |
 | `shutdown_timeout_ms` | integer | `30000` | How long a stop may spend finishing in-flight requests. `0` means do not wait. See [Operations](11-OPERATIONS.md#systemd). |
+| `max_connections` | integer | `512` | The most concurrent client connections the HTTP front-end accepts. `0` means no ceiling; `--max-connections` overrides it. |
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
 | `compression` | table | absent | Response compression. Off unless the table is there. |
 | `serve_only` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
@@ -707,6 +708,7 @@ command = "php worker.php"
 | `workers` | integer | `0` | How many workers to run. `0` means one per logical CPU. |
 | `memory_limit_mb` | integer | absent | Recycle a worker whose peak RSS exceeds this. |
 | `max_requests` | integer | absent | Recycle a worker after this many requests. |
+| `request_timeout_ms` | integer | `30000` | How long one request may take before the slot is replaced. `0` is refused: a request with no deadline holds its slot for ever. |
 | `working_dir` | path | absent | The working directory for the worker. |
 | `env` | table | empty | Extra environment variables for the worker, merged over `[server.env]`. |
 | `services` | array of strings | empty | What this backend's workers may call: a namespace (`"kv.cache"`, `"workers"`), a method (`"workers.list"`, `"kv.cache.get"`) or a verb across storages (`"kv.get"`). See [Services](08-SERVICES.md). |
@@ -740,6 +742,7 @@ instead of starting worker processes.
 | `workers` | integer | **required** | How many connections to hold open. |
 | `relay` | string | absent | The relay address. Falls back to `VOLUCER_RELAY_SOCKET`. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
+| `request_timeout_ms` | integer | `30000` | How long one request may take before the slot's process is treated as gone. `0` is refused. |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
 | `services` | array of strings | empty | What this backend's workers may call: a namespace (`"kv.cache"`, `"workers"`), a method (`"workers.list"`, `"kv.cache.get"`) or a verb across storages (`"kv.get"`). See [Services](08-SERVICES.md). |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
@@ -783,6 +786,7 @@ Exactly one of `binary` and `command`:
 | `base_port` | integer | `19001` | The first port, when not using a socket. |
 | `socket` | string | absent | A socket prefix instead of TCP ports. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
+| `request_timeout_ms` | integer | `30000` | How long one request may take before the slot's process is treated as gone. `0` is refused. |
 | `env` | table | empty | Extra environment variables for every slot. |
 | `services` | array of strings | empty | What this backend's application may reach over `[rpc]`, by namespace or by method. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
 

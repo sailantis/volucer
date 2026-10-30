@@ -806,6 +806,7 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
             socket: None,
         },
         checksum: Checksum::Optional,
+        request_timeout: crate::worker_pool::REQUEST_TIMEOUT,
     }
 }
 

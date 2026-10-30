@@ -763,8 +763,36 @@ impl Backend {
 
 /// Whether a failure means the connection is gone rather than the request being
 /// refused.
+/// Whether a failure is the *deadline expiring* rather than a dropped connection.
+///
+/// **Separate from [`is_transport_error`], and the distinction has to exist.** A timed-out request
+/// has already been waited for once; retrying it spends a second whole budget on a worker that is
+/// plainly not answering, so `request_timeout_ms = 1000` would take two seconds to fail and
+/// `30000` would take a minute. Measured against the built binary: a request to a fixture that
+/// sleeps three seconds, with the deadline set to one, answered `504` after 2.1 s — the deadline
+/// plus the retry — and the message named a socket timeout rather than the deadline the operator
+/// configured.
+///
+/// A `Broken pipe` or a reset, by contrast, is what a reconnecting retry is *for*: the backend
+/// closed a connection it had agreed to keep, and one more attempt against a fresh connection is
+/// the ordinary fix.
+pub fn is_deadline_expired(err: &volucer_fcgi::FcgiError) -> bool {
+    match err {
+        volucer_fcgi::FcgiError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ),
+        _ => false,
+    }
+}
+
 ///
 /// Shared so both backends treat a dropped connection the same way.
+///
+/// **A deadline is not a dropped connection**, and it used to be treated as one: `TimedOut` and
+/// `WouldBlock` were in this list, so the one retry spent a *second* full budget on a worker that
+/// had already proved it was not answering. [`is_deadline_expired`] is the predicate that answer
+/// belongs to, and the two pools ask it first.
 pub fn is_transport_error(err: &volucer_fcgi::FcgiError) -> bool {
     match err {
         volucer_fcgi::FcgiError::Io(io) => matches!(
@@ -834,6 +862,7 @@ mod tests {
                 memory_limit_mb: None,
                 max_requests: None,
                 working_dir: None,
+                request_timeout_ms: None,
                 env: Default::default(),
                 checksum: Default::default(),
                 services: Vec::new(),

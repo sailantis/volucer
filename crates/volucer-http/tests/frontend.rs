@@ -133,6 +133,7 @@ fn worker_config(workers: u32) -> Config {
                 memory_limit_mb: None,
                 max_requests: None,
                 working_dir: None,
+        request_timeout_ms: None,
                 env: Default::default(),
                 checksum: Default::default(),
                 services: Vec::new(),

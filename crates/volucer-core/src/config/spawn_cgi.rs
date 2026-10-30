@@ -185,6 +185,15 @@ pub struct SpawnCgiConfig {
     #[serde(default)]
     pub max_requests: Option<u64>,
 
+    /// How long a single request may take before the slot's process is treated as gone, in
+    /// milliseconds.
+    ///
+    /// The same key `worker` has, and for the same reason: the value was hard-coded at thirty
+    /// seconds, so a request that legitimately takes longer could not be served at all. `0` is
+    /// refused rather than read as "no limit".
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+
     /// Working directory for each started process.
     ///
     /// The key `worker`, a job consumer and `upstream` already have, and its absence here was

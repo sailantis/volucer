@@ -9,6 +9,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`request_timeout_ms` is a per-backend key, and `[server] max_connections` exists.** Both were
+  limits that only code knew about.
+
+  `request_timeout_ms` was hard-coded at thirty seconds for a `worker` and a `spawn_cgi` slot, so a
+  request that legitimately takes sixty — a report export, a slow external call, a large upload being
+  processed — could not be served at all: the pool killed the worker mid-request and the client saw a
+  `502`. Nothing in the file said so and nothing in `check` reported it, which is exactly the class of
+  defect `check` exists to prevent. `0` is refused rather than read as "no limit": a request with no
+  deadline holds its slot for ever, and the pool cannot tell that from a slow one until it has run out
+  of slots. `volucer check` prints the effective deadline for each backend.
+
+  **Two defects surfaced while verifying it, and neither was findable by reading.** A deadline was
+  classified as a transport error, so the one retry spent a *second* full budget on a worker that had
+  already proved it was not answering — a three-second fixture with `request_timeout_ms = 1000`
+  answered after 2.1 s. The two are separated by `is_deadline_expired`, which the pools ask before the
+  retry predicate. And the error a client saw was the OS's socket timeout (`os error 10060`, "a
+  connection attempt failed"), which sends an operator looking for a network problem that does not
+  exist; it now names the millisecond budget the configuration set. Measured after the fix: 1.09 s,
+  with the deadline in the message.
+
+  `max_connections` was reachable only as `--max-connections`, the single limit of its kind with no
+  key — so a deployment driven by a systemd unit and a file could not express it, and an operator
+  reading `[server]` had no way to learn it existed. The flag now has no `default_value`, which is
+  what makes the file reachable at all: a flag carrying a default is indistinguishable from one an
+  operator typed, so the configuration could never win. `0` means no ceiling, and the flag still
+  overrides the file.
+
 - **`[server.access_log] path = "-"` writes the access log to the process's stdout.** This is what
   a container expects: the runtime's log driver captures the records, no volume is needed, and
   `docker logs` shows the access log beside the diagnostics, which go to stderr. nginx spells the

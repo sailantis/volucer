@@ -25,6 +25,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
         base_port,
         socket: None,
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
@@ -169,6 +170,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
         base_port: 19_900,
         socket: Some(format!("unix:{prefix}")),
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
@@ -245,6 +247,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
         base_port: 19_920,
         socket: Some(prefix.clone()),
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
@@ -302,6 +305,7 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
         base_port: 19_950,
         socket: Some(format!("unix:{prefix}")),
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         env: Default::default(),
         legacy_capacity: None,
@@ -716,6 +720,7 @@ fn a_command_driver_serves_through_the_address_it_was_given() {
         base_port,
         socket: None,
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         // One request per slot: a bare `php-cgi -b` does not prefork, so this is the honest
         // number for what a `command` slot can answer at once.
@@ -771,6 +776,7 @@ fn a_command_with_no_address_placeholder_is_a_misconfiguration() {
         base_port,
         socket: None,
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         concurrency: 0,
         working_dir: None,
@@ -814,6 +820,7 @@ fn a_command_that_exits_is_not_retried_across_ports() {
         base_port,
         socket: None,
         max_requests: None,
+        request_timeout_ms: None,
         children: 0,
         concurrency: 0,
         working_dir: None,
@@ -1066,4 +1073,57 @@ fn a_command_driven_slot_is_swept_on_the_address_it_was_given() {
     assert!(String::from_utf8_lossy(&response.stdout).contains("after"));
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A deadline is not a dropped connection, and retrying one spends a second budget.**
+///
+/// The predicate pair, asserted together because the defect was that they were one predicate:
+/// `TimedOut` and `WouldBlock` sat in `is_transport_error`, so the single retry the CGI pool makes
+/// re-sent a request whose worker had already been waited for. Measured against the built binary: a
+/// three-second fixture with `request_timeout_ms = 1000` answered `504` after 2.1 s, and the message
+/// said "a connection attempt failed" rather than naming the deadline an operator had configured.
+#[test]
+fn a_deadline_is_distinguished_from_a_dropped_connection() {
+    use volucer_fcgi::{FcgiError, REQUEST_ID};
+
+    let io = |kind| FcgiError::Io(std::io::Error::from(kind));
+
+    // The two that mean "the deadline expired", and therefore must not be retried.
+    for expired in [
+        io(std::io::ErrorKind::TimedOut),
+        io(std::io::ErrorKind::WouldBlock),
+    ] {
+        assert!(
+            volucer_server::backend::is_deadline_expired(&expired),
+            "{expired:?} is a deadline"
+        );
+    }
+
+    // The four that mean "the connection went away", which is what a retry is for.
+    for dropped in [
+        io(std::io::ErrorKind::BrokenPipe),
+        io(std::io::ErrorKind::ConnectionReset),
+        io(std::io::ErrorKind::UnexpectedEof),
+        FcgiError::IncompleteResponse {
+            request_id: REQUEST_ID,
+            complete: false,
+        },
+    ] {
+        assert!(
+            !volucer_server::backend::is_deadline_expired(&dropped),
+            "{dropped:?} is a dropped connection, not a deadline"
+        );
+        assert!(
+            volucer_server::backend::is_transport_error(&dropped),
+            "{dropped:?} must stay retryable, or a recycled slot becomes a 502"
+        );
+    }
+
+    // And the property the fix states: a deadline is still classified as a transport error — the
+    // classification was not wrong, the *retry* was — so a caller that only asks that question is
+    // unchanged. The two pools ask the new one first.
+    assert!(
+        volucer_server::backend::is_transport_error(&io(std::io::ErrorKind::TimedOut)),
+        "removing this from the transport set would change the error a caller sees"
+    );
 }

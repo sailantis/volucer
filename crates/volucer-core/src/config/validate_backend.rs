@@ -10,6 +10,26 @@ use super::*;
 impl Config {
     pub(super) fn validate_backend(&self, name: &str, backend: &BackendConfig) -> Result<()> {
         let bad = |msg: String| Err(Error::Config(format!("backends.{name}: {msg}")));
+        // **`request_timeout_ms = 0` is refused for every kind that has the key**, and checked
+        // before the per-kind match so a new kind cannot inherit the key without the rule. The two
+        // pools also refuse it at construction, which is the load-bearing check — `Spec` and
+        // `CgiPool` are reachable from a `Config` that never went through `validate` — so this is
+        // the one `volucer check` reports, by name, before anything is started.
+        let timeout = match backend {
+            BackendConfig::Worker(w) => w.request_timeout_ms,
+            BackendConfig::SpawnCgi(c) => c.request_timeout_ms,
+            BackendConfig::Attach(_) | BackendConfig::External(_) | BackendConfig::Upstream(_) => {
+                None
+            }
+        };
+        if timeout == Some(0) {
+            return bad(
+                "request_timeout_ms = 0 would give a request no deadline at all, so one hung \
+                 request could hold a slot for ever; write the number of milliseconds you mean \
+                 instead"
+                    .to_string(),
+            );
+        }
         match backend {
             BackendConfig::Worker(w) => {
                 if w.command.trim().is_empty() {

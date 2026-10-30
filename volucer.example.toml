@@ -113,6 +113,12 @@ fastcgi = "127.0.0.1:9080"
 #
 # `0` means "do not wait at all": recycle instantly and accept the truncation.
 # shutdown_timeout_ms = 30000
+#
+# The most concurrent client connections the HTTP front-end accepts. It used to
+# be reachable only as `--max-connections`, so a deployment driven by a file
+# could not express it and an operator reading [server] had no way to learn it
+# existed. `0` is the honest spelling of unlimited; the flag still wins.
+# max_connections = 512
 # What a backend is handed as its `traceparent`. The four values are nginx's
 # `otel_trace_context`, with the same meaning:
 #
@@ -597,6 +603,13 @@ command = "php worker.php"
 workers = 0               # 0 = one per logical CPU
 memory_limit_mb = 256     # recycle a worker above this RSS
 max_requests = 1000       # and after this many requests
+# request_timeout_ms = 30000
+#   How long ONE request may take before the worker is killed and the client
+#   answered 502. The value used to be hard-coded at thirty seconds, so a report
+#   export or a slow external call that legitimately takes sixty could not be
+#   served at all -- and nothing in the file said so. `0` is refused: a request
+#   with no deadline holds its slot for ever, and the pool cannot tell that from
+#   a slow one until it runs out of slots.
 working_dir = "."
 # services = ["config"]   # What this backend's workers may CALL, mid-request. Absent means
                           # none, which is the safe default: the worker channel is a
@@ -834,6 +847,11 @@ binary = "C:/php-8.3.31/php-cgi.exe"
 workers = 8
 bind_host = "127.0.0.1"   # loopback only; never expose php-cgi
 base_port = 19001
+
+# How long ONE request may take before the slot's process is treated as gone and
+# the client is answered 502. Hard-coded at thirty seconds before this key
+# existed, so a slow report could not be served at all. `0` is refused.
+# request_timeout_ms = 30000
 
 # A unix socket instead of TCP, where the platform has them (Linux, macOS).
 # This is a path PREFIX: slot 0 binds /run/volucer/cgi.0.sock, slot 1 the next.

@@ -575,3 +575,81 @@ pat = "typo"
     let err = Config::from_toml(text).expect_err("must fail");
     assert!(err.to_string().contains("pat"), "{err}");
 }
+
+/// **`max_connections` is a key, not only a flag, and `0` means no ceiling.**
+///
+/// The flag used to carry the default itself, which is what made the key unreachable: a flag with a
+/// `default_value` cannot be told apart from one an operator typed, so the file could never win.
+/// The resolution order is asserted here as the *config* half — flag first, then this, then the
+/// default — and `0` reads through as `0` rather than being turned into the default.
+#[test]
+fn max_connections_is_configurable_and_zero_means_no_ceiling() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+max_connections = 64
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    assert_eq!(config.server.max_connections(), 64);
+
+    // Absent: the value the flag always defaulted to, so an unconfigured deployment is unchanged.
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    assert_eq!(
+        config.server.max_connections(),
+        512,
+        "the default must be the number the flag used to carry"
+    );
+
+    // `0` is the honest spelling of unlimited and must not be read as "absent".
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+max_connections = 0
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("0 is a deliberate setting");
+    assert_eq!(config.server.max_connections(), 0);
+}
+
+/// **`request_timeout_ms` is configurable per backend, and `0` is refused by name.**
+///
+/// The value was hard-coded at thirty seconds, so a request that legitimately takes sixty — a report
+/// export, a slow external call — could not be served at all: the pool killed the worker mid-request
+/// and the client saw a 502. Nothing in the file said so and nothing in `check` reported it, which is
+/// the pair of failures this key exists to end.
+#[test]
+fn a_request_timeout_is_configurable_per_backend_and_zero_is_refused() {
+    for (kind, table) in [
+        ("worker", "[backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\""),
+        (
+            "spawn_cgi",
+            "[backends.app]\nkind = \"spawn_cgi\"\nbinary = \"php-cgi\"",
+        ),
+    ] {
+        let text = format!(
+            "[server]\nhttp = \"127.0.0.1:8080\"\ndefault_backend = \"app\"\n\n{table}\n\
+             request_timeout_ms = 60000\n"
+        );
+        let config = Config::from_toml(&text).expect("parses");
+        config.validate().expect("a long deadline is legal");
+        let timeout = match &config.backends["app"] {
+            BackendConfig::Worker(w) => w.request_timeout_ms,
+            BackendConfig::SpawnCgi(c) => c.request_timeout_ms,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(timeout, Some(60_000), "{kind}");
+
+        let text = text.replace("request_timeout_ms = 60000", "request_timeout_ms = 0");
+        let config = Config::from_toml(&text).expect("parses");
+        let err = config.validate().expect_err("0 must be refused");
+        assert!(
+            err.to_string().contains("request_timeout_ms = 0"),
+            "the refusal has to name the key: {kind}: {err}"
+        );
+    }
+}

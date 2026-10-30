@@ -32,6 +32,20 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
 
+    /// How long a single request may take before the worker is replaced, in milliseconds.
+    ///
+    /// **The key that was missing, and the reason is a real workload rather than tidiness.** The
+    /// value was hard-coded at thirty seconds, so a request that legitimately takes sixty — a report
+    /// export, a slow external call, a large upload being processed — could not be served at all: the
+    /// pool killed the worker mid-request and the client saw a 502. Nothing in the file said so, and
+    /// nothing in `check` reported it, so the only way to find out was to watch it happen.
+    ///
+    /// Thirty seconds by default, which is what the constant was. `0` is refused rather than read as
+    /// "no limit": a worker with no deadline is a worker that can be lost for ever with the slot it
+    /// holds, and a deployment that wants a long deadline has a number to write.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+
     /// Extra environment variables for the worker process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,

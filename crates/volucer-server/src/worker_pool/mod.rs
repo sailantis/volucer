@@ -1241,7 +1241,7 @@ impl WorkerPool {
             });
         }
 
-        let response = match invoke(&mut slot, request) {
+        let response = match invoke(&mut slot, request, self.spec.request_timeout) {
             Ok(response) => response,
             Err(AttemptError { source, retryable }) => {
                 // `invoke` has already decided the worker's fate: a fatal
@@ -1785,7 +1785,16 @@ struct FailedAttempt {
 
 /// Run one request on a worker, putting the slot back into rotation if the pipes
 /// survived.
-fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerResponse, AttemptError> {
+///
+/// `timeout` is the pool's own `request_timeout_ms`, passed rather than read from the constant: the
+/// deadline a pool enforces is a property of the pool this process built, and reading the
+/// configuration here would let a reload change the deadline of workers that were started under the
+/// old one.
+fn invoke(
+    slot: &mut Slot,
+    request: &Request,
+    timeout: Duration,
+) -> std::result::Result<WorkerResponse, AttemptError> {
     let result = match slot.exchange.as_mut() {
         // The head is serialized here, while the CGI environment it borrows is alive: the exchange
         // thread cannot borrow it, because on a timeout that thread outlives this call. Encoding it
@@ -1801,7 +1810,7 @@ fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerRespo
                 body_len: request.body.len() as u64,
                 ..draft
             };
-            exchange.request(encode_head(&head), &request.body, REQUEST_TIMEOUT)
+            exchange.request(encode_head(&head), &request.body, timeout)
         }
         // A slot is only chosen while it has an exchange, so this cannot happen;
         // it is reported rather than panicked because a panic here would take the

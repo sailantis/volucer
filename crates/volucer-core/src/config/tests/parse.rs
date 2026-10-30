@@ -545,6 +545,7 @@ fn children_decides_process_count_and_concurrency_together() {
             children,
             concurrency: 0,
             max_requests: None,
+            request_timeout_ms: None,
             working_dir: None,
             env: Default::default(),
             legacy_capacity: None,

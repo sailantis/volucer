@@ -6,6 +6,7 @@
 use crate::error::{Result, ServerError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use volucer_core::config::{
     AttachConfig, ChecksumMode, JobsPoolConfig, WorkerConfig, WorkerTransport,
 };
@@ -67,6 +68,13 @@ pub(super) struct Spec {
     /// and then respawned a worker under `required` would have one worker verifying and the rest
     /// not, which is a difference nothing would report.
     pub(super) checksum: Checksum,
+    /// How long one request may take before the slot's worker is replaced.
+    ///
+    /// On the spec rather than read from the configuration at each request, for the same reason
+    /// `checksum` is: the value is a property of the pool this process built, and a reload does not
+    /// change it — the deadlines a running pool enforces are the ones it started with, which is what
+    /// `restart_only` says out loud.
+    pub(super) request_timeout: Duration,
 }
 
 impl Spec {
@@ -112,6 +120,7 @@ impl Spec {
                 socket: config.socket.clone(),
             },
             checksum: checksum_of(config.checksum),
+            request_timeout: request_timeout_of(config.request_timeout_ms, name)?,
         })
     }
 
@@ -131,6 +140,7 @@ impl Spec {
                 memory_limit_mb: config.memory_limit_mb,
                 max_requests: config.max_jobs,
                 working_dir: config.working_dir.clone(),
+                request_timeout_ms: None,
                 env: config.env.clone(),
                 services: Vec::new(),
                 grpc_services: Vec::new(),
@@ -171,6 +181,10 @@ impl Spec {
                 workers: config.workers,
             }),
             checksum: checksum_of(config.checksum),
+            // An attached pool's deadline is the pool's own: there is no process to kill, so a
+            // replacement is a reconnect, and the supervisor on the far side has its own timeouts.
+            // Configurable on the backend it belongs to (`[backends.<n>]`), not on `attach`.
+            request_timeout: crate::worker_pool::REQUEST_TIMEOUT,
         })
     }
 
@@ -257,6 +271,26 @@ fn checksum_of(mode: ChecksumMode) -> Checksum {
     }
 }
 
+/// A configured `request_timeout_ms`, resolved or refused.
+///
+/// `None` means the pool's own default, which is the thirty seconds the constant always was. `0` is
+/// refused rather than read as "no limit": a worker with no deadline can be lost for ever with the
+/// slot it holds, and the pool has no way to tell that from a slow request — the two would be
+/// indistinguishable until the pool ran out of slots.
+fn request_timeout_of(configured: Option<u64>, backend: &str) -> Result<Duration> {
+    match configured {
+        None => Ok(crate::worker_pool::REQUEST_TIMEOUT),
+        Some(0) => Err(ServerError::Misconfigured {
+            backend: backend.to_string(),
+            reason: "request_timeout_ms = 0 would give a worker no deadline at all, so a hung \
+                     request could hold its slot for ever; write the number of milliseconds you \
+                     mean instead"
+                .to_string(),
+        }),
+        Some(millis) => Ok(Duration::from_millis(millis)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +302,7 @@ mod tests {
             memory_limit_mb: None,
             max_requests: None,
             working_dir: None,
+            request_timeout_ms: None,
             env: Default::default(),
             checksum: Default::default(),
             services: Vec::new(),
