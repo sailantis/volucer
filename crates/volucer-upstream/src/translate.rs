@@ -544,6 +544,14 @@ pub enum GrpcStatus {
     /// gRPC client cannot read a 429 at all, so without this a rate-limited call would reach a
     /// client as "unexpected HTTP status" and the retry would never happen.
     ResourceExhausted,
+    /// The caller was refused by policy: gRPC's `PERMISSION_DENIED`.
+    ///
+    /// The gRPC spelling of the HTTP `403` beside it, and the pair is worth keeping apart from
+    /// `RESOURCE_EXHAUSTED` for the reason the client acts differently on each: a rate-limited
+    /// caller is told to come back, and a caller an access list refused is not. The specification
+    /// makes `PERMISSION_DENIED` explicitly non-retryable, so a client that retries a
+    /// `RESOURCE_EXHAUSTED` will not retry this.
+    PermissionDenied,
 }
 
 impl GrpcStatus {
@@ -554,6 +562,7 @@ impl GrpcStatus {
             GrpcStatus::Internal => 13,
             GrpcStatus::Unavailable => 14,
             GrpcStatus::ResourceExhausted => 8,
+            GrpcStatus::PermissionDenied => 7,
         }
     }
 
@@ -564,6 +573,7 @@ impl GrpcStatus {
             GrpcStatus::Internal => "INTERNAL",
             GrpcStatus::Unavailable => "UNAVAILABLE",
             GrpcStatus::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            GrpcStatus::PermissionDenied => "PERMISSION_DENIED",
         }
     }
 
@@ -584,6 +594,7 @@ impl GrpcStatus {
             // The one message a client is meant to *act* on rather than read, which is what the
             // specification asks for with a retryable code.
             GrpcStatus::ResourceExhausted => "the caller is over its rate limit",
+            GrpcStatus::PermissionDenied => "this caller is not permitted",
         }
     }
 }

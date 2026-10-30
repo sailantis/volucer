@@ -283,6 +283,7 @@ impl Http3Listener {
             Arc::clone(&handles.observe),
             Arc::clone(&handles.client_ip),
             Arc::clone(&handles.rate_limit),
+            Arc::clone(&handles.access),
             // `None`: this listener's own responses must not advertise the endpoint they arrived
             // on. A client already speaking HTTP/3 has nothing to learn from `Alt-Svc`.
             None,

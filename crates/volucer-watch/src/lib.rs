@@ -195,6 +195,55 @@ impl RateLimitCell {
     }
 }
 
+/// The process's access policy, in a form a reload can replace.
+///
+/// Deliberately the same shape as [`RateLimitCell`] rather than a fifth field on [`Reloaded`], and
+/// the reason is what the two have in common: **both decide whether a request is admitted at all, so
+/// neither belongs to a site.** An access list that lived in the site table would be a per-site
+/// answer to a question that is asked before the site is known — the site is resolved *after* a
+/// request is admitted, which is the whole value of the list. It is process-wide like the rate
+/// limit, replaced by the same reload, and read on the same request path.
+///
+/// The load is one atomic pointer read even when a list is configured, and `None` when there is no
+/// `[server.access]` table, so an unconfigured deployment's request path does no work at all.
+///
+/// **[`Replace`] carries no state across, unlike the rate limit's.** A token bucket is a running
+/// total that a policy change can meaningfully keep; an address list is not. There is nothing to
+/// carry, and pretending otherwise would be a rule with no purpose.
+#[derive(Debug)]
+pub struct AccessCell {
+    current: Swappable<Option<Arc<volucer_core::AccessPolicy>>>,
+}
+
+impl AccessCell {
+    /// A cell holding a policy, or `None` for a deployment with no `[server.access]`.
+    pub fn new(policy: Option<volucer_core::AccessPolicy>) -> Self {
+        AccessCell {
+            current: Swappable::new(policy.map(Arc::new)),
+        }
+    }
+
+    /// The policy to consult, or `None` to consult nothing.
+    pub fn load(&self) -> Arc<Option<Arc<volucer_core::AccessPolicy>>> {
+        self.current.load()
+    }
+
+    /// Whether a list is configured at all, for `serve`'s own report.
+    pub fn is_some(&self) -> bool {
+        self.current.load().is_some()
+    }
+
+    /// Replace the policy.
+    ///
+    /// Returns nothing, unlike [`RateLimitCell::replace`]: there is no caller for a "what was
+    /// carried" answer because nothing is carried. The policy has already been built and validated
+    /// by the caller, so a configuration that failed to parse never reaches here and the previous
+    /// list stays in force — which is the property that makes a reload of a broken file harmless.
+    pub fn replace(&self, next: Option<volucer_core::AccessPolicy>) {
+        let _replaced = self.current.replace(next.map(Arc::new));
+    }
+}
+
 /// The site table both front-ends serve from, and what a reload replaces.
 ///
 /// Wraps [`Sites`] rather than being an alias for it so that the *shared* thing is named: both

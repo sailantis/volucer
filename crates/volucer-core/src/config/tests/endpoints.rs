@@ -698,6 +698,168 @@ http = "127.0.0.1:8080"
 
 /// An empty table is the ordinary case and must not be reported as a configured feature.
 #[test]
+fn an_absent_access_table_admits_everything_and_costs_nothing() {
+    // Presence is the switch, like every other table in this file: no `[server.access]` means no
+    // policy object at all, which is what keeps an unconfigured request path free.
+    let config = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
+    assert!(config.server.access.is_none());
+    assert!(
+        config
+            .server
+            .access_policy()
+            .expect("no table is not an error")
+            .is_none()
+    );
+    config.validate().expect("an unconfigured deployment validates");
+}
+
+#[test]
+fn access_rules_keep_the_order_they_are_written_in() {
+    // The order *is* the security property: first match decides, so an exception inside a blocked
+    // range has to stay on the line the operator wrote it on. A parser that reordered by range
+    // width — the rule the host table uses — would silently give the opposite answer.
+    let config = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access]
+default = "allow"
+rules = [
+  { action = "allow", range = "10.1.2.3" },
+  { action = "deny",  range = "10.0.0.0/8" },
+]
+"#,
+    )
+    .expect("parses");
+    config.validate().expect("the ranges parse and the default is allow");
+
+    let policy = config
+        .server
+        .access_policy()
+        .expect("the ranges parse")
+        .expect("a stated table builds a policy");
+    let specs: Vec<&str> = policy.rules().iter().map(|rule| rule.spec()).collect();
+    assert_eq!(
+        specs,
+        ["10.1.2.3", "10.0.0.0/8"],
+        "the written order must survive parsing: {specs:?}"
+    );
+
+    // And the ordering has an effect, which is what makes preserving it worth a test. **The
+    // exception is written above the range it excepts from**, because the first match decides.
+    let inside: std::net::IpAddr = "10.1.2.3".parse().expect("an address");
+    let other: std::net::IpAddr = "10.9.9.9".parse().expect("an address");
+    assert!(policy.admits(Some(inside)), "the exception is admitted");
+    assert!(!policy.admits(Some(other)), "the range around it is not");
+}
+
+#[test]
+fn access_refuses_a_range_it_cannot_parse_by_name_and_position() {
+    // A dropped rule is a range that is *served*, so the failure has a direction and has to stop the
+    // server. The position is in the message because an operator with forty rules cannot grep for
+    // "invalid".
+    let config = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access]
+rules = [
+  { action = "allow", range = "10.0.0.0/8" },
+  { action = "deny",  range = "10.0.0.0/64" },
+]
+"#,
+    )
+    .expect("the file parses; the range does not");
+    let err = config.validate().expect_err("a /64 on a v4 range is not a range");
+    let text = err.to_string();
+    assert!(text.contains("server.access"), "{text}");
+    assert!(text.contains("rule 2"), "{text}");
+    assert!(text.contains("10.0.0.0/64"), "{text}");
+}
+
+#[test]
+fn a_deny_default_is_accepted_on_its_own_and_refused_beside_a_unix_socket() {
+    // The half that runs everywhere: a closed default is a legitimate policy, so it must not be
+    // refused by the rule below for existing. Without this, the platform-gated test could pass
+    // against a validator that refused `default = "deny"` unconditionally.
+    let closed = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access]
+default = "deny"
+rules = [{ action = "allow", range = "127.0.0.0/8" }]
+"#,
+    )
+    .expect("parses");
+    closed
+        .validate()
+        .expect("a closed default over a TCP listener is a legitimate policy");
+
+    // A socket has no client address, so no rule can match one and `default = "deny"` would refuse
+    // every request the listener receives. That reads as a broken rule rather than as a listener that
+    // cannot be filtered, so it is refused by name. **Gated on the platform** because a `unix:`
+    // listener is itself refused on Windows, before this rule is reached — so on Windows the test
+    // would be asserting the earlier message.
+    #[cfg(unix)]
+    {
+        let config = Config::from_toml(
+            r#"
+[server]
+http = "unix:/tmp/volucer-access-test.sock"
+
+[server.access]
+default = "deny"
+rules = [{ action = "allow", range = "127.0.0.0/8" }]
+"#,
+        )
+        .expect("parses");
+        let err = config
+            .validate()
+            .expect_err("a closed default cannot be applied to a socket");
+        let text = err.to_string();
+        assert!(text.contains("server.access.default"), "{text}");
+        assert!(text.contains("unix:/tmp/volucer-access-test.sock"), "{text}");
+        assert!(text.contains("no client address"), "{text}");
+
+        // The same table with `allow` is fine: that is a rule that can never match rather than a
+        // door that refuses everybody.
+        let open = Config::from_toml(
+            r#"
+[server]
+http = "unix:/tmp/volucer-access-test.sock"
+
+[server.access]
+rules = [{ action = "deny", range = "10.0.0.0/8" }]
+"#,
+        )
+        .expect("parses");
+        open.validate()
+            .expect("an allow default over a socket is fine");
+    }
+}
+
+#[test]
+fn an_access_rule_refuses_an_unknown_action() {
+    // `action` has two values and a typo must not silently mean one of them — the direction a
+    // mistyped `deny` would fail in is "everything is served".
+    let err = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access]
+rules = [{ action = "denyy", range = "10.0.0.0/8" }]
+"#,
+    )
+    .expect_err("an unknown action is a parse error");
+    assert!(format!("{err}").contains("denyy"), "{err}");
+}
+
+#[test]
 fn an_absent_error_pages_table_is_empty() {
     let text = "[server]\nhttp = \"127.0.0.1:8080\"\n";
     let config = Config::from_toml(text).expect("parses");

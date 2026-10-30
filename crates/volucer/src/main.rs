@@ -2440,6 +2440,20 @@ fn serve(
             .map_err(|reason| ServerError::Listener { reason })?,
     ));
 
+    // Which addresses may reach this server at all. Built beside the rate limit and for the same
+    // reason — one cell, cloned into both front-ends and into the reloader, so a `SIGHUP` moves the
+    // list both of them consult. Two cells would be two lists, and a client refused over HTTP would
+    // be served over FastCGI.
+    //
+    // `None` for an unconfigured deployment, which is what keeps its request path free: the load is
+    // one pointer read that answers `None`, and no range is ever scanned.
+    let access = Arc::new(volucer_http::AccessCell::new(
+        config
+            .server
+            .access_policy()
+            .map_err(|reason| ServerError::Listener { reason })?,
+    ));
+
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
     // before the runtime is built.
@@ -2455,7 +2469,8 @@ fn serve(
                 },
             )?
             .with_observability(Arc::clone(&observe))
-            .with_rate_limit(Arc::clone(&rate_limit));
+            .with_rate_limit(Arc::clone(&rate_limit))
+            .with_access(Arc::clone(&access));
             // The bound address when there is one, and the configured path for a unix socket — which
             // has no address to report and whose path is what an operator matches against their file.
             match listener.local_addr() {
@@ -2695,7 +2710,8 @@ fn serve(
             .with_observability(Arc::clone(&observe))
             .with_client_ip(Arc::clone(&client_ip))
             .with_error_pages(resolve_error_pages(&config, &source.dir()))
-            .with_rate_limit(Arc::clone(&rate_limit));
+            .with_rate_limit(Arc::clone(&rate_limit))
+            .with_access(Arc::clone(&access));
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
             _ => handles,
@@ -2964,6 +2980,7 @@ fn serve(
             tls: tls_state.clone(),
             observe,
             rate_limit,
+            access,
             reset_gate,
             pools: dispatcher.pools(),
         },
@@ -3519,6 +3536,12 @@ struct Reloader {
     /// a caller from where they already were. That is the difference between a limit and a limit that
     /// can be escaped by asking the operator to reload.
     rate_limit: Arc<volucer_http::RateLimitCell>,
+    /// Which addresses may reach this server, so a reload can change the list.
+    ///
+    /// The same cell both front-ends read, for the same reason `rate_limit` is: two would be two
+    /// lists. Unlike the rate limit there is nothing to carry across a replacement, so this is a
+    /// plain swap — an address list is not a running total.
+    access: Arc<volucer_http::AccessCell>,
     /// The worker grant, so `[status.workers] allow` can be changed by a
     /// reload.
     ///
@@ -3694,6 +3717,26 @@ impl Reloader {
             Err(reason) => tracing::error!(
                 %reason,
                 "the rate limit was not replaced; the previous one is still limiting"
+            ),
+        }
+
+        // The access list, beside the rate limit and replaced by the same rule: a list that cannot be
+        // built must not take the tables above it with it, so it is reported rather than silently
+        // kept. Nothing is carried across — an address list is not a running total — so the only
+        // outcome worth a line is that it changed.
+        match config.server.access_policy() {
+            Ok(policy) => {
+                let rules = policy.as_ref().map_or(0, |policy| policy.rules().len());
+                self.access.replace(policy);
+                if rules == 0 {
+                    tracing::info!("the access list was replaced; no rule is configured, so every client is admitted");
+                } else {
+                    tracing::info!(rules, "the access list was replaced");
+                }
+            }
+            Err(reason) => tracing::error!(
+                %reason,
+                "the access list was not replaced; the previous one is still admitting or refusing"
             ),
         }
 
@@ -4039,6 +4082,44 @@ fn check(
             );
         }
         None => println!("    rate limit: none (server.rate_limit is unset; nothing is throttled)"),
+    }
+
+    // The access list. Printed in the off case as well, for the same reason the rate limit is: "no
+    // list" and "a list I wrote wrongly" look identical from a client's behaviour, and only one of
+    // them is intended.
+    match config.server.access.as_ref() {
+        Some(access) => {
+            let policy = config
+                .server
+                .access_policy()
+                .map_err(volucer_core::Error::Config)?
+                .expect("a stated table builds a policy");
+            println!("    access list:");
+            println!(
+                "      default:  {} (an address no rule matched)",
+                policy.default_action()
+            );
+            if policy.is_empty() {
+                println!("      rules:    none -- the default decides every request");
+            } else {
+                println!("      rules:    first match decides, top to bottom");
+                for (index, rule) in policy.rules().iter().enumerate() {
+                    println!("        {:>2}. {}  {}", index + 1, rule.action(), rule.spec());
+                }
+            }
+            if !access.rules.is_empty() && config.server.proxy.is_none() {
+                // The pair that has to be read together: the list is applied to the address
+                // `[server.proxy]` resolves, so with no proxy table it sees the socket peer. Behind
+                // nginx that is nginx, and every client shares its verdict.
+                println!(
+                    "      note:     no [server.proxy] table, so this list sees the socket peer -- \
+                     behind a reverse proxy that is the proxy, and every client gets its verdict"
+                );
+            }
+        }
+        None => println!(
+            "    access list: none (server.access is unset; every address is admitted)"
+        ),
     }
 
     // TLS, and which paths were actually resolved. The resolution is printed rather than
@@ -6076,6 +6157,15 @@ document_root = "/from/file"
                  {joined}"
             );
         }
+
+        // `[server.access]` is checked separately rather than in the list above, because its name is
+        // a prefix of `[server.access_log]` — which *is* restart-only — so a plain `contains` would
+        // fail on the correct text. The bracketed form is what a restart-only line would say.
+        assert!(
+            !joined.contains("[server.access]"),
+            "[server.access] is replaced through the `AccessCell` on every reload, so listing it as \
+             restart-only would tell an operator to restart for nothing: {joined}"
+        );
     }
 
     /// A PEM blob of a chain plus a key splits at the key, not at the second block.

@@ -318,6 +318,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
 
+    /// Which client addresses may reach this server at all. **Absent is what turns it off.**
+    ///
+    /// The same presence-is-the-switch convention as [`Self::rate_limit`] and [`Self::proxy`]. It is
+    /// consulted **first**, above the rate limit, the redirect and the site table, because its job is
+    /// to stop a request costing anything — see [`AccessConfig`] for the ordering rule and for why
+    /// the default admits rather than refuses.
+    #[serde(default)]
+    pub access: Option<AccessConfig>,
+
     /// What happens to the W3C `traceparent` on the way to a backend. Defaults to `extract`.
     ///
     /// # Why this is here rather than in `[telemetry]`
@@ -407,6 +416,78 @@ pub struct RateLimitConfig {
 
 fn default_rate_interval_ms() -> u64 {
     1000
+}
+
+/// Which addresses may reach this server, as an ordered rule list.
+///
+/// ```toml
+/// [server.access]
+/// default = "allow"          # what an address no rule matched gets; the default
+/// rules = [
+///   { action = "allow", range = "192.0.2.7" },      # except one host...
+///   { action = "deny",  range = "192.0.2.0/24" },   # ...from this scraped range
+/// ]
+/// ```
+///
+/// # Why one ordered list and not `allow` / `deny`
+///
+/// Two lists cannot express an order *between* them, and **the order is the security property**:
+/// the first matching rule decides. See [`volucer_core::access`](crate::access) for why
+/// most-specific-wins — the rule the host table uses — is the wrong answer here, and for why an
+/// address that matches nothing is admitted by default.
+///
+/// **An exception goes above the rule it excepts from.** A broad range listed first claims every
+/// address inside it, so a narrower rule written after it is never reached — `check` prints the list
+/// in the order it will be evaluated so this can be read rather than discovered.
+///
+/// # Why this is keyed on the resolved client, not the socket peer
+///
+/// The address tested is the one `[server.proxy]` resolves, which is the same identity the rate
+/// limiter and the access log use. Behind nginx the socket peer is nginx, so a list applied to it
+/// would either block the proxy or block nobody — the list has to see what the proxy saw.
+///
+/// **That makes a trusted `X-Forwarded-For` an admission decision**, which is why it is
+/// `trusted_subnets` that has to name the proxy and not this table: a client that can set the header
+/// itself can claim any address, including an allowed one. The two tables are a pair and neither is
+/// safe alone; the documentation says so rather than leaving it to be worked out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessConfig {
+    /// What an address that matches no rule gets: `"allow"` (the default) or `"deny"`.
+    ///
+    /// Defaults to `"allow"` so a half-written list cannot take a deployment offline — the same
+    /// rule nginx applies with its implicit `allow all`. A closed door is written
+    /// `default = "deny"` plus the ranges to admit, and it is then impossible to arrive at by
+    /// accident.
+    ///
+    /// **`"deny"` beside a listener with no peer address is refused by `validate`.** A unix socket
+    /// has no address, so no rule can ever match it and every request would be refused — the
+    /// deployment would have closed a door that has no lock on it, and the failure would look like
+    /// a misconfigured rule rather than a listener that cannot be filtered at all.
+    #[serde(default)]
+    pub default: crate::access::Action,
+
+    /// The rules, evaluated top to bottom; the first match decides.
+    ///
+    /// Each entry is `{ action = "allow" | "deny", range = "10.0.0.0/8" }`. The range forms follow
+    /// `[server.proxy].trusted_subnets` exactly — one parser, one set of rules, so `10.0.0.0/8`
+    /// means the same thing in both places. A bare address is a range of one.
+    ///
+    /// An empty list is allowed and means "no rule can match, so `default` decides everything";
+    /// `check` reports it as such rather than as an active policy.
+    #[serde(default)]
+    pub rules: Vec<AccessRuleConfig>,
+}
+
+/// One line of [`AccessConfig::rules`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRuleConfig {
+    /// What this rule does with a matching request.
+    pub action: crate::access::Action,
+
+    /// The address or CIDR range this rule matches, e.g. `"10.0.0.0/8"` or `"127.0.0.1"`.
+    pub range: String,
 }
 
 /// Which peers may assert a client address, and through which headers.
@@ -741,5 +822,26 @@ impl ServerConfig {
         )
         .map(Some)
         .map_err(|reason| format!("server.rate_limit: {reason}"))
+    }
+
+    /// The access policy this deployment asks for, or the reason it is not usable.
+    ///
+    /// `Ok(None)` when there is no `[server.access]` table, which is the default and means no list
+    /// is consulted at all — not a list configured to allow everything. The caller skips the scan
+    /// entirely in that case, which is what keeps an unconfigured deployment's request path free.
+    ///
+    /// The ranges are parsed here, once. A range that does not parse is an error rather than a rule
+    /// that matches nobody: this is the one setting whose typo has a direction, and a dropped
+    /// `deny` line is a range that is served.
+    pub fn access_policy(&self) -> std::result::Result<Option<crate::access::AccessPolicy>, String> {
+        let Some(access) = &self.access else {
+            return Ok(None);
+        };
+        crate::access::AccessPolicy::new(
+            access.rules.iter().map(|rule| (rule.action, &rule.range)),
+            access.default,
+        )
+        .map(Some)
+        .map_err(|reason| format!("server.access: {reason}"))
     }
 }

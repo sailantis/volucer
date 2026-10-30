@@ -336,6 +336,22 @@ pub fn write_rate_limited<W: Write>(
     )
 }
 
+/// A refusal by `[server.access]`.
+///
+/// Its own function rather than a `write_error(…, ServerErrorKind::AddressDenied)` call, so the
+/// reason cannot be passed with the wrong kind: the status line and the `no-store` both follow from
+/// this one argument, and a caller that picked `Backend` by mistake would answer a 502 for a
+/// deliberate refusal.
+pub fn write_forbidden<W: Write>(writer: &mut W, request_id: u16, message: &str) -> Result<()> {
+    write_error_with(
+        writer,
+        request_id,
+        message,
+        ServerErrorKind::AddressDenied,
+        None,
+    )
+}
+
 fn write_error_with<W: Write>(
     writer: &mut W,
     request_id: u16,
@@ -350,7 +366,7 @@ fn write_error_with<W: Write>(
         (ServerErrorKind::RateLimited, Some(seconds)) => {
             format!("Cache-Control: no-store\r\nRetry-After: {seconds}\r\n")
         }
-        (ServerErrorKind::BodyTooLarge | ServerErrorKind::RateLimited, _) => {
+        (ServerErrorKind::BodyTooLarge | ServerErrorKind::RateLimited | ServerErrorKind::AddressDenied, _) => {
             "Cache-Control: no-store\r\n".to_string()
         }
         _ => String::new(),
@@ -406,6 +422,13 @@ pub enum ServerErrorKind {
     /// went wrong. `Overloaded` would tell nginx to retry elsewhere, and a rate-limited caller is
     /// rate-limited at every worker.
     RateLimited,
+    /// The caller's address is refused by `[server.access]`.
+    ///
+    /// A 403 and its own kind for the same reason [`ServerErrorKind::RateLimited`] is its own: nginx
+    /// relays the `Status:` line, so a refusal by policy has to reach the client as the status the
+    /// policy means. Reporting it as the backend failure beside it would send an operator to look at
+    /// PHP for a decision this server made.
+    AddressDenied,
 }
 
 impl ServerErrorKind {
@@ -420,6 +443,7 @@ impl ServerErrorKind {
             // oversized body is oversized at every worker.
             ServerErrorKind::BodyTooLarge => ProtocolStatus::RequestComplete,
             ServerErrorKind::RateLimited => ProtocolStatus::RequestComplete,
+            ServerErrorKind::AddressDenied => ProtocolStatus::RequestComplete,
         }
     }
 
@@ -434,6 +458,7 @@ impl ServerErrorKind {
             // and `413 Content Too Large` is the answer nginx itself gives for the same reason.
             ServerErrorKind::BodyTooLarge => "413 Content Too Large",
             ServerErrorKind::RateLimited => "429 Too Many Requests",
+            ServerErrorKind::AddressDenied => "403 Forbidden",
             _ => "502 Bad Gateway",
         }
     }

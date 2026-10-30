@@ -497,6 +497,12 @@ pub(crate) struct FrontEnd {
     /// — see [`ReloadHandles::rate_limit`]. The load is one pointer read, which is the same cost the
     /// `None` check had.
     rate_limit: Arc<RateLimitCell>,
+    /// Which client addresses may reach this server at all, when the deployment asked.
+    ///
+    /// **The same cell both front-ends hold**, and read before anything else in the request path —
+    /// see [`AccessCell`] for why it is process-wide rather than per site. `None` when there is no
+    /// `[server.access]` table, so an unconfigured deployment's request path costs one pointer read.
+    access: Arc<AccessCell>,
     /// The `Alt-Svc` header value that advertises this process's HTTP/3 endpoint, if there is one.
     ///
     /// **Without this header no browser ever finds the UDP listener.** A page served over
@@ -541,6 +547,7 @@ impl FrontEnd {
         observe: Arc<volucer_observe::Observability>,
         client_ip: Arc<volucer_core::ClientIpPolicy>,
         rate_limit: Arc<RateLimitCell>,
+        access: Arc<AccessCell>,
         alt_svc: Option<HeaderValue>,
         shutdown_timeout: Duration,
     ) -> Self {
@@ -557,6 +564,7 @@ impl FrontEnd {
             observe,
             client_ip,
             rate_limit,
+            access,
             alt_svc,
             connections: ConnectionRegistry::new(),
             shutdown_timeout,
@@ -616,7 +624,7 @@ impl FrontEnd {
 /// `Reloaded`, `Resolved` and the site table's derived maps live in `volucer-watch`, because both
 /// front-ends build them and a reload has to be able to. Re-exported here because this is where a
 /// reader looks for them.
-pub use volucer_watch::{RateLimitCell, Reloaded, Resolved};
+pub use volucer_watch::{AccessCell, RateLimitCell, Reloaded, Resolved};
 
 /// What one front-end needs in hand to serve a request.
 ///
@@ -684,7 +692,15 @@ pub struct ReloadHandles {
     /// writes into: the FastCGI listener holds a clone of this `Arc`, not a copy of the policy, so
     /// replacing it moves both front-ends. See [`RateLimitCell`].
     pub rate_limit: Arc<RateLimitCell>,
-    /// The page this server answers an error status with, by code, already resolved against the
+    /// Which client addresses may reach this server at all, when the deployment asked.
+    ///
+    /// Here for the same reason `rate_limit` is: it is a process-wide decision both front-ends must
+    /// share, because a client refused on one protocol and admitted on the other has not been
+    /// refused at all — an access list that reached one front-end would be a suggestion.
+    ///
+    /// **Reloadable**, and unlike the rate limit there is nothing to carry across a replacement: an
+    /// address list is not a running total. See [`AccessCell`].
+    pub access: Arc<AccessCell>,
     /// configuration file's directory.
     ///
     /// A plain map rather than the configuration type: this is what a listener needs, and the
@@ -708,6 +724,7 @@ impl ReloadHandles {
             observe: Arc::new(volucer_observe::Observability::disabled()),
             client_ip: Arc::new(volucer_core::ClientIpPolicy::off()),
             rate_limit: Arc::new(RateLimitCell::new(None)),
+            access: Arc::new(AccessCell::new(None)),
             grpc_grants: Arc::new(volucer_watch::GrpcGrantsMap::new()),
             error_pages: std::collections::BTreeMap::new(),
         }
@@ -760,6 +777,17 @@ impl ReloadHandles {
     #[must_use]
     pub fn with_rate_limit(mut self, rate_limit: Arc<RateLimitCell>) -> Self {
         self.rate_limit = rate_limit;
+        self
+    }
+
+    /// The same, around an access cell `serve` already built.
+    ///
+    /// Builder-shaped for the reason [`ReloadHandles::with_rate_limit`] is, and it takes the `Arc`
+    /// both front-ends are given rather than building one: two cells would be two lists, and a
+    /// client refused over HTTP would be admitted over FastCGI.
+    #[must_use]
+    pub fn with_access(mut self, access: Arc<AccessCell>) -> Self {
+        self.access = access;
         self
     }
 
@@ -1398,6 +1426,7 @@ impl HttpListener {
                 Arc::clone(&handles.observe),
                 Arc::clone(&handles.client_ip),
                 Arc::clone(&handles.rate_limit),
+                Arc::clone(&handles.access),
                 alt_svc,
                 shutdown_timeout,
             )),
@@ -2379,6 +2408,40 @@ async fn prepare(
     // application reading `REMOTE_ADDR` should see that there is no address, and `""` is a value it
     // might parse into something.
     let remote_addr = resolved_peer.map(|address| address.to_string());
+
+    // **The access list is the first thing consulted, above even the rate limit.** Both exist to
+    // stop a request costing something, but they answer different questions and the difference
+    // decides the order: a rate limit says "you have had enough *for now*" and expects the caller
+    // back, while an access list says "not you, ever". Checking the limit first would let a blocked
+    // caller spend a token out of a bucket it can never use, and would answer a 429 to a client an
+    // operator has already decided to refuse — a retryable status for a permanent decision.
+    //
+    // `resolved_peer` and not the socket peer: the list is applied to the address `[server.proxy]`
+    // resolved, which is the same identity the rate limit and the access log use. That makes a
+    // trusted `X-Forwarded-For` an admission decision, which is why `trusted_subnets` has to name
+    // the proxy — a client that can set the header itself can claim an allowed address.
+    //
+    // `None` (a unix socket) is decided by the policy's default rather than skipped, and
+    // `validate` is what stops a `deny` default being written beside a socket listener.
+    if let Some(policy) = front_end.access.load().as_ref() {
+        if !policy.is_empty() || policy.default_action() == volucer_core::Action::Deny {
+            if let Some(refusal) = policy.refusal(resolved_peer) {
+                // A refused gRPC call is refused as a gRPC failure for the same reason a limited
+                // one is: the protocol is known here and cannot be recovered by `error_response`,
+                // and an HTTP 403 is unreadable to a gRPC client — it reports "unexpected HTTP
+                // status" and the operator sees nothing. `PERMISSION_DENIED` is the code, and it is
+                // deliberately *not* retryable, which is what distinguishes it from the rate
+                // limit's `RESOURCE_EXHAUSTED` beside it.
+                if volucer_upstream::is_grpc(&parts.headers) {
+                    return Err(HttpError::Grpc {
+                        status: volucer_upstream::GrpcStatus::PermissionDenied,
+                        reason: refusal.to_string(),
+                    });
+                }
+                return Err(HttpError::Forbidden(refusal.to_string()));
+            }
+        }
+    }
 
     // **The rate limit is the first thing consulted, and before anything that costs work.**
     // Before the redirect, before the site table, before the static layer's `stat`, and above all

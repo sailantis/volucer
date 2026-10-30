@@ -9,6 +9,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[server.access]` blocks and admits client addresses, and it is consulted first.** The rate
+  limiter could throttle a caller but there was no way to refuse one, and the only lever for "this
+  range is not welcome" was a rule in the proxy in front.
+
+  ```toml
+  [server.access]
+  default = "allow"
+  rules = [
+    { action = "allow", range = "192.0.2.7" },      # this host is mine
+    { action = "deny",  range = "192.0.2.0/24" },   # the range around it is scraped
+  ]
+  ```
+
+  It is evaluated **above the rate limit, the redirect, the site table, the static `stat` and the
+  body read**, so it is not a filter on the remaining work — a refused request costs one pointer
+  read and one range comparison. That placement is the feature: a limit is a filter on cost, a
+  boundary is not.
+
+  **The first matching rule decides**, and the order is the security property. Most-specific-wins —
+  the rule the host table uses — cannot express "block this range except that host", which is the
+  case a list is usually written for. An exception therefore goes *above* the rule it excepts from,
+  and `volucer check` prints the rules in evaluation order so the answer is readable rather than
+  discovered. `default = "allow"` is the default for the same reason nginx appends an implicit
+  `allow all`: a half-written list must not take a deployment offline.
+
+  The address tested is the one `[server.proxy]` resolves, which makes a trusted `X-Forwarded-For`
+  an admission decision — the two tables are a pair, and the docs say what that means in each
+  direction. `default = "deny"` beside a `unix:` listener is **refused**: a socket has no client
+  address, so no rule could match and every request would be refused, which reads as a broken rule
+  rather than as a listener that cannot be filtered.
+
+  Both front-ends share one cell, so a client refused over HTTP is refused over FastCGI, and a
+  `SIGHUP` replaces the list for the next request.
+
+- **A refused gRPC call is `PERMISSION_DENIED`, not a `403`.** A gRPC client reads its outcome from
+  the trailer section, so an HTTP error status reaches it as "unexpected HTTP status" and the refusal
+  disappears. Code 7 is explicitly non-retryable, which is what tells a client this is not the rate
+  limit's `RESOURCE_EXHAUSTED` beside it.
+
 - **`[server.error_pages]` gives an error status a page of its own.** Every `502`, `504`, `429` and
   router-level `404` was a single line of plain text, which is what a client sees on the worst day
   the deployment has.

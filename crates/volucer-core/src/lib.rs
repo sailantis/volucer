@@ -1,5 +1,6 @@
 //! Shared building blocks for volucer: configuration, backend model and PHP discovery.
 
+pub mod access;
 pub mod clientip;
 pub mod config;
 pub mod env;
@@ -12,6 +13,7 @@ pub mod proto;
 pub mod ratelimit;
 pub mod script;
 pub mod sites;
+pub use access::{AccessPolicy, AccessRule, Action, Refusal};
 pub use clientip::{ClientIpPolicy, HeaderLookup};
 pub use config::{BackendConfig, Config, Listener, ServerConfig, SiteProtocol};
 pub use error::{Error, Result};

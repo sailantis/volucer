@@ -132,6 +132,12 @@ pub struct FastCgiListener {
     /// no `[server.rate_limit]` table exists, so an unconfigured deployment's request path does one
     /// pointer read and no work.
     rate_limit: Option<Arc<volucer_watch::RateLimitCell>>,
+    /// Which client addresses may reach this server at all, when the deployment asked for a list.
+    ///
+    /// The **same cell both front-ends hold**, so a client refused over HTTP is refused here too. It
+    /// is `Option` for the same reason `rate_limit` is: a caller that built a listener by hand has
+    /// no list, and `None` costs one `Option` check per request rather than a cell load.
+    access: Option<Arc<volucer_watch::AccessCell>>,
 }
 
 impl FastCgiListener {
@@ -186,6 +192,7 @@ impl FastCgiListener {
             limits,
             observe: Arc::new(volucer_observe::Observability::disabled()),
             rate_limit: None,
+            access: None,
         })
     }
 
@@ -209,6 +216,17 @@ impl FastCgiListener {
     #[must_use]
     pub fn with_rate_limit(mut self, rate_limit: Arc<volucer_watch::RateLimitCell>) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// The same listener with an access list.
+    ///
+    /// Builder-shaped for the same reason [`FastCgiListener::with_rate_limit`] is, and it takes the
+    /// cell the HTTP listener was given: two cells would be two lists, and a client refused on one
+    /// protocol would be served on the other.
+    #[must_use]
+    pub fn with_access(mut self, access: Arc<volucer_watch::AccessCell>) -> Self {
+        self.access = Some(access);
         self
     }
 
@@ -284,6 +302,7 @@ impl FastCgiListener {
                     let limits = self.limits;
                     let observe = Arc::clone(&self.observe);
                     let rate_limit = self.rate_limit.clone();
+                    let access = self.access.clone();
                     let shared = Shared {
                         dispatcher,
                         sites,
@@ -293,7 +312,9 @@ impl FastCgiListener {
                     };
                     handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
                     handlers.push(std::thread::spawn(move || {
-                        if let Err(err) = serve_connection(stream, shared, limits, rate_limit) {
+                        if let Err(err) =
+                            serve_connection(stream, shared, limits, rate_limit, access)
+                        {
                             tracing::debug!(%peer, %err, "connection ended");
                         }
                     }));
@@ -719,6 +740,7 @@ fn serve_connection(
     shared: Shared,
     limits: Limits,
     rate_limit: Option<Arc<volucer_watch::RateLimitCell>>,
+    access: Option<Arc<volucer_watch::AccessCell>>,
 ) -> Result<()> {
     let Shared {
         dispatcher,
@@ -864,6 +886,43 @@ fn serve_connection(
             param(request.params.as_slice(), b"HTTP_TRACEPARENT"),
         );
         let started = Instant::now();
+
+        // **The access list is consulted before the rate limit, and for the reason it is on the HTTP
+        // path too**: a rate limit says "not yet" and an access list says "never", so checking the
+        // limit first would spend a token out of a bucket the caller can never use and answer a
+        // retryable 429 to a client that has been permanently refused.
+        //
+        // The address is `REMOTE_ADDR`, the same one the rate limit keys on and for the same
+        // asymmetry: nginx sets it from `$remote_addr`, the address it saw the client at, while the
+        // `HTTP_*` params beside it are the client's own claims. Under `default = "allow"` a request
+        // with no `REMOTE_ADDR` is served; under `"deny"` it is refused, and `validate` is what stops
+        // that combination being written beside a socket listener in the first place.
+        if let Some(cell) = &access {
+            let policy = cell.load();
+            let policy = policy.as_ref().as_ref();
+            if let Some(policy) = policy {
+                if !policy.is_empty() || policy.default_action() == volucer_core::Action::Deny {
+                    let address = param(request.params.as_slice(), b"REMOTE_ADDR")
+                        .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok());
+                    if let Some(refusal) = policy.refusal(address) {
+                        stats.failed.fetch_add(1, Ordering::Relaxed);
+                        let reason = refusal.to_string();
+                        tracing::debug!(%reason, "refusing a request");
+                        // Logged *before* the answer, like the rate-limited refusal beside it: there
+                        // is no backend answer to wait for, and the alternative is a request an
+                        // operator can see arrive and never see answered.
+                        if observe.is_active() {
+                            record_fastcgi(&observe, &context, &request, 403, 0, started.elapsed());
+                        }
+                        fastcgi::write_forbidden(stream.get_mut(), request_id, &reason)?;
+                        if !keep_conn {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
 
         // **The rate limit, before the site is resolved and before any backend is reached.** It is
         // deliberately later than on the HTTP path — a `PARAMS` block has to arrive before a request

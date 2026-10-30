@@ -3271,6 +3271,191 @@ fn a_rate_limited_grpc_call_is_resource_exhausted_rather_than_a_429() {
     );
 }
 
+// ------------------------------------------------------------ access lists
+//
+// `[server.access]` is consulted above the rate limit, and the two are told apart by what a client
+// is meant to do with the answer: a 429 is "come back", a 403 is "not you". These tests pin that
+// order and the default, because both are the security property rather than an implementation
+// detail — a list that ran after the limiter would spend an allowance a blocked caller can never
+// use, and a default that refused would take a deployment offline on a half-written list.
+
+/// A static-layer server behind an access policy.
+fn access_controlled_server(policy: volucer_core::AccessPolicy) -> Option<Server> {
+    let root = static_root("access-list");
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_access(Arc::new(volucer_http::AccessCell::new(Some(policy))));
+
+    Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+}
+
+/// A policy from `(action, range)` pairs, which panics on a range that does not parse.
+fn access_policy(
+    rules: &[(volucer_core::Action, &str)],
+    default: volucer_core::Action,
+) -> volucer_core::AccessPolicy {
+    volucer_core::AccessPolicy::new(rules.iter().copied(), default)
+        .expect("the test's ranges parse")
+}
+
+#[test]
+fn a_denied_address_is_a_403_before_anything_else_happens() {
+    // The local test client reaches this server from `127.0.0.1`, so denying the whole v4 loopback
+    // range is the one way to be sure the request really is refused rather than merely unserved: the
+    // file it asks for exists and the static layer would answer a 200.
+    let Some(server) = access_controlled_server(access_policy(
+        &[(volucer_core::Action::Deny, "127.0.0.0/8")],
+        volucer_core::Action::Allow,
+    )) else {
+        return;
+    };
+
+    let refused = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        refused.status, 403,
+        "a denied address must be a 403, not a 404 or a 502: {refused:?}"
+    );
+    // The reason names the rule the operator wrote, so the log answers "which line blocked this
+    // client" without them reading the whole list.
+    assert!(
+        String::from_utf8_lossy(&refused.body).contains("127.0.0.0/8"),
+        "the refusal must name the rule that decided: {refused:?}"
+    );
+}
+
+#[test]
+fn an_allowed_address_is_served_and_the_default_admits() {
+    // The negative control for the test above: the same server, one rule narrower than the client,
+    // answers normally. Without this, a 403 for every request would pass the test above.
+    let Some(server) = access_controlled_server(access_policy(
+        &[(volucer_core::Action::Deny, "10.0.0.0/8")],
+        volucer_core::Action::Allow,
+    )) else {
+        return;
+    };
+
+    let served = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        served.status, 200,
+        "a client outside every rule must be admitted under default = allow: {served:?}"
+    );
+}
+
+#[test]
+fn the_access_list_is_checked_before_the_rate_limit() {
+    // Both are refusals, so a status alone cannot tell which ran first — a 429 here would mean the
+    // limiter spent a token on a request the list was always going to refuse, and a caller an
+    // operator has permanently blocked was told to come back.
+    let root = static_root("access-before-limit");
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    // A burst of one, which a single request spends. If the list ran second, the first request
+    // would be *limited* rather than denied — and the assertion below would read 429.
+    .with_rate_limit(Arc::new(volucer_http::RateLimitCell::new(Some(slow_limit(1)))))
+    .with_access(Arc::new(volucer_http::AccessCell::new(Some(access_policy(
+        &[(volucer_core::Action::Deny, "127.0.0.0/8")],
+        volucer_core::Action::Allow,
+    )))));
+
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles) else {
+        return;
+    };
+
+    // Every one of these is refused by the list. A 429 on any of them means the limiter ran first.
+    for _ in 0..3 {
+        let refused = get(&server.address, "/assets/app.css");
+        assert_eq!(
+            refused.status, 403,
+            "the access list must be consulted before the rate limit, or a blocked caller spends \
+             an allowance it can never use: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_denied_grpc_call_is_permission_denied_rather_than_a_403() {
+    // A gRPC client reads the outcome from the trailer section, so a 403 reaches it as "unexpected
+    // HTTP status" and the operator's refusal is invisible. `PERMISSION_DENIED` is code 7 and is
+    // explicitly non-retryable, which is what tells a client this is not the rate limit's "come
+    // back later" beside it.
+    let Some(server) = access_controlled_server(access_policy(
+        &[(volucer_core::Action::Deny, "127.0.0.0/8")],
+        volucer_core::Action::Allow,
+    )) else {
+        return;
+    };
+
+    let refused = post_grpc(&server.address, "/pkg.Service/Method");
+    assert!(
+        refused.contains("grpc-status: 7"),
+        "a denied gRPC call must be PERMISSION_DENIED: {refused}"
+    );
+    assert!(
+        !refused.contains("403"),
+        "a gRPC failure must not use an HTTP error status: {refused}"
+    );
+}
+
+#[test]
+fn a_reloaded_access_list_takes_effect_on_the_next_request() {
+    // The list is reloadable for the same reason the rate limit is: an operator who blocks a range
+    // during an incident expects the next request to be refused, not the next restart. The cell is
+    // shared, so replacing it through one handle moves every front-end that holds it.
+    let cell = Arc::new(volucer_http::AccessCell::new(Some(access_policy(
+        &[],
+        volucer_core::Action::Allow,
+    ))));
+
+    let root = static_root("access-reload");
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_access(Arc::clone(&cell));
+
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles) else {
+        return;
+    };
+
+    assert_eq!(get(&server.address, "/assets/app.css").status, 200);
+
+    cell.replace(Some(access_policy(
+        &[(volucer_core::Action::Deny, "127.0.0.0/8")],
+        volucer_core::Action::Allow,
+    )));
+
+    assert_eq!(
+        get(&server.address, "/assets/app.css").status,
+        403,
+        "a reloaded list must move both front-ends' next request, not the next restart's"
+    );
+}
+
 // ------------------------------------------------------------ trace propagation
 //
 // `[server].trace_context` decides one thing: **what the backend receives.** These tests are about

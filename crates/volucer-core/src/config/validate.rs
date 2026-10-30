@@ -777,6 +777,35 @@ impl Config {
         if let Err(reason) = self.server.rate_limiter() {
             return Err(Error::Config(reason));
         }
+        // Built here for the same reason the rate limit is: a file `check` accepts is a file a
+        // listener can apply, and the constructor is the thing that parses ranges.
+        if let Err(reason) = self.server.access_policy() {
+            return Err(Error::Config(reason));
+        }
+        // **A closed default beside a listener with no peer address refuses every request it
+        // receives.** A unix socket has no client address, so no rule can ever match one and
+        // `default = "deny"` would decide every request. That is a deployment that believes it
+        // closed a door and instead stopped serving, and the symptom reads as a broken rule rather
+        // than as a listener that cannot be filtered — so it is refused by name.
+        if let Some(access) = &self.server.access {
+            if access.default == crate::access::Action::Deny {
+                let socket_listeners = [
+                    ("server.http", self.server.http.as_deref()),
+                    ("server.fastcgi", self.server.fastcgi.as_deref()),
+                ];
+                for (key, listener) in socket_listeners {
+                    let Some(listener) = listener else { continue };
+                    if listener.trim_start().starts_with("unix:") {
+                        return Err(Error::Config(format!(
+                            "server.access.default is \"deny\" but {key} is {listener:?}, a unix \
+                             socket: a socket has no client address, so no rule can match and every \
+                             request would be refused. Filter the socket's users in the proxy in \
+                             front, or set server.access.default = \"allow\""
+                        )));
+                    }
+                }
+            }
+        }
         // `serve_only = "backend"` and an enabled static layer are contradictory:
         // one says the static layer never runs, the other says it must. Which wins
         // would otherwise depend on which check read the config, so it is refused.

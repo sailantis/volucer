@@ -606,6 +606,63 @@ fastcgi = "127.0.0.1:9080"
 #   header named next to a key that does not read one is a line that believes it
 #   limits that header.
 # ---------------------------------------------------------------------------
+# IP allow/deny. Refuses a request before it costs anything: above the rate
+# limit, the redirect, the site table, the static `stat` and the body read.
+#
+# The list is checked IN ORDER and the first matching rule decides, which is the
+# whole of the security model. It is not "most specific wins": that rule cannot
+# express "block this range except that host", which is the case a list is
+# usually written for. **An exception goes above the rule it excepts from** --
+# a broad range listed first claims every address inside it.
+#
+# ```toml
+# [server.access]
+# default = "allow"
+# rules = [
+#   { action = "allow", range = "192.0.2.7" },      # this host is mine
+#   { action = "deny",  range = "192.0.2.0/24" },   # the range around it is scraped
+# ]
+# ```
+#
+# `volucer check` prints the rules in evaluation order with their numbers, so
+# the answer to "which line blocked this client" is readable rather than
+# discovered.
+#
+# default = "allow"
+#   What an address that matches NO rule gets. Defaults to "allow" so a
+#   half-written list cannot take a deployment offline -- nginx makes the same
+#   choice with its implicit `allow all`. A closed door is `default = "deny"`
+#   plus the ranges to admit, and it cannot then happen by accident.
+#
+#   Refused beside a `unix:` listener: a socket has no client address, so no
+#   rule can match one and every request would be refused. That reads as a
+#   broken rule rather than as a listener that cannot be filtered, so it is
+#   named at startup instead.
+#
+# rules[].range
+#   An address or CIDR range, in the same forms as
+#   `[server.proxy].trusted_subnets` -- one parser, one set of rules, so a range
+#   means the same thing in both places. A bare address is a range of one.
+#   A v4 range does not match a v6 address (or a v4-mapped one), so a listener
+#   on `[::]` needs the mapped range written out.
+#
+# WHICH ADDRESS IS TESTED, and the pair this forms with `[server.proxy]`:
+#   the address `[server.proxy]` resolves -- the same one the rate limiter keys
+#   on and the access log records. That makes a trusted `X-Forwarded-For` an
+#   admission decision, so the two tables are a pair. Behind nginx you need
+#   `trusted_subnets` naming nginx, or every request is judged by nginx's own
+#   address; and trusting a subnet you do not control lets a client claim an
+#   allowed address. With no `[server.proxy]` table the list sees the socket
+#   peer, which behind a proxy is the proxy.
+#
+# RELOADABLE. SIGHUP replaces the list in place and the next request is judged by
+# the new one. Nothing is carried across, unlike the rate limit: an address list
+# is not a running total.
+#
+# A refused gRPC call is answered PERMISSION_DENIED (code 7) in the trailers with
+# an HTTP 200, not a 403 -- a gRPC client reads its outcome from the trailer
+# section, so an HTTP error status reaches it as "unexpected HTTP status".
+# ---------------------------------------------------------------------------
 # Persistent worker pool: the process boots the application once and stays
 # resident. volucer talks to it over the child's stdin/stdout pipes using its
 # own framed protocol. State is NOT reset per request, so the application must

@@ -75,5 +75,5 @@ pub use tls::{
     TlsError,
 };
 pub use volucer_watch::{
-    GrpcGrantsMap, RateLimitCell, Registry, SharedState, Swappable, DEFAULT_SITE_KEY,
+    AccessCell, GrpcGrantsMap, RateLimitCell, Registry, SharedState, Swappable, DEFAULT_SITE_KEY,
 };

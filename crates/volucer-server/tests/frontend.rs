@@ -974,6 +974,97 @@ document_root = {root:?}
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ------------------------------------------------------------ access lists
+//
+// `[server.access]` on the front end behind nginx. The list has to reach this path too, or a client
+// refused over HTTP is served over FastCGI — which is not a partial refusal, it is no refusal at
+// all, since nginx is the front door and almost every request arrives here.
+
+#[test]
+fn a_denied_fastcgi_client_is_a_403_and_the_connection_survives() {
+    // The `REMOTE_ADDR` param, not the socket peer: nginx sets it from `$remote_addr`, the address it
+    // saw the client at, so a list keyed on the peer would be a list on nginx. The backend is
+    // deliberately unreachable, so a *permitted* request is a 502 and the assertion below cannot be
+    // satisfied by a script that happened to produce a 403.
+    let root = std::env::temp_dir().join(format!("volucer-fcgi-access-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let text = format!(
+        r#"
+[server]
+default_backend = "unreachable"
+fastcgi = "127.0.0.1:0"
+document_root = {root:?}
+"#,
+        root = root.to_string_lossy(),
+    );
+    let config = Config::from_toml(&text).expect("config parses");
+
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let sites = SharedState::new(Sites::from_config(&config, &root));
+    let registry = Arc::new(Registry::new(sites));
+    let access = Arc::new(volucer_watch::AccessCell::new(Some(
+        volucer_core::AccessPolicy::new(
+            [(volucer_core::Action::Deny, "192.0.2.0/24")],
+            volucer_core::Action::Allow,
+        )
+        .expect("the range parses"),
+    )));
+
+    let listener = FastCgiListener::bind_registered(
+        "127.0.0.1:0",
+        Arc::clone(&dispatcher),
+        Arc::clone(&registry),
+        Limits::default(),
+    )
+    .expect("bind the fastcgi listener")
+    .with_access(Arc::clone(&access));
+    let address = listener.local_addr().expect("bound address");
+    let shutdown = listener.shutdown_handle();
+    let handle = std::thread::spawn(move || listener.run());
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut connection = fastcgi_connection(address);
+
+    // A client outside the range reaches the backend, which cannot be reached: a 502 rather than a
+    // 403. This is the negative control — without it, a front end that refused everything would pass.
+    let permitted = request_from(&mut connection, 1, "203.0.113.7", "/index.php");
+    assert!(
+        permitted.contains("Status: 502") || permitted.contains("Status: 200"),
+        "a permitted client must reach the backend: {permitted}"
+    );
+
+    // A client inside the range is refused, and the reason names the operator's own line.
+    let refused = request_from(&mut connection, 2, "192.0.2.40", "/index.php");
+    assert!(
+        refused.contains("Status: 403 Forbidden"),
+        "a denied client must be a 403: {refused}"
+    );
+    assert!(
+        refused.contains("192.0.2.0/24"),
+        "the refusal must name the rule that decided: {refused}"
+    );
+    assert!(
+        refused.contains("no-store"),
+        "a cacheable refusal would be served to every other client: {refused}"
+    );
+
+    // **The connection survives**, `continue` rather than `close`, which is what nginx does for any
+    // other 4xx: a refused request must not cost the keep-alive.
+    let other = request_from(&mut connection, 3, "203.0.113.8", "/index.php");
+    assert!(
+        !other.contains("403"),
+        "another client on the same connection must be served: {other}"
+    );
+
+    shutdown.shutdown();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ------------------------------------------------------------ trace propagation
 //
 // The FastCGI front-end is the one behind nginx, and that is exactly why it needs its own test:

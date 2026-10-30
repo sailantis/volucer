@@ -294,6 +294,7 @@ Some features are enabled by the presence of their table. They do not need an
 | `[server.acme]` | Automatic certificates (`enabled` inside it defaults to `true`) |
 | `[server.access_log]` | Access logging |
 | `[server.rate_limit]` | Rate limiting |
+| `[server.access]` | IP allow/deny lists |
 | `[status]` | The status listener, and therefore `/health` and `/ready` |
 | `[status.metrics]` | The Prometheus exposition (`/health` and `/ready` stay as they were) |
 | `[status.workers]` | The worker-control routes |
@@ -333,6 +334,7 @@ its certificate or ACME settings.
 | `access_log` | table | absent | The access log. Presence enables it. |
 | `proxy` | table | absent | Which peers may assert a client address. |
 | `rate_limit` | table | absent | The rate limiter. Presence enables it. |
+| `access` | table | absent | IP allow/deny rules. Presence enables them. See [`[server.access]`](#serveraccess). |
 | `trace_context` | string | `"extract"` | How the client's trace context is handled when setting a backend's `traceparent`: `"ignore"`, `"extract"`, `"inject"` or `"propagate"`. See [Observability](06-OBSERVABILITY.md#trace-context). |
 
 ### `trace_context`
@@ -625,6 +627,69 @@ rather than granting each a fresh burst.
 Changing `key` or `header` changes the identity definition, so Volucer starts new buckets
 and reports this in the log. Adding or removing the entire table also starts with empty
 buckets.
+
+## `[server.access]`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `default` | string | `"allow"` | What an address matching no rule gets: `"allow"` or `"deny"`. |
+| `rules` | array of tables | empty | `{ action = "allow" \| "deny", range = "10.0.0.0/8" }`, evaluated top to bottom. |
+
+This list decides whether a request may be served **before anything else happens** — above
+the rate limit, the HTTPS redirect, the site table, the static `stat` and the body read. It
+is therefore not a filter on the remaining work; it is the boundary.
+
+### The order is the security property
+
+**The first matching rule decides**, and the list is evaluated exactly as written. An
+exception must go *above* the range it excepts from:
+
+```toml
+[server.access]
+rules = [
+  { action = "allow", range = "192.0.2.7" },      # this host is mine
+  { action = "deny",  range = "192.0.2.0/24" },   # the range around it is scraped
+]
+```
+
+Reversing those two lines blocks `192.0.2.7` as well, because a broad rule listed first
+claims every address inside it. Volucer uses first-match rather than most-specific-wins
+for that reason: most-specific-wins cannot express "block this range except that host".
+`volucer check` prints the list in evaluation order with its numbers, so the order is
+readable rather than discoverable.
+
+### The default admits
+
+`default = "allow"` is the default so that a half-written list cannot take a deployment
+offline — the same choice nginx makes with its implicit `allow all`. A closed door is
+written as `default = "deny"` plus the ranges to admit, which cannot happen by accident.
+
+`default = "deny"` is **refused beside a `unix:` listener**. A socket has no client
+address, so no rule can ever match one and every request would be refused; that reads as a
+broken rule rather than as a listener that cannot be filtered, so `check` names it instead.
+
+### Which address is tested
+
+The address `[server.proxy]` resolves, which is the same one the rate limiter keys on and
+the access log records. **That makes a trusted `X-Forwarded-For` an admission decision**:
+the two tables are a pair. Behind nginx you need `[server.proxy].trusted_subnets` naming
+nginx, or every request is judged by nginx's own address. Conversely, trusting a subnet you
+do not control lets a client claim an allowed address. With no `[server.proxy]` table the
+list sees the socket peer, which behind a proxy is the proxy.
+
+### Reloadable
+
+`SIGHUP` replaces the list in place; the next request is judged by the new one. Unlike the
+rate limit there is nothing to carry across a replacement, because an address list is not a
+running total.
+
+### gRPC
+
+A refused gRPC call is answered `PERMISSION_DENIED` (code 7) in the trailers with an HTTP
+`200`, not a `403`. A gRPC client reads its outcome from the trailer section, so an HTTP
+error status reaches it as "unexpected HTTP status" and the refusal is invisible. Code 7 is
+explicitly non-retryable, which is what distinguishes it from the rate limit's
+`RESOURCE_EXHAUSTED` beside it.
 
 ## `[[server.routes]]`
 
