@@ -3454,6 +3454,16 @@ fn to_cgi_with(
     })
 }
 
+/// Where the body starts within a FastCGI `STDOUT` payload.
+///
+/// One subtraction rather than a second header scan: `split_response_body` already locates the
+/// terminator and returns the tail, so the offset is what the tail is not. Written as a helper
+/// because `from_cgi` needs the offset *and* the parsed headers, and computing them from one borrow
+/// would mean parsing twice.
+fn body_offset_of(stdout: &[u8]) -> usize {
+    stdout.len() - volucer_fcgi::split_response_body(stdout).len()
+}
+
 /// Turn a backend response into an HTTP response.
 ///
 /// `Content-Length` is always set from the body that is actually sent, and an
@@ -3462,14 +3472,34 @@ fn to_cgi_with(
 /// connection, while declaring less is merely conservative. `HEAD` is handled by
 /// `hyper`, which suppresses the body and keeps the length — which is exactly
 /// what `HEAD` is for.
-fn from_cgi(
+///
+/// # One copy, not two
+///
+/// `Response::stdout` is an owned `Vec<u8>` that already holds a `Status:` block, the headers and
+/// the body. This used to copy the body out of it — `let body = body.to_vec()` — which meant a 30 MiB
+/// worker response existed twice at the moment it became an HTTP response. Instead the whole
+/// `stdout` is moved into `Bytes` once, and the body is a **slice** of it: `Bytes::slice` is a
+/// refcounted view, so the copy is gone and the response costs exactly what the backend allocated.
+///
+/// The header block stays alive inside that `Bytes` for as long as the body does, which is a few
+/// hundred bytes — the trade is one `Vec` allocation's worth of retention against a full duplicate of
+/// every response this server has ever answered.
+pub fn from_cgi(
     response: volucer_fcgi::Response,
     compression: &volucer_core::config::CompressionSetting,
     request_headers: &hyper::header::HeaderMap,
 ) -> Result<Response<ResponseBody>> {
     let settings = crate::compress::Settings::from(compression);
-    let (status, headers, body) = response.parse();
-    let body = body.to_vec();
+    // **A `Bytes` view of the whole payload, moved rather than copied.** `Bytes::from(Vec)` takes
+    // ownership and the body is then a refcounted slice of it, so a 30 MiB worker response is one
+    // allocation rather than two. The header block stays alive inside that `Bytes` for as long as
+    // the body does, which is a few hundred bytes of retention against a full duplicate.
+    let stdout = Bytes::from(response.stdout);
+    // Located on the `Bytes` rather than on a borrow of the `Vec`, so the split is one subtraction
+    // and no rescan.
+    let body_offset = body_offset_of(&stdout);
+    let (status, headers) = volucer_fcgi::parse_response_headers(&stdout);
+    let body = stdout.slice(body_offset..);
 
     // The application's headers, kept as an **ordered list of pairs** because repeats are
     // meaningful: two `Set-Cookie` headers are two cookies, and folding them into one corrupts
@@ -3496,7 +3526,7 @@ fn from_cgi(
     // Compression is decided from what the application sent, before `Body` is built: the
     // encoding, the length and `Vary` are header facts, and a body handed to `hyper` cannot be
     // replaced afterwards.
-    let original = Bytes::from(body);
+    let original = body;
     let decision = {
         let view = {
             let mut map = hyper::header::HeaderMap::new();

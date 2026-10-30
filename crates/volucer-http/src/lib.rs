@@ -63,7 +63,7 @@ pub use error::HttpError;
 #[cfg(feature = "http3")]
 pub use http3::{Http3Listener, RunningHttp3};
 pub use listener::{
-    to_cgi, to_cgi_routed, H3Counters, HttpLimits, HttpListener, HttpShutdown, HttpStats,
+    from_cgi, to_cgi, to_cgi_routed, H3Counters, HttpLimits, HttpListener, HttpShutdown, HttpStats,
     ListenerSettings, Payload, ReloadHandle, ReloadHandles, Reloaded, Resolved, RunningHttp,
     TlsSettings,
 };

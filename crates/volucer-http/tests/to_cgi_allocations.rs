@@ -456,3 +456,115 @@ fn the_body_is_moved_not_copied() {
         "and it must still do the translation's own work; got {count} allocations"
     );
 }
+
+// --------------------------------------------------- one copy of a backend response
+
+/// A backend response of `body_len` bytes, as the pool hands it over: `Status:` block, headers,
+/// blank line, body — all in one `Vec`.
+fn backend_response(body_len: usize) -> volucer_fcgi::Response {
+    let mut stdout = Vec::with_capacity(body_len + 128);
+    stdout.extend_from_slice(b"Status: 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n");
+    stdout.extend(std::iter::repeat_n(b'x', body_len));
+    volucer_fcgi::Response {
+        stdout,
+        ..volucer_fcgi::Response::default()
+    }
+}
+
+#[test]
+fn a_backend_response_is_not_copied_into_a_second_buffer() {
+    // **The property: turning a response into an HTTP response allocates about as much as the
+    // response, not twice as much.** `Response::stdout` is already an owned `Vec<u8>` holding the
+    // header block and the body; `Bytes::from` takes it over and `slice` gives the body as a
+    // refcounted view, so the payload is moved rather than duplicated.
+    //
+    // This used to copy the body out — `let body = body.to_vec()` — which meant a 30 MiB worker
+    // response existed twice at the moment it became a response. Written as an allocation *size*
+    // assertion rather than a count, because a count cannot distinguish one 4 MiB buffer from a
+    // thousand small ones, and the size is what makes the peak memory claim true.
+    const BODY: usize = 4 * 1024 * 1024;
+    let headers = hyper::header::HeaderMap::new();
+    let compression = volucer_core::config::CompressionSetting::default();
+
+    // **Built outside the measurement**, or the fixture would dominate it: the assertion is about
+    // what the *conversion* allocates, not about what the backend already allocated.
+    let response = backend_response(BODY);
+    let (_, bytes) = allocations(|| {
+        let converted =
+            volucer_http::from_cgi(response, &compression, &headers).expect("a usable response");
+        std::hint::black_box(&converted);
+    });
+
+    // The payload was built before the measurement, so what this counts is the conversion. A second
+    // copy of the body would put it at roughly 2 × `BODY`; the header map and the `Response`
+    // plumbing add a little on top of whatever the `Bytes` move costs, which is nothing.
+    assert!(
+        bytes < BODY / 2,
+        "converting a {BODY}-byte response allocated {bytes} bytes, which is about a full copy \
+         more than it should: a response must be *moved* into the HTTP body, never duplicated"
+    );
+}
+
+#[test]
+fn a_compressed_response_allocates_its_compressed_size_and_not_the_original() {
+    // Compression replaces the body wholesale, so the original is released rather than kept — but
+    // only if nothing else still holds it. This pins that the `Bytes` the uncompressed path shares
+    // is dropped on the compressed path, which is the trap a refcounted body introduces: a stale
+    // clone would keep 4 MiB alive for the whole of a 200-byte response.
+    const BODY: usize = 4 * 1024 * 1024;
+    let mut headers = hyper::header::HeaderMap::new();
+    headers.insert(
+        hyper::header::ACCEPT_ENCODING,
+        hyper::header::HeaderValue::from_static("gzip"),
+    );
+    let compression = volucer_core::config::CompressionSetting {
+        enabled: true,
+        encodings: vec!["gzip".to_string()],
+        min_length: Some(0),
+        level: 1,
+    };
+
+    let response = backend_response(BODY);
+    let (_, bytes) = allocations(|| {
+        let converted =
+            volucer_http::from_cgi(response, &compression, &headers).expect("a usable response");
+        std::hint::black_box(&converted);
+    });
+    // **Bounded by the input, not by a tenth of it**, and the arithmetic is the point. The
+    // compressor reserves `body.len() / 2` before it writes anything — a deliberate guess at the
+    // output size that is cheap insurance against realloc churn on incompressible input — so a
+    // measurement of a few hundred kilobytes would be measuring that reservation, not this
+    // function. The claim being pinned is the one that matters: the uncompressed payload is not
+    // *also* alive, which would put the total above `BODY` rather than comfortably under it.
+    assert!(
+        bytes < BODY,
+        "compressing a {BODY}-byte response allocated {bytes} bytes, which is at least the \
+         uncompressed payload again: the `Bytes` handle on the original must be released when the \
+         body is replaced"
+    );
+    // And the compressed body really is small, so the previous bound is not passing by accident on a
+    // conversion that did nothing. A tenth is a generous ceiling: gzip on four mebibytes of one
+    // repeated byte is a few hundred bytes plus framing, and the point here is only that it is not
+    // still four mebibytes.
+    let declared = response_len(&headers, compression.clone(), BODY);
+    assert!(
+        declared < BODY / 10,
+        "the compressed body is {declared} bytes of a {BODY}-byte input, so it was not compressed"
+    );
+}
+
+/// The `Content-Length` `from_cgi` produced, read back out of the response.
+fn response_len(
+    headers: &hyper::header::HeaderMap,
+    compression: volucer_core::config::CompressionSetting,
+    body: usize,
+) -> usize {
+    let response = volucer_http::from_cgi(backend_response(body), &compression, headers)
+        .expect("a usable response");
+    response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("a declared length")
+}

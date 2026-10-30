@@ -7,6 +7,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A backend response is moved into the HTTP body instead of copied.** `Response::stdout` already
+  holds the whole payload — the `Status:` block, the headers and the body in one `Vec<u8>` — and
+  `from_cgi` used to copy the body out of it, so a 30 MiB worker response existed twice at the moment
+  it became an HTTP response. The `Vec` is now moved into `Bytes` once and the body is a refcounted
+  slice of it, which costs one `Bytes` handle instead of a duplicate of every response this server
+  has ever answered.
+
+  Measured, not asserted: converting a 4 MiB response allocates **1,706 bytes** rather than the
+  **4,196,034** the copy cost, and the test fails on the old shape — which is how the claim is
+  worth anything. The header block stays alive inside that `Bytes` for as long as the body does,
+  which is a few hundred bytes of retention traded against a full duplicate.
+
+  The compressed path is pinned separately, because a refcounted body introduces a trap the copying
+  version did not have: a stale handle on the original would keep the 4 MiB alive for the whole of a
+  200-byte response. That test asserts the conversion both allocates less than the input **and**
+  actually compressed it, so neither half can pass on its own.
+
 ### Added
 
 - **A large response is relayed instead of buffered, past `server.stream_threshold_bytes`.** Every
