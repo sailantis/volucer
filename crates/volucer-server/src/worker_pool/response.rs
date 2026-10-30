@@ -9,6 +9,26 @@ use volucer_fcgi::{EndRequest, Response};
 use volucer_worker::codec::WorkerResponse;
 use volucer_worker::LogRecord;
 
+/// The `Status:` line and headers a worker's head becomes, `\r\n\r\n` included.
+///
+/// Split out from [`render`] because a streamed response needs the head **before** the body exists,
+/// and the two must produce byte-identical header blocks or the same response would look different
+/// depending on whether the client's deployment relayed it.
+pub(super) fn render_head(head: &volucer_worker::ResponseHead) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(
+        format!("Status: {} {}\r\n", head.status, reason_phrase(head.status)).as_bytes(),
+    );
+    for (name, value) in &head.headers {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
 /// Turn a worker response into what the rest of volucer expects.
 ///
 /// The body is relayed verbatim, exactly as for the FastCGI backends, but the
@@ -17,22 +37,7 @@ use volucer_worker::LogRecord;
 /// once, at the backend, is what keeps both front-ends identical for every
 /// backend kind.
 pub(super) fn render(response: WorkerResponse, duration: Duration) -> Response {
-    let mut stdout = Vec::with_capacity(response.body.len() + 128);
-    stdout.extend_from_slice(
-        format!(
-            "Status: {} {}\r\n",
-            response.head.status,
-            reason_phrase(response.head.status)
-        )
-        .as_bytes(),
-    );
-    for (name, value) in &response.head.headers {
-        stdout.extend_from_slice(name.as_bytes());
-        stdout.extend_from_slice(b": ");
-        stdout.extend_from_slice(value.as_bytes());
-        stdout.extend_from_slice(b"\r\n");
-    }
-    stdout.extend_from_slice(b"\r\n");
+    let mut stdout = render_head(&response.head);
     stdout.extend_from_slice(&response.body);
 
     Response {
@@ -60,7 +65,7 @@ pub(super) fn render(response: WorkerResponse, duration: Duration) -> Response {
 /// backend says out of band: nginx writes it to its error log, which is where a
 /// developer looks first. Without this a worker's `emitLog()` would be read,
 /// stored, and then silently dropped.
-fn render_logs(logs: &[LogRecord]) -> Vec<u8> {
+pub(super) fn render_logs(logs: &[LogRecord]) -> Vec<u8> {
     if logs.is_empty() {
         return Vec::new();
     }

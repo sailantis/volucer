@@ -35,6 +35,12 @@ use std::process::Child;
 ///
 /// Dropping it kills the children it owns, so it has to be held for as long as
 /// the server runs and dropped last.
+///
+/// **Not `Clone`, and the streamed-response ending is why that matters.** A callback that ran on an
+/// exchange thread had to reach the guard to replace a worker, and a second handle to a `Lifecycle`
+/// job object is a second handle that can be closed while the first is still adopting children. The
+/// ending therefore takes the pool's own `&Arc<WorkerPool>` instead of a cloned guard, so there is
+/// still exactly one.
 #[derive(Debug)]
 pub struct LifecycleGuard {
     #[cfg(windows)]

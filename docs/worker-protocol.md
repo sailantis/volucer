@@ -290,6 +290,25 @@ A server that asked for a stream but is answered with a declared length reads it
 buffered response. Which shape a response takes belongs to the worker, so a worker may serve both
 kinds and a client never has to know in advance which it will get.
 
+**The reverse also holds: a server that asked for nothing may be answered with a stream.** A worker
+does not know which front-end is behind it, and the FastCGI one relays whole records rather than a
+`hyper` body — so a `STREAMED` head to a buffered request is legal, and the server reads it in full
+and answers with it. What changes is only the end signal: `LAST` is checked instead of the length.
+Refusing would make one deployment's front-end decide whether an application's response is legal.
+
+What the server does with a stream is a **policy**, not a protocol rule, and it is the same policy
+the FastCGI backends obey (`Relay`):
+
+| Head | What happens |
+| --- | --- |
+| 2xx, no `Content-Length`, no `X-Sendfile` | Relayed: head to the client first, then each chunk as it arrives |
+| Anything else | Collected whole and answered as an ordinary response |
+
+So a non-2xx, an `X-Sendfile` instruction or a measured body behaves exactly as it did before
+streaming existed, and `stream_threshold_bytes = 0` turns the whole feature off. **A streamed
+response is never compressed** and never carries a `Content-Length` — both need the whole body,
+which is the thing that does not exist yet.
+
 A worker that streams is expected to forward each chunk as it is produced. **A buffered runtime can
 still stream** — it just emits one `BODY` frame, which is correct rather than wasteful — so
 `STREAMED` is a statement about the body's *length*, never a promise of many frames.

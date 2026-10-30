@@ -66,6 +66,25 @@ pub enum Delivery {
     Relayed(Relayed),
 }
 
+/// A streamed response that has been opened.
+///
+/// # Why this is a type at all
+///
+/// The FastCGI path hands back a [`Relayed`] and nothing else, because its reader thread has already
+/// taken the slot's permit: it will be released when that thread finishes. A *worker* has one
+/// exchange thread per worker for the worker's whole life, and the pool keeps the lease — so the
+/// ending is a callback the pool must run, not a `Drop` on something the reader owns. This pairs the
+/// two so they cannot be separated: a caller either holds both or neither.
+pub(crate) struct RelayOpening {
+    /// The head and the body still arriving.
+    pub(crate) relayed: Relayed,
+}
+
+impl RelayOpening {
+    pub(crate) fn new(relayed: Relayed) -> Self {
+        RelayOpening { relayed }
+    }
+}
 
 /// How long to wait for a slot to start accepting connections.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -190,11 +209,9 @@ fn exchange(
     // that may not even exist under that name.
     let mut client = match take {
         Some(client) if client.is_reusable() => client,
-        _ => Client::connect(endpoint, Some(timeout)).map_err(|source| {
-            ServerError::Worker {
-                backend: backend.to_string(),
-                source,
-            }
+        _ => Client::connect(endpoint, Some(timeout)).map_err(|source| ServerError::Worker {
+            backend: backend.to_string(),
+            source,
         })?,
     };
 
@@ -751,7 +768,6 @@ impl SlotPermits {
     fn in_flight(&self) -> Option<usize> {
         self.state.try_lock().ok().map(|in_flight| *in_flight)
     }
-
 }
 
 impl CgiPool {

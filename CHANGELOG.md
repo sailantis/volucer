@@ -7,7 +7,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A worker-mode response can be streamed, so a generated 1 GB download no longer costs 1 GB.**
+  A worker sets `STREAMED` on its response head and declares no length; the server answers the head
+  at once and forwards each `BODY` frame as it arrives. In PHP this is `StreamedResponse` — wrap a
+  generator and the response is chunked as it is produced, with `StreamedResponse::events()` adding
+  the headers SSE needs.
+
+  The relay policy is the same one the FastCGI backends already obey, so a non-2xx, an `X-Sendfile`
+  instruction and a body the worker measured are all answered exactly as before.
+  `stream_threshold_bytes = 0` turns relaying off for every backend at once.
+
+  A relayed response is **never compressed** and carries **no `Content-Length`** — both need the
+  whole body, which is the thing that does not exist yet. That is the same trade every server makes
+  for a stream, and it is why a download that is a *file* is still better served with `X-Sendfile`.
+
+  The slot is held until the last byte: the ending that releases it, counts it against
+  `max_requests` and decides whether the worker may be reused runs on that worker's exchange thread.
+  Releasing at return time would let the pool hand the same worker a second request while the first
+  response's body was still on its pipe.
+
 ### Fixed
+
+- **A worker's stream that stops without `LAST` is a truncation, and now says so.** A worker that
+  throws inside its generator has already sent a `200`, so there is no status left to report with.
+  The server reports the body as unfinished — no terminating chunk, and the worker is replaced
+  rather than trusted with another request, because a pipe abandoned mid-body leaves the next
+  response's frames in the wrong place. A client sees a truncated transfer rather than a complete
+  file that happens not to be.
 
 - **A push into a deleted AMQP queue is an error rather than a silent success.** RabbitMQ returns an
   unroutable `mandatory` publish with `312 NO_ROUTE` and *then* confirms it, so a driver that watched

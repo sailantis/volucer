@@ -1608,7 +1608,6 @@ fn a_backend_that_grants_nothing_is_handed_neither_an_address_nor_a_token() {
     );
 }
 
-
 /// A response far above the streaming threshold, read chunk by chunk as it arrives.
 ///
 /// Three claims, and each is one this feature would silently fail:
@@ -1679,7 +1678,7 @@ echo str_repeat('m', 8192);
         let params = volucer_fcgi::build_params(&info, &routing).expect("params build");
         Request {
             params,
-                        ..Request::default()
+            ..Request::default()
         }
     };
 
@@ -1752,7 +1751,6 @@ echo str_repeat('m', 8192);
     }
 }
 
-
 /// A large response relayed through the FastCGI front-end, record by record.
 ///
 /// This is the deployment behind nginx, which is the case the threshold exists for at all: a
@@ -1803,7 +1801,7 @@ for ($i = 0; $i < 128; $i++) { echo $chunk; flush(); }
         Request {
             params,
             keep_conn: true,
-                        ..Request::default()
+            ..Request::default()
         }
     };
 
@@ -1843,7 +1841,10 @@ for ($i = 0; $i < 128; $i++) { echo $chunk; flush(); }
                 }
             }
             RecordType::EndRequest => {
-                end = Some(volucer_fcgi::EndRequest::decode(&record.content).expect("a decodable END_REQUEST"));
+                end = Some(
+                    volucer_fcgi::EndRequest::decode(&record.content)
+                        .expect("a decodable END_REQUEST"),
+                );
                 break;
             }
             _ => continue,
@@ -1877,8 +1878,190 @@ for ($i = 0; $i < 128; $i++) { echo $chunk; flush(); }
     );
 }
 
-/// A slot mid-relay is **not** idle, so a rolling restart leaves it alone.
+/// A **worker's** stream re-framed by the FastCGI front-end, record by record.
 ///
+/// The FastCGI-shaped sibling of the relay test above, and the deployment it protects is `nginx`
+/// in front of volucer: that configuration almost never has `[server.http]` enabled, so a feature
+/// only the HTTP listener honoured would be absent from the common shape.
+///
+/// The assertion is the record count, not the bytes. `write_relayed` writes the head as one
+/// `STDOUT` group and then one per chunk, so **five** records prove the response was forwarded as
+/// it arrived — `php`'s own buffering had one record-group for the whole response, and a worker's
+/// buffered answer is the same. Four extra records is the observable difference between streaming
+/// and assembling.
+#[test]
+fn a_workers_streamed_response_is_re_framed_as_separate_records() {
+    use volucer_core::config::WorkerConfig;
+
+    let _serial = serial();
+    let Some(php) = find_php() else {
+        eprintln!("skipping: no php on PATH");
+        return;
+    };
+    let script = worker_script();
+    if !script.is_file() {
+        eprintln!(
+            "skipping: the SDK example worker is not at {} — set VOLUCER_SDK_DIR",
+            script.display()
+        );
+        return;
+    }
+
+    let worker = WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers: 1,
+        memory_limit_mb: None,
+        max_requests: None,
+        working_dir: None,
+        request_timeout_ms: None,
+        env: Default::default(),
+        checksum: Default::default(),
+        services: Vec::new(),
+        grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
+        transport: Default::default(),
+        socket: None,
+    };
+    let config = Config {
+        backends: [("app".to_string(), BackendConfig::Worker(worker))]
+            .into_iter()
+            .collect(),
+        server: ServerConfig {
+            default_backend: Some("app".to_string()),
+            // One byte, so the policy relays whatever the worker streams.
+            stream_threshold_bytes: Some(1),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let dispatcher = Dispatcher::from_config(&config, volucer_fcgi::Routing::default())
+        .expect("the worker pool starts");
+
+    let mut relayed = match dispatcher
+        .dispatch_to_relayed(
+            "app",
+            &worker_request("/stream"),
+            1,
+            volucer_fcgi::Relay::above_budget(),
+        )
+        .expect("the worker answered")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(response) => panic!(
+            "a STREAMED head must be relayed through this front-end too; got {:?}",
+            String::from_utf8_lossy(&response.stdout)
+        ),
+    };
+
+    let mut wire = Vec::new();
+    let (status, body_bytes) =
+        volucer_server::frontend::write_relayed(&mut wire, 1, &mut relayed).expect("relayed");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body_bytes,
+        "row-1\nrow-2\nrow-3\nrow-4\n".len() as u64,
+        "every byte was forwarded"
+    );
+
+    let mut reader = wire.as_slice();
+    let mut stdout = Vec::new();
+    let mut groups = 0usize;
+    let mut end = None;
+    while let Some(record) = record::read_record(&mut reader).expect("a readable record") {
+        match record.record_type() {
+            RecordType::Stdout => {
+                stdout.extend_from_slice(&record.content);
+                if !record.content.is_empty() {
+                    groups += 1;
+                }
+            }
+            RecordType::EndRequest => {
+                end = Some(
+                    volucer_fcgi::EndRequest::decode(&record.content)
+                        .expect("a decodable END_REQUEST"),
+                );
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    assert_eq!(
+        groups, 5,
+        "the head is one group and the four chunks are four more; a buffered response would have \
+         been one. Got {groups}"
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(
+        text.contains("row-1\nrow-2\nrow-3\nrow-4\n"),
+        "the body arrived whole: {text:?}"
+    );
+    assert_eq!(
+        end,
+        Some(volucer_fcgi::EndRequest::complete()),
+        "a complete response ends with END_REQUEST, which is what tells nginx it has everything"
+    );
+    let _ = php;
+}
+
+/// A `Request` addressed at a worker, through the real CGI environment.
+fn worker_request(uri: &str) -> Request {
+    let info = volucer_fcgi::RequestInfo {
+        method: "GET".to_string(),
+        uri: uri.to_string(),
+        ..volucer_fcgi::RequestInfo::default()
+    };
+    let routing = volucer_fcgi::Routing {
+        document_root: Path::new(".").to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..volucer_fcgi::Routing::default()
+    };
+    let params = volucer_fcgi::build_params(&info, &routing).expect("params build");
+    Request {
+        params,
+        keep_conn: true,
+        ..Request::default()
+    }
+}
+
+/// `php` on `PATH`.
+fn find_php() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let names: &[&str] = &["php.exe", "php"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["php"];
+
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The SDK's example worker, which owns the `/stream` route this test drives.
+fn worker_script() -> std::path::PathBuf {
+    match std::env::var_os("VOLUCER_SDK_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir)
+            .join("example")
+            .join("worker.php"),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("volucer-php-sdk")
+            .join("example")
+            .join("worker.php"),
+    }
+}
+
+/// A slot mid-relay is **not** idle, so a rolling restart leaves it alone.
 /// This is the property that had to be pinned rather than the release itself, and the reason is that
 /// releasing the permit is easy to get right by accident and impossible to get *wrong* safely: a
 /// permit given back at return time also lets the next request through, so a test that only asks "did
@@ -1927,10 +2110,10 @@ for ($i = 0; $i < 512; $i++) { echo $chunk; flush(); }
     };
     let params = volucer_fcgi::build_params(&info, &routing).expect("params build");
     let request = Request {
-            params,
-            keep_conn: true,
-            ..Request::default()
-        };
+        params,
+        keep_conn: true,
+        ..Request::default()
+    };
 
     let mut relayed = match dispatcher
         .dispatch_to_relayed(

@@ -79,6 +79,7 @@ use crate::calls::MethodRegistry;
 use crate::error::{Result, ServerError};
 use crate::lifecycle::LifecycleGuard;
 use crate::pool::worker_count;
+use crate::pool::Delivery;
 use crate::respawn::RespawnReport;
 use exchange::ChannelExchange;
 use handshake::{boot, Link, Ready};
@@ -319,7 +320,6 @@ impl FreeSlots {
 }
 
 /// A slot handed to one request for as long as it serves it.
-///
 /// The fairness mechanism, and therefore the reason a request cannot be served on a slot
 /// another request is using: a lease can only be obtained for a slot sitting in the pool's
 /// free list, and holding it is what keeps it out of that list. No request has to be
@@ -347,6 +347,29 @@ impl<'a> Lease<'a> {
 }
 
 impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        self.pool.release(self.index);
+    }
+}
+
+/// A [`Lease`] that owns a share of the pool, so it can be released from another thread.
+///
+/// # Why the ordinary lease cannot do this
+///
+/// A streamed response keeps its slot until the last byte of its body, and that byte is read on the
+/// worker's **exchange thread** — created when the worker boots, outliving every request. So the
+/// thing that releases the slot cannot borrow the pool: the borrow ends when `request_relayed`
+/// returns, and the body outlives that.
+///
+/// `request_relayed` therefore takes `&Arc<Self>` and hands out this instead, which is the same
+/// release through a different owner. One `release`, so the free list cannot drift; the only
+/// difference is where the reference count came from.
+struct OwnedLease {
+    pool: Arc<WorkerPool>,
+    index: usize,
+}
+
+impl Drop for OwnedLease {
     fn drop(&mut self) {
         self.pool.release(self.index);
     }
@@ -1174,6 +1197,176 @@ impl WorkerPool {
         }
     }
 
+    /// Serve one request, relaying its body when the worker streams one.
+    ///
+    /// # Why this is a second entry point rather than a mode of [`Self::request`]
+    ///
+    /// The two differ in *when they answer*, not in what they answer with. `request` returns when
+    /// the response is complete and owns nothing afterwards. This returns when the head is known
+    /// and keeps the slot until the last byte, which is the only way a 1 GB generated download does
+    /// not have to be held in memory — and it is the difference the front-ends already model as
+    /// `Delivery`.
+    ///
+    /// # The three answers it can give, and why none of them is a fourth shape
+    ///
+    /// - `Buffered` — the worker measured its response, or `relay` refuses to relay it (an error
+    ///   page, an `X-Sendfile` instruction). Byte-identical to what `request` would have returned.
+    /// - `Relayed` — the head arrived and the body is arriving. The deployment's own policy decided
+    ///   this, not the pool; a pool that guessed would make `stream_threshold_bytes` mean two things.
+    /// - `Err` — nothing was opened, and the retry rule is the ordinary one.
+    ///
+    /// # The lease is released on the exchange thread
+    ///
+    /// **This is the part that must not be got wrong.** A worker's exchange thread is already
+    /// running when a streamed body starts, and it is the only thread that may touch that worker's
+    /// pipe. So the slot is handed to it, not held here: `on_end` releases the slot and takes the
+    /// recycling decision after the last frame. Releasing at return time would let the pool hand the
+    /// same worker a second request while the first response's body was still on its pipe — which
+    /// interleaves two responses' frames, and a rolling restart would then kill a stream that looked
+    /// idle.
+    pub fn request_relayed(
+        self: &Arc<Self>,
+        request: &Request,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        match self.attempt_relayed(request, relay) {
+            Err(failure) if failure.retryable => self
+                .attempt_relayed(request, relay)
+                .map_err(|failure| failure.source),
+            outcome => outcome.map_err(|failure| failure.source),
+        }
+    }
+
+    /// One try at a relayed request. The counterpart of [`Self::attempt`].
+    fn attempt_relayed(
+        self: &Arc<Self>,
+        request: &Request,
+        relay: volucer_fcgi::Relay,
+    ) -> std::result::Result<Delivery, FailedAttempt> {
+        let queued_at = Instant::now();
+        let lease = self.acquire_owned().map_err(|source| FailedAttempt {
+            source,
+            retryable: false,
+        })?;
+        let index = lease.index;
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if !slot.is_available() {
+            tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
+            let outcome = respawn(
+                &self.name,
+                &self.spec,
+                index as u32,
+                &self.guard,
+                self.call_handler.as_ref(),
+                &mut slot,
+            );
+            drop(slot);
+            return Err(FailedAttempt {
+                source: match outcome {
+                    Ok(()) => ServerError::NoWorker {
+                        backend: self.name.clone(),
+                    },
+                    Err(source) => source,
+                },
+                retryable: true,
+            });
+        }
+
+        let Some(head) = slot.exchange.as_ref().map(|_| encode_relayed_head(request)) else {
+            drop(slot);
+            return Err(FailedAttempt {
+                source: ServerError::WorkerProtocol {
+                    backend: self.name.clone(),
+                    source: volucer_worker::WorkerError::Closed(
+                        "the worker has no exchange".to_string(),
+                    ),
+                },
+                retryable: true,
+            });
+        };
+
+        // The ending: release the slot, then decide whether the worker may serve again. Built here
+        // because it needs the pool's own state, and moved to the exchange thread because that is
+        // where the last frame is read. It holds the pool rather than the pool's fields, so the
+        // lifecycle guard is still reached through the one handle that owns it.
+        let ending = PoolEnding {
+            pool: Arc::clone(self),
+            spec: self.spec.clone(),
+            call_handler: self.call_handler.clone(),
+            lease,
+            started,
+        };
+
+        let outcome = match slot.exchange.as_mut() {
+            Some(exchange) => exchange.request_streamed(
+                head,
+                &request.body,
+                self.spec.request_timeout,
+                relay,
+                Box::new(move |done| ending.finish(done)),
+            ),
+            None => unreachable!("the exchange was checked immediately above"),
+        };
+
+        // The slot lock is released on **every** path before this returns: the ending re-acquires
+        // it to make the recycling decision, and holding it across the body would deadlock against
+        // its own callback the moment a call arrived on the exchange thread.
+        drop(slot);
+
+        match outcome {
+            Ok(Ok(response)) => {
+                if !response.metrics.is_empty() {
+                    self.stash_metrics(response.metrics.to_vec());
+                }
+                Ok(Delivery::Buffered(render(response, started.elapsed())))
+            }
+            // A streamed response. Its ending has already been reported to the pool on the exchange
+            // thread, so there is nothing left to decide here.
+            Ok(Err(opening)) => Ok(crate::pool::Delivery::Relayed(opening.relayed)),
+            Err((stage, source)) => {
+                // `owned` was moved into the ending, which has already run — `pump_streamed` calls
+                // it on every path before returning — so the slot is back in the free list.
+                if source.is_fatal() {
+                    // The stream desynchronised, so the worker must not serve again until it is
+                    // replaced. Done here rather than in the ending because only this side still
+                    // has the evidence: `fatal` is about the frame that failed, not about whether
+                    // the body ended.
+                    if let Ok(mut slot) = self.slots[index].lock() {
+                        if slot.exchange.is_some() {
+                            replace(
+                                &self.name,
+                                &self.spec,
+                                &self.guard,
+                                self.call_handler.as_ref(),
+                                &mut slot,
+                            );
+                        }
+                    }
+                }
+                Err(FailedAttempt {
+                    retryable: may_retry(stage, request),
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                })
+            }
+        }
+    }
+
     /// One try at a request, with the slot chosen here so a retry can pick a
     /// different one.
     fn attempt(&self, request: &Request) -> std::result::Result<Response, FailedAttempt> {
@@ -1580,7 +1773,29 @@ impl WorkerPool {
     /// push a slot until this thread is parked, so a slot cannot be pushed while the waiter is
     /// between checking and waiting, and no wake-up can be lost.
     fn acquire(&self) -> Result<Lease<'_>> {
+        let index = self.acquire_index()?;
+        Ok(Lease { pool: self, index })
+    }
+
+    /// Take a slot for a *streamed* request, as something that can outlive this call.
+    ///
+    /// Same acquisition as [`Self::acquire`] and deliberately not a second implementation: a streamed
+    /// response keeps its slot until its last byte, which is read on the worker's exchange thread, so
+    /// the token has to own a share of the pool. What must **not** happen is what a borrow-then-convert
+    /// would do — dropping the borrowed lease to create the owned one releases the slot immediately,
+    /// letting another request onto a worker that is mid-response.
+    fn acquire_owned(self: &Arc<Self>) -> Result<OwnedLease> {
+        let index = self.acquire_index()?;
+        Ok(OwnedLease {
+            pool: Arc::clone(self),
+            index,
+        })
+    }
+
+    /// The acquisition every lease form shares.
+    fn acquire_index(&self) -> Result<usize> {
         if self.slots.is_empty() {
+            
             return Err(ServerError::NoWorker {
                 backend: self.name.clone(),
             });
@@ -1591,13 +1806,14 @@ impl WorkerPool {
         // slot before a woken waiter could re-acquire the mutex, and the requests that queued
         // would be the ones starved — a tail kept alive by the fix itself.
         if let Some(index) = self.take_free() {
-            return Ok(Lease { pool: self, index });
+            return Ok(index);
         }
 
         // No slot is free, so this request is about to be charged for someone else's work.
         // That is unavoidable — twelve workers cannot serve thirty-two clients — and the only
         // question is how long it is allowed to be charged for.
         let Some(limit) = self.max_wait else {
+            
             return Err(ServerError::AllBusy {
                 backend: self.name.clone(),
             });
@@ -1613,7 +1829,7 @@ impl WorkerPool {
             if let Some(index) = free.take_woken() {
                 free.waiters -= 1;
                 drop(free);
-                return Ok(Lease { pool: self, index });
+                return Ok(index);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -1761,6 +1977,148 @@ impl Drop for WorkerPool {
     }
 }
 
+/// What a streamed response owes the pool once its body has ended.
+///
+/// Runs on the worker's exchange thread, which is the only thread allowed to touch that worker's
+/// pipe and the only one that knows the body is over. Two jobs, in this order:
+///
+/// 1. **Release the slot**, so the worker can serve again. A slot is not idle until its last
+///    response byte has been read, which is exactly why this cannot happen at return time.
+/// 2. **Decide whether the worker may be reused**, using the same three rules as
+///    [`WorkerPool::after_response`]: the worker asked to be recycled, a count was reached, memory
+///    went over a limit. Written as a second copy on purpose — an `END` is not a
+///    [`WorkerResponse`](volucer_worker::codec::WorkerResponse), and inventing an empty one would
+///    make [`WorkerPool::after_response`] read `keep_alive: false` from a default and recycle every
+///    worker after every streamed response.
+struct PoolEnding {
+    pool: Arc<WorkerPool>,
+    spec: Spec,
+    call_handler: Option<Arc<MethodRegistry>>,
+    lease: OwnedLease,
+    started: Instant,
+}
+
+impl PoolEnding {
+    fn finish(self, done: crate::worker_pool::exchange::StreamDone) {
+        let PoolEnding {
+            pool,
+            spec,
+            call_handler,
+            lease,
+            started,
+        } = self;
+        let index = lease.index;
+
+        // **`lock`, not `try_lock`, and the difference matters.** The stream can finish before the
+        // caller has returned from `request_streamed` — a one-chunk body does — and the caller still
+        // holds this slot's lock at that moment. Treating that as "unobservable, leave it alone"
+        // would leave a worker whose stream never ended *unreplaced*, which is the one case where
+        // reusing the slot desynchronises the pipe. Waiting is safe in both directions: the only
+        // lock holder is that caller, which is on its way out, and a `CALL` cannot arrive while this
+        // runs because it is this same thread that would have to serve it.
+        let mut slot = pool.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if !done.complete {
+            // **An incomplete body means the worker's pipes are in an unknown position on the wire.**
+            // Replaced rather than trusted: the next request through this slot would otherwise read
+            // the rest of *this* body as its own response, which is the frame-desynchronisation
+            // failure the whole pool is arranged to avoid.
+            let why = done
+                .failure
+                .clone()
+                .unwrap_or_else(|| "the worker did not end a streamed response".to_string());
+            tracing::warn!(
+                backend = %pool.name,
+                slot = index,
+                reason = %why,
+                "a response did not complete; replacing the worker"
+            );
+            replace(
+                &pool.name,
+                &spec,
+                &pool.guard,
+                call_handler.as_ref(),
+                &mut slot,
+            );
+            drop(slot);
+            drop(lease);
+            return;
+        }
+
+        // Complete, so the worker may serve again. The count and the recycle thresholds are applied
+        // only when there is a terminal frame to read them from: a **buffered** answer arrives here
+        // with `end == None`, and it has already been through `after_response` on the caller's
+        // thread — counting it twice would make `max_requests` fire at half the configured value.
+        if let Some(end) = done.end {
+            slot.served += 1;
+            slot.peak_memory_bytes = end.peak_memory_bytes;
+            let mut recycle = if end.keep_alive {
+                None
+            } else {
+                Some("the worker asked to be recycled")
+            };
+            if recycle.is_none() {
+                if let Some(max) = pool.max_requests {
+                    if max > 0 && slot.served >= max {
+                        recycle = Some("max_requests");
+                    }
+                }
+            }
+            if recycle.is_none() {
+                if let Some(limit) = pool.memory_limit_bytes {
+                    if slot.peak_memory_bytes > limit {
+                        recycle = Some("memory_limit_mb");
+                    }
+                }
+            }
+            if let Some(reason) = recycle {
+                tracing::debug!(
+                    backend = %pool.name,
+                    pid = slot.link.id(),
+                    reason,
+                    "recycling a worker after a streamed response"
+                );
+                replace(
+                    &pool.name,
+                    &spec,
+                    &pool.guard,
+                    call_handler.as_ref(),
+                    &mut slot,
+                );
+            }
+        }
+
+        drop(slot);
+        // **Last, and after the lock.** A release notifies a waiter, and a waiter that woke to a
+        // worker mid-respawn would be handed a slot whose process is being replaced.
+        drop(lease);
+
+        tracing::debug!(
+            backend = %pool.name,
+            slot = index,
+            duration_us = started.elapsed().as_micros() as u64,
+            "a streamed response ended"
+        );
+    }
+}
+
+/// Encode the request head for [`WorkerPool::attempt_relayed`].
+///
+/// Deliberately the same three statements as the inline version in [`invoke`], and kept as a
+/// function because the *order* matters: the head borrows the CGI environment, so it must be encoded
+/// while that environment is alive, and a caller that held a borrow across the send would not
+/// compile. Two copies of three lines is the price of not threading a lifetime through a callback.
+fn encode_relayed_head(request: &Request) -> Vec<u8> {
+    let translated = borrowed_request(request);
+    let draft = translated.draft();
+    encode_head(&RequestHeaderJson {
+        body_len: request.body.len() as u64,
+        ..draft
+    })
+}
+
 /// A failed attempt at one request, and whether it may be made again.
 #[derive(Debug)]
 struct AttemptError {
@@ -1804,13 +2162,16 @@ fn invoke(
         // head: it takes bytes that are already framed, so the declared length and the bytes sent
         // are reconciled at the one place that holds both.
         Some(exchange) => {
-            let translated = borrowed_request(request);
-            let draft = translated.draft();
-            let head = RequestHeaderJson {
-                body_len: request.body.len() as u64,
-                ..draft
+            // The head is encoded first, while the CGI environment it borrows is still alive.
+            let head = {
+                let translated = borrowed_request(request);
+                let draft = translated.draft();
+                encode_head(&RequestHeaderJson {
+                    body_len: request.body.len() as u64,
+                    ..draft
+                })
             };
-            exchange.request(encode_head(&head), &request.body, timeout)
+            exchange.request(head, &request.body, timeout)
         }
         // A slot is only chosen while it has an exchange, so this cannot happen;
         // it is reported rather than panicked because a panic here would take the

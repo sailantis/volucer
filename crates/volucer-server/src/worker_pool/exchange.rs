@@ -47,8 +47,96 @@ pub(super) enum Exchange {
         payload: Vec<u8>,
         extra_flags: u16,
     },
+    /// Send one request and hand back its head, relaying the body as it arrives.
+    ///
+    /// The counterpart of [`Exchange::Request`] and the reason it is a separate variant rather than
+    /// a flag: this one **does not finish**. `Request` returns when the response is complete, and
+    /// this returns when the *head* is complete — the channel stays out of the free list, and this
+    /// thread stays inside `run`, until the last body frame has been forwarded.
+    ///
+    /// Progress travels on `events` rather than on this exchange's answer slot, because the caller
+    /// stops waiting long before the work is done: [`round_trip`](ChannelExchange::round_trip) is
+    /// one answer to one exchange, and this exchange has two answers and a body between them. See
+    /// [`StreamEvent`] for the three things the caller is told and in what order.
+    ///
+    /// `relay` is the deployment's policy, consulted **after** the head arrives — the worker, not the
+    /// server, decides whether to stream, so a response the policy refuses (an error page, an
+    /// `X-Sendfile` instruction, a measured body) has to be collected and returned whole instead.
+    ///
+    /// `on_end` runs on this thread after the last frame is read and before the caller is told the
+    /// exchange is over, which is the only point at which both "the slot is free again" and "the
+    /// body channel is closed" are true. It is a `Box<dyn FnOnce>` rather than a channel because the
+    /// pool's half of it is not `Send`-agnostic data: it releases a lease and may respawn a worker,
+    /// which is work, not a message.
+    Streamed {
+        head: Vec<u8>,
+        body: Vec<u8>,
+        relay: volucer_fcgi::Relay,
+        events: std::sync::mpsc::Sender<StreamEvent>,
+        on_end: Box<dyn FnOnce(StreamDone) + Send>,
+    },
 }
 
+/// What a streamed exchange tells its caller, in order.
+///
+/// Exactly one message, and then the sender is dropped — which is itself the "nothing more is
+/// coming" signal. There is deliberately nothing after it on this channel: the *end* of a streamed
+/// response is reported through `on_end`, because by then the caller's slot has to be released and
+/// releasing it is work rather than a message.
+pub(super) enum StreamEvent {
+    /// A streamed response whose body is arriving.
+    Head(crate::relay::StreamHead),
+    /// The whole response instead of a stream, because the relay policy refused to relay it.
+    ///
+    /// Not a failure: an error page, a `X-Sendfile` instruction and a body the worker measured are
+    /// all responses this server must answer with as it always did, and re-framing any of them as
+    /// chunked would break the feature that depends on it.
+    Buffered(volucer_worker::codec::WorkerResponse),
+    /// Nothing was opened, and the request may be retried under the ordinary rule.
+    Failed(StreamFailure),
+}
+
+/// A failure before a response existed.
+///
+/// `stage` is carried so the pool can apply the same replay rule it applies to an ordinary request:
+/// a failure in the send phase cannot have run anything, and one in the read phase may have.
+pub(super) struct StreamFailure {
+    pub(super) stage: RequestStage,
+    pub(super) message: String,
+}
+
+impl StreamFailure {
+    fn from_error(err: &WorkerError) -> Self {
+        StreamFailure {
+            // A `request_streamed` failure is always in the read phase unless the head frame could
+            // not be written, and the codec reports that by failing before any read happens. The
+            // distinction is made by the staging callback, which has already run by now — so this
+            // only has to be wrong-never rather than wrong-sometimes: `Reading` is the conservative
+            // of the two, because it is the one that limits a replay to idempotent verbs.
+            stage: RequestStage::Reading,
+            message: err.to_string(),
+        }
+    }
+}
+
+/// How a streamed exchange ended.
+pub(super) struct StreamDone {
+    /// The worker's terminal frame, when there was one.
+    ///
+    /// `Some` is the only evidence that the worker finished the exchange and may serve again.
+    pub(super) end: Option<volucer_worker::RequestEnd>,
+    /// Whether the response was delivered **whole**, whether as a stream that reached `END` or as a
+    /// buffered answer.
+    ///
+    /// Two facts rather than one, and the difference is load-bearing: a buffered response has no
+    /// streamed state at all, so `end` is `None` for it — and reading that as "truncated" would
+    /// replace the worker after *every* ordinary request, which turns a one-worker pool into a
+    /// stream of respawns. `None` with `complete == true` means "a body that was measured, so there
+    /// is no terminal frame to find".
+    pub(super) complete: bool,
+    /// Why the body did not reach its end, when it did not.
+    pub(super) failure: Option<String>,
+}
 impl Exchange {
     /// Run this exchange on a live channel.
     ///
@@ -88,6 +176,210 @@ impl Exchange {
                 channel.send_frame(message_type, request_id, &payload, extra_flags)?;
                 Ok(None)
             }
+            Exchange::Streamed {
+                head,
+                body,
+                relay,
+                events,
+                on_end,
+            } => {
+                // **Always `Ok(None)`, whatever happened.** `run`'s return value is queued on the
+                // answer channel that `round_trip` reads, and this caller stops reading after one
+                // message — so an `Err` here would sit on that channel until the *next* request's
+                // `round_trip` consumed it and failed for a reason that had nothing to do with it.
+                // Every outcome therefore leaves through `events` (for the opening) and `on_end`
+                // (for the ending), which are this exchange's own channels and nobody else's.
+                pump_streamed(channel, head, &body, relay, &events, on_end, &mut *on_stage);
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Send one request, hand its opening back, and then relay the body into the caller's channel.
+///
+/// # Why the pump runs here and not in `relay.rs`
+///
+/// `relay::spawn_reader` owns its own thread because the FastCGI client is a separate object on a
+/// separate slot. A worker's pipe is already owned by exactly one thread — this one, for the worker's
+/// whole life — and two readers on one pipe would interleave frames. So the *loop* lives here and the
+/// *back-pressure policy* lives in `relay.rs`, which is also where the FastCGI path gets it. That
+/// split is why a slow client stalls an application the same way whichever backend it is on.
+///
+/// # The five outcomes, and why each is told apart
+///
+/// - **Nothing opened.** `events` says why, and nothing has been promised to a client. This is the
+///   same class of failure as an ordinary request's, so the pool applies the same retry rule.
+/// - **A response the relay policy refuses.** Collected whole and handed over as `Buffered`, which
+///   is what makes an error page, an `X-Sendfile` instruction and a measured body behave exactly as
+///   they did before this existed.
+/// - **Head, then a protocol error mid-body.** The head is already on the wire, so the only honest
+///   signal left is a closed channel with `finished == false`, which the front-end renders as a
+///   truncated response rather than a complete one.
+/// - **Head, then the client went away.** `blocking_send` fails; the pump stops forwarding but keeps
+///   reading to `LAST`/`END` — a pipe abandoned mid-response would leave the worker blocked writing
+///   into a full one, and the slot would never be usable again.
+/// - **Head, then the end.** The ordinary case: `END` arrived, so `finished` is true.
+///
+/// # Why this returns nothing
+///
+/// The caller stops listening after one message, so there is no return value anybody would read.
+/// `on_end` is that caller's only channel for the ending, and it runs on this thread after the last
+/// frame — which is the only moment at which both "the body channel is closed" and "the slot may be
+/// reused" are true at once.
+fn pump_streamed(
+    channel: &mut Channel,
+    head: Vec<u8>,
+    body: &[u8],
+    relay: volucer_fcgi::Relay,
+    events: &std::sync::mpsc::Sender<StreamEvent>,
+    on_end: Box<dyn FnOnce(StreamDone) + Send>,
+    on_stage: &mut dyn FnMut(RequestStage),
+) {
+    let started = std::time::Instant::now();
+    let verdict = crate::relay::Verdict::new();
+    let (sender, receiver) = crate::relay::channel();
+    // Whether the worker actually streamed. A buffered answer takes the other arm and has no terminal
+    // frame — `stream_end()` is `None` for it — so this is what lets the ending tell "measured" from
+    // "truncated" without guessing.
+    let mut saw_stream = false;
+
+    let outcome = match channel.request_streamed(head, body, &mut *on_stage) {
+        Ok(volucer_worker::Delivery::Streamed(streamed)) => {
+            saw_stream = true;
+            // **The policy is consulted here, after the head, and that is the only place it can
+            // be.** Whether a response may be relayed is a question about its status, its
+            // `Content-Length` and whether it names a file — none of which exist until the head
+            // has arrived. Asking the worker "will you stream?" first and the policy second would
+            // mean the worker had already started emitting a body this server must not relay.
+            let head_bytes = super::response::render_head(&streamed.head);
+            let (_, parsed) = volucer_fcgi::parse_response_headers(&head_bytes);
+            if !relay.admits(streamed.head.status, &parsed) {
+                // Refused, so it is collected whole and returned as an ordinary response. The rest
+                // of the body is already on the pipe and `next_chunk` is the only thing that can
+                // read it, so this is a drain that happens to build the body — not a second
+                // implementation of `request`.
+                let mut collected = Vec::new();
+                let drained = loop {
+                    match channel.next_chunk() {
+                        Ok(Some(chunk)) => collected.extend_from_slice(&chunk),
+                        Ok(None) => break Ok(()),
+                        Err(err) => break Err(err),
+                    }
+                };
+                drop(sender);
+                match drained {
+                    Ok(()) => {
+                        let mut response = volucer_worker::codec::WorkerResponse {
+                            head: streamed.head,
+                            body: collected,
+                            ..Default::default()
+                        };
+                        if let Some(end) = channel.stream_end() {
+                            response.end = end.clone();
+                        }
+                        response.logs = channel.logs().to_vec();
+                        response.metrics = channel.metrics().to_vec();
+                        let _ = events.send(StreamEvent::Buffered(response));
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                let answered = crate::relay::StreamHead {
+                    head: head_bytes,
+                    head_duration: started.elapsed(),
+                    body: receiver,
+                    verdict: verdict.clone(),
+                };
+                if events.send(StreamEvent::Head(answered)).is_err() {
+                    // Nobody will read this body, so pumping it is pointless — but the pipe still
+                    // has to reach `END`, or the worker blocks writing into a full one and the slot
+                    // is lost.
+                    drain_stream(channel)
+                } else {
+                    pump_body(channel, &sender, &verdict)
+                }
+            }
+        }
+        // The worker measured its response, so there is nothing to relay. It is a complete response
+        // and the caller answers with it exactly as `request` would have.
+        Ok(volucer_worker::Delivery::Buffered(response)) => {
+            drop(sender);
+            let _ = events.send(StreamEvent::Buffered(response));
+            Ok(())
+        }
+        Err(err) => {
+            drop(sender);
+            // Nothing was opened, so the caller is still waiting: told on `events` rather than
+            // through `on_end`, which is only installed once a response exists.
+            let _ = events.send(StreamEvent::Failed(StreamFailure::from_error(&err)));
+            Err(err)
+        }
+    };
+
+    // **Always run, and run last.** The pool's slot is only handed back here, so an exchange that
+    // ended without this would leave a slot reserved for ever — a pool that silently shrinks by one
+    // per streamed response, which is the failure mode this whole design has to avoid.
+    //
+    // The end frame is read *before* the callback so the caller can decide whether the worker is
+    // reusable from evidence rather than from an absence. `complete` distinguishes the two kinds of
+    // `None`: a buffered answer has no terminal frame because its body was measured, and a stream
+    // that stopped has none because it was truncated. Reading the first as the second would replace
+    // the worker after every ordinary request.
+    let end = match outcome {
+        Ok(()) => channel.stream_end().cloned(),
+        Err(_) => None,
+    };
+    let body_ended = matches!(outcome, Ok(()));
+    on_end(StreamDone {
+        end: end.clone(),
+        complete: body_ended && (end.is_some() || !saw_stream),
+        failure: outcome.as_ref().err().map(|err| err.to_string()),
+    });
+}
+/// Forward every remaining body chunk into `sender`, and publish the verdict.
+fn pump_body(
+    channel: &mut Channel,
+    sender: &crate::relay::Sender,
+    verdict: &crate::relay::Verdict,
+) -> std::result::Result<(), WorkerError> {
+    loop {
+        match channel.next_chunk() {
+            Ok(Some(chunk)) => {
+                // **A client that went away is not a reason to stop reading.** `blocking_send`
+                // returns `Err` once the receiver is dropped, and walking off here would leave the
+                // worker blocked writing into a full pipe — the slot would never be reusable.
+                if sender.blocking_send(bytes::Bytes::from(chunk)).is_err() {
+                    return drain_stream(channel);
+                }
+            }
+            Ok(None) => {
+                let stderr = super::response::render_logs(channel.logs());
+                verdict.publish(&stderr, true);
+                return Ok(());
+            }
+            Err(err) => {
+                // Left unfinished, deliberately: that is what makes the front-end report a
+                // truncation rather than present a short body as the whole response.
+                verdict.publish(&[], false);
+                tracing::warn!(%err, "a streamed worker response failed part way through");
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Read a streamed body to its end without forwarding it.
+///
+/// The one caller is "the client went away", and the reason it exists is the pipe rather than the
+/// client: a worker mid-body keeps writing, and a reader that walks off leaves it blocked forever.
+fn drain_stream(channel: &mut Channel) -> std::result::Result<(), WorkerError> {
+    loop {
+        match channel.next_chunk() {
+            Ok(Some(_)) => continue,
+            Ok(None) => return Ok(()),
+            Err(err) => return Err(err),
         }
     }
 }
@@ -250,6 +542,93 @@ impl ChannelExchange {
                 ),
             )),
             Err(failure) => Err(failure),
+        }
+    }
+
+    /// Hand one request to a worker and come back as soon as its **head** is known.
+    ///
+    /// # Why this does not use `round_trip`
+    ///
+    /// `round_trip` posts an exchange and waits for one answer on `answers`, and it also marks the
+    /// channel `ended` on a timeout. Neither is right here: this exchange produces *two* messages
+    /// and a body between them, and the caller is expected to stop waiting after the first. So the
+    /// exchange carries its own `events` sender, and the timeout below covers only the wait for the
+    /// opening message — the deadline that covers the body is the slot's own, enforced by the
+    /// front-end dropping the receiver and this thread draining to `END`.
+    ///
+    /// `Ok(Err(..))` is a response the relay policy refused, which the caller answers with as it
+    /// always did. `Err` is a failure with nothing sent, and is `RequestStage`-tagged so the pool can
+    /// decide whether the request may be replayed — the same rule as an ordinary request, which is
+    /// only true because the head is the point this function returns at.
+    pub fn request_streamed(
+        &mut self,
+        head: Vec<u8>,
+        body: &[u8],
+        timeout: Duration,
+        relay: volucer_fcgi::Relay,
+        on_end: Box<dyn FnOnce(StreamDone) + Send>,
+    ) -> std::result::Result<
+        std::result::Result<volucer_worker::codec::WorkerResponse, crate::pool::RelayOpening>,
+        (RequestStage, WorkerError),
+    > {
+        if self.ended {
+            return Err((
+                RequestStage::Reading,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            ));
+        }
+        let Some(work) = self.work.as_ref() else {
+            return Err((
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has already ended".to_string()),
+            ));
+        };
+
+        let (events_tx, events) = mpsc::channel();
+        work.send(Exchange::Streamed {
+            head,
+            body: body.to_vec(),
+            relay,
+            events: events_tx,
+            on_end,
+        })
+        .map_err(|_| {
+            self.ended = true;
+            (
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            )
+        })?;
+
+        // The opening message, or the reason there is none. A timeout here is the *send* deadline
+        // rather than a body deadline: nothing has been handed to a client yet, so the worker may
+        // be killed and the request replayed under the ordinary rule.
+        let opening = match events.recv_timeout(timeout) {
+            Ok(opening) => opening,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err((RequestStage::Reading, WorkerError::Timeout(timeout)))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.ended = true;
+                return Err((
+                    RequestStage::Reading,
+                    WorkerError::Closed("the exchange thread ended without answering".to_string()),
+                ));
+            }
+        };
+
+        match opening {
+            // The whole response instead of a stream, and `on_end` has already run by then: it is
+            // the last thing `pump_streamed` does on every path, before it returns.
+            StreamEvent::Buffered(response) => Ok(Ok(response)),
+            StreamEvent::Head(stream_head) => {
+                let relayed = stream_head.into_relayed();
+                Ok(Err(crate::pool::RelayOpening::new(relayed)))
+            }
+            StreamEvent::Failed(failure) => {
+                self.ended = true;
+                Err((failure.stage, WorkerError::Closed(failure.message)))
+            }
         }
     }
 

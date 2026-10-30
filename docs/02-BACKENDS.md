@@ -500,7 +500,7 @@ knowing before choosing one for an application that serves files.
 | `upstream` | streams | streams | ✅ forwarded as it arrives |
 | `spawn_cgi` | buffered | relayed above `stream_threshold_bytes` | ✅ 64 KiB records, relayed |
 | `external` (php-fpm) | buffered | relayed above `stream_threshold_bytes` | ✅ 64 KiB records, relayed |
-| `worker` | buffered | buffered | ❌ the whole response in memory |
+| `worker` | buffered | relayed when the worker streams | ✅ forwarded chunk by chunk |
 | static files | n/a | streams | ✅ 64 KiB reads, ranges supported |
 
 The two FastCGI kinds **relay** a response larger than
@@ -509,14 +509,21 @@ answered at once and each subsequent FastCGI record is forwarded as it arrives, 
 is one record rather than a second copy of the response. The body is also **moved rather than
 copied** out of the backend's payload, so even a buffered response costs one allocation and not two.
 
-**`worker` mode still buffers**, because its protocol frames a response with a declared length before
-the body. That is tracked as the next change, and until it lands an application in worker mode should
-either use `X-Sendfile` for files it holds (see [Static Files](04-STATIC-FILES.md#x-sendfile)) or be
-served on a FastCGI backend.
+**Worker mode relays too, and the application decides.** A worker that does not know its response's
+length sets the `STREAMED` flag on its head instead of declaring one — `StreamedResponse` in the PHP
+SDK does this for a generator — and the server answers the head before the body exists and forwards
+each frame as it arrives. A worker that declares a length keeps exactly the behaviour it had: the
+response is buffered, length-checked and compressible. Which one an answer is belongs to the
+application, so one route can stream an export while another returns a page.
 
-`X-Sendfile` is the best answer for a download that is a *file*, on any backend: the static layer
-serves it with ranges and validators, and costs 64 KiB whatever the size. Relaying is for a body the
-application generates — a CSV export, a log, a media file it streams itself.
+The relay policy is the same one the FastCGI backends obey, so a non-2xx, an `X-Sendfile`
+instruction and a measured body are all answered as they always were. `stream_threshold_bytes = 0`
+turns relaying off everywhere. A relayed response is never compressed and carries no
+`Content-Length` — both need the whole body, which is what does not exist.
+
+`X-Sendfile` is still the best answer for a download that is a *file*, on any backend: the static
+layer serves it with ranges and validators, and costs 64 KiB whatever the size. Relaying is for a
+body the application generates — a CSV export, a log, a media file it streams itself.
 
 ## TLS to an upstream origin
 

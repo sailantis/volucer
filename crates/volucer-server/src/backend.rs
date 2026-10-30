@@ -509,11 +509,12 @@ impl Backend {
 
     /// Ask this backend for a response, relaying the body when it does not fit in `buffer`.
     ///
-    /// **The two FastCGI kinds relay; the other two say so by returning a whole response.** A
-    /// worker's answer is framed by volucer's own protocol, which is the next phase's change; an
-    /// upstream already streams and needs nothing here. Returning `Buffered` from those is therefore
-    /// the honest answer, and it is byte-identical to [`Self::request`] — so a caller gets correctness
-    /// either way and streaming is a property of the deployment rather than something it must know.
+    /// **All three CGI-shaped kinds relay; an upstream says so by returning a whole response.** A
+    /// worker's answer is framed by volucer's own protocol, and since `flags::STREAMED` exists the
+    /// worker itself decides whether to stream — so this asks for a stream and answers `Buffered`
+    /// when the worker measured its response or the policy refuses to relay it. An upstream already
+    /// streams and needs nothing here, so `Buffered` from it is the honest answer rather than a
+    /// missing feature.
     pub fn request_relayed(
         &self,
         request: &Request,
@@ -525,7 +526,8 @@ impl Backend {
             Backend::External { name, pool } => {
                 Self::external_relayed(name, pool, request, buffer, relay)
             }
-            _ => self.request(request).map(crate::pool::Delivery::Buffered),
+            Backend::Worker { pool, .. } => pool.request_relayed(request, relay),
+            Backend::Upstream { .. } => self.request(request).map(crate::pool::Delivery::Buffered),
         }
     }
 

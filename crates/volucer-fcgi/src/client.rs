@@ -458,6 +458,11 @@ impl Relay {
 
     /// Whether this status and header block may be relayed at all.
     ///
+    /// Public because a backend that frames its own responses — the worker pool, whose `STREAMED`
+    /// flag is decided by the application — has to ask the same question about a head it parsed
+    /// itself. Answering it twice would let the two paths disagree about which responses may be
+    /// relayed, and the disagreement would show up as an error page arriving chunked.
+    ///
     /// The decision reads the *parsed* head rather than the raw bytes, because the question is about
     /// what the response says — a `Status:` line, a `Content-Length`, a file name — not about its
     /// spelling.
@@ -475,7 +480,7 @@ impl Relay {
     ///   it would put the reader thread and the file in a race over one slot, so it is answered
     ///   buffered as it always was. The body of such a response is a placeholder of a few bytes, so
     ///   buffering it costs nothing.
-    fn admits(&self, status: u16, headers: &ParsedHeaders<'_>) -> bool {
+    pub fn admits(&self, status: u16, headers: &ParsedHeaders<'_>) -> bool {
         if !self.enabled {
             return false;
         }
@@ -970,7 +975,6 @@ impl<T: Read + Write> Client<T> {
         Ok(())
     }
 
-
     /// Read backend variables with `GET_VALUES`.
     ///
     /// This is the mechanism `php-fpm` exposes for health and status polling, so
@@ -1151,7 +1155,10 @@ mod tests {
         while let Some(chunk) = client.next_chunk(&mut stream).unwrap() {
             relayed.extend_from_slice(&chunk);
         }
-        assert_eq!(relayed, body, "every body byte, in order, and none of the head twice");
+        assert_eq!(
+            relayed, body,
+            "every body byte, in order, and none of the head twice"
+        );
         assert!(stream.is_finished(), "the backend reached END_REQUEST");
         assert!(
             client.is_reusable(),
@@ -1220,7 +1227,11 @@ mod tests {
         else {
             panic!("expected a streamed delivery");
         };
-        assert_eq!(stream.head(), head, "the body that shared the record is not in the head");
+        assert_eq!(
+            stream.head(),
+            head,
+            "the body that shared the record is not in the head"
+        );
 
         let mut relayed = Vec::new();
         while let Some(chunk) = client.next_chunk(&mut stream).unwrap() {
@@ -1274,7 +1285,10 @@ mod tests {
         let delivery = client
             .request_streaming(&a_request(), 256, Relay::above_budget())
             .unwrap();
-        assert!(delivery.is_buffered(), "a non-2xx response is answered as one");
+        assert!(
+            delivery.is_buffered(),
+            "a non-2xx response is answered as one"
+        );
         let Delivery::Buffered(response) = delivery else {
             unreachable!()
         };

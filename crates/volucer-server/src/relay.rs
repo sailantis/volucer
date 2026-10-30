@@ -61,6 +61,9 @@ pub const CHUNKS_IN_FLIGHT: usize = 32;
 /// `poll_recv` a `Body` implementation needs without an extra dependency.
 pub type Chunks = mpsc::Receiver<Bytes>;
 
+/// The writing half a backend's pump feeds.
+pub type Sender = mpsc::Sender<Bytes>;
+
 /// What a backend answered with when its response did not fit in the buffer.
 #[derive(Debug)]
 pub struct Relayed {
@@ -84,6 +87,29 @@ pub struct Relayed {
 }
 
 impl Relayed {
+    /// Assemble a relayed response whose reader has not been started yet.
+    ///
+    /// The FastCGI path builds one in [`spawn_reader`], which owns its thread. A worker's body is
+    /// pumped by that worker's own exchange thread instead — the only thread that may touch the
+    /// pipe — so the head and the channel are handed over separately and joined here.
+    ///
+    /// `verdict` is where the pump publishes `finished`/`stderr` at the end; the two `Arc`s this
+    /// keeps are clones of the same pair, so the body reports truncation from the same values.
+    pub(crate) fn new(
+        head: Vec<u8>,
+        body: Chunks,
+        head_duration: Duration,
+        verdict: Verdict,
+    ) -> Self {
+        Relayed {
+            head,
+            body,
+            head_duration,
+            finished: Arc::clone(&verdict.finished),
+            stderr: Arc::clone(&verdict.stderr),
+        }
+    }
+
     /// Whether the backend reached `END_REQUEST` after every byte had been relayed.
     pub fn finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
@@ -116,21 +142,28 @@ impl Relayed {
 /// A small struct rather than two arguments because they must be updated in the same order every
 /// time — `finished` after `stderr`, so a reader that observes `finished == true` also observes the
 /// last `STDERR` byte.
-pub(crate) struct Verdict {
+///
+/// `Clone` because a worker's pump publishes through a copy it owns while the [`StreamHead`] it
+/// handed over keeps the other. Both point at the same two `Arc`s, so there is one verdict either
+/// way — the clone is of the handles, never of the answer.
+#[derive(Clone)]
+pub struct Verdict {
     pub(crate) finished: Arc<AtomicBool>,
     pub(crate) stderr: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl Verdict {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Verdict {
             finished: Arc::new(AtomicBool::new(false)),
             stderr: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    /// Publish the outcome, in the order a reader may rely on.
-    pub(crate) fn publish(&self, stderr: &[u8], finished: bool) {
+    /// Say how the response ended, and what the application wrote out of band.
+    ///
+    /// `finished` last, so a body that observes completion also observes the last `STDERR` byte.
+    pub fn publish(&self, stderr: &[u8], finished: bool) {
         {
             let mut slot = self
                 .stderr
@@ -143,9 +176,53 @@ impl Verdict {
     }
 }
 
+impl Default for Verdict {
+    fn default() -> Self {
+        Verdict::new()
+    }
+}
+
+/// A streamed response's head, as a backend hands one back before its body is drained.
+///
+/// A struct rather than a tuple because three of the four fields are things a caller may ignore and
+/// the fourth is the one it cannot: a positional return would make the head the *last* thing a reader
+/// notices in the signature, which is the opposite of what it is for.
+pub struct StreamHead {
+    /// The `Status:` line and headers, `\r\n\r\n` included.
+    pub head: Vec<u8>,
+    /// How long the backend took to produce the header block. Time to first byte.
+    pub head_duration: Duration,
+    /// The body, chunk by chunk, ending when the sender is dropped.
+    pub body: Chunks,
+    /// Where the backend's verdict will be published.
+    pub verdict: Verdict,
+}
+
+impl StreamHead {
+    /// Turn the head into the [`Relayed`] the rest of volucer consumes.
+    pub fn into_relayed(self) -> Relayed {
+        let StreamHead {
+            head,
+            head_duration,
+            body,
+            verdict,
+        } = self;
+        Relayed::new(head, body, head_duration, verdict)
+    }
+}
+
 /// Build the channel pair a reader thread and the front-end share.
-pub(crate) fn channel() -> (mpsc::Sender<Bytes>, Chunks) {
+pub fn channel() -> (Sender, Chunks) {
     mpsc::channel(CHUNKS_IN_FLIGHT)
+}
+
+/// Build the channel, with a bound of the caller's choosing.
+///
+/// The bound is [`CHUNKS_IN_FLIGHT`] everywhere that matters; this exists so a test can use a
+/// channel of one and prove that a slow reader actually blocks the writer rather than filling a
+/// buffer that would have hidden it.
+pub fn channel_with_bound(bound: usize) -> (Sender, Chunks) {
+    mpsc::channel(bound.max(1))
 }
 
 /// Give a streamed response its own thread and hand back the head plus the channel.

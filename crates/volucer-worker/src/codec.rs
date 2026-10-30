@@ -163,6 +163,48 @@ impl BoundedChannel {
         self.channel.request_encoded(head, body, on_stage)
     }
 
+    /// Send a request and return as soon as its head has arrived, leaving the body to drain.
+    ///
+    /// Forwarded from [`WorkerChannel::request_streamed`], which owns the reasoning.
+    pub fn request_streamed(
+        &mut self,
+        head: Vec<u8>,
+        body: &[u8],
+        on_stage: impl FnMut(RequestStage),
+    ) -> Result<Delivery> {
+        self.channel.request_streamed(head, body, on_stage)
+    }
+
+    /// Whether a streamed body is still on this channel's pipe.
+    pub fn is_streaming(&self) -> bool {
+        self.channel.is_streaming()
+    }
+
+    /// Whether the streamed response reached its `END` frame.
+    pub fn stream_finished(&self) -> bool {
+        self.channel.stream_finished()
+    }
+
+    /// The terminal frame of a drained stream, once it has been read.
+    pub fn stream_end(&self) -> Option<&crate::RequestEnd> {
+        self.channel.stream_end()
+    }
+
+    /// The next non-empty body chunk, or `None` when the streamed body is over.
+    pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        self.channel.next_chunk()
+    }
+
+    /// Log lines this worker has emitted and not yet taken.
+    pub fn logs(&self) -> &[LogRecord] {
+        self.channel.logs()
+    }
+
+    /// Metric samples this worker has emitted and not yet taken.
+    pub fn metrics(&self) -> &[MetricRecord] {
+        self.channel.metrics()
+    }
+
     /// Hand one job to a consumer and wait for its terminal answer.
     ///
     /// The consumer side's counterpart of `request_encoded`, and the reason it takes an owned
@@ -769,6 +811,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     ) -> Result<WorkerResponse> {
         let mut response = WorkerResponse::default();
         let mut have_head = false;
+        let mut streamed = false;
         let mut body = Vec::new();
         let mut expected_body = 0u64;
         let mut seen_last_body = false;
@@ -806,15 +849,30 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
                         });
                     }
                     let head: ResponseHead = Json::decode(payload)?;
-                    // The head arrives before the body, so the body can be sized once instead
-                    // of regrowing frame by frame. The declaration is checked against what
-                    // actually arrives below, and the reservation is capped, so a worker that
-                    // declares a length it does not send cannot make this allocate it.
-                    let declared = usize::try_from(head.body_len).unwrap_or(usize::MAX);
-                    if declared <= BODY_RESERVE_LIMIT {
-                        body.reserve(declared);
+                    // **A streamed head is read here too, and has to be.** `request_streamed` is
+                    // the caller that *wants* a stream; this loop is the caller that cannot have
+                    // one — the FastCGI front-end relays whole records, and `Backend::request`
+                    // returns a `Response`. A worker does not know which kind of caller it is
+                    // talking to, so it may legitimately answer a buffered request with a
+                    // `STREAMED` head, and refusing that would make one deployment's front-end
+                    // decide whether an application's response is legal.
+                    //
+                    // What changes is only the end signal: `body_len` is not authoritative, so the
+                    // length check below is skipped and `LAST` becomes the one that matters. The
+                    // memory cost is the same as buffering any other response, which is exactly what
+                    // this caller asked for.
+                    streamed = header.flags & flags::STREAMED != 0;
+                    if !streamed {
+                        // The head arrives before the body, so the body can be sized once instead
+                        // of regrowing frame by frame. The declaration is checked against what
+                        // actually arrives below, and the reservation is capped, so a worker that
+                        // declares a length it does not send cannot make this allocate it.
+                        let declared = usize::try_from(head.body_len).unwrap_or(usize::MAX);
+                        if declared <= BODY_RESERVE_LIMIT {
+                            body.reserve(declared);
+                        }
+                        expected_body = head.body_len;
                     }
-                    expected_body = head.body_len;
                     response.head = head;
                     have_head = true;
                 }
@@ -918,20 +976,44 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             });
         }
         // Two independent checks, because either one catching a bug is cheaper
-        // than debugging a truncated response in production.
-        if body.len() as u64 != expected_body {
-            return Err(WorkerError::Remote {
-                message: format!(
-                    "request {request_id} declared {} body bytes but sent {}",
-                    expected_body,
-                    body.len()
-                ),
-            });
-        }
-        if expected_body > 0 && !seen_last_body {
-            return Err(WorkerError::Remote {
-                message: format!("request {request_id} did not flag its last body frame"),
-            });
+        // than debugging a truncated response in production. **Neither applies to a streamed head**:
+        // there is no declared length to compare against, and `LAST` is checked instead — which is
+        // the same trade `next_chunk` makes, for the same reason.
+        if streamed {
+            // A `STREAMED` head that also declared a length is a worker bug: the sender and the
+            // reader disagree about the body's end signal. Refused rather than resolved, exactly as
+            // `request_streamed` refuses it, so the two readers cannot disagree about what is legal.
+            if response.head.body_len != 0 {
+                return Err(WorkerError::Remote {
+                    message: format!(
+                        "request {request_id} set STREAMED and declared {} body bytes; a streamed \
+                         response declares no length",
+                        response.head.body_len
+                    ),
+                });
+            }
+            if !seen_last_body {
+                return Err(WorkerError::Remote {
+                    message: format!(
+                        "request {request_id} ended a streamed body without a LAST frame"
+                    ),
+                });
+            }
+        } else {
+            if body.len() as u64 != expected_body {
+                return Err(WorkerError::Remote {
+                    message: format!(
+                        "request {request_id} declared {} body bytes but sent {}",
+                        expected_body,
+                        body.len()
+                    ),
+                });
+            }
+            if expected_body > 0 && !seen_last_body {
+                return Err(WorkerError::Remote {
+                    message: format!("request {request_id} did not flag its last body frame"),
+                });
+            }
         }
 
         response.body = body;
@@ -1192,7 +1274,10 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
                         actual: header.request_id,
                     });
                 }
-                Some(ResponseFrame::Body(payload, header.flags & flags::LAST != 0))
+                Some(ResponseFrame::Body(
+                    payload,
+                    header.flags & flags::LAST != 0,
+                ))
             }
             MessageType::End => {
                 if header.request_id != request_id {
@@ -1364,9 +1449,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     /// truncated**. A front-end must not present that as complete: for HTTP/1.1 the only honest
     /// signal left is closing the connection without the terminating chunk.
     pub fn stream_finished(&self) -> bool {
-        self.streaming
-            .as_ref()
-            .is_some_and(Streaming::is_finished)
+        self.streaming.as_ref().is_some_and(Streaming::is_finished)
     }
 
     /// The terminal frame of a drained stream, once it has been read.
@@ -1710,7 +1793,10 @@ mod tests {
             chunks.push(String::from_utf8(chunk).unwrap());
         }
         assert_eq!(chunks, ["one", "two", "three"]);
-        assert!(channel.stream_finished(), "END arrived after the last chunk");
+        assert!(
+            channel.stream_finished(),
+            "END arrived after the last chunk"
+        );
         assert!(
             !channel.is_streaming() || channel.stream_end().is_some(),
             "a finished stream carries its terminal frame"
@@ -1726,7 +1812,9 @@ mod tests {
     fn a_streamed_body_without_last_is_a_truncation_rather_than_a_short_body() {
         let script = streaming(&["one", "two"], false);
         let mut channel = script.channel();
-        channel.request_streamed(b"{}".to_vec(), b"", |_| {}).unwrap();
+        channel
+            .request_streamed(b"{}".to_vec(), b"", |_| {})
+            .unwrap();
 
         let mut seen = Vec::new();
         let error = loop {
@@ -1765,10 +1853,7 @@ mod tests {
         let error = channel
             .request_streamed(b"{}".to_vec(), b"", |_| {})
             .expect_err("both end signals at once is a worker bug");
-        assert!(
-            error.to_string().contains("declares no length"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("declares no length"), "{error}");
     }
 
     /// A worker that declares a length when streaming was asked for is still read in full.
@@ -1819,8 +1904,43 @@ mod tests {
         }
     }
 
+    /// **A buffered request must tolerate a `STREAMED` head.** This is the change that made the
+    /// flag usable in both directions: a worker does not know which caller it is answering, so it
+    /// may legitimately stream to a front-end that cannot relay — the FastCGI one writes whole
+    /// records, and `Backend::request` returns a `Response`. Refusing would make one deployment's
+    /// front-end decide whether an application's response is legal.
+    ///
+    /// What changes is only the end signal: no declared length to check, so `LAST` is the one that
+    /// matters, and a body that stops without it is a truncation rather than a short success.
     #[test]
-    fn a_request_and_its_response_round_trip_over_one_channel() {        let script = echoing("hello");
+    fn a_buffered_request_reads_a_streamed_head_in_full() {
+        let script = streaming(&["one", "two"], true);
+        let mut channel = script.channel();
+
+        let response = channel
+            .request(&RequestHeader::default(), b"")
+            .expect("a STREAMED head is a legal answer to a buffered request");
+        assert_eq!(response.body, b"onetwo");
+        assert_eq!(
+            response.head.body_len, 0,
+            "the head still declares nothing, so the body is the reader's tally"
+        );
+
+        // And the negative control: without `LAST` the same frames are a truncation.
+        let truncated = streaming(&["one", "two"], false);
+        let mut channel = truncated.channel();
+        let error = channel
+            .request(&RequestHeader::default(), b"")
+            .expect_err("a streamed body with no LAST must not read as complete");
+        assert!(
+            error.to_string().contains("without a LAST frame"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_request_and_its_response_round_trip_over_one_channel() {
+        let script = echoing("hello");
         let mut channel = script.channel();
 
         let response = channel

@@ -563,6 +563,225 @@ fn a_worker_that_asks_to_be_recycled_is_replaced() {
     );
 }
 
+/// A streamed response that arrives through the **dispatcher**, which is the seam a front-end calls.
+///
+/// The pool test above proves the pool relays. This proves the wire from the configuration to that
+/// pool is connected — the `Backend::request_relayed` arm, which is the one thing that could
+/// silently route a worker's stream back through the buffering path and still look correct from the
+/// pool alone. It is also the arm that decides which `Relay` policy a worker is given, and getting
+/// that wrong would leave `stream_threshold_bytes = 0` meaning "buffer" for FastCGI and "stream"
+/// for workers.
+#[test]
+fn a_worker_stream_reaches_the_dispatcher() {
+    let _serial = serial();
+    require_sdk!();
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", example_worker().display()),
+        workers: 1,
+        working_dir: None,
+        ..config(1)
+    });
+    let configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+
+    // A 1-byte threshold, so the policy is unambiguously "relay what the worker streams".
+    let mut relayed = match dispatcher
+        .dispatch_relayed(&get("/stream"), 1, volucer_fcgi::Relay::above_budget())
+        .expect("the dispatcher answered")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(response) => panic!(
+            "a worker's STREAMED head must reach the front-end as a relay; got {:?}",
+            String::from_utf8_lossy(&response.stdout)
+        ),
+    };
+
+    assert_eq!(relayed.parse().0, 200);
+
+    let mut body = Vec::new();
+    while let Some(chunk) = relayed.body.blocking_recv() {
+        body.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        String::from_utf8(body).expect("the body is text"),
+        "row-1\nrow-2\nrow-3\nrow-4\n"
+    );
+    assert!(relayed.finished());
+
+    // **The other arm: the policy can still say no.** A response the relay refuses is answered
+    // buffered, and it has to be *byte-identical* to what `dispatch` would have returned — the whole
+    // reason a front-end may ask for the relayed form unconditionally.
+    let buffered = dispatcher
+        .dispatch_relayed(&get("/stream"), 1, volucer_fcgi::Relay::never())
+        .expect("the dispatcher answered");
+    match buffered {
+        volucer_server::Delivery::Buffered(response) => {
+            assert_eq!(
+                body_of(&response),
+                "row-1\nrow-2\nrow-3\nrow-4\n",
+                "a refused stream is collected whole and answered as an ordinary response"
+            );
+        }
+        volucer_server::Delivery::Relayed(_) => {
+            panic!("Relay::never must not relay anything")
+        }
+    }
+}
+
+/// A streamed response reaches the client in pieces, and the slot comes back afterwards.
+///
+/// This is the whole point of `flags::STREAMED`: a worker that does not know its body's length
+/// declares `0` on the head and flags it, and the server forwards each `BODY` frame as it arrives
+/// instead of assembling the response first. What is asserted is not "the bytes are right" — a
+/// buffered response would pass that — but that **the head arrives before the body is complete**
+/// and that the pool is usable again once the body ends.
+///
+/// The pool being usable afterwards is the part that has actually gone wrong in designs like this:
+/// the lease is held across the body, so a release placed at return time would leave the slot
+/// reserved permanently and the pool would shrink by one per streamed response.
+#[test]
+fn a_streamed_response_arrives_before_its_body_is_complete() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+    let pool = std::sync::Arc::new(pool);
+
+    let mut relayed = match pool
+        .request_relayed(&get("/stream"), volucer_fcgi::Relay::unknown_length())
+        .expect("the worker answered")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(buffered) => {
+            panic!(
+                "a STREAMED head must be relayed, not buffered; got {:?}",
+                String::from_utf8_lossy(&buffered.stdout)
+            )
+        }
+    };
+
+    // **The head is available now.** If the server had assembled the response first there would be
+    // nothing to read from the channel yet — but the more robust assertion is the one below, on the
+    // chunks: four separate ones is what a stream produces and what a buffer cannot.
+    let (status, headers) = relayed.parse();
+    assert_eq!(status, 200, "the head carries the application's status");
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
+                && value.starts_with("text/plain")),
+        "the head carries the application's own headers: {headers:?}"
+    );
+
+    let mut chunks = Vec::new();
+    let mut body = Vec::new();
+    while let Some(chunk) = relayed.body.blocking_recv() {
+        chunks.push(chunk.len());
+        body.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(
+        String::from_utf8(body).expect("the body is text"),
+        "row-1\nrow-2\nrow-3\nrow-4\n",
+        "every chunk arrived, in order and exactly once"
+    );
+    assert_eq!(
+        chunks.len(),
+        4,
+        "four generator yields are four forwardings; one chunk would mean the body was buffered \
+         and split afterwards, which is the behaviour this replaced"
+    );
+    assert!(
+        relayed.finished(),
+        "the worker sent END, so the response is complete rather than truncated"
+    );
+
+    // **The slot came back.** A second request proves it: with one worker, a lease that was never
+    // released would make this block until the slot wait expired and then fail with `AllBusy`.
+    let second = pool
+        .request(&get("/health"))
+        .expect("the slot was released");
+    assert_eq!(second.parse_status_headers().0, 200);
+}
+
+/// A streamed body that stops without `LAST` is a truncation, not a short response.
+///
+/// The negative control for the test above. A worker that throws inside its generator has already
+/// sent a `200`, so the only signal left is a body that ends early — and the server must not
+/// present that as complete. `finished()` is the flag the front-end reads to decide exactly that.
+///
+/// Without this test, "streaming works" would be satisfied by an implementation that forwarded the
+/// chunks and dropped the truncation flag, which is the failure that turns a broken download into a
+/// plausible-looking one.
+#[test]
+fn a_stream_that_never_ends_is_reported_as_truncated() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+    let pool = std::sync::Arc::new(pool);
+
+    let pid_before = pool.pids()[0];
+
+    let mut relayed = match pool
+        .request_relayed(&get("/stream-boom"), volucer_fcgi::Relay::unknown_length())
+        .expect("the head arrived before the failure")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(response) => {
+            panic!(
+                "a STREAMED head must be relayed even when its body fails; got {:?}",
+                String::from_utf8_lossy(&response.stdout)
+            )
+        }
+    };
+
+    let mut body = Vec::new();
+    while let Some(chunk) = relayed.body.blocking_recv() {
+        body.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(
+        String::from_utf8(body).expect("the body is text"),
+        "first\n",
+        "the chunk the generator produced before failing still reached the client"
+    );
+    assert!(
+        !relayed.finished(),
+        "a body with no LAST must not report as finished — a client told otherwise believes a \
+         truncated download is complete"
+    );
+
+    // **The worker was replaced, and the assertion has to be made before the next request.**
+    //
+    // This is the part that took a negative control to get right. A worker whose stream never ended
+    // has closed its output — the SDK stops writing after the failure — so the *next* request would
+    // find it dead and replace it anyway. Comparing pids after that request therefore proves
+    // nothing: the control (removing the ending's `replace`) passed with the assertion still in
+    // place. What is actually under test is that the pool decided *at the ending*, so the pid is
+    // read right here, with no request in between.
+    assert_ne!(
+        pool.pids()[0],
+        pid_before,
+        "a worker whose stream did not end must be replaced by the ending itself, not left for the \
+         next request's liveness check to notice"
+    );
+
+    // And the pool still serves, which is the observable consequence of having replaced it.
+    let after = pool.request(&get("/health")).expect("the pool recovered");
+    assert_eq!(after.parse_status_headers().0, 200);
+}
+
 #[test]
 fn the_pool_reports_the_peak_memory_its_workers_measured() {
     let _serial = serial();
@@ -3190,7 +3409,8 @@ fn a_second_sweep_finishes_what_the_first_left_behind() {
     let _serial = serial();
     require_sdk!();
 
-    let markers = std::env::temp_dir().join(format!("volucer-twice-markers-{}", std::process::id()));
+    let markers =
+        std::env::temp_dir().join(format!("volucer-twice-markers-{}", std::process::id()));
     let pool = booting_pool("roll-twice", 2, &markers, 900_000);
     let before = pool.pids();
 
