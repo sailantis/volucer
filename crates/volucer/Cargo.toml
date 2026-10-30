@@ -96,3 +96,7 @@ rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-
 # handshake is the observation.
 [target.'cfg(unix)'.dev-dependencies]
 rustls = { version = "0.23", features = ["custom-provider"] }
+# `libc::kill`, so a test can send the `SIGTERM` a supervisor sends. `Child::kill` is `SIGKILL`,
+# which runs no shutdown path at all — so without this no test could ask for a *clean* stop, and
+# an assertion about draining or unlinking would be asserting what the kill made impossible.
+libc = "0.2"

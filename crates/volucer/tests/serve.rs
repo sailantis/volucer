@@ -204,6 +204,15 @@ struct Server {
     /// way to diagnose it was to guess and rerun, which is exactly what happened to
     /// `Test (windows-latest)` in run 39829499236.
     diagnostics: Option<std::thread::JoinHandle<String>>,
+    /// Everything the server wrote to stdout *after* the banner, drained for the same reason as
+    /// `diagnostics` and one more.
+    ///
+    /// The extra reason is a panic: `println!` to a pipe nobody reads fails with `Broken pipe`,
+    /// and `println!` panics on that failure. Reading the banner and then dropping the pipe — which
+    /// is what this did — made every shutdown `println!` (`http: N request(s)`) abort the process
+    /// with exit 101, so a correctly draining server looked like a crashed one. A test that stops a
+    /// server and asserts on its exit status cannot leave stdout undrained.
+    stdout_tail: Option<std::thread::JoinHandle<String>>,
 }
 
 impl Server {
@@ -273,6 +282,7 @@ impl Server {
             status_address: None,
             banner: String::new(),
             diagnostics,
+            stdout_tail: None,
         };
         let stdout = server.child.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
@@ -333,6 +343,17 @@ impl Server {
                 {
                     break;
                 }
+                // The banner is over. **Keep reading**, on a thread: the server's
+                // shutdown prints its summary with `println!`, and `println!`
+                // panics when the write fails — and it fails with `Broken pipe`
+                // if nobody holds the read end. Dropping the pipe here made
+                // every clean stop exit 101, which is a test harness turning a
+                // correct server into a crashing one.
+                server.stdout_tail = Some(std::thread::spawn(move || {
+                    let mut rest = String::new();
+                    let _ = reader.read_to_string(&mut rest);
+                    rest
+                }));
                 return Some(server);
             }
         }
@@ -343,6 +364,22 @@ impl Server {
     /// The banner `serve` printed before it started listening.
     fn banner(&self) -> &str {
         &self.banner
+    }
+
+    /// Everything the server printed after the banner, waiting for it to exit if it has not.
+    ///
+    /// This is the shutdown summary — the `http: N request(s)` line. Reading it proves the process
+    /// reached the end of its shutdown rather than dying partway, so a test can tell "drained and
+    /// summarised" from "exited for some other reason".
+    ///
+    /// Only the Linux-only [`Server::stop_gracefully`] calls it: a graceful stop needs a signal, and
+    /// the platforms that have one are the ones that can assert on the summary.
+    #[cfg(target_os = "linux")]
+    fn summary(&mut self) -> String {
+        let Some(handle) = self.stdout_tail.take() else {
+            return String::new();
+        };
+        handle.join().unwrap_or_default()
     }
 
     /// What the server logged to stderr, after asking it to stop.
@@ -386,6 +423,50 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Server {
+    /// Ask the server to stop the way an operator or a supervisor does, and wait for it to exit.
+    ///
+    /// **`drop` is not this, and the difference is the whole point.** `Drop` calls `Child::kill`,
+    /// which is `SIGKILL`: the process dies where it stands, so no shutdown path runs at all — no
+    /// drain, no socket unlink, no summary. A test that asserted any of those after a `drop` would
+    /// be asserting a behaviour it had just made impossible, and would fail against correct code.
+    ///
+    /// `SIGTERM` is what `systemd`, `docker stop` and a Kubernetes `preStop` actually send, so this
+    /// exercises the path a deployment exercises. Returns the exit status, because "exited 0" is
+    /// half of what "clean" means.
+    ///
+    /// Linux only: Windows has no `SIGTERM`, and the shutdown path there is a console control event
+    /// a child cannot be sent from a test. `serve` states the same limitation for `SIGHUP`.
+    #[cfg(target_os = "linux")]
+    fn stop_gracefully(&mut self, within: Duration) -> (std::process::ExitStatus, String) {
+        let pid = self.child.id() as libc::pid_t;
+        // SAFETY: `kill` on a pid we own. A failure here means the child is already gone, which the
+        // `wait` below reports properly.
+        let sent = unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert_eq!(
+            sent, 0,
+            "SIGTERM could not be delivered to the server: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let deadline = Instant::now() + within;
+        let status = loop {
+            match self.child.try_wait().expect("poll the child") {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("the server did not exit within {within:?} of SIGTERM");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        // Joined after the exit, so the pipe reaches EOF and the summary is complete rather than
+        // racing the process it describes.
+        (status, self.summary())
     }
 }
 
@@ -2475,6 +2556,15 @@ impl TestOrigin {
     /// `response` is written verbatim after the request is read, so a test controls the status,
     /// the headers — including two with the same name — and the body.
     fn start(response: &'static str) -> Self {
+        TestOrigin::start_after(response, Duration::ZERO)
+    }
+
+    /// The same, but the origin waits `delay` before answering.
+    ///
+    /// That delay is what makes a *drain* observable: a response that is still on the origin when
+    /// the stop signal arrives is a request in flight, and whether the client receives it whole is
+    /// the difference between draining and cancelling.
+    fn start_after(response: &'static str, delay: Duration) -> Self {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind an origin on a free port");
         let address = listener.local_addr().expect("address").to_string();
@@ -2499,6 +2589,9 @@ impl TestOrigin {
                 seen.lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(raw);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
                 let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -5072,13 +5165,13 @@ fn a_unix_http_listener_serves_a_request_and_cleans_up_its_socket() {
     let socket = root.join("http.sock");
     let config_path = root.join("volucer.toml");
     let config = format!(
-        "[server]\nhttp = \"unix:{socket}\"\\nserve_only = \"static\"\\ndocument_root = {root}\\n",
+        "[server]\nhttp = \"unix:{socket}\"\nserve_only = \"static\"\ndocument_root = {root}\n",
         socket = socket.display(),
         root = toml_string(&root.display().to_string()),
     );
     std::fs::write(&config_path, config).expect("write the config");
 
-    let Some(server) = Server::start(&binary, &config_path) else {
+    let Some(mut server) = Server::start(&binary, &config_path) else {
         panic!("the server must start with a unix http listener");
     };
 
@@ -5101,6 +5194,17 @@ fn a_unix_http_listener_serves_a_request_and_cleans_up_its_socket() {
         response.text().contains("over a unix socket"),
         "the request must be answered over the socket: {response:?}"
     );
+
+    // A **graceful** stop, not `drop`: `Drop` is `SIGKILL`, which runs no shutdown path at all, so
+    // asserting the unlink after one would assert what the kill made impossible.
+    #[cfg(target_os = "linux")]
+    {
+        let (status, summary) = server.stop_gracefully(Duration::from_secs(30));
+        assert!(
+            status.success(),
+            "a clean stop must exit 0, got {status}\n{summary}"
+        );
+    }
 
     // Drop kills the child and waits; the socket must be gone afterwards, or the next start fails.
     drop(server);
@@ -5141,7 +5245,7 @@ fn a_stale_socket_path_is_replaced_rather_than_fatal() {
 
     let config_path = root.join("volucer.toml");
     let config = format!(
-        "[server]\nhttp = \"unix:{socket}\"\\nserve_only = \"static\"\\ndocument_root = {root}\\n",
+        "[server]\nhttp = \"unix:{socket}\"\nserve_only = \"static\"\ndocument_root = {root}\n",
         socket = socket.display(),
         root = toml_string(&root.display().to_string()),
     );
@@ -5182,7 +5286,7 @@ fn a_unix_fastcgi_listener_answers_a_get_values_probe() {
     let socket = root.join("fcgi.sock");
     let config_path = root.join("volucer.toml");
     let config = format!(
-        "[server]\nfastcgi = \"unix:{socket}\"\\nserve_only = \"static\"\\ndocument_root = {root}\\n",
+        "[server]\nfastcgi = \"unix:{socket}\"\nserve_only = \"static\"\ndocument_root = {root}\n",
         socket = socket.display(),
         root = toml_string(&root.display().to_string()),
     );
@@ -5222,5 +5326,101 @@ fn a_unix_fastcgi_listener_answers_a_get_values_probe() {
     );
 
     drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A stop finishes the request that is already running instead of truncating it.**
+///
+/// The defect this pins: leaving the accept loop used to *return*, which dropped the runtime on the
+/// listener thread and cancelled every connection task. A response half-written at that instant
+/// reached the client as `RemoteDisconnected` with no body, and the process still exited 0 — so a
+/// rolling deploy looked clean while silently failing whatever was in flight.
+///
+/// The origin answers only after a delay, so the request is unambiguously *in flight* when `SIGTERM`
+/// arrives: the client has sent everything, the server is waiting on the upstream, and nothing has
+/// been written back yet. Draining means that request still completes; the old behaviour failed it
+/// 100% of the time rather than intermittently, which is why this is a real assertion and not a
+/// race.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_finishes_a_request_that_is_already_in_flight() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let body = "the response that was in flight";
+    let origin = TestOrigin::start_after(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 33\r\n\r\nthe response that was in flight",
+        Duration::from_millis(1500),
+    );
+
+    let root = std::env::temp_dir().join(format!("volucer-drain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {root}\ndefault_backend = \"origin\"\n\n\
+         [backends.origin]\nkind = \"upstream\"\norigin = \"{url}\"\n",
+        root = toml_string(&root.display().to_string()),
+        url = origin.origin_url(),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(mut server) = Server::start(&binary, &config_path) else {
+        panic!("the server must start against a reachable origin");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("a bound http listener");
+
+    // The request in the background, so the stop can happen while it is unanswered.
+    let in_flight = std::thread::spawn(move || {
+        let mut stream =
+            std::net::TcpStream::connect(&address).expect("connect to the http listener");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("a read timeout");
+        stream
+            .write_all(b"GET /report HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+            .expect("write the request");
+        stream.flush().expect("flush");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read the response");
+        raw
+    });
+
+    // Long enough that the origin has certainly received it and is certainly still sleeping: the
+    // request is in the server, not in this process's scheduler queue.
+    std::thread::sleep(Duration::from_millis(400));
+    let (status, summary) = server.stop_gracefully(Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "a draining stop must still exit 0, got {status}\n{summary}"
+    );
+    // The summary is printed only after both listeners have drained, so its presence is the second
+    // half of "the shutdown ran to the end" — an exit status alone cannot distinguish a drain from a
+    // process that died after the last request.
+    assert!(
+        summary.contains("http:"),
+        "the shutdown summary must be printed after the drain: {summary:?}"
+    );
+    assert!(
+        !summary.contains("abandoned"),
+        "the drain must not have hit its budget: {summary:?}"
+    );
+
+    let raw = in_flight.join().expect("the in-flight request thread");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        text.contains("200 OK"),
+        "the in-flight request was not answered: {text:?}"
+    );
+    assert!(
+        text.contains(body),
+        "the in-flight response was truncated by the stop: {text:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
