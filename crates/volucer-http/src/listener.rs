@@ -2582,6 +2582,50 @@ async fn prepare(
     // question is the drift.
     let route = volucer_core::config::select_route(&site.routes, host, parts.uri.path());
 
+    // A redirect answers the request here and reaches neither layer below. It is placed **after
+    // the route is selected and before the static layer**, which is the only position that makes
+    // both halves of its meaning true: it wins over a file that happens to exist at the old path
+    // (which is the whole point of a migration — the file is what you are retiring), and it costs
+    // no `stat` and no dispatch.
+    //
+    // **Before the body is read, deliberately.** A `307`/`308` preserves the method, so a redirected
+    // `POST` is answered without this server ever buffering its body: the client is told where to go
+    // and sends it there. Buffering first would spend the upload on an answer that never needed it.
+    if let Some(redirect) = route.and_then(|route| route.redirect.as_ref()) {
+        let target = redirect.location(
+            parts
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or(parts.uri.path()),
+        );
+        let location = HeaderValue::from_str(&target).map_err(|_| {
+            // Refused by `validate` for a control character, so this is a table built by hand.
+            // Answered rather than panicking: a 500 names the value, and a panic would take the
+            // connection task down with the request.
+            HttpError::BadGateway(format!(
+                "the route's redirect target {target:?} is not a valid Location header value"
+            ))
+        })?;
+        return Ok(Response::builder()
+            .status(redirect.status)
+            .header(hyper::header::LOCATION, location)
+            .header(hyper::header::CONTENT_LENGTH, "0")
+            // `no-store` on a temporary redirect only: a `301`/`308` is *meant* to be cached — that
+            // is what permanent means — but a `302`/`303`/`307` that a cache kept would outlive the
+            // condition it described.
+            .header(
+                hyper::header::CACHE_CONTROL,
+                if matches!(redirect.status, 301 | 308) {
+                    "public"
+                } else {
+                    "no-store"
+                },
+            )
+            .body(body_of(Bytes::new()))
+            .expect("a redirect with a location is a valid response"));
+    }
+
     // A route's policy is the site's `serve_only` for one subtree -- the only place a
     // deployment can say "/assets is files, /api is the application" without splitting the
     // site in two. A route that states nothing gets the site's behaviour, because `policy`

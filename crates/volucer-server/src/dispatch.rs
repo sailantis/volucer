@@ -1994,6 +1994,7 @@ url = "redis://127.0.0.1:6379"
             path_suffix: None,
             host: None,
             backend: Some("legacy".to_string()),
+            redirect: None,
         }];
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
 
@@ -2031,6 +2032,7 @@ url = "redis://127.0.0.1:6379"
                 path_suffix: None,
                 host: None,
                 backend: Some("api".to_string()),
+                redirect: None,
             },
             RouteConfig {
                 policy: RoutePolicy::All,
@@ -2038,6 +2040,7 @@ url = "redis://127.0.0.1:6379"
                 path_suffix: None,
                 host: Some("admin.test".to_string()),
                 backend: Some("admin_api".to_string()),
+                redirect: None,
             },
         ];
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
@@ -2166,6 +2169,7 @@ url = "redis://127.0.0.1:6379"
                 path_prefix: Some("/api".to_string()),
                 path_suffix: None,
                 backend: Some("api".to_string()),
+                redirect: None,
             },
             // A *suffix* route, deliberately, because it is the one that makes the stripping
             // load-bearing: `/api` as a prefix still matches `/api?x=1` with the query left on,
@@ -2176,6 +2180,7 @@ url = "redis://127.0.0.1:6379"
                 path_prefix: None,
                 path_suffix: Some(".php".to_string()),
                 backend: Some("app".to_string()),
+                redirect: None,
             },
         ];
         let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();

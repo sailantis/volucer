@@ -347,6 +347,7 @@ binary = "/usr/bin/php-cgi"
             path_suffix: None,
             policy: RoutePolicy::All,
             backend: Some(name.to_string()),
+            redirect: None,
         };
         skip_stat(
             &route,
@@ -481,6 +482,7 @@ fn skip_stat_reads_the_sites_list_rather_than_a_constant() {
         path_suffix: Some(suffix.to_string()),
         policy: RoutePolicy::All,
         backend: Some("app".to_string()),
+        redirect: None,
     };
 
     assert!(skip_stat(&route(".php"), false, &php));

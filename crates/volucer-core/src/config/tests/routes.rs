@@ -197,6 +197,7 @@ fn a_files_only_route_never_skips_the_stat() {
         host: None,
         policy: RoutePolicy::Static,
         backend: None,
+        redirect: None,
     };
     let extensions = crate::script::ScriptExtensions::default();
     assert!(
@@ -316,5 +317,208 @@ backend = "specific"
         config.route_backend(Some("api.example"), "/api/x"),
         Some("specific"),
         "specificity is decided before declaration order"
+    );
+}
+
+// ------------------------------------------------------------ redirects
+
+/// A minimal configuration around a route table, without needing a backend.
+fn redirect_config(routes: &str) -> Config {
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "."
+{routes}
+"#
+    );
+    Config::from_toml(&text).expect("the fixture parses")
+}
+
+#[test]
+fn a_redirect_route_needs_no_backend_and_accepts_the_five_redirection_statuses() {
+    // The `backend` requirement exists because a route that *can* dispatch must say where. A
+    // redirect dispatches nowhere, so naming none is correct — and naming one is refused, because a
+    // line that does nothing is the shape this file refuses everywhere else.
+    for status in [301u16, 302, 303, 307, 308] {
+        let config = redirect_config(&format!(
+            r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = {{ status = {status}, to = "/new" }}
+"#
+        ));
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("status {status} is a redirection: {err}"));
+    }
+
+    let both = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+backend = "app"
+redirect = { status = 301, to = "/new" }
+"#,
+    );
+    let err = both
+        .validate()
+        .expect_err("a redirect and a backend cannot both be stated");
+    assert!(format!("{err}").contains("redirect"), "{err}");
+}
+
+#[test]
+fn a_redirect_refuses_a_status_that_is_not_a_redirection() {
+    // `300`, `304` and `305` are in the 3xx range and are not this, and a `200` in a `redirect` is a
+    // route that answers successfully and never redirects — the "looks configured, does nothing"
+    // shape.
+    for status in [200u16, 300, 304, 305, 399, 404] {
+        let config = redirect_config(&format!(
+            r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = {{ status = {status}, to = "/new" }}
+"#
+        ));
+        let err = config
+            .validate()
+            .expect_err("only 301/302/303/307/308 are redirections");
+        assert!(
+            format!("{err}").contains(&status.to_string()),
+            "the message must name the status: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_redirect_target_must_be_absolute_or_a_path() {
+    // A `Location` of `example.com/x` is read as a *relative* path by every client, so it resolves
+    // to `/example.com/x` on the deploying host — a redirect to nothing, found in production.
+    let config = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = { status = 301, to = "example.com/new" }
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a bare host is not a redirect target");
+    assert!(format!("{err}").contains("example.com/new"), "{err}");
+    assert!(format!("{err}").contains("relative path"), "{err}");
+
+    // And the three shapes that are fine: root-relative, absolute, and a token-only target.
+    for to in ["/new", "https://new.example/x", "{path}"] {
+        let config = redirect_config(&format!(
+            r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = {{ status = 301, to = "{to}" }}
+"#
+        ));
+        // `{path}` beside `path_prefix = "/old"` is not a loop: it strips nothing but also does not
+        // re-add the prefix, so a client is sent to the path it asked for — which *is* a loop, so
+        // only check the two that are unambiguously fine here.
+        if to == "{path}" {
+            continue;
+        }
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{to:?} is a valid target: {err}"));
+    }
+}
+
+#[test]
+fn a_redirect_that_loops_back_to_its_own_prefix_is_refused() {
+    // `path_prefix = "/old"` with `to = "/old{path}"` maps every matched request onto itself: a
+    // browser hides the loop from the operator and a scraper follows it for ever.
+    let config = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = { status = 301, to = "/old{path}" }
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a self-referential redirect is a loop");
+    assert!(format!("{err}").contains("/old{path}"), "{err}");
+    assert!(format!("{err}").contains("for ever"), "{err}");
+
+    // A constant target under the route's own prefix loops too, and for the same reason: the
+    // redirect lands on this route again.
+    let constant = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/blog"
+redirect = { status = 302, to = "/blog/archive" }
+"#,
+    );
+    constant
+        .validate()
+        .expect_err("a constant target under the same prefix is a loop");
+
+    // The negative control: the same shape one prefix over is the ordinary migration and must be
+    // accepted, or the check above would refuse the feature it exists for.
+    let fine = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/blog"
+redirect = { status = 301, to = "/news{path}" }
+"#,
+    );
+    fine.validate().expect("a different prefix is the migration shape");
+}
+
+#[test]
+fn a_redirect_cannot_share_a_route_with_a_policy() {
+    // `policy` decides which layer answers, and a redirect answers before either is consulted — so
+    // stating one beside `redirect` is a line that appears to matter and does not.
+    let config = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+policy = "static"
+redirect = { status = 301, to = "/new" }
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a redirect makes the policy inert");
+    assert!(format!("{err}").contains("policy"), "{err}");
+}
+
+#[test]
+fn a_redirect_outranks_an_equally_specific_route_that_serves() {
+    // The tie rule: a deployment migrating `/old` would otherwise lose to the route that was there
+    // before it, because a tie goes to the earlier entry — and the earlier entry is the one being
+    // retired.
+    let config = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "."
+default_backend = "app"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[[server.routes]]
+path_prefix = "/old"
+backend = "app"
+
+[[server.routes]]
+path_prefix = "/old"
+redirect = { status = 301, to = "/new" }
+"#,
+    )
+    .expect("the fixture parses");
+    config.validate().expect("the fixture validates");
+    let selected = super::select_route(&config.server.routes, None, "/old/x")
+        .expect("one of the two matches");
+    assert!(
+        selected.redirect.is_some(),
+        "the redirect must win the tie, not the route it is retiring"
     );
 }

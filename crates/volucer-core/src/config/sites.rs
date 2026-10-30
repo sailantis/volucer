@@ -583,8 +583,105 @@ pub struct RouteConfig {
     /// reach a backend without naming one would have to guess, and the guess would be
     /// `default_backend` — which is the site's setting, not this route's. Refused
     /// otherwise, at the route that omitted it.
+    ///
+    /// **Also optional for a redirect**, which reaches no backend at all: see
+    /// [`RouteConfig::redirect`].
     #[serde(default)]
     pub backend: Option<String>,
+
+    /// Answer the matched requests with a redirect instead of serving them.
+    ///
+    /// ```toml
+    /// [[server.routes]]
+    /// path_prefix = "/old-blog"
+    /// redirect = { status = 301, to = "https://blog.example.com/new" }
+    /// ```
+    ///
+    /// # Why this is not a rewrite engine
+    ///
+    /// A `Location` and 301/302/307/308 are the whole of it: no regular expressions, no captures, no
+    /// substitution. Every SEO migration needs exactly this, and every one of them currently has to
+    /// be PHP — a script executed for a request whose entire answer is one header. A rewrite engine
+    /// is a language with its own operator surface and its own bugs, and nginx's `rewrite` is the
+    /// part of nginx's configuration nobody can read. **Non-Turing-complete is the feature.**
+    ///
+    /// # The one substitution, and why it is not a regex
+    ///
+    /// `to` may contain `{path}`, which is replaced with the request's own path-and-query — the
+    /// whole of it, verbatim. That is what makes "send everything under `/old` to `/new`, keeping the
+    /// rest of the URL" expressible without a capture group:
+    ///
+    /// ```toml
+    /// redirect = { status = 308, to = "/new{path}" }
+    /// ```
+    ///
+    /// A `{path}` that would produce a redirect to the same path it was given is **refused at
+    /// startup**, because it is a loop the client cannot escape, and answering it with a 500 at
+    /// request time would turn a configuration slip into an incident.
+    ///
+    /// # What it does not do
+    ///
+    /// **The `Host` is not rewritten.** A redirect to a relative `to` stays on the host the client
+    /// asked for; one to an absolute URL leaves this server. Redirecting a name to another name is a
+    /// site-level decision and is left to `redirect_to_https` or to the proxy — a route matching
+    /// `host` *and* redirecting would be the same table answering "which site" twice.
+    #[serde(default)]
+    pub redirect: Option<RedirectConfig>,
+}
+
+/// A route's answer: a status and where to send the client.
+///
+/// See [`RouteConfig::redirect`] for what this deliberately is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectConfig {
+    /// The status: `301`, `302`, `303`, `307` or `308`. Required, because the choice is not
+    /// cosmetic.
+    ///
+    /// The five are the ones RFC 9110 defines for this, and the default is deliberately *not*
+    /// filled in:
+    ///
+    /// - `301` **permanent**, and a client may cache it for ever. A browser that has cached a
+    ///   `301` will not ask again, so a `301` written by mistake is not something a reload fixes.
+    /// - `302` **found**, temporary, and the common case for "not here right now". A `POST` may be
+    ///   turned into a `GET`, which is what most clients have always done and what the standard now
+    ///   permits.
+    /// - `303` **see other**, which turns any method into a `GET` — the right answer after a
+    ///   `POST` succeeds and the client should go and *look* at the result.
+    /// - `307`/`308` **temporary/permanent** with the method *preserved*, which is what an API
+    ///   redirect needs: a `PUT` that becomes a `GET` silently loses its body.
+    ///
+    /// Anything else is refused by name, including `300` and `304`, which are in the 3xx range and
+    /// are not this.
+    pub status: u16,
+
+    /// Where to send the client: a path, or an absolute `http`/`https` URL.
+    ///
+    /// `{path}` is replaced with the request's path and query. A bare absolute URL is written as it
+    /// is. **A `to` that is not one of those is refused at startup** rather than emitted as a
+    /// `Location` a client cannot parse.
+    pub to: String,
+}
+
+impl RedirectConfig {
+    /// Whether this redirect can be answered without the request's path.
+    ///
+    /// A `to` with no `{path}` is a constant, so the `Location` is one header written from the
+    /// configuration — see `validate` for the one property that has to hold for it to be correct.
+    #[must_use]
+    pub fn is_constant(&self) -> bool {
+        !self.to.contains("{path}")
+    }
+
+    /// The `Location` for a request whose path-and-query is `path`.
+    ///
+    /// `{path}` is substituted verbatim, and **only that token**: a bare `{` or `}` a deployment
+    /// meant literally is left alone rather than treated as an error, because a URL may legitimately
+    /// contain either and refusing them would refuse a valid target.
+    #[must_use]
+    pub fn location(&self, path: &str) -> String {
+        self.to.replace("{path}", path)
+    }
 }
 
 impl RouteConfig {
@@ -592,10 +689,18 @@ impl RouteConfig {
     ///
     /// Used to pick a winner when several routes match, so a route naming a host
     /// and a path beats one naming only the path.
+    ///
+    /// **A redirect outranks an otherwise equally specific route that serves**, and that is why it
+    /// adds to the count rather than being ignored. A deployment migrating `/old` writes a redirect
+    /// for the prefix; a pre-existing `/old/api` route with the same two constraints would otherwise
+    /// tie, and the tie goes to the earlier entry — which is the one that was there before the
+    /// migration and is the one being retired. The redirect is the newer, more specific *intent*, so
+    /// it wins outright.
     pub fn specificity(&self) -> usize {
         self.host.is_some() as usize
             + self.path_prefix.is_some() as usize
             + self.path_suffix.is_some() as usize
+            + self.redirect.is_some() as usize
     }
 
     /// Whether this route's host constraint is an exact name rather than a

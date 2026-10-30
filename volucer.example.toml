@@ -907,6 +907,40 @@ socket = "unix:/run/php/php-fpm.sock"
 # host = "admin.example.com"
 # path_prefix = "/"
 # backend = "fpm"
+#
+# `redirect` turns a route into an answer instead of a dispatch, which is how a
+# URL is retired without writing a PHP script that exists only to send a header.
+#
+# ```toml
+# [[server.routes]]
+# path_prefix = "/blog"
+# redirect = { status = 308, to = "/news{path}" }
+# ```
+#
+#   It reaches no backend, so `backend` must be absent and `policy` must be left
+#   alone -- both are refused beside it rather than ignored, because a line that
+#   appears to matter and does not is the shape this file refuses everywhere.
+#
+#   It is answered BEFORE the static layer, so it wins over a file that still
+#   exists at the old path -- which is the whole point of a migration: the file
+#   there is what you are retiring. It is also answered before the body is read,
+#   so a redirected POST costs nothing.
+#
+#   `{path}` is the request's path AND query, verbatim -- the only substitution.
+#   There are no regexes, no captures and no rewrite engine, deliberately: that
+#   is the part of nginx's configuration nobody can read.
+#
+#   `status` decides what a cache may keep. 301/308 are sent with
+#   `Cache-Control: public`, because being cached is what permanent means;
+#   302/303/307 get `no-store`, because a cached temporary redirect outlives the
+#   condition it described. 307/308 preserve the method and 302/303 turn it into
+#   GET, so an API redirect wants the first pair.
+#
+#   Refused at startup rather than at request time, because a client cannot
+#   recover from either: a `to` that is neither an absolute URL nor starts with
+#   '/' (a client reads `example.com/x` as a relative path, so it resolves to
+#   `/example.com/x` here), and a `to` that sends a request back into the route's
+#   own prefix, which is a loop.
 
 # ---------------------------------------------------------------------------
 # php-cgi pool: N processes on N ports. The only option on Windows, where

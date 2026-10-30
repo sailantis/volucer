@@ -3456,7 +3456,156 @@ fn a_reloaded_access_list_takes_effect_on_the_next_request() {
     );
 }
 
-// ------------------------------------------------------------ trace propagation
+// ------------------------------------------------------------ redirects
+//
+// A route's `redirect` answers before the static layer and before any backend, and it is the only
+// place a deployment can retire a URL without a PHP script. These tests pin the three things that
+// make it safe: it wins over a file that still exists at the old path, `{path}` expands to the
+// request's own path-and-query, and the status decides what a cache may keep.
+
+fn redirect_server(routes: &str) -> Option<Server> {
+    let root = static_root("redirect-routes");
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {root:?}
+{routes}
+"#,
+        root = root.to_string_lossy(),
+    );
+    let config = Config::from_toml(&text).expect("the fixture parses");
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&config, routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(Sites::from_config(&config, &root));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )));
+    Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+}
+
+#[test]
+fn a_redirect_wins_over_a_file_that_still_exists_at_the_old_path() {
+    // The whole point of a migration: the old URL still has something at it, and the deployment has
+    // decided clients should stop using it. A redirect placed after the static layer would serve the
+    // retired file and the migration would never take effect — which is why the placement is
+    // asserted with a file that *does* exist rather than with one that does not.
+    let Some(server) = redirect_server(
+        r#"
+[[server.routes]]
+path_prefix = "/assets"
+redirect = { status = 301, to = "/static" }
+"#,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        answer.status, 301,
+        "a redirect must win over the file at the old path: {answer:?}"
+    );
+    let location = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(location.as_deref(), Some("/static"));
+
+    // A `301` is meant to be cached — that is what permanent means — and a `no-store` on it would
+    // make a browser ask again for ever.
+    let cache = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(cache.as_deref(), Some("public"));
+}
+
+#[test]
+fn a_temporary_redirect_is_not_cacheable() {
+    // The other half of the rule above: a `302` that a cache kept would outlive the condition it
+    // described, so the status decides the header rather than the caller.
+    let Some(server) = redirect_server(
+        r#"
+[[server.routes]]
+path_prefix = "/promo"
+redirect = { status = 302, to = "/offers" }
+"#,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/promo/x");
+    assert_eq!(answer.status, 302, "{answer:?}");
+    let cache = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(
+        cache.as_deref(),
+        Some("no-store"),
+        "a temporary redirect must not be cached"
+    );
+}
+
+#[test]
+fn a_path_token_carries_the_request_onto_the_new_prefix() {
+    // `{path}` is the request's own path-and-query, substituted verbatim. That is what makes "move
+    // everything under /old to /new, keeping the rest of the URL" expressible without a regex, and
+    // it must carry the query too or a redirect silently drops parameters.
+    let Some(server) = redirect_server(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = { status = 308, to = "/new{path}" }
+"#,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/old/a/b?x=1&y=2");
+    assert_eq!(answer.status, 308, "{answer:?}");
+    let location = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(
+        location.as_deref(),
+        Some("/new/old/a/b?x=1&y=2"),
+        "the token is the whole path, and the query travels with it"
+    );
+}
+
+#[test]
+fn a_redirect_leaves_a_path_outside_its_prefix_alone() {
+    // The negative control for all three above: without it, a route table that redirected everything
+    // would satisfy every assertion so far.
+    let Some(server) = redirect_server(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = { status = 301, to = "/new{path}" }
+"#,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        answer.status, 200,
+        "a path outside the redirect's prefix must still be served: {answer:?}"
+    );
+}
+
+
 //
 // `[server].trace_context` decides one thing: **what the backend receives.** These tests are about
 // that, through a real origin, because the header is written by the listener and a unit test of

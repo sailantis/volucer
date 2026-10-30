@@ -699,11 +699,50 @@ explicitly non-retryable, which is what distinguishes it from the rate limit's
 | `path_suffix` | string | absent | Match paths ending with this. |
 | `host` | string | absent | Match this `Host` header. |
 | `policy` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
-| `backend` | string | absent | The backend for matched requests. Required unless `policy = "static"`. |
+| `backend` | string | absent | The backend for matched requests. Required unless `policy = "static"` or `redirect` is set. |
+| `redirect` | table | absent | Answer the matched requests with a redirect: `{ status = 301, to = "/new{path}" }`. |
 
 These routes belong to the unnamed site and are declared as `[[server.routes]]` alongside
 the other `[server]` settings. A `[sites.<name>]` table can define its own `routes`; that
 list **replaces** the global list rather than extending it.
+
+### `redirect`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `status` | integer | **required** | `301`, `302`, `303`, `307` or `308`. |
+| `to` | string | **required** | A path, an absolute `http(s)` URL, or one containing `{path}`. |
+
+A redirect answers the request itself: it reaches no backend, so `backend` must be absent
+and `policy` must be left at its default. It is answered **before the static layer**, so
+it wins over a file that still exists at the old path — which is the whole point of a
+migration — and before the request body is read, so a redirected `POST` costs nothing.
+
+`{path}` expands to the request's path **and query**, verbatim. That is the only
+substitution; there are no regular expressions, no captures and no rewrite engine, and
+that is deliberate:
+
+```toml
+# Move a blog to a new prefix, keeping the rest of every URL.
+[[server.routes]]
+path_prefix = "/blog"
+redirect = { status = 308, to = "/news{path}" }
+```
+
+The status decides what a cache may keep: `301`/`308` are sent with `Cache-Control: public`
+because being cached is what permanent means, and `302`/`303`/`307` with `no-store`
+because a cached temporary redirect outlives the condition it described. The method is
+preserved by `307`/`308` and turned into `GET` by `302`/`303`, which is why an API
+redirect wants the first pair and a "moved page" wants the second.
+
+Two misconfigurations are refused at startup rather than at request time, because a client
+cannot recover from either:
+
+- a `to` that is neither an absolute URL nor starts with `/` — a client reads
+  `example.com/x` as a *relative* path, so it would resolve to `/example.com/x` on the
+  deploying host;
+- a `to` that sends a request back into the route's own `path_prefix`, which is a loop.
+
 
 **Configuration changed in 0.3.0:** `[[routes]]` and the top-level `default_backend`
 moved under `[server]`. The old forms are rejected at startup, with an error that names

@@ -148,6 +148,17 @@ pub(super) fn validate_route(
     // route that omitted it rather than resolved somewhere the operator did not look. Only
     // `static` may leave it out, because it never dispatches.
     let backend = match (route.policy, &route.backend) {
+        // A redirect reaches no backend, so naming one is a line the deployment believes does
+        // something. Refused rather than ignored: a route that both redirects and dispatches would
+        // have to pick, and picking silently is how a migration sends half its traffic to a page it
+        // meant to retire.
+        (_, Some(_)) if route.redirect.is_some() => {
+            return Err(Error::Config(format!(
+                "{where_}[{index}] has both `redirect` and `backend`. A redirect answers the request \
+                 itself and never dispatches, so `backend` would do nothing; remove one of them"
+            )))
+        }
+        (_, _) if route.redirect.is_some() => None,
         (RoutePolicy::Static, None) => None,
         (_, Some(name)) => Some(name),
         (policy, None) => {
@@ -158,6 +169,21 @@ pub(super) fn validate_route(
             )))
         }
     };
+
+    // A redirect makes `policy` inert for the same reason it makes `backend` inert: the request is
+    // answered before either layer is consulted. Refused rather than ignored, so a route cannot
+    // appear to state two things and honour one.
+    if route.redirect.is_some() && route.policy != RoutePolicy::default() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}] has both `redirect` and policy {:?}. A redirect answers before the \
+             static layer and the backend are consulted, so the policy would do nothing; remove it",
+            route.policy.as_str()
+        )));
+    }
+
+    if let Some(redirect) = &route.redirect {
+        validate_redirect(redirect, where_, index, route)?;
+    }
 
     if let Some(name) = backend {
         if !backends.contains_key(name) {
@@ -192,6 +218,101 @@ pub(super) fn validate_route(
     }
     if let Some(host) = &route.host {
         validate_host_pattern(host, &format!("{where_}[{index}].host"))?;
+    }
+    Ok(())
+}
+
+/// Validate a route's `redirect` table.
+///
+/// The three things that can be wrong are all things a client cannot recover from, which is why none
+/// of them is left to request time:
+///
+/// - **A status `Location` cannot express.** Only `301`, `302`, `303`, `307` and `308` are
+///   redirections; `300`, `304` and `305` live in the 3xx range and mean something else, and a
+///   `200` in a `redirect` is a route that would answer successfully and never redirect.
+/// - **A `to` that is neither an absolute `http`/`https` URL nor a path.** A `Location` of
+///   `example.com/x` is read as a *relative* path by every client, so it silently resolves to
+///   `/example.com/x` on the deploying host — a redirect to nothing, discovered in production.
+/// - **A `{path}` that leads back to the path it was given.** `path_prefix = "/app"` with
+///   `to = "/app{path}"` is an infinite loop that a browser hides from the operator and a scraper
+///   follows for ever.
+fn validate_redirect(
+    redirect: &RedirectConfig,
+    where_: &str,
+    index: usize,
+    route: &RouteConfig,
+) -> Result<()> {
+    const STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
+    if !STATUSES.contains(&redirect.status) {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].redirect.status is {}, which is not a redirection. Use one of 301 \
+             (permanent), 302 (found), 303 (see other, and the method becomes GET), 307 or 308 \
+             (temporary or permanent, and the method is preserved)",
+            redirect.status
+        )));
+    }
+
+    let to = redirect.to.trim();
+    if to.is_empty() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].redirect.to is empty; name a path or an absolute URL"
+        )));
+    }
+
+    // Three shapes are allowed: an absolute `http`/`https` URL, a root-relative path, and a relative
+    // target that begins with `{path}` — the last of which is how `"{path}"` alone and
+    // `"https://new.example{path}"` both work.
+    let absolute = to.starts_with("http://") || to.starts_with("https://");
+    let root_relative = to.starts_with('/');
+    if !absolute && !root_relative {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].redirect.to is {to:?}, which is neither an absolute http(s) URL nor \
+             a path beginning with '/'. A client reads a bare host as a relative path, so it would \
+             resolve to this deployment's own host"
+        )));
+    }
+
+    // A control character in a header value is a response-splitting attempt; a client would never
+    // have sent one and an operator cannot have meant one.
+    if to.chars().any(|ch| ch.is_control()) {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].redirect.to contains a control character, which cannot appear in a \
+             Location header"
+        )));
+    }
+
+    // The loop check. A redirect loops when the `Location` it produces for a request under its own
+    // prefix is a request the *same route* matches — which for `to` beginning with the prefix and
+    // then `{path}` is every request, because `{path}` already starts with that prefix.
+    //
+    // The check is deliberately about the *route's own pattern* rather than about the whole table: a
+    // redirect to a different route's subtree is a legitimate migration, and only sending a client
+    // back to the pattern it just matched is provably a loop.
+    if let Some(prefix) = &route.path_prefix {
+        if let Some(tail) = to.strip_prefix(prefix.as_str()) {
+            // `{path}` expands to a path that starts with `prefix`, so a target of exactly
+            // `prefix + {path}` maps every matched request onto itself.
+            if tail == "{path}" {
+                return Err(Error::Config(format!(
+                    "{where_}[{index}].redirect.to is {to:?}, which sends every request under \
+                     {prefix:?} back to the path it asked for: a client would follow it for ever, \
+                     and a scraper would not stop. Change the prefix or the target"
+                )));
+            }
+        }
+        // The same loop with a constant target: every matched path redirects to `to`, and if `to` is
+        // itself under `prefix` then the redirect lands on this route again.
+        if redirect.is_constant() {
+            let target_path = to.trim_end_matches('/');
+            let prefix_path = prefix.trim_end_matches('/');
+            if target_path == prefix_path || target_path.starts_with(&format!("{prefix_path}/")) {
+                return Err(Error::Config(format!(
+                    "{where_}[{index}].redirect.to is {to:?}, which is itself under the route's own \
+                     path_prefix {prefix:?}: the redirect would land on this route again and never \
+                     reach a page"
+                )));
+            }
+        }
     }
     Ok(())
 }

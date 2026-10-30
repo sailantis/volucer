@@ -1022,6 +1022,49 @@ fn serve_connection(
         let selected = dispatcher
             .backend_for_routes(&site.routes, &request)
             .to_string();
+
+        // **A redirect answers before anything is dispatched**, and it is answered here rather than
+        // on the HTTP path alone because a deployment behind nginx almost never has `[server.http]`
+        // at all: a redirect written in the route table would otherwise be unreachable in exactly
+        // the deployment that needs it most.
+        //
+        // `REQUEST_URI` is what the client asked for, including the query, so `{path}` expands to the
+        // same thing it does on the HTTP path — nginx's `fastcgi_params` sets it from `$request_uri`,
+        // which is the raw request line's target rather than a decoded path.
+        if let Some(redirect) = volucer_core::config::select_route(
+            &site.routes,
+            host.as_deref(),
+            param(request.params.as_slice(), b"REQUEST_URI")
+                .and_then(|uri| uri.split('?').next())
+                .unwrap_or("/"),
+        )
+        .and_then(|route| route.redirect.as_ref())
+        {
+            let path = param(request.params.as_slice(), b"REQUEST_URI")
+                .map(|uri| uri.to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let target = redirect.location(&path);
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            if observe.is_active() {
+                // The record is written before the answer, like the refusals above and unlike a
+                // backend's: there is no backend answer to wait for, so an order that waited for
+                // one would log nothing.
+                record_fastcgi(&observe, &context, &request, redirect.status, 0, started.elapsed());
+            }
+            fastcgi::write_redirect(
+                stream.get_mut(),
+                request_id,
+                redirect.status,
+                &target,
+                keep_conn,
+            )?;
+            requests_string = stats.requests.load(Ordering::Relaxed).to_string();
+            if !keep_conn {
+                return Ok(());
+            }
+            continue;
+        }
+
         dispatcher.inject_rpc_params(&selected, &mut request);
 
         let response = dispatcher.dispatch_with_routes(&site.routes, &request);

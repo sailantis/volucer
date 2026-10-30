@@ -279,6 +279,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
                 host: None,
                 policy: volucer_core::config::RoutePolicy::All,
                 backend: Some("api_pool".to_string()),
+                redirect: None,
             }],
             ..Default::default()
         },
@@ -1058,6 +1059,83 @@ document_root = {root:?}
     assert!(
         !other.contains("403"),
         "another client on the same connection must be served: {other}"
+    );
+
+    shutdown.shutdown();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ------------------------------------------------------------ redirects
+//
+// A route's `redirect` on the front end behind nginx. This path is the one that needs the test more
+// than the HTTP one: a deployment behind nginx often has no `[server.http]` at all, so a redirect
+// reached only by the HTTP listener would be unreachable in exactly the shape that uses it.
+
+#[test]
+fn a_redirect_route_answers_on_the_fastcgi_path_without_dispatching() {
+    let root = std::env::temp_dir().join(format!("volucer-fcgi-redirect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let text = format!(
+        r#"
+[server]
+default_backend = "unreachable"
+fastcgi = "127.0.0.1:0"
+document_root = {root:?}
+
+[[server.routes]]
+path_prefix = "/old"
+redirect = {{ status = 301, to = "/new{{path}}" }}
+"#,
+        root = root.to_string_lossy(),
+    );
+    let config = Config::from_toml(&text).expect("config parses");
+
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let sites = SharedState::new(Sites::from_config(&config, &root));
+    let registry = Arc::new(Registry::new(sites));
+
+    let listener = FastCgiListener::bind_registered(
+        "127.0.0.1:0",
+        Arc::clone(&dispatcher),
+        Arc::clone(&registry),
+        Limits::default(),
+    )
+    .expect("bind the fastcgi listener");
+    let address = listener.local_addr().expect("bound address");
+    let shutdown = listener.shutdown_handle();
+    let handle = std::thread::spawn(move || listener.run());
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut connection = fastcgi_connection(address);
+
+    // The backend is deliberately unreachable, so a dispatched request would answer 502. A 301 here
+    // therefore proves the redirect was answered before anything was reached — not that the backend
+    // happened to produce a 301.
+    let redirected = request_from(&mut connection, 1, "203.0.113.7", "/old/a?x=1");
+    assert!(
+        redirected.contains("Status: 301"),
+        "the redirect must be answered on this path: {redirected}"
+    );
+    assert!(
+        redirected.contains("Location: /new/old/a?x=1"),
+        "`{{path}}` must carry the request's path and query: {redirected}"
+    );
+    assert!(
+        !redirected.contains("502"),
+        "nothing may be dispatched for a redirect: {redirected}"
+    );
+
+    // The negative control: a path outside the prefix still reaches the (unreachable) backend, which
+    // is what shows the redirect is scoped to its route rather than answering everything.
+    let dispatched = request_from(&mut connection, 2, "203.0.113.7", "/index.php");
+    assert!(
+        dispatched.contains("Status: 502") || dispatched.contains("Status: 200"),
+        "a path outside the redirect's prefix must still be dispatched: {dispatched}"
     );
 
     shutdown.shutdown();

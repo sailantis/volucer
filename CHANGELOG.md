@@ -9,6 +9,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A route can answer with a redirect**, which is how a URL is retired without a PHP script that
+  exists only to send one header. Every SEO migration needs exactly this and every one of them had to
+  be application code.
+
+  ```toml
+  [[server.routes]]
+  path_prefix = "/blog"
+  redirect = { status = 308, to = "/news{path}" }
+  ```
+
+  It is answered **before the static layer**, so it wins over a file that still exists at the old
+  path — the file is what is being retired, so a redirect placed after that layer would serve it and
+  the migration would never take effect. Verified by moving the check and watching the test answer
+  `200` with the retired file's bytes. It is also answered before the body is read, so a redirected
+  `POST` costs nothing.
+
+  **Deliberately not a rewrite engine.** `{path}` — the request's path and query, verbatim — is the
+  only substitution; no regular expressions, no captures. nginx's `rewrite` is the part of its
+  configuration nobody can read, and nothing here needs it. `status` decides what a cache may keep:
+  `301`/`308` are sent `public` because being cached is what permanent means, and `302`/`303`/`307`
+  `no-store` because a cached temporary redirect outlives the condition it described.
+
+  Three misconfigurations are refused at startup, because a client cannot recover from any of them:
+  a `to` that is neither an absolute URL nor a `/` path (a client reads `example.com/x` as a relative
+  path, so it would resolve to `/example.com/x` on this host), a `to` that sends a request back into
+  the route's own prefix, and `redirect` beside `backend` or `policy` — both of which would do
+  nothing, and a line that appears to matter and does not is the shape this configuration refuses
+  everywhere.
+
+  Answered on the FastCGI front end too, which is the path that needed it more: a deployment behind
+  nginx often has no `[server.http]` at all, so a redirect reachable only by the HTTP listener would
+  be unreachable in exactly the shape that uses it.
+
 - **`[server.access]` blocks and admits client addresses, and it is consulted first.** The rate
   limiter could throttle a caller but there was no way to refuse one, and the only lever for "this
   range is not welcome" was a rule in the proxy in front.

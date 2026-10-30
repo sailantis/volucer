@@ -352,6 +352,71 @@ pub fn write_forbidden<W: Write>(writer: &mut W, request_id: u16, message: &str)
     )
 }
 
+/// The reason phrase for a status this server produces from configuration.
+///
+/// Only the statuses a redirect can carry are named, plus the ones `ServerErrorKind` already writes,
+/// because a lookup table for every code would be a table nobody checks and a wrong phrase is
+/// invisible. Anything unknown falls back to RFC 9110's wording for the class, which is what a client
+/// reads when it does not recognise the code anyway.
+pub fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        _ => "Redirect",
+    }
+}
+
+/// A route's redirect.
+///
+/// A `Status:` line and a `Location`, with no body and no `END_REQUEST` failure: the request was
+/// served, and its answer is where to look instead. **The status is passed rather than chosen here**
+/// because `301` and `302` mean different things to a client and to a cache — see
+/// [`volucer_core::config::RedirectConfig::status`] — and a helper that picked one would be a second
+/// place the choice is made.
+///
+/// `Cache-Control` follows the status, not the caller: `301`/`308` are meant to be cached, and a
+/// `302`/`303`/`307` that a cache kept would outlive the condition it described. The same rule the
+/// HTTP path applies, written once on each side rather than shared, because a shared helper would
+/// have to live in a crate neither front-end owns.
+pub fn write_redirect<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    status: u16,
+    location: &str,
+    keep_conn: bool,
+) -> Result<()> {
+    let cache = if matches!(status, 301 | 308) {
+        "public"
+    } else {
+        "no-store"
+    };
+    let body = format!(
+        "Status: {status} {}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Location: {location}\r\nCache-Control: {cache}\r\n\r\n",
+        crate::frontend::fastcgi::reason_phrase(status)
+    );
+    write_assembled(writer, |out| {
+        record::append_records(out, RecordType::Stdout, request_id, body.as_bytes(), true);
+        out.extend_from_slice(
+            &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
+        );
+        out.extend_from_slice(
+            &EndRequest {
+                app_status: 0,
+                // `RequestComplete`: the request was served. Anything else would tell nginx the
+                // gateway failed, and it would then answer a 502 over the redirect.
+                protocol_status: ProtocolStatus::RequestComplete,
+            }
+            .encode(),
+        );
+    })?;
+    let _ = keep_conn;
+    Ok(())
+}
+
 fn write_error_with<W: Write>(
     writer: &mut W,
     request_id: u16,
