@@ -7,6 +7,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`volucer workers restart` reports why a sweep was incomplete instead of assuming it was busy.**
+  The command explained exit `1` with a fixed sentence — *"at least one slot was serving a request"* —
+  which is only one of the three ways the route answers `202`. For the most serious of the other two
+  it was actively misleading: a replacement that **could not boot** was reported as a busy slot, so
+  the operator was told to sweep again for an application that does not start. Found by making a
+  worker exit non-zero during startup and reading what the command said, rather than what it was
+  supposed to say.
+
+  The cause now comes from the report, failure first because it is the one a retry cannot clear:
+
+  ```
+  # was: ... at least one slot was serving a request ...
+  # now: ... 1 slot(s) could not be replaced, so the new code does not run there — check the
+  #          application's startup error in the server's log ...
+  ```
+
+  A mixed report leads with the failure, an unmanaged backend is named as not volucer's to roll, and
+  a report that cannot be read is said to be unknown rather than guessed at. The exit status is
+  unchanged, so a deploy script written against it needs no change — but one that loops unconditionally
+  on `failed` will spin, which `docs/14-DEPLOYING.md` now says out loud.
+
 ### Changed
 
 - **A backend response is moved into the HTTP body instead of copied.** `Response::stdout` already
@@ -27,6 +50,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   actually compressed it, so neither half can pass on its own.
 
 ### Added
+
+- **`docs/14-DEPLOYING.md` documents the rolling deploy end to end.** The operations guide
+  describes the three verbs and what each backend kind does during a sweep, but the deployment
+  question — *what does my deploy script do, and in what order?* — was never answered in one place.
+  The new guide covers the sweep's incomplete-by-design behaviour and the loop a pipeline needs (exit
+  `1` means "accepted, still serving old code, sweep again"), the difference between a roll and a
+  restart, and the ordering when a release changes both code and configuration.
+
+  Every claim in it was verified against the built binary with a real `php` worker: two idle slots
+  replaced with new PIDs and a new boot marker; a sweep issued while two requests were in flight
+  answered `{"replaced":[],"skipped_busy":[0,1],"complete":false}` with exit `1` and **both requests
+  completed**; the next sweep replaced both and reported `complete:true`.
 
 - **A large response is relayed instead of buffered, past `server.stream_threshold_bytes`.** Every
   FastCGI response used to be assembled whole before a client saw a byte: `Client::receive` extended

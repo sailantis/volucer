@@ -724,11 +724,19 @@ enum HealthError {
     },
 
     #[error(
-        "the rolling restart was accepted but is not complete: at least one slot was serving a \
-         request, so it still runs the previous code. Run `volucer workers restart` again to finish \
-         the roll"
+        "the rolling restart was accepted but is not complete: {reason}. Run `volucer workers \
+         restart` again to finish the roll"
     )]
-    Incomplete,
+    Incomplete {
+        /// What the report actually said, rather than an assumed cause.
+        ///
+        /// This used to be a fixed sentence claiming "at least one slot was serving a request",
+        /// which was wrong whenever the incomplete report was a **failed** replacement instead of a
+        /// busy slot. A sweep that could not boot the new code was telling the operator to sweep
+        /// again, which cannot fix it — the same class of defect as `check` accepting a
+        /// configuration `serve` refuses. The cause is now read from the report.
+        reason: String,
+    },
 
     #[error(transparent)]
     Config(Box<volucer_core::Error>),
@@ -868,9 +876,75 @@ fn workers_restart(
     // error's, and it is *not* also logged here: `main` folds an `Err` into one `error!` line, so a
     // `warn!` beside it printed the same instruction twice.
     if status == 202 {
-        return Err(HealthError::Incomplete);
+        return Err(HealthError::Incomplete {
+            reason: why_incomplete(&body),
+        });
     }
     Ok(())
+}
+
+/// Why a sweep answered `202` rather than `200`, in the report's own terms.
+///
+/// Three causes, and telling them apart is the difference between a deploy script that loops and
+/// one that pages somebody: a **busy** slot is an unfinished roll that the next sweep finishes, a
+/// **failed** replacement is an application that does not start and will not start on a retry, and
+/// an **unmanaged** backend is one volucer never owned. The report carries all three, so this reads
+/// them rather than assuming the common case — a fixed sentence here told an operator whose new code
+/// would not boot to "run it again", which is advice that cannot work.
+fn why_incomplete(body: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let count = |key: &str| -> usize {
+        value
+            .get("backends")
+            .and_then(|backends| backends.as_array())
+            .map(|backends| {
+                backends
+                    .iter()
+                    .map(|backend| {
+                        backend
+                            .get(key)
+                            .and_then(|list| list.as_array())
+                            .map_or(0, Vec::len)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+
+    let failed = count("failed");
+    let busy = count("skipped_busy");
+    let unmanaged = value
+        .get("backends")
+        .and_then(|backends| backends.as_array())
+        .map(|backends| {
+            backends
+                .iter()
+                .filter(|backend| {
+                    backend
+                        .get("unmanaged")
+                        .is_some_and(|reason| !reason.is_null())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    match (failed, busy, unmanaged) {
+        // Failure first: it is the one cause a second sweep cannot fix, so it must not be reported
+        // as "busy" and buried under advice to retry.
+        (failed, _, _) if failed > 0 => format!(
+            "{failed} slot(s) could not be replaced, so the new code does not run there — check the \
+             application's startup error in the server's log"
+        ),
+        (_, busy, _) if busy > 0 => format!(
+            "{busy} slot(s) were serving a request and still run the previous code"
+        ),
+        (_, _, unmanaged) if unmanaged > 0 => format!(
+            "{unmanaged} backend(s) are not volucer's to roll; their own supervisor deploys them"
+        ),
+        // A 202 with nothing to report is a shape this does not know. Said plainly rather than
+        // guessed at, because a wrong cause is worse than none.
+        _ => "the report named no busy, failed or unmanaged slot".to_string(),
+    }
 }
 
 /// One backend's share of a sweep, as a line.
@@ -6398,5 +6472,87 @@ document_root = "/from/file"
             describe_sweep(&unmanaged),
             "an unmanaged backend says who owns it, because that is the instruction"
         );
+    }
+
+    /// **An incomplete sweep reports its actual cause, not an assumed one.**
+    ///
+    /// The message used to be a fixed sentence: "at least one slot was serving a request". That is
+    /// only one of the three ways a sweep answers `202`, and for the most serious of them — a
+    /// replacement that would not boot — it told the operator to sweep again, which cannot fix an
+    /// application that does not start. Found by making a worker exit non-zero on boot and reading
+    /// what the command actually said: `failed:[0]` was reported as a busy slot.
+    ///
+    /// Every arm is asserted, because a fix that only special-cased failure would have left the
+    /// unmanaged case claiming a request was in flight.
+    #[test]
+    fn an_incomplete_sweep_names_the_cause_the_report_gives() {
+        let busy = serde_json::json!({
+            "backends": [{
+                "backend": "app", "replaced": [], "skipped_busy": [0, 1],
+                "failed": [], "unmanaged": serde_json::Value::Null,
+            }],
+            "complete": false,
+        });
+        let reason = why_incomplete(&busy.to_string());
+        assert!(
+            reason.contains("serving a request"),
+            "a busy slot is the one cause a second sweep fixes: {reason}"
+        );
+
+        let failed = serde_json::json!({
+            "backends": [{
+                "backend": "app", "replaced": [], "skipped_busy": [],
+                "failed": [0], "unmanaged": serde_json::Value::Null,
+            }],
+            "complete": false,
+        });
+        let reason = why_incomplete(&failed.to_string());
+        assert!(
+            reason.contains("could not be replaced"),
+            "a failed replacement must not be described as busy: {reason}"
+        );
+        assert!(
+            !reason.contains("serving a request"),
+            "the wrong cause is worse than none, because it sends the operator to retry: {reason}"
+        );
+
+        // Both at once: failure wins, because it is the one a retry cannot clear.
+        let both = serde_json::json!({
+            "backends": [{
+                "backend": "app", "replaced": [], "skipped_busy": [2],
+                "failed": [0], "unmanaged": serde_json::Value::Null,
+            }],
+            "complete": false,
+        });
+        let reason = why_incomplete(&both.to_string());
+        assert!(
+            reason.contains("could not be replaced"),
+            "a mixed report leads with the cause a sweep cannot fix: {reason}"
+        );
+
+        let unmanaged = serde_json::json!({
+            "backends": [{
+                "backend": "fpm", "replaced": [], "skipped_busy": [], "failed": [],
+                "unmanaged": { "slots": 4, "reason": "php-fpm owns this pool" },
+            }],
+            "complete": false,
+        });
+        let reason = why_incomplete(&unmanaged.to_string());
+        assert!(
+            reason.contains("not volucer's to roll"),
+            "an unmanaged backend is not a busy one: {reason}"
+        );
+    }
+
+    /// A report this does not understand is said to be unknown rather than guessed at.
+    #[test]
+    fn an_unreadable_sweep_report_does_not_invent_a_cause() {
+        for body in ["", "not json", "{}", r#"{"backends":[]}"#] {
+            let reason = why_incomplete(body);
+            assert!(
+                reason.contains("named no busy, failed or unmanaged slot"),
+                "{body:?} produced {reason:?}"
+            );
+        }
     }
 

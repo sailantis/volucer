@@ -45,6 +45,8 @@ This guide explains how to configure, run, and maintain Volucer.
   metrics and distributed tracing.
 - **[Operations](11-OPERATIONS.md)** — Reloading, running behind nginx, containers,
   systemd and the release process.
+- **[Deploying](14-DEPLOYING.md)** — Shipping application code without dropping a request:
+  the roll, why a sweep may not finish in one pass, and the loop a deploy script needs.
 - **[SDKs and Frameworks](10-SDKS-AND-FRAMEWORKS.md)** — The PHP, Python and Ruby SDKs,
   and the framework integrations built on them.
 - **[Benchmarks](12-BENCHMARKS.md)** — Performance and memory measurements against
