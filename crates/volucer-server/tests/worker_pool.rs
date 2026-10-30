@@ -3003,3 +3003,273 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     drop(dispatcher);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 3a: respawn_idle, the rolling restart of application code.
+// ---------------------------------------------------------------------------------------------
+
+/// A worker that records when it booted, so a replacement is observable as a new pid **and** as a
+/// fresh marker.
+///
+/// The pid alone would be enough for the pool, but a deploy's actual question is "is the code that
+/// is now on disk what is running", and a marker written at boot is the only thing that answers it:
+/// a slot that was left alone runs the same pid and holds the marker it wrote when it started.
+fn booting_worker(tag: &str, marker_dir: &Path, micros: u64) -> PathBuf {
+    std::fs::create_dir_all(marker_dir).expect("create the marker directory");
+    let dir = std::env::temp_dir().join(format!("volucer-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("booting-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    let markers = marker_dir.display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+// Written before `connect()`, so the marker is the *boot* event rather than a response event:
+// a slot that is merely served is not a slot that has loaded new code.
+file_put_contents('{markers}/' . getmypid() . '.boot', (string) getmypid());
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    usleep({micros});
+    return Response::json(['pid' => getmypid()]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+    script
+}
+
+/// A pool of booting workers.
+fn booting_pool(tag: &str, workers: u32, marker_dir: &Path, micros: u64) -> WorkerPool {
+    let script = booting_worker(tag, marker_dir, micros);
+    let config = WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers,
+        memory_limit_mb: None,
+        max_requests: None,
+        working_dir: None,
+        env: Default::default(),
+        checksum: Default::default(),
+        services: Vec::new(),
+        grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
+        transport: Default::default(),
+        socket: None,
+    };
+    WorkerPool::start("roll", &config).expect("pool starts")
+}
+
+/// **A sweep replaces every idle worker, and the pool serves across it.**
+///
+/// The mechanism Phase 3a exists for. Two things are asserted together because either alone would
+/// pass against a broken implementation: every slot's process is new (so new code is in front of
+/// traffic), and a request after the sweep is answered 200 (so the pool is not merely restarted).
+#[test]
+fn a_sweep_replaces_every_idle_worker_and_the_pool_keeps_serving() {
+    let _serial = serial();
+    require_sdk!();
+
+    let markers = std::env::temp_dir().join(format!("volucer-roll-markers-{}", std::process::id()));
+    let pool = booting_pool("roll-all", 3, &markers, 0);
+    let before = pool.pids();
+    assert_eq!(before.len(), 3);
+
+    let report = pool.respawn_idle();
+    assert_eq!(report.backend, "roll");
+    assert_eq!(
+        report.replaced,
+        vec![0, 1, 2],
+        "an idle pool sweeps every slot: {report:?}"
+    );
+    assert!(report.skipped_busy.is_empty(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(report.is_complete(), "{report:?}");
+
+    let after = pool.pids();
+    assert_eq!(after.len(), 3, "the pool kept its size");
+    for (old, new) in before.iter().zip(after.iter()) {
+        assert_ne!(
+            old, new,
+            "slot for slot, every worker is a new process: {before:?} -> {after:?}"
+        );
+    }
+
+    // The replacement is a *working* worker, not merely a new pid.
+    let response = pool
+        .request(&get("/"))
+        .expect("the pool serves after a sweep");
+    assert_eq!(response.parse_status_headers().0, 200);
+    assert_eq!(pool.free_slots(), 3, "no slot was lost to the sweep");
+
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&markers);
+}
+
+/// **A busy slot is skipped and reported, not replaced.**
+///
+/// The correctness half of the trade, and the reason `respawn_idle` is not just "restart everything":
+/// replacing a slot mid-request truncates a live response. The test holds one slot with a slow
+/// request and asserts that the request is answered *and* that the slot's pid is unchanged, while
+/// the other slot was swept.
+#[test]
+fn a_sweep_leaves_a_busy_slot_alone_and_says_so() {
+    let _serial = serial();
+    require_sdk!();
+
+    let markers = std::env::temp_dir().join(format!("volucer-busy-markers-{}", std::process::id()));
+    let pool = booting_pool("roll-busy", 2, &markers, 900_000);
+    let before = pool.pids();
+
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(|| {
+            pool.request(&get("/"))
+                .expect("the in-flight request is answered")
+                .parse_status_headers()
+                .0
+        });
+
+        // Wait until one slot is genuinely taken, so this cannot pass by winning a race.
+        let mut waited = Duration::ZERO;
+        while pool.free_slots() != 1 && waited < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+            waited += Duration::from_millis(5);
+        }
+        assert_eq!(pool.free_slots(), 1, "exactly one slot is held");
+
+        let report = pool.respawn_idle();
+        assert_eq!(
+            report.replaced.len(),
+            1,
+            "the free slot was swept: {report:?}"
+        );
+        assert_eq!(
+            report.skipped_busy.len(),
+            1,
+            "the held slot was skipped and reported rather than ignored: {report:?}"
+        );
+        assert!(
+            !report.is_complete(),
+            "a sweep that left a slot behind is not a finished deploy: {report:?}"
+        );
+        let busy = report.skipped_busy[0];
+        assert_eq!(
+            pool.pids()[busy],
+            before[busy],
+            "the busy slot's process must be the one that was serving, or its response is truncated"
+        );
+
+        assert_eq!(holder.join().expect("no thread panics"), 200);
+    });
+
+    assert_eq!(pool.free_slots(), 2, "the held slot came back");
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&markers);
+}
+
+/// A second sweep finishes a roll the first one could not.
+///
+/// The operational contract, stated as a test because it is the thing a deploy script depends on:
+/// `is_complete() == false` is not a failure, it is an instruction to sweep again. Without this a
+/// busy slot would be left on the old code for ever.
+#[test]
+fn a_second_sweep_finishes_what_the_first_left_behind() {
+    let _serial = serial();
+    require_sdk!();
+
+    let markers = std::env::temp_dir().join(format!("volucer-twice-markers-{}", std::process::id()));
+    let pool = booting_pool("roll-twice", 2, &markers, 900_000);
+    let before = pool.pids();
+
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(|| pool.request(&get("/")).map(|_| ()));
+        let mut waited = Duration::ZERO;
+        while pool.free_slots() != 1 && waited < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+            waited += Duration::from_millis(5);
+        }
+        let first = pool.respawn_idle();
+        assert_eq!(first.replaced.len(), 1, "{first:?}");
+        assert_eq!(first.skipped_busy.len(), 1, "{first:?}");
+        holder.join().expect("no thread panics").expect("served");
+    });
+
+    assert_eq!(pool.free_slots(), 2, "the held slot came back");
+    let second = pool.respawn_idle();
+    assert_eq!(
+        second.replaced.len(),
+        2,
+        "the second sweep covers the slot the first one skipped: {second:?}"
+    );
+    assert!(second.is_complete(), "{second:?}");
+    assert_ne!(
+        pool.pids(),
+        before,
+        "both slots now run a process booted by a sweep"
+    );
+
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&markers);
+}
+
+/// **An `attach` pool reports itself unmanaged instead of pretending.**
+///
+/// Volucer dialled that relay; the processes belong to somebody's supervisor. Replacing a connection
+/// would look, from the far side, like a worker dying — so the honest answer is a refusal with the
+/// reason, and `is_complete()` must be false so a deploy script does not read it as done.
+#[test]
+fn an_attached_pool_reports_that_it_cannot_be_swept() {
+    use volucer_core::config::AttachConfig;
+
+    // Nothing is listening on this path, and nothing has to be: the pool is asked what it *can* do,
+    // and `start_attached` dials per slot — so a pool of zero connections is the way to ask without
+    // a relay. `workers: 0` is refused by validation, which is why the count is one and the connect
+    // failure is tolerated: the report is about ownership, not about liveness.
+    let config = AttachConfig {
+        relay: Some("unix:/nonexistent/volucer-roll-test.sock".to_string()),
+        workers: 1,
+        max_requests: None,
+        services: Vec::new(),
+        checksum: Default::default(),
+        grpc_services: Vec::new(),
+        grpc_serve_any: false,
+        grpc_proto: Vec::new(),
+        grpc_proto_services: Vec::new(),
+    };
+    let pool = match WorkerPool::start_attached("attached", &config, None) {
+        Ok(pool) => pool,
+        // A pool cannot be built without its relay; the assertion below is unreachable then, and
+        // saying so is better than a test that silently asserts nothing.
+        Err(err) => {
+            eprintln!("skipping: the attach pool could not be built ({err})");
+            return;
+        }
+    };
+
+    let report = pool.respawn_idle();
+    assert_eq!(report.backend, "attached");
+    assert!(
+        report.replaced.is_empty(),
+        "volucer must not replace processes it did not start: {report:?}"
+    );
+    let unmanaged = report
+        .unmanaged
+        .as_ref()
+        .expect("an attached pool says who owns its processes");
+    assert_eq!(unmanaged.slots, 1, "{report:?}");
+    assert!(
+        unmanaged.reason.contains("attach"),
+        "the reason names the shape, so an operator knows why: {report:?}"
+    );
+    assert!(
+        !report.is_complete(),
+        "a pool nothing was replaced in must not read as a finished deploy: {report:?}"
+    );
+    assert!(report.is_noop());
+}

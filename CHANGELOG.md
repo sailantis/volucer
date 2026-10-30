@@ -162,6 +162,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`SIGHUP` no longer appears to deploy application code, because it never did — `SIGUSR2` does
+  now.** The two were conflated by omission: `SIGHUP` re-reads the configuration and swaps the site,
+  certificate, rate-limit and gRPC-grant tables, and leaves every PHP process exactly as it was. A
+  persistent worker keeps the code it loaded when it booted, which is the point of a persistent
+  worker, so deploying new PHP required a **full process restart** — the one path that dropped
+  requests. There was no rolling-restart primitive anywhere in the tree.
+
+  Three triggers now reach one implementation, so they cannot disagree about what an idle slot is:
+
+  | Trigger | How |
+  | --- | --- |
+  | `SIGUSR2` | the default; `systemctl kill -s SIGUSR2 volucer` |
+  | `volucer workers restart` | a client of the `[status]` route, so it works where signals do not (Windows, a container with no shell) |
+  | `POST /workers/restart` | a new `workers.restart` grant, alongside `workers.list` and `workers.reset` |
+
+  `workers.restart` is **not** an alias for `workers.reset`. A reset names one worker and either
+  replaces it or is refused with `409`; a restart sweeps every slot and replaces the ones that are
+  not serving a request. It answers `200` when the sweep finished and **`202` when it left a busy
+  slot for the next pass** — a rolling restart is explicitly allowed to be incomplete, because
+  replacing a slot mid-request truncates a live response. `volucer workers restart` exits non-zero
+  on `202` for the same reason, so a pipeline loops instead of stopping one sweep short of deploying.
+
+  Two backend kinds are reported as *unmanaged* rather than counted as success, with the reason
+  naming who owns them: an `attach` pool's processes belong to somebody else's supervisor, and an
+  `external` (`php-fpm`) pool's belong to php-fpm. An `upstream` origin is restarted if volucer
+  supervises it, and that is the one arm that cannot avoid losing in-flight requests: an HTTP origin
+  serves many at once and has no idle state.
+
+  The idleness test is conservative by construction. A worker slot is *known* idle when it is on the
+  pool's free list — the same condition the request path uses — and it is **reserved** from that list
+  before being replaced, so a request cannot arrive between the check and the kill and be served by a
+  worker that is being torn down. A `spawn_cgi` slot is idle when its permit count is zero and its
+  lock is uncontended, because with `children > 0` one address serves several requests at once and
+  the lock alone would not say so. Correctness over completeness: a slot that merely *might* be busy
+  is skipped and reported as `skipped_busy`.
+
+  **`SIGUSR1` is now registered in order to be ignored, and not registering it was a crash.** It
+  means "reopen the log" in nginx, so a `logrotate` script written for nginx sends it — and an
+  unregistered signal keeps its default disposition, which for `SIGUSR1` is to terminate the
+  process. Measured against the build that only *logged* a warning arm for it: `kill -USR1` on a
+  running server exited with code 10 and wrote nothing to the log. Registering the signal turns that
+  into a warning that names the signal the operator probably meant.
+
+  **A `spawn_cgi` pool and a supervised `upstream` origin are swept too, and the route exists for
+  them.** The worker-control surface was gated on holding a `WorkerPool`, so `POST /workers/restart`
+  answered `405` on exactly the deployments whose code it is able to roll — found by running it
+  against an `upstream` deployment. A sweep now goes through the dispatcher, which reaches every
+  backend kind; the list and the reset still need a pool, and are still `404` without one.
+
 - **A single backend no longer needs `default_backend`.** With exactly one backend there is nothing
   to choose, so the key may be omitted and that backend receives every request that matches no
   route:

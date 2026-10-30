@@ -167,17 +167,19 @@ Worker-control routes are absent by default. To expose them, name the methods un
 listen = "127.0.0.1:2114"
 
 [status.workers]
-allow = ["workers.list", "workers.reset"]
+allow = ["workers.list", "workers.reset", "workers.restart"]
 ```
 
 ```sh
 curl -sf http://127.0.0.1:2114/workers | jq        # the list
 curl -sf -XPOST http://127.0.0.1:2114/workers/3/reset
+curl -sf -XPOST http://127.0.0.1:2114/workers/restart   # roll application code
 ```
 
 **`allow` is a grant of methods, not a switch.** `allow = ["workers.list"]` publishes the list and
 answers `404` to a reset, so an operator or a dashboard can see a pool without the file arming a
-`POST`. Adding `"workers.reset"` is what makes the recycle exist.
+`POST`. Adding `"workers.reset"` is what makes the recycle exist, and `"workers.restart"` the
+rolling deploy.
 
 `GET /workers` returns JSON describing workers across all pools. The `index` is the
 process-wide worker index used by the reset route; `slot` is the worker's index within its
@@ -187,6 +189,12 @@ Reset responses use HTTP status codes: `404` means the index does not exist, `40
 the worker is currently serving a request, and `500` means the replacement worker failed
 to start. A busy worker can be reset after it becomes idle. Worker replacement runs via
 `spawn_blocking`, so a slow startup does not block the status listener.
+
+`POST /workers/restart` replaces every worker that is not serving a request and returns the
+per-backend report. It answers **`200` when the sweep finished and `202` when it left a busy slot
+for the next pass** — a rolling restart is explicitly allowed to be incomplete, because replacing
+a slot mid-request would truncate that request. Run it again (or let the next deploy) to finish the
+roll. `SIGUSR2` and `volucer workers restart` reach the same sweep.
 
 These routes do not provide authentication. Keep the listener on loopback or a private
 interface and restrict access through your network configuration. Volucer refuses

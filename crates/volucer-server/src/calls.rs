@@ -2909,6 +2909,21 @@ pub trait PoolLookup: Send + Sync {
     /// the reason survives as a type. `curl -f` has to fail on "no such worker" without the caller
     /// parsing a document to find out, and a `String` would force exactly that.
     fn restart(&self, index: usize) -> std::result::Result<(), ResetRefusal>;
+
+    /// Replace every application process that is not serving a request.
+    ///
+    /// The rolling restart, reachable from the same three places `restart` is — but unlike
+    /// `restart` it is **not** about one worker: it is how a deployment puts new code in front of
+    /// the same addresses without a second process or a dropped request.
+    ///
+    /// A default implementation that reports nothing rather than a required method, because the
+    /// trait has a second implementor: `volucer-http`'s status listener holds a
+    /// `Box<dyn PoolLookup>`-shaped handle and a test there supplies a recorder with no pools at
+    /// all. Making this required would force every such fixture to answer a question it has no
+    /// pools for, and the honest answer for "no pools" is an empty list.
+    fn respawn_idle(&self) -> Vec<crate::respawn::RespawnReport> {
+        Vec::new()
+    }
 }
 
 /// Why a `workers.reset` did not happen.
@@ -3049,8 +3064,22 @@ impl Namespace for WorkersNamespace {
                     Err(reason) => Return::refused(reason.to_string()),
                 }
             }
-            other => Return::refused(format!("the workers namespace does not serve {other}")),
-        }
+            // The rolling restart, as a call so that a worker can deploy its siblings and a
+            // `[rpc]` client can deploy a deployment. The report is returned whole rather than as a
+            // count, because "two of eight replaced" is what tells an operator to sweep again.
+            "workers.restart" => {
+                let reports = self.pools.respawn_idle();
+                match serde_json::to_value(&reports) {
+                    Ok(value) => Return::ok(serde_json::json!({
+                        "complete": reports.iter().all(crate::respawn::RespawnReport::is_complete),
+                        "backends": value,
+                    })),
+                    Err(err) => Return::refused(format!(
+                        "the rolling restart happened, but its report could not be encoded: {err}"
+                    )),
+                }
+            }
+            other => Return::refused(format!("the workers namespace does not serve {other}")),        }
     }
 }
 
@@ -3064,6 +3093,7 @@ mod worker_reset_tests {
     struct Recording {
         restarts: AtomicUsize,
         last_index: AtomicUsize,
+        sweeps: AtomicUsize,
     }
 
     impl Recording {
@@ -3071,6 +3101,7 @@ mod worker_reset_tests {
             Recording {
                 restarts: AtomicUsize::new(0),
                 last_index: AtomicUsize::new(usize::MAX),
+                sweeps: AtomicUsize::new(0),
             }
         }
     }
@@ -3084,6 +3115,15 @@ mod worker_reset_tests {
             self.restarts.fetch_add(1, Ordering::Relaxed);
             self.last_index.store(index, Ordering::Relaxed);
             Ok(())
+        }
+
+        fn respawn_idle(&self) -> Vec<crate::respawn::RespawnReport> {
+            self.sweeps.fetch_add(1, Ordering::Relaxed);
+            vec![crate::respawn::RespawnReport {
+                backend: "app".to_string(),
+                replaced: vec![0, 1],
+                ..crate::respawn::RespawnReport::default()
+            }]
         }
     }
 
@@ -3164,5 +3204,37 @@ mod worker_reset_tests {
         assert!(registry.serve(&reset_call("workers.list", 0)).ok);
         assert!(registry.serve(&reset_call("workers.reset", 0)).ok);
         assert_eq!(pools.restarts.load(Ordering::Relaxed), 1);
+    }
+
+    /// **`workers.restart` reaches the pool as a sweep, not as a reset.**
+    ///
+    /// The three methods of the namespace are one grant surface, so a call plane that learned the
+    /// rolling form has to route it to the sweep — otherwise a worker asking to deploy its siblings
+    /// would kill one worker and report success. Asserted through a registry, for the same reason the
+    /// reset test is: the routing is on the text before the first dot, and only the registry sees it.
+    #[test]
+    fn a_sweep_reaches_the_pool_through_the_registry_and_is_not_a_reset() {
+        let pools = Arc::new(Recording::new());
+        let registry = MethodRegistry::new().with(WorkersNamespace::new(
+            Arc::clone(&pools) as Arc<dyn PoolLookup>
+        ));
+
+        let answer = registry.serve(&reset_call("workers.restart", 0));
+        assert!(answer.ok, "the sweep was served: {answer:?}");
+        assert_eq!(
+            pools.sweeps.load(Ordering::Relaxed),
+            1,
+            "the call reached the sweep rather than a refusal"
+        );
+        assert_eq!(
+            pools.restarts.load(Ordering::Relaxed),
+            0,
+            "and it did not recycle a single worker instead: a sweep is not a reset"
+        );
+        // The answer is the report, because "two of eight replaced" is what tells an operator to
+        // sweep again — a bare `ok` would be the answer that hides a partial roll.
+        let result = answer.result.clone().expect("a sweep answers with its report");
+        assert_eq!(result["complete"], true, "{answer:?}");
+        assert_eq!(result["backends"][0]["backend"], "app", "{answer:?}");
     }
 }

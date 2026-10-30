@@ -655,6 +655,18 @@ impl PoolLookup for PoolDirectory {
             }),
         }
     }
+
+    /// Every live pool, swept in configuration order.
+    ///
+    /// Deliberately *not* a `Dispatcher` walk: the directory is what both the call plane and the
+    /// status listener reach, and a sweep that went through the dispatcher would be a second path
+    /// to the same pools that could enumerate them differently. A pool whose strong handle has gone
+    /// is skipped for the same reason [`PoolDirectory::visit`] skips it — the upgrade failing is the
+    /// moment the pools are being torn down, and resurrecting one to sweep it would be a restart of
+    /// a process that is already exiting.
+    fn respawn_idle(&self) -> Vec<crate::respawn::RespawnReport> {
+        self.visit(|_, pool| pool.respawn_idle())
+    }
 }
 
 impl Dispatcher {
@@ -876,6 +888,39 @@ impl Dispatcher {
             Backend::Worker { .. } => Some(Arc::clone(&self.directory)),
             _ => None,
         })
+    }
+
+    /// Replace the application processes behind every backend, where that can be done without
+    /// dropping a request.
+    ///
+    /// The one rolling restart, for all three of its triggers — `SIGUSR2`, the `workers.restart`
+    /// call and `volucer workers restart` — so that they cannot disagree about what a sweep is.
+    /// Per backend the answers differ and are documented on [`Backend::respawn_idle`]; across
+    /// backends the sweep is sequential and each backend's report is returned, so an operator
+    /// reading the log can tell which part of the deployment rolled.
+    ///
+    /// **`&self`, and not a stop-then-start**: the whole point is that the dispatcher and the
+    /// listeners keep running, so the front-ends never see the pools change shape.
+    pub fn respawn_idle(&self) -> Vec<crate::respawn::RespawnReport> {
+        let reports: Vec<_> = self
+            .backends
+            .values()
+            .map(Backend::respawn_idle)
+            .collect();
+        for report in &reports {
+            if report.is_noop() {
+                continue;
+            }
+            tracing::info!(
+                backend = %report.backend,
+                replaced = report.replaced.len(),
+                skipped_busy = report.skipped_busy.len(),
+                failed = report.failed.len(),
+                "rolling restart: {}",
+                report.summary()
+            );
+        }
+        reports
     }
 
     /// The queues this deployment built, if it has a `[jobs]` table.

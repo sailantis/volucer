@@ -185,7 +185,7 @@ fn an_empty_worker_grant_is_refused() {
     assert!(err.to_string().contains("empty `allow`"), "{err}");
 }
 
-/// A name that is not one of the listener's two routes is refused, and the message lists them.
+/// A name that is not one of the listener's routes is refused, and the message lists them.
 #[test]
 fn an_unknown_worker_method_is_refused() {
     let text = "[server]\nhttp = \"127.0.0.1:8080\"\n[status]\nlisten = \"127.0.0.1:2114\"\n\
@@ -195,9 +195,42 @@ fn an_unknown_worker_method_is_refused() {
     let message = err.to_string();
     assert!(message.contains("workers.nuke"), "{message}");
     assert!(
-        message.contains("workers.list") && message.contains("workers.reset"),
-        "the refusal has to say what the two routes are: {message}"
+        message.contains("workers.list")
+            && message.contains("workers.reset")
+            && message.contains("workers.restart"),
+        "the refusal has to say what the three routes are: {message}"
     );
+}
+
+/// **The rolling restart is a granted route, and a wildcard address refuses it like a reset.**
+///
+/// The sweep does not kill a process out from under a request, so it reads as gentler than a reset —
+/// but it *does* replace every worker, which is a way to make a deployment run whatever code is on
+/// disk. The protection is therefore the same, and asserting it here is what keeps the two from
+/// drifting apart: an operator who grants a sweep on `0.0.0.0` has handed anyone who can reach the
+/// port a deploy button.
+#[test]
+fn a_wildcard_status_address_cannot_carry_the_rolling_restart() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[status]
+listen = "0.0.0.0:2114"
+
+[status.workers]
+allow = ["workers.list", "workers.restart"]
+"#;
+    let config = Config::from_toml(text).expect("config parses");
+    let err = config.validate().expect_err("must be refused");
+    assert!(err.to_string().contains("workers.restart"), "{err}");
+
+    // And on a specific address it is legal, because that is the deployment shape it exists for: a
+    // deploy step that reaches the status port over the orchestrator's network.
+    let text = text.replace("0.0.0.0:2114", "127.0.0.1:2114");
+    let config = Config::from_toml(&text).expect("config parses");
+    config
+        .validate()
+        .expect("a sweep on a loopback status listener is legal");
 }
 
 /// The exposition may not take a path the listener already serves.
@@ -306,6 +339,11 @@ allow = ["workers.list", "workers.reset"]
     // list on a wildcard bind are a deployment somebody chose, and refusing them would be refusing
     // the wrong thing — the list is a fact about this process, not a lever on it.
     let text = text.replace(r#", "workers.reset""#, "");
+    assert!(
+        !text.contains("\"workers.reset\""),
+        "the replacement must actually remove the name, or the assertion below is about the \
+         original text"
+    );
     let config = Config::from_toml(&text).expect("config parses");
     config
         .validate()

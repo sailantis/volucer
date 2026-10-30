@@ -3,10 +3,31 @@
 This guide covers configuration reloads, reverse-proxy deployments, systemd, containers,
 and release operations.
 
-## Reloading
+## Reloading, deploying, and stopping
 
-On Unix, send `SIGHUP` to reload and apply the configuration file. Windows has no
-`SIGHUP` equivalent, so restart the server there.
+Three distinct operations, three distinct verbs. They are separated because they mean
+different things and a deployment that conflates them either does not deploy or drops requests.
+
+| Verb                    | Signal                | What it does                                                     | Drops a request? |
+| ----------------------- | --------------------- | ---------------------------------------------------------------- | ---------------- |
+| Reload configuration    | `SIGHUP`              | Re-reads the file and applies the reloadable settings            | No               |
+| Roll application code   | `SIGUSR2`             | Replaces the worker processes, keeping every address             | No               |
+| Stop                    | `SIGTERM` / `SIGINT`  | Stops accepting, finishes in-flight requests, then exits         | No               |
+
+`SIGUSR1` is deliberately ignored with a warning. It means "reopen the log" in nginx, so a
+`logrotate` script written for nginx sends it; volucer reopens its access log on `SIGHUP` instead.
+Ignoring it explicitly is not cosmetic — an unregistered signal keeps its default action, which for
+`SIGUSR1` is to terminate the process.
+
+**`SIGHUP` does not deploy application code.** It swaps configuration tables — sites,
+certificates, the rate limit, gRPC grants, which worker-control routes exist — and it leaves
+every PHP process exactly as it was. A `worker` or `spawn_cgi` slot keeps the code it loaded
+when it booted, which is the whole point of a persistent worker. Deploying new PHP means
+replacing those processes, and that is `SIGUSR2`.
+
+### Reloading configuration
+
+On Unix, send `SIGHUP`. Windows has no `SIGHUP` equivalent, so restart the server there.
 
 ```sh
 kill -HUP $(pidof volucer)      # or: systemctl reload volucer
@@ -16,7 +37,72 @@ Reloadable configuration is replaced as a single snapshot. New requests use the 
 configuration; in-flight requests continue with the snapshot they started with. HTTP and
 FastCGI front ends share the same site configuration, so a reload applies to both.
 
-`SIGHUP` reloads configuration. `SIGTERM` stops the server.
+### Rolling application code
+
+`SIGUSR2` replaces the application processes with whatever is now on disk, **without
+closing a listener and without dropping a request**:
+
+```sh
+kill -USR2 $(pidof volucer)
+```
+
+It sweeps every slot and replaces the ones that are **not serving a request**. A slot that is
+mid-request is left alone and reported, so:
+
+> **A sweep may not finish the roll in one pass.** Each sweep replaces the idle slots; the
+> busy ones are left for the next one. For a deployment under continuous load, run the sweep
+> again until it reports that nothing was skipped — or accept that the roll completes on the
+> next idle moment, which for a busy slot means the next deploy.
+
+Three triggers, one implementation. Every one of them runs the same sweep, so they cannot
+disagree about what an idle slot is:
+
+```sh
+# 1. The signal, for a systemd unit or a supervisor.
+kill -USR2 $(pidof volucer)
+
+# 2. The command, which calls the [status] route. The deployment must grant it:
+#      [status.workers] allow = ["workers.restart"]
+volucer workers restart --config /etc/volucer/volucer.toml
+
+# 3. The route directly, for a CI step or a supervisor that cannot send signals.
+curl -f -XPOST http://127.0.0.1:2114/workers/restart
+```
+
+`volucer workers restart` exits **non-zero when the sweep was accepted but is incomplete**, so
+a pipeline can loop on it; `--json` prints the per-backend report, which names the slots that
+were replaced, skipped as busy, or failed.
+
+What each backend kind does:
+
+| Backend               | A sweep…                                                                     |
+| --------------------- | ---------------------------------------------------------------------------- |
+| `worker`              | replaces each idle slot's process, in place                                  |
+| `spawn_cgi`           | replaces each idle slot's process **on its own address**                      |
+| `attach`              | does nothing — the supervisor that started those processes owns them          |
+| `external` (php-fpm)  | does nothing — reload php-fpm instead (`SIGHUP`/`USR2` to its own master)     |
+| `upstream`            | restarts the origin **if** volucer supervises it; in-flight requests are lost |
+
+The `attach` and `external` rows are reported as *unmanaged*, with the reason, rather than
+counted as success. An `upstream` origin is the one kind that cannot be rolled without losing
+requests: it serves many at once and has no idle state, so the restart is announced and the
+origin's readiness gate is waited out before the sweep reports success.
+
+### Stopping
+
+On `SIGTERM` (or Ctrl-C), Volucer stops accepting connections immediately, then lets the
+requests that are already in flight finish, up to `[server] shutdown_timeout_ms` (default
+30 s). Requests still running when that expires are abandoned and the count is logged at
+`warn`, so a truncated request can be traced to a deadline rather than to the application.
+
+Give your supervisor a longer grace period than that deadline, or it will `SIGKILL` mid-drain
+and produce exactly the truncation the drain exists to avoid:
+
+| Supervisor | Setting to check                                             |
+| ---------- | ------------------------------------------------------------ |
+| systemd    | `TimeoutStopSec` and `KillSignal=SIGTERM`                     |
+| Docker     | `docker stop -t <seconds>`, or `stop_grace_period` in Compose |
+| Kubernetes | `terminationGracePeriodSeconds`                               |
 
 ### What a reload changes
 
@@ -204,7 +290,6 @@ TimeoutStopSec=30
 
 Restart=on-failure
 RestartSec=1
-
 User=volucer
 Group=volucer
 StateDirectory=volucer
@@ -222,6 +307,20 @@ WantedBy=multi-user.target
 
 `ExecReload` sends `SIGHUP` to reload configuration. If the new configuration is invalid,
 the server continues using the previous one.
+
+**It does not deploy application code.** To put new PHP in front of the same addresses, send
+`SIGUSR2` — there is no `ExecReload=` verb for it because `systemd` maps a unit's reload to one
+signal, and the two operations are different:
+
+```sh
+# Roll the workers with the code that is now on disk. Keeps both listeners open and
+# replaces only the slots that are idle, so no request is dropped.
+systemctl kill -s SIGUSR2 volucer
+```
+
+A deploy therefore looks like: copy the new code into place, `systemctl kill -s SIGUSR2 volucer`,
+then (only if the configuration also changed) `systemctl reload volucer`. Reversing the order
+would deploy the old code under the new configuration.
 
 You can also provide configuration through command-line arguments instead of a
 configuration file:

@@ -245,7 +245,7 @@ impl Config {
                             .to_string(),
                     ));
                 }
-                let mut mutating = false;
+                let mut mutating: Option<&str> = None;
                 for method in &workers.allow {
                     // Checked against the same catalogue a backend's `services` is, so the two
                     // surfaces cannot drift about what a method is called — and so a method the call
@@ -257,29 +257,34 @@ impl Config {
                             if namespace == "workers"
                                 && Method::verbs_of("workers").contains(&verb.as_str()) =>
                         {
-                            if verb == "reset" {
-                                mutating = true;
+                            // The name is kept, not just a flag, because the refusal below has to
+                            // say *which* route it is about. It used to say `workers.reset`
+                            // unconditionally, which was true while that was the only mutation and
+                            // became a misleading message the moment a second one existed.
+                            if verb != "list" && mutating.is_none() {
+                                mutating = Some(method.as_str());
                             }
                         }
                         _ => {
                             return Err(Error::Config(format!(
                                 "status.workers.allow contains {method:?}, which is not a route this \
-                                 listener serves; the two are \"workers.list\" (GET /workers) and \
-                                 \"workers.reset\" (POST /workers/{{index}}/reset)"
+                                 listener serves; they are \"workers.list\" (GET /workers), \
+                                 \"workers.reset\" (POST /workers/{{index}}/reset) and \
+                                 \"workers.restart\" (POST /workers/restart)"
                             )));
                         }
                     }
                 }
-                // The mutation routes recycle a worker, so they are worth a refusal rather than a
-                // warning on the one address that makes them reachable from anywhere. A loopback
-                // address is not proof of safety — a container's loopback is the container's — but a
-                // wildcard bind is proof of the opposite, and an operator who wrote one while
-                // granting a reset has almost certainly not meant to. The hint names the fix rather
-                // than restating the rule.
+                // The mutation routes replace worker processes, so they are worth a refusal rather
+                // than a warning on the one address that makes them reachable from anywhere. A
+                // loopback address is not proof of safety — a container's loopback is the
+                // container's — but a wildcard bind is proof of the opposite, and an operator who
+                // wrote one while granting a mutation has almost certainly not meant to. The hint
+                // names the fix rather than restating the rule.
                 //
                 // The *list* route alone is legal anywhere: what it publishes is a fact about this
                 // process, and it is already reachable by whoever can reach a status port.
-                if mutating {
+                if let Some(granted) = mutating {
                     let broad = match parse_listener(&status.listen)
                         .map_err(|e| Error::Config(format!("status.listen: {e}")))?
                     {
@@ -288,10 +293,10 @@ impl Config {
                     };
                     if broad {
                         return Err(Error::Config(format!(
-                            "status.workers.allow names \"workers.reset\" and status.listen is {}, \
-                             which binds every interface; POST /workers/{{index}}/reset recycles a \
-                             worker and has no authentication, so give [status] a loopback or \
-                             private address and reach it through the orchestrator's own network",
+                            "status.workers.allow names {granted:?} and status.listen is {}, which \
+                             binds every interface; the worker-control routes replace processes and \
+                             have no authentication, so give [status] a loopback or private address \
+                             and reach it through the orchestrator's own network",
                             status.listen
                         )));
                     }

@@ -284,8 +284,67 @@ enum Command {
         timeout_ms: u64,
     },
 
+    /// Replace the processes that run your application's code, without dropping a request.
+    ///
+    /// See `volucer workers restart --help`.
+    Workers {
+        #[command(subcommand)]
+        action: WorkersAction,
+    },
+
     /// Print the version, the PHP floor, and the protocols this build speaks.
     Version,
+}
+
+/// What `volucer workers` can be asked to do.
+///
+/// A nested subcommand rather than a flat `workers-restart`, because the namespace is a noun that
+/// will gain verbs — `list` is the obvious next one — and a flat spelling would have to invent a
+/// new hyphenated name for each.
+#[derive(Subcommand, Debug)]
+enum WorkersAction {
+    /// Replace every worker that is not serving a request.
+    ///
+    /// The rolling deploy: new PHP reaches the same addresses, the listener never closes, and a
+    /// worker that *is* serving is left alone and reported. That makes this able to exit
+    /// successfully having replaced only part of the pool — **sweep again to finish the roll**.
+    ///
+    /// This is not a configuration reload (that is `SIGHUP`) and not a restart of the server.
+    /// Backends, their commands and their worker counts are unchanged: only the processes are new.
+    ///
+    /// Calls the `[status]` route rather than doing the sweep itself, so a worker's own
+    /// `workers.restart` call, a `SIGUSR2` and this command are one code path with one idea of what
+    /// an idle slot is. That route must be granted: `[status.workers] allow = ["workers.restart"]`.
+    Restart {
+        /// The URL of the status listener, e.g. `http://127.0.0.1:2114`.
+        ///
+        /// The base address; `/workers/restart` is appended. Wins over `--config`, and over
+        /// `VOLUCER_STATUS_URL`.
+        #[arg(long, conflicts_with = "config")]
+        url: Option<String>,
+
+        /// Take the address from this configuration file's `[status] listen`.
+        ///
+        /// Defaults to `VOLUCER_STATUS_CONFIG`, and then to `volucer.toml` beside the working
+        /// directory — the same resolution `health` uses, so one file answers both.
+        #[arg(long, conflicts_with = "url")]
+        config: Option<PathBuf>,
+
+        /// Write the sweep's report to stdout instead of only its one-line summary.
+        ///
+        /// The report is the JSON the route answered with: per backend, which slots were replaced,
+        /// which were busy, and which failed. A deploy script wants `complete` from it; a person
+        /// wants the summary.
+        #[arg(long)]
+        json: bool,
+
+        /// How long to wait for the sweep, in milliseconds.
+        ///
+        /// Longer than `health`'s default by design: one sweep may boot every worker in every pool,
+        /// and each boot waits for the application's own handshake.
+        #[arg(long, default_value_t = 120_000)]
+        timeout_ms: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -361,6 +420,18 @@ fn main() -> ExitCode {
                 reason: err.to_string(),
             }
         }),
+        Command::Workers { action } => match action {
+            WorkersAction::Restart {
+                url,
+                config,
+                json,
+                timeout_ms,
+            } => workers_restart(url.as_deref(), config.as_deref(), json, timeout_ms).map_err(
+                |err| ServerError::Probe {
+                    reason: err.to_string(),
+                },
+            ),
+        },
         Command::Version => {
             version();
             Ok(())
@@ -628,6 +699,24 @@ enum HealthError {
     #[error("{address} answered something that is not HTTP/1.x: {head}")]
     NotHttpResponse { address: String, head: String },
 
+    #[error(
+        "{address} answered {status}: {body}\n  \
+         a 404 here means the deployment has not granted the route — \
+         [status.workers] allow = [\"workers.restart\"] — or has no worker pool at all"
+    )]
+    SweepRefused {
+        address: String,
+        status: u16,
+        body: String,
+    },
+
+    #[error(
+        "the rolling restart was accepted but is not complete: at least one slot was serving a \
+         request, so it still runs the previous code. Run `volucer workers restart` again to finish \
+         the roll"
+    )]
+    Incomplete,
+
     #[error(transparent)]
     Config(Box<volucer_core::Error>),
 }
@@ -689,8 +778,130 @@ fn probe_url_for(config: &Path, path: &str) -> Result<String, HealthError> {
     Ok(format!("http://{}{path}", probe_host(&address)))
 }
 
-/// The address to probe a listener on, from the address it binds.
+/// `workers restart` rolls application code by asking a running server to do it.
 ///
+/// **A client of the `[status]` route, not a second implementation of the sweep.** The route is where
+/// the pools are; a CLI that reimplemented the sweep would either have to start a second server or
+/// reach into another process, and both are worse than an HTTP request. The consequence is worth
+/// stating because it is a real requirement: the deployment must have granted
+/// `[status.workers] allow = ["workers.restart"]`, and a server that did not answers 404.
+///
+/// **The exit status distinguishes three outcomes**, because a deploy script acts on it: `0` for a
+/// sweep that finished, `1` for a sweep that was accepted but left slots behind (a roll still in
+/// progress — sweep again), and the ordinary failure for anything else. That is why the route's
+/// `202` is not treated as success: a pipeline that read it as success would stop one sweep short of
+/// deploying, which is a defect that only shows up as "some requests still ran the old code".
+fn workers_restart(
+    url: Option<&str>,
+    config: Option<&Path>,
+    json: bool,
+    timeout_ms: u64,
+) -> Result<(), HealthError> {
+    let base = match url {
+        Some(url) => url.to_string(),
+        None => {
+            let config = match config {
+                Some(config) => config.to_path_buf(),
+                None => std::env::var_os("VOLUCER_STATUS_CONFIG")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("volucer.toml")),
+            };
+            let loaded = Config::load(&config).map_err(|err| HealthError::Config(Box::new(err)))?;
+            let address = loaded
+                .status
+                .as_ref()
+                .map(|status| status.listen.clone())
+                .ok_or(HealthError::NoProbeListener)?;
+            format!("http://{}", probe_host(&address))
+        }
+    };
+    if !base.starts_with("http://") {
+        return Err(HealthError::NotHttp { url: base });
+    }
+    let url = format!("{}/workers/restart", base.trim_end_matches('/'));
+
+    let (authority, status, body) = round_trip(&url, "POST", None, timeout_ms)?;
+    // `200` and `202` are both answers; anything else is the route refusing. The message is this
+    // command's own rather than the health probe's, because a deploy that gets a 404 here needs to
+    // learn that the route is ungranted rather than read that "the probe failed".
+    if !matches!(status, 200 | 202) {
+        return Err(HealthError::SweepRefused {
+            address: authority,
+            status,
+            body: body.trim().to_string(),
+        });
+    }
+
+    if json {
+        println!("{}", body.trim());
+    } else {
+        // The summary is derived from the report's own fields rather than re-parsed as JSON: the
+        // body is the `serde_json` of `RespawnReport`, and a `serde_json::Value` walk here would be a
+        // second reader of a shape the server owns.
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        match value.get("backends").and_then(|b| b.as_array()) {
+            Some(backends) if !backends.is_empty() => {
+                for backend in backends {
+                    println!("{}", describe_sweep(backend));
+                }
+            }
+            _ => println!(
+                "no worker pool reported: this deployment has none, or its pools were not up yet"
+            ),
+        }
+    }
+
+    // `202` is reported rather than swallowed; see the doc comment. The message is the returned
+    // error's, and it is *not* also logged here: `main` folds an `Err` into one `error!` line, so a
+    // `warn!` beside it printed the same instruction twice.
+    if status == 202 {
+        return Err(HealthError::Incomplete);
+    }
+    Ok(())
+}
+
+/// One backend's share of a sweep, as a line.
+fn describe_sweep(backend: &serde_json::Value) -> String {
+    let name = backend
+        .get("backend")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unnamed>");
+    // **`is_null` as well as a presence check, and that is not belt-and-braces.** `RespawnReport`
+    // serialises its `unmanaged` field as `null` when it is `None`, so `get` returns `Some(Null)`
+    // and a presence check alone reported every successful sweep as "nothing replaced". Found by
+    // running the command against a live server; every assertion on the route's own body passed,
+    // because the route answers the report rather than this rendering of it.
+    if let Some(unmanaged) = backend.get("unmanaged").filter(|value| !value.is_null()) {
+        let reason = unmanaged
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("volucer does not manage this backend's processes");
+        return format!("{name}: nothing replaced — {reason}");
+    }
+    let list = |key: &str| -> Vec<u64> {
+        backend
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|slots| slots.iter().filter_map(|slot| slot.as_u64()).collect())
+            .unwrap_or_default()
+    };
+    let replaced = list("replaced");
+    let busy = list("skipped_busy");
+    let failed = list("failed");
+    let mut line = format!("{name}: {} slot(s) replaced", replaced.len());
+    if !busy.is_empty() {
+        line.push_str(&format!(
+            "; {} busy and left for the next sweep",
+            busy.len()
+        ));
+    }
+    if !failed.is_empty() {
+        line.push_str(&format!("; {} FAILED to restart", failed.len()));
+    }
+    line
+}
+
+/// The address to probe a listener on, from the address it binds.///
 /// A wildcard bind has to be turned into something connectable: `0.0.0.0:2114` and `[::]:2114` are
 /// not destinations, and a `HEALTHCHECK` that tried to connect to them would fail on the one
 /// configuration a container actually uses — the default, where the listener has to be reachable
@@ -710,6 +921,33 @@ fn probe_host(address: &str) -> String {
 }
 
 fn probe(url: &str, timeout_ms: u64) -> Result<(), HealthError> {
+    let (authority, status, body) = round_trip(url, "GET", None, timeout_ms)?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(HealthError::Unhealthy {
+            address: authority,
+            status,
+            body: body.trim().to_string(),
+        })
+    }
+}
+
+/// One HTTP/1.1 request, reduced to a status, its body and the address it was sent to.
+///
+/// Shared by `health` and `workers restart`, because they are the same program: a supervisor that
+/// has no shell and no `curl` is exactly the caller for both, and a second hand-written request
+/// would be a second place that gets `[::1]` authorities wrong on the one deployment that used a
+/// v6 literal.
+///
+/// `Connection: close` framing means the read ends on EOF, which is why nothing here parses
+/// `Content-Length` — a caller that failed because the framing changed would be a false alarm.
+fn round_trip(
+    url: &str,
+    method: &str,
+    body: Option<&str>,
+    timeout_ms: u64,
+) -> Result<(String, u16, String), HealthError> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| HealthError::NotHttp {
@@ -779,8 +1017,12 @@ fn probe(url: &str, timeout_ms: u64) -> Result<(), HealthError> {
             source,
         })?;
 
+    let payload = body.unwrap_or("");
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: volucer-healthcheck\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: volucer/{}\r\n\
+         Connection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+        env!("CARGO_PKG_VERSION"),
+        payload.len()
     );
     stream
         .write_all(request.as_bytes())
@@ -816,16 +1058,7 @@ fn probe(url: &str, timeout_ms: u64) -> Result<(), HealthError> {
             address: authority.to_string(),
             head: head.lines().next().unwrap_or("").to_string(),
         })?;
-
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(HealthError::Unhealthy {
-            address: authority.to_string(),
-            status,
-            body: body.trim().to_string(),
-        })
-    }
+    Ok((authority.to_string(), status, body.to_string()))
 }
 
 /// `version` prints what is running, and what that build can do.
@@ -2686,6 +2919,7 @@ fn serve(
             observe,
             rate_limit,
             reset_gate,
+            pools: dispatcher.pools(),
         },
     );
 
@@ -3026,6 +3260,7 @@ fn worker_grant(status: &volucer_core::config::StatusConfig) -> volucer_http::Wo
         match method.as_str() {
             "workers.list" => grant.list = true,
             "workers.reset" => grant.reset = true,
+            "workers.restart" => grant.restart = true,
             other => tracing::error!(
                 method = other,
                 "[status.workers] names a method this listener does not serve; validation refuses \
@@ -3036,38 +3271,67 @@ fn worker_grant(status: &volucer_core::config::StatusConfig) -> volucer_http::Wo
     grant
 }
 
-/// The worker-control routes' implementation, when this deployment has a worker pool at all.
+/// The worker-control routes' implementation, when this deployment has a backend a sweep could roll.
 ///
-/// **Not gated on the grant**, and that is what a reloadable gate forces: the pool handle has to be
-/// there *before* a method can be granted, because a reload must not have to rebuild a listener to
-/// start answering `/workers`. Whether a caller may reach a route is
+/// **Not gated on the grant**, and that is what a reloadable gate forces: the handle has to be there
+/// *before* a method can be granted, because a reload must not have to rebuild a listener to start
+/// answering `/workers`. Whether a caller may reach a route is
 /// [`WorkerResetGate`](volucer_http::WorkerResetGate)'s answer, asked per request.
 ///
-/// `None` for a deployment with no worker pool: there is nothing to list, and `/workers` would be an
-/// empty array that looks like a pool with no workers. A static-only or upstream-only deployment gets
-/// no route rather than a misleading one, whatever the grant says.
+/// `None` for a deployment with no backends at all: there is nothing to list and nothing to sweep, and
+/// `/workers` would be an empty array that looks like a pool with no workers. A deployment with a
+/// `spawn_cgi` pool or a supervised `upstream` origin gets a handle even though neither holds a
+/// [`WorkerPool`](volucer_server::WorkerPool) — a sweep is defined for both, and gating on the pool
+/// handle answered `405` to the sweep on exactly the deployments whose code it can roll.
 fn workers_control(dispatcher: &Arc<Dispatcher>) -> Option<Arc<dyn volucer_http::WorkerControl>> {
-    let pools = dispatcher.pools()?;
-    Some(Arc::new(PoolControl { pools }))
+    if !dispatcher.has_backends() {
+        return None;
+    }
+    Some(Arc::new(PoolControl {
+        dispatcher: Arc::clone(dispatcher),
+    }))
 }
 
-/// [`volucer_http::WorkerControl`] over the pool directory the call plane already reads.
+/// [`volucer_http::WorkerControl`] over the dispatcher the request path already goes through.
 ///
-/// A newtype rather than implementing the trait on `PoolDirectory`, so the HTTP crate depends on a
-/// trait it declares and `volucer-server` never learns that a status listener exists.
+/// A newtype rather than implementing the trait on `Dispatcher`, so the HTTP crate depends on a trait
+/// it declares and `volucer-server` never learns that a status listener exists.
+///
+/// **It holds the dispatcher rather than the pool directory**, because the two methods need different
+/// things from it: `workers` and `restart` act on a pool slot by index and go through
+/// [`PoolLookup`](volucer_server::PoolLookup) — the *same* implementation the `workers.list` call
+/// answers from, so the HTTP route and a worker's own call cannot disagree — while a sweep has to
+/// reach every backend kind, including the ones with no pool. Holding the directory alone made the
+/// sweep a no-op on a `spawn_cgi` or `upstream` deployment, which is how this was found.
 struct PoolControl {
-    pools: Arc<volucer_server::PoolDirectory>,
+    dispatcher: Arc<Dispatcher>,
 }
 
 impl volucer_http::WorkerControl for PoolControl {
     fn workers(&self) -> Vec<volucer_server::WorkerStatus> {
-        // Through the trait, so this is the *same* implementation `workers.list` answers from rather
-        // than a second rendering of the pools that could drift from it.
-        volucer_server::PoolLookup::workers(&*self.pools)
+        match self.dispatcher.pools() {
+            Some(pools) => volucer_server::PoolLookup::workers(&*pools),
+            None => Vec::new(),
+        }
     }
 
     fn restart(&self, index: usize) -> std::result::Result<(), volucer_server::ResetRefusal> {
-        volucer_server::PoolLookup::restart(&*self.pools, index)
+        match self.dispatcher.pools() {
+            Some(pools) => volucer_server::PoolLookup::restart(&*pools, index),
+            // A deployment with no pool has no index to act on, and answering "no such worker" with
+            // the count it actually has is the accurate refusal rather than a silent success.
+            None => Err(volucer_server::ResetRefusal::NoSuchWorker {
+                index,
+                workers: 0,
+            }),
+        }
+    }
+
+    fn respawn_idle(&self) -> Vec<volucer_server::RespawnReport> {
+        // Through the dispatcher, so every backend kind is swept — including the ones that hold no
+        // `WorkerPool`. A sweep that only walked the pool directory would report success having
+        // replaced nothing on a `spawn_cgi` or `upstream` deployment.
+        self.dispatcher.respawn_idle()
     }
 }
 
@@ -3218,9 +3482,69 @@ struct Reloader {
     /// wildcard `[status] address` beside the flag, so the *open* direction is as safe through a
     /// reload as it was at startup.
     reset_gate: Arc<volucer_http::WorkerResetGate>,
+    /// The pools a `SIGUSR2` rolls, or `None` when the deployment has none.
+    ///
+    /// **Taken from the dispatcher, and held only as the directory**, so the signal thread reaches
+    /// exactly the pools the call plane and the `[status]` route reach — one answer to "which pools
+    /// exist" rather than a second enumeration that could drift. It is safe to hold here for the
+    /// same reason `PoolDirectory` exists at all: the handles inside are `Weak`, so nothing in this
+    /// struct keeps a worker process alive.
+    ///
+    /// `None` is the honest value for a deployment with no `worker` or `attach` backend, which is
+    /// exactly the deployment a static or `upstream`-only server is. `SIGUSR2` then says so instead
+    /// of doing nothing.
+    ///
+    /// **`None` also on Windows**, where there is no signal to install; the field is still built
+    /// there so the two `Reloader` values differ in one place rather than in every call site, and
+    /// the CLI/`[status]` routes are the trigger a Windows deployment uses.
+    #[cfg_attr(windows, allow(dead_code))]
+    pools: Option<Arc<volucer_server::PoolDirectory>>,
 }
 
 impl Reloader {
+    /// Roll application code: replace every worker that is not serving a request.
+    ///
+    /// The `SIGUSR2` action, and the reason it is a method on this struct rather than in the signal
+    /// thread: it needs the pool directory, and everything else a signal does lives here too.
+    ///
+    /// **Reported, never silently dropped.** A deployment that sends `SIGUSR2` and reads nothing has
+    /// no way to know whether new code is in front of traffic, so an empty sweep is a warning that
+    /// names the reason rather than a quiet success.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn restart_workers(&self) {
+        let Some(pools) = &self.pools else {
+            tracing::warn!(
+                "SIGUSR2: this deployment has no worker pool, so there is no application code to \
+                 roll; a `worker` or `attach` backend is what this signal restarts"
+            );
+            return;
+        };
+        // Through the trait, so a signal, a `workers.restart` call and the `volucer workers
+        // restart` command are one implementation rather than three that could disagree about what
+        // an idle slot is.
+        let reports = volucer_server::PoolLookup::respawn_idle(&**pools);
+        if reports.is_empty() {
+            tracing::warn!(
+                "SIGUSR2: the pool directory is empty, so nothing was rolled — the pools are not up \
+                 yet, or this process has no `worker` backend"
+            );
+            return;
+        }
+        for report in &reports {
+            // `info` for a complete sweep and `warn` for a partial one, because the two are
+            // different facts: "the deploy landed" and "some slots still run the old code".
+            if report.is_complete() {
+                tracing::info!(backend = %report.backend, "rolling restart: {}", report.summary());
+            } else {
+                tracing::warn!(
+                    backend = %report.backend,
+                    "rolling restart: {} — sweep again to finish the roll",
+                    report.summary()
+                );
+            }
+        }
+    }
+
     /// Re-read the configuration file and apply it, whole or not at all.
     ///
     /// The two failure modes are reported and *nothing is changed*: a file that does not parse, and
@@ -3360,9 +3684,11 @@ impl Reloader {
             tracing::info!(
                 list = granted.list,
                 reset = granted.reset,
-                "this reload changed the worker-control routes: {} list, {} reset",
+                restart = granted.restart,
+                "this reload changed the worker-control routes: {} list, {} reset, {} restart",
                 if granted.list { "granted" } else { "removed" },
-                if granted.reset { "granted" } else { "removed" }
+                if granted.reset { "granted" } else { "removed" },
+                if granted.restart { "granted" } else { "removed" }
             );
         }
 
@@ -3383,6 +3709,7 @@ impl Reloader {
 pub fn restart_only() -> Vec<&'static str> {
     vec![
         "a reload does not change: listener addresses (the sockets are already bound)",
+        "a reload does not deploy application code: a worker keeps the code it loaded when it booted, so send SIGUSR2 (or run `volucer workers restart`) to replace the processes — SIGHUP only re-reads this file",
         "a reload does not change: backends, their commands and worker counts (the processes are running)",
         "a reload does not change: [server.env] and a backend's env (the processes are already running with the old values, so a reload would leave a replacement worker on the new ones and its siblings on the old)",
         "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
@@ -3458,11 +3785,11 @@ fn install_shutdown_handler(shutdown: Option<volucer_server::ShutdownHandle>, re
 #[cfg(unix)]
 mod signals {
     use super::Reloader;
-    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
     use signal_hook::iterator::Signals;
     use std::sync::Arc;
 
-    /// Stop on SIGINT/SIGTERM, reload on SIGHUP.
+    /// Stop on SIGINT/SIGTERM, reload configuration on SIGHUP, roll application code on SIGUSR2.
     ///
     /// The signal number is what makes this possible, and it is the whole reason `signal-hook` is
     /// used here rather than the `ctrlc` this crate already depends on for Windows: `ctrlc` calls
@@ -3470,11 +3797,27 @@ mod signals {
     /// had to tell a reload from a shutdown could not be written against it. Its `termination`
     /// feature also maps SIGHUP to the shutdown callback, which is what made `kill -HUP` stop the
     /// server.
+    ///
+    /// # Why `SIGUSR2` and not `SIGHUP` for the roll
+    ///
+    /// Because the two are different deployments and conflating them would surprise every operator
+    /// migrating from nginx, where `SIGHUP` is the *configuration* reload and there is no
+    /// code-roll signal at all. `SIGUSR2` is what PHP-FPM-adjacent and Gunicorn-style servers use
+    /// for "replace the workers with the code that is now on disk", which is exactly what this is.
+    ///
+    /// # `SIGUSR1` is registered *in order to be ignored*
+    ///
+    /// It means "reopen the log" in nginx, and a `logrotate` script written for nginx sends it, so
+    /// rolling every worker on it would be wrong — but **not registering it is worse than wrong**:
+    /// an unregistered signal keeps its default disposition, and the default action for `SIGUSR1` is
+    /// to terminate the process. Measured: `kill -USR1` on a running server exited with code 10 and
+    /// left nothing in the log. Registering it is what turns that into the warning below, which names
+    /// the signal an operator probably meant.
     pub fn install(
         stop: impl Fn() + Send + 'static,
         reloader: Reloader,
     ) -> Result<(), std::io::Error> {
-        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2])?;
         let reloader = Arc::new(reloader);
         std::thread::Builder::new()
             .name("signals".into())
@@ -3485,10 +3828,21 @@ mod signals {
                             tracing::info!("SIGHUP: reloading configuration");
                             reloader.reload();
                         }
+                        SIGUSR2 => {
+                            tracing::info!("SIGUSR2: restarting application workers");
+                            reloader.restart_workers();
+                        }
                         SIGINT | SIGTERM => stop(),
                         // Registered signals only, so nothing else can arrive; named rather than
                         // silently ignored so that adding one to the set above without deciding
-                        // what it means is visible here.
+                        // what it means is visible here. `SIGUSR1` is named on its own because an
+                        // operator *will* send it, expecting nginx's meaning, and "ignoring an
+                        // unhandled signal" does not say which one they probably meant.
+                        SIGUSR1 => tracing::warn!(
+                            "SIGUSR1: ignored. Application code is rolled with SIGUSR2 and \
+                             configuration is reloaded with SIGHUP; SIGUSR1 reopens the access log, \
+                             which volucer does on SIGHUP"
+                        ),
                         other => tracing::warn!(signal = other, "ignoring an unhandled signal"),
                     }
                 }
@@ -4502,22 +4856,32 @@ fn check(
                     .as_ref()
                     .is_some_and(|workers| workers.allow.iter().any(|m| m == method))
             };
-            let routes = match (has("workers.list"), has("workers.reset")) {
-                (true, true) => {
-                    "GET /workers and POST /workers/{index}/reset (no authentication)".to_string()
-                }
-                (true, false) => {
-                    "GET /workers only (no authentication; a reset is not granted)".to_string()
-                }
-                // Worth its own line: the list is how a caller learns an index, so a grant of the
+            // Built from the grant rather than from a table of the eight combinations, because the
+            // number of combinations is now three independent bits and a table that enumerated them
+            // would be a list to forget a row in. The order is the order an operator learns them.
+            let mut served = Vec::new();
+            if has("workers.list") {
+                served.push("GET /workers");
+            }
+            if has("workers.reset") {
+                served.push("POST /workers/{index}/reset");
+            }
+            if has("workers.restart") {
+                served.push("POST /workers/restart");
+            }
+            let routes = if served.is_empty() {
+                "none ([status.workers] is absent, so the routes do not exist)".to_string()
+            } else {
+                let mut line = format!("{} (no authentication)", served.join(" and "));
+                // Worth its own note: the list is how a caller learns an index, so a grant of the
                 // reset alone is a route whose documentation cannot be followed.
-                (false, true) => {
-                    "POST /workers/{index}/reset only (no authentication, and the list that names an \
-                     index is not served)"
-                        .to_string()
+                if !has("workers.list") && has("workers.reset") {
+                    line.push_str(
+                        ", and the list that names an index is not served — reset takes the index \
+                         from worker order, which is not something an operator should guess",
+                    );
                 }
-                (false, false) => "none ([status.workers] is absent, so the routes do not exist)"
-                    .to_string(),
+                line
             };
             println!("    worker routes:    {routes}");
             println!(
@@ -5545,6 +5909,7 @@ document_root = "/from/file"
 
         for required in [
             "listener addresses",
+            "does not deploy application code",
             "backends",
             "server.env",
             "min_version",
@@ -5647,3 +6012,64 @@ document_root = "/from/file"
         );
     }
 }
+
+    /// **A completed sweep renders as replaced slots, not as "nothing replaced".**
+    ///
+    /// `RespawnReport` serialises `unmanaged` as `null` when it is `None`, so a presence check on the
+    /// key matched every report and the CLI printed "nothing replaced — volucer does not manage this
+    /// backend's processes" for a sweep that had just replaced every worker. Found against a live
+    /// server; the route's own tests all passed, because they assert the body rather than this
+    /// rendering of it.
+    #[test]
+    fn a_completed_sweep_renders_as_replaced_rather_than_unmanaged() {
+        let completed = serde_json::json!({
+            "backend": "app",
+            "replaced": [0, 1, 2],
+            "skipped_busy": [],
+            "failed": [],
+            "unmanaged": serde_json::Value::Null,
+        });
+        assert_eq!(
+            "app: 3 slot(s) replaced",
+            describe_sweep(&completed),
+            "a successful sweep must not read as an unmanaged backend"
+        );
+
+        let partial = serde_json::json!({
+            "backend": "app",
+            "replaced": [0],
+            "skipped_busy": [1],
+            "failed": [],
+            "unmanaged": serde_json::Value::Null,
+        });
+        assert_eq!(
+            "app: 1 slot(s) replaced; 1 busy and left for the next sweep",
+            describe_sweep(&partial),
+            "a partial sweep has to say what is left, which is the instruction to sweep again"
+        );
+
+        let failed = serde_json::json!({
+            "backend": "app",
+            "replaced": [],
+            "skipped_busy": [],
+            "failed": [0],
+            "unmanaged": serde_json::Value::Null,
+        });
+        assert_eq!(
+            "app: 0 slot(s) replaced; 1 FAILED to restart",
+            describe_sweep(&failed)
+        );
+
+        let unmanaged = serde_json::json!({
+            "backend": "fpm",
+            "replaced": [],
+            "skipped_busy": [],
+            "failed": [],
+            "unmanaged": { "slots": 4, "reason": "php-fpm owns this pool" },
+        });
+        assert_eq!(
+            "fpm: nothing replaced — php-fpm owns this pool",
+            describe_sweep(&unmanaged),
+            "an unmanaged backend says who owns it, because that is the instruction"
+        );
+    }

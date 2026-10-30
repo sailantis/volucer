@@ -48,7 +48,7 @@ without the ability to `clear` it.
 ```text
 services:          workers, kv.cache
 expands to:        kv.cache.clear, kv.cache.delete, kv.cache.get, kv.cache.getMultiple, ...
-                   workers.list, workers.reset
+                   workers.list, workers.reset, workers.restart
 ```
 
 Key-value access is granted per storage, allowing a deployment to use separate stores for
@@ -76,10 +76,16 @@ to give an application a call plane, `[status.workers]` is the surface to reach 
 ### Read, and read-write
 
 Granting a namespace grants every method in it, which is why the method form exists. `workers`
-is the pair to know: `workers.list` is an answer, and `workers.reset` kills worker *N* and
-waits for the replacement to finish its handshake. `services = ["workers"]` hands over both;
+is the group to know: `workers.list` is an answer, `workers.reset` kills worker *N* and waits for
+the replacement to finish its handshake, and `workers.restart` sweeps the pool — replacing every
+slot that is not serving a request, and leaving the busy ones for the next sweep. That last one is
+how a deployment rolls application code without dropping a request; it is what `SIGUSR2` triggers
+and what `volucer workers restart` calls. `services = ["workers"]` hands over all three;
 `services = ["workers.list"]` hands over the first. The same distinction is available to the
 HTTP routes as `[status.workers] allow`, which names the same methods.
+
+`services = ["workers"]` still means what it always did, so an application granted the whole
+namespace can roll its own siblings. Grant the individual methods when that is not wanted.
 
 The same split runs through the others. `kv` reads with `get`, `has`, `ttl` and `getMultiple`,
 and writes with `set`, `setIfAbsent`, `delete`, `clear` and `setMultiple` — `clear` wiping the

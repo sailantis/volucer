@@ -41,6 +41,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 x509-parser.workspace = true
+# For reading the report the `[status]` routes answer, which is how `volucer workers restart` tells a
+# finished roll from one that has slots left to sweep. Already in the graph through `volucer-server`.
+serde_json.workspace = true
 
 [features]
 default = []
@@ -79,9 +82,9 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # ends up in someone's deployment.
 rcgen = "0.13"
 
-# For reading the JSON the `[status]` worker routes answer. Already in the graph through
-# `volucer-server`, which encodes `workers.list` with it — so a test parses the very document the
-# worker channel carries rather than a second encoding of the same fields.
+# For reading the JSON the `[status]` worker routes answer in the integration tests, and for the same
+# reason: a test parses the very document the route or the worker channel produced rather than a
+# second encoding of the same fields.
 serde_json.workspace = true
 
 # For `an_acme_configured_server_serves_its_cached_certificate`: writing a cached certificate

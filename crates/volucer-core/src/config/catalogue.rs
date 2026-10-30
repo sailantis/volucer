@@ -118,9 +118,13 @@ pub const METHODS: &[Method] = &[
     // The deployment's own description, redacted. Read-only, and the only method it has.
     flat("config.describe", "config", "describe", false),
     // The pools. `list` is an answer about the process; `reset` kills a worker and waits for its
-    // replacement, which is why the two are separable at all.
+    // replacement, which is why the two are separable at all. `restart` is the rolling form: it
+    // replaces every worker that is not serving a request, which is how new application code reaches
+    // the same addresses without a second process — see `RespawnReport` for why it is allowed to be
+    // incomplete.
     flat("workers.list", "workers", "list", false),
     flat("workers.reset", "workers", "reset", true),
+    flat("workers.restart", "workers", "restart", true),
     // KV, per verb and per storage. Reads first, then writes, then `clear`, which wipes a storage.
     storage("get", false),
     storage("has", false),

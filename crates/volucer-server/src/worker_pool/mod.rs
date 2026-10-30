@@ -79,11 +79,12 @@ use crate::calls::MethodRegistry;
 use crate::error::{Result, ServerError};
 use crate::lifecycle::LifecycleGuard;
 use crate::pool::worker_count;
+use crate::respawn::RespawnReport;
 use exchange::ChannelExchange;
 use handshake::{boot, Link, Ready};
 use request::{encode_head, text_param};
 use response::render;
-use spec::Spec;
+use spec::{Launch, Spec};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1404,6 +1405,119 @@ impl WorkerPool {
         drop(slot);
         self.release(index);
         outcome
+    }
+
+    /// Replace every worker that is not serving a request, and report what was left behind.
+    ///
+    /// This is the mechanism behind a rolling restart of application code: new files on disk
+    /// reach the application because the processes that loaded the old ones are replaced, and no
+    /// request is lost because a slot that is serving is skipped rather than swapped.
+    ///
+    /// # Why a slot that might be busy is skipped
+    ///
+    /// The idleness test is deliberately conservative. A sweep that guessed wrong would replace a
+    /// worker mid-request, and what the client sees is a truncated response, a 502, or both —
+    /// indistinguishable from an application bug, and much harder to diagnose because it appears
+    /// only during a deploy. Correctness over completeness: a busy slot is left for the next
+    /// sweep, which is why [`RespawnReport`] reports `skipped_busy` rather than claiming success.
+    ///
+    /// A slot is *known* idle when it is on the free list, which is the same condition the request
+    /// path uses — see [`WorkerPool::acquire`]. Taking it from the list is what makes the decision
+    /// atomic: the list and the slot lock together are the pool's agreement about who may use a
+    /// slot, so a sweep that holds both cannot be racing a request. A slot that is not on the list
+    /// is skipped without locking it, so a sweep never waits for a request to finish.
+    ///
+    /// # The two probes, and which one does the work
+    ///
+    /// The free-list reservation is **the** idleness test, and the `try_lock` after it is a
+    /// second, narrower check. That was verified rather than assumed: with the reservation in place
+    /// the `try_lock` arm could not be reached at all — a request must hold the free-list lock to
+    /// take a slot, so a slot that is off the list *and* locked is a state the reservation has
+    /// already excluded. The arm is kept because it is the correct answer if the reservation is
+    /// ever relaxed (a sweep that does not reserve, or a slot removed from the list by another
+    /// path), and because removing it would make a future change to `acquire` silently unsafe.
+    /// Removing the *reservation* makes [`RespawnReport::skipped_busy`] permanently empty, which
+    /// the busy-slot test asserts.
+    ///
+    /// A slot that could **not** be replaced is reported in `failed` rather than retried here:
+    /// retrying would make one sweep take as long as a broken application takes to fail, per slot,
+    /// in series. The slot is left empty, and the next request through it repairs it.
+    ///
+    /// # Attached pools are not swept
+    ///
+    /// An `attach` pool dials a relay somebody else started, so volucer has no process to replace.
+    /// Reporting that as "replaced" would be a lie an operator acts on, and replacing it anyway
+    /// would close a connection the supervisor on the far side reads as "this worker died". So the
+    /// whole pool is reported as unmanaged, with the reason, and the roll is the supervisor's job.
+    pub fn respawn_idle(&self) -> RespawnReport {
+        let mut report = RespawnReport::new(self.name.clone());
+        if let Err(reason) = self.owns_processes() {
+            return RespawnReport::unmanaged_by(self.name.clone(), self.slots.len(), reason);
+        }
+
+        for index in 0..self.slots.len() {
+            // Reserved from the free list *first*, and this is what makes the sweep safe rather than
+            // the `try_lock` below. A slot on the list is one the request path may hand out, so
+            // taking it off is what keeps a request from arriving between the idleness check and the
+            // replacement and being served by a worker that is being killed. The slot goes back on
+            // the list only after its replacement has booted.
+            if self.take_specific(index).is_none() {
+                report.skipped_busy.push(index);
+                continue;
+            }
+
+            // `try_lock` rather than `lock`, and it is not a shortcut: a call is answered on the
+            // exchange thread of a worker whose request is in flight, holding that worker's slot
+            // lock — so a sweep reached from `workers.restart` could otherwise wait on the very
+            // lock its own caller holds. A slot that is *reserved* but cannot be locked is one a
+            // request was already on its way into; it is left alone and its reservation is returned.
+            let outcome = match self.slots[index].try_lock() {
+                Ok(mut slot) => respawn(
+                    &self.name,
+                    &self.spec,
+                    index as u32,
+                    &self.guard,
+                    self.call_handler.as_ref(),
+                    &mut slot,
+                ),
+                Err(_) => {
+                    self.release(index);
+                    report.skipped_busy.push(index);
+                    continue;
+                }
+            };
+            self.release(index);
+            match outcome {
+                Ok(()) => report.replaced.push(index),
+                Err(err) => {
+                    tracing::error!(
+                        backend = %self.name,
+                        slot = index,
+                        %err,
+                        "a worker could not be replaced during a rolling restart; the next \
+                         request through this slot will retry"
+                    );
+                    report.failed.push(index);
+                }
+            }
+        }
+        report
+    }
+
+    /// Whether volucer may replace this pool's processes, or why it may not.
+    ///
+    /// The one question an `attach` pool answers differently from a spawned one, asked once here
+    /// rather than inferred at each sweep: [`Launch::Attach`] describes a relay, and the processes
+    /// behind it belong to whoever started them.
+    fn owns_processes(&self) -> std::result::Result<(), String> {
+        match &self.spec.launch {
+            Launch::Spawn { .. } => Ok(()),
+            Launch::Attach(attach) => Err(format!(
+                "volucer did not start the workers behind {} (this backend uses `attach`), so \
+                 rolling them is its supervisor's job",
+                attach.relay
+            )),
+        }
     }
 
     /// Stop every worker, waiting for each to exit.

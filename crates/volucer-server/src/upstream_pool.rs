@@ -205,8 +205,15 @@ impl Shared {
 #[derive(Debug)]
 pub struct Supervisor {
     shared: Arc<Shared>,
+    /// The origin this supervisor was built for, kept so a restart can wait for the replacement to
+    /// answer. The address is not on `Shared` because it is not something the watcher needs — the
+    /// watcher restarts a process, it does not re-probe one — and a `Supervisor` is the only thing
+    /// that holds a readiness gate.
+    origin: OriginSpec,
     /// Held for the life of the supervisor; dropping it reaps the child even if nothing else ran.
-    _guard: LifecycleGuard,
+    ///
+    /// Not `_guard`: a restart adopts the replacement into it, so it is used after construction.
+    guard: LifecycleGuard,
     watcher: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -337,7 +344,8 @@ impl Supervisor {
 
         Ok(Supervisor {
             shared,
-            _guard: guard,
+            origin: origin.clone(),
+            guard,
             watcher,
         })
     }
@@ -350,6 +358,58 @@ impl Supervisor {
             .unwrap_or_else(|p| p.into_inner())
             .child
             .id()
+    }
+
+    /// Stop the origin and start it again, on the same terms it was started with.
+    ///
+    /// The `upstream` arm of a rolling restart. Unlike a worker or `php-cgi` slot there is no idle
+    /// state to wait for — an HTTP origin serves many requests at once and has no notion of a slot —
+    /// so the honest contract is different in kind and is stated here rather than buried: **requests
+    /// in flight to this origin are lost.** A client that was mid-response when this ran sees a
+    /// truncated body or a 502.
+    ///
+    /// That is why the origin is *stopped* rather than merely signalled, and why the readiness gate
+    /// is waited out again before returning: the backend is unusable from the moment this is called
+    /// until the new process answers, and a rolling restart that returned while the origin was still
+    /// booting would hand operators a window of 502s they had no reason to expect. The window is
+    /// therefore as short as it can be and, crucially, it *ends* before the sweep reports success.
+    ///
+    /// The alternative — leaving it running and letting a deploy replace the code underneath — is not
+    /// volucer's to decide: the origin's own reload (`gunicorn`'s `SIGHUP`, Puma's `USR2`) is better
+    /// than a kill, and an operator who wants it should run it there. This exists so that a
+    /// deployment which asked volucer to *own* the process can roll it through the same verb as
+    /// everything else.
+    pub fn restart(&self) -> Result<()> {
+        if self.shared.stopping.load(Ordering::SeqCst) {
+            return Err(ServerError::Misconfigured {
+                backend: self.shared.name.clone(),
+                reason: "the origin is being shut down, so it will not be restarted".to_string(),
+            });
+        }
+        self.shared.kill();
+        let mut child = self.shared.spawn()?;
+        // Adopted again, because the guard's protection is per process: on Windows the job object
+        // has to be told about a handle it has never seen, and skipping this would leave the new
+        // origin alive after volucer exits. A failure here is reported the same way `start` reports
+        // it, and the child is not left running behind the error.
+        if let Err(source) = self.guard.adopt(&child) {
+            let _ = crate::lifecycle::kill(&mut child);
+            let _ = child.wait();
+            return Err(ServerError::Spawn {
+                binary: self.shared.spec.binary.clone(),
+                source,
+            });
+        }
+        {
+            let mut process = self.shared.process.lock().unwrap_or_else(|p| p.into_inner());
+            process.child = child;
+            process.started_at = Instant::now();
+        }
+        // A failure here leaves the replacement *running* rather than killing it: it may still be
+        // booting, and the supervisor's readiness gate is the operator's own threshold, not proof
+        // that the process is broken. The watcher goes on supervising it, so if it does exit it is
+        // restarted — which is the same treatment any other origin exit gets.
+        wait_until_ready(&self.shared, &self.origin)
     }
 
     /// Stop the origin.

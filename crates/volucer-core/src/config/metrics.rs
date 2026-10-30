@@ -199,25 +199,32 @@ pub struct StatusHealth {
 
 /// The worker-control routes, and what they may do.
 ///
-/// **A method list rather than a `reset = true` flag**, because the two routes are not equally
+/// **A method list rather than a `reset = true` flag**, because the routes are not equally
 /// dangerous and a deployment that wants to *see* a pool should not have to arm a `POST` to do it.
 /// `allow = ["workers.list"]` publishes the list and answers 404 to a reset; naming `workers.reset`
 /// as well adds the recycle. An empty list is refused: a table that grants nothing is a block an
 /// operator wrote expecting an endpoint, and the honest answer is an error rather than a listener
 /// that answers 404 to a route it was configured for.
 ///
+/// **`workers.restart` is the rolling deploy, and it is a third name rather than an alias.**
+/// `workers.reset` replaces one named worker or refuses with `409`; `workers.restart` sweeps every
+/// slot and replaces the ones that are not serving, answering `202` when a busy slot was left for the
+/// next pass. A deploy pipeline wants the sweep and has no business picking a worker off by index, so
+/// the two are granted separately. See `docs/11-OPERATIONS.md`.
+///
 /// The names are the call plane's own — the same `workers.list` a worker would name in `services` —
 /// so one vocabulary describes both surfaces, and the method catalogue that decides what `services`
 /// accepts decides what this accepts.
 ///
-/// A wildcard address with `workers.reset` in the list is refused, with the argument the flag used
-/// to get: a `POST` with no authentication that recycles a worker, reachable from anywhere, is a
-/// remote kill switch. A list of `workers.list` alone is legal on any address, because a list of
+/// A wildcard address with a mutation in the list is refused, with the argument the flag used to get:
+/// a `POST` with no authentication that replaces worker processes, reachable from anywhere, is a
+/// remote deploy button. A list of `workers.list` alone is legal on any address, because a list of
 /// workers is a fact about this process rather than a lever on it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusWorkers {
-    /// The methods these routes may serve: `"workers.list"`, `"workers.reset"`, or both.
+    /// The methods these routes may serve: `"workers.list"`, `"workers.reset"`, `"workers.restart"`,
+    /// or a subset of the three.
     pub allow: Vec<String>,
 }
 

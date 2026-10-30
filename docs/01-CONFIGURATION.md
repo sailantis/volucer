@@ -905,14 +905,16 @@ same table, is a parse error ("cannot extend value of type inline table"). Overr
 affected — `-o status.metrics.collect.<name>.type=…` is applied after parsing, so it adds an entry
 to either spelling.
 
-`[status.workers]` — `GET /workers` and `POST /workers/{index}/reset`. Absent means neither exists.
+`[status.workers]` — `GET /workers`, `POST /workers/{index}/reset` and `POST /workers/restart`.
+Absent means none exists.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `allow` | array of strings | **required** | The methods the routes may serve. |
 
-The two names are `"workers.list"` (`GET /workers`) and `"workers.reset"`
-(`POST /workers/{index}/reset`). **The list is a grant, not a switch:**
+The three names are `"workers.list"` (`GET /workers`), `"workers.reset"`
+(`POST /workers/{index}/reset`) and `"workers.restart"` (`POST /workers/restart`). **The list is a
+grant, not a switch:**
 
 ```toml
 [status]
@@ -923,24 +925,31 @@ allow = ["workers.list"]     # read the pool, and nothing that mutates it
 ```
 
 A deployment that wants to *see* a pool should not have to arm a `POST` to do it, so
-`workers.list` alone publishes the list and answers `404` to a reset. Naming both adds the recycle.
-An empty `allow` is refused: a table that grants nothing is a block an operator wrote expecting an
+`workers.list` alone publishes the list and answers `404` to a reset. Naming others adds them. An
+empty `allow` is refused: a table that grants nothing is a block an operator wrote expecting an
 endpoint.
+
+**`workers.restart` is the rolling deploy and is not an alias for `workers.reset`.** A reset names
+one worker and either replaces it or is refused with `409`; a restart sweeps every slot and replaces
+the ones that are not serving a request, answering `200` when the sweep finished and `202` when it
+left a busy slot for the next pass. A deploy pipeline wants the sweep and has no business picking a
+worker off by index, which is why granting one does not grant the other. See
+[Operations](11-OPERATIONS.md#rolling-application-code).
 
 These are the same names a backend's `services` list uses, so one vocabulary describes both
 surfaces: `services = ["workers.list"]` gives an application the call and this table gives an
 operator the route.
 
-**Neither route authenticates.** What protects the recycle is that it does not exist until the file
-grants it, and until then `/workers/{i}/reset` answers `405` — not `403`, because an endpoint that
-exists and refuses is an endpoint an attacker can enumerate. Volucer refuses `workers.reset` when
-`listen` is a wildcard address; `workers.list` alone is legal on any address, because a list of
-workers is a fact about the process rather than a lever on it. Bind `[status]` to loopback or a
-private interface and expose it only to your orchestrator.
+**None of these routes authenticates.** What protects them is that they do not exist until the file
+grants them, and until then `/workers/{i}/reset` answers `405` — not `403`, because an endpoint that
+exists and refuses is an endpoint an attacker can enumerate. Volucer refuses `workers.reset` and
+`workers.restart` when `listen` is a wildcard address; `workers.list` alone is legal on any address,
+because a list of workers is a fact about the process rather than a lever on it. Bind `[status]` to
+loopback or a private interface and expose it only to your orchestrator.
 
 `allow` can be changed in either direction with `SIGHUP`. Removing a method makes its route a `404`
-on the next request without restarting the server. Adding `workers.reset` during a reload is subject
-to the same wildcard-address refusal as at startup. `[status] listen` cannot be reloaded because its
+on the next request without restarting the server. Adding a mutation during a reload is subject to
+the same wildcard-address refusal as at startup. `[status] listen` cannot be reloaded because its
 socket is already bound.
 
 `volucer health` reads the address from `listen`, so you do not need to specify the port again. In a

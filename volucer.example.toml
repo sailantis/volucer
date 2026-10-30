@@ -1108,20 +1108,31 @@ base_port = 19001
 # allow = ["workers.list"]
 #
 # `[status.metrics]` absent means no exposition on this port. `[status.workers]`
-# absent means neither worker route exists.
+# absent means none of the worker routes exists.
 #
-# The worker grant is a *method* list rather than a boolean, because the two
+# The worker grant is a *method* list rather than a boolean, because the three
 # routes are not equally dangerous:
 #
-#   "workers.list"  -- GET  /workers               JSON, the same document the
-#                                                  workers.list call answers
-#   "workers.reset" -- POST /workers/{index}/reset recycle one worker, 200 with
-#                                                  its index
+#   "workers.list"    -- GET  /workers               JSON, the same document the
+#                                                      workers.list call answers
+#   "workers.reset"   -- POST /workers/{index}/reset recycle one worker, 200 with
+#                                                      its index
+#   "workers.restart" -- POST /workers/restart       roll application code: every
+#                                                      slot that is not serving a
+#                                                      request is replaced in place
 #
 # A deployment that wants to *see* a pool should not have to arm a POST to do it,
 # so allow = ["workers.list"] publishes the list and answers 404 to a reset.
-# Naming both adds the recycle. An empty allow is refused: a table that grants
-# nothing is a block written expecting an endpoint.
+# Naming others adds them. An empty allow is refused: a table that grants nothing
+# is a block written expecting an endpoint.
+#
+# `workers.restart` is a rolling deploy and is NOT an alias for `workers.reset`.
+# A reset names one worker and either replaces it or is refused with 409; a
+# restart sweeps the pool, answers 200 when every idle slot was replaced and 202
+# when a busy slot was left for the next pass -- a sweep may not finish a roll in
+# one pass, and 202 is how a pipeline learns to run it again. The same sweep is
+# what SIGUSR2 triggers, and what `volucer workers restart` calls. See
+# docs/11-OPERATIONS.md, "Rolling application code".
 #
 # `{index}` is the global one from the GET, so `curl -f -XPOST` is the whole
 # command: no subcommand, no client, and `-f` fails on 404 (no such worker), 409
@@ -1130,17 +1141,17 @@ base_port = 19001
 # not exist until its method is granted, which is why an ungranted one answers
 # 404 -- not 403 -- for the path.
 #
-# `workers.reset` on a wildcard `listen` is refused rather than warned about: a
-# POST with no authentication that recycles a worker, reachable from anywhere, is
-# a remote kill switch. `workers.list` alone is legal on any address -- a list of
-# workers is a fact about this process, not a lever on it.
+# A mutation on a wildcard `listen` is refused rather than warned about: a POST
+# with no authentication that replaces worker processes, reachable from anywhere,
+# is a remote deploy button. `workers.list` alone is legal on any address -- a
+# list of workers is a fact about this process, not a lever on it.
 #
 # RELOADABLE, in both directions. A SIGHUP that removes a method makes its route
 # stop existing on the next request -- a 404, the same answer a deployment that
 # never granted it gives -- so an unauthenticated mutation surface can be closed
-# without restarting a serving process. Adding `workers.reset` is subject to the
-# same wildcard-address refusal through a reload as at startup, because that
-# check runs when the file is read.
+# without restarting a serving process. Adding a mutation is subject to the same
+# wildcard-address refusal through a reload as at startup, because that check
+# runs when the file is read.
 #
 # `listen` is not reloadable: the socket is already bound.
 #

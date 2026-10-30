@@ -878,3 +878,192 @@ fn is_running(pid: u32) -> bool {
                 .unwrap_or(true)
     }
 }
+
+/// **A rolling restart replaces every idle `spawn_cgi` slot on its own address.**
+///
+/// The FastCGI half of Phase 3a. Two properties are asserted together, because either alone passes
+/// against a broken implementation: every slot is a new pid (so new code is in front of traffic) and
+/// the pool still answers on the *same ports* afterwards (so a deploy did not move the addresses the
+/// front-end's routes were built from).
+#[test]
+fn a_sweep_replaces_every_idle_cgi_slot_and_keeps_its_addresses() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(3) else {
+        eprintln!("skipping: no run of free ports");
+        return;
+    };
+    let (root, script) = fixture("sweep");
+
+    let pool = CgiPool::start("sweep", &config_for(&binary, 3, base)).expect("pool starts");
+    let addresses = pool.endpoints();
+    let before = pool.pids();
+    assert_eq!(before.len(), 3);
+
+    // A request first, so the slot holds a warm connection: a replacement that kept the old
+    // connection would be dialling a process that has exited.
+    let request = request_for(&root, &script, "warm");
+    pool.request(&request).expect("warm-up");
+
+    let report = pool.respawn_idle();
+    assert_eq!(report.backend, "sweep");
+    assert_eq!(report.replaced, vec![0, 1, 2], "{report:?}");
+    assert!(report.skipped_busy.is_empty(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(report.is_complete(), "{report:?}");
+    assert!(report.unmanaged.is_none());
+
+    assert_eq!(
+        pool.endpoints(),
+        addresses,
+        "a sweep keeps each slot's address; the front-end's routes were built from them"
+    );
+    let after = pool.pids();
+    for (old, new) in before.iter().zip(after.iter()) {
+        assert_ne!(old, new, "{before:?} -> {after:?}");
+    }
+    for old in &before {
+        assert!(!is_running(*old), "the replaced process {old} is gone");
+    }
+
+    // And the pool serves, which is the part a pid comparison cannot prove.
+    for _ in 0..3 {
+        let response = pool.request(&request).expect("a request after the sweep");
+        response.check_protocol().expect("completed");
+        assert!(
+            String::from_utf8_lossy(&response.stdout).contains("warm"),
+            "the replacement served the request"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A `spawn_cgi` slot that is serving is skipped, and its request is answered.**
+///
+/// The `children` path is where this pool's idleness test is not obvious: with `children > 0` a slot
+/// is several processes behind one address, so "the slot lock is free" does not mean "idle" — the
+/// permit count does. This holds the slot with a slow request and asserts the sweep left it alone.
+#[test]
+fn a_sweep_leaves_a_busy_cgi_slot_alone() {
+    use std::time::Instant;
+
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(2) else {
+        eprintln!("skipping: no run of free ports");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-pool-sweep-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    let _script = write_script(
+        &root,
+        "index.php",
+        "<?php usleep(1200000); echo 'SLOW-OK';",
+    );
+
+    let pool = CgiPool::start("busy", &config_for(&binary, 1, base)).expect("pool starts");
+    let before = pool.pids();
+    let request = request_for(&root, "index.php", "");
+    let started = Instant::now();
+
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(|| {
+            let response = pool.request(&request).expect("the slow request is served");
+            response.check_protocol().expect("completed");
+            String::from_utf8_lossy(&response.stdout).into_owned()
+        });
+
+        // Wait until the request is genuinely in flight before sweeping, so this cannot pass by
+        // racing it. The fixture sleeps for 1.2 s, so 400 ms in is unambiguous.
+        while started.elapsed() < Duration::from_millis(400) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let report = pool.respawn_idle();
+        assert!(
+            report.replaced.is_empty(),
+            "a slot with a request in flight must not be replaced: {report:?}"
+        );
+        assert_eq!(report.skipped_busy, vec![0], "{report:?}");
+        assert!(!report.is_complete(), "{report:?}");
+        assert_eq!(
+            pool.pids(),
+            before,
+            "the process serving the request is untouched"
+        );
+
+        let body = holder.join().expect("no thread panics");
+        assert!(
+            body.contains("SLOW-OK"),
+            "the in-flight response arrived complete: {body:?}"
+        );
+    });
+
+    // The slot is idle again, so a second sweep does the work the first one deferred.
+    let report = pool.respawn_idle();
+    assert_eq!(report.replaced, vec![0], "{report:?}");
+    assert!(report.is_complete(), "{report:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pool of one slot can be built from a `command` driver and swept as well.
+///
+/// The `command` driver reaches its address through `{address}`, so a sweep is the case where a
+/// replacement must be handed *the same* address: a driver that re-derived one would either move the
+/// slot or fail to bind. `php-cgi` covers the `binary` half above; this covers `command`.
+#[test]
+fn a_command_driven_slot_is_swept_on_the_address_it_was_given() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+    let (root, script) = fixture("sweep-command");
+    let port = base;
+
+    let mut config = config_for(&binary, 1, base);
+    config.binary = None;
+    config.command = Some(format!(
+        "{} -b {{address}}",
+        binary.to_string_lossy().replace('\\', "/")
+    ));
+
+    let pool = CgiPool::start("sweep-command", &config).expect("pool starts");
+    let addresses = pool.endpoints();
+    assert!(
+        addresses[0].contains(&port.to_string()),
+        "the command was given this slot's address: {addresses:?}"
+    );
+    let before = pool.pids();
+
+    let report = pool.respawn_idle();
+    assert_eq!(report.replaced, vec![0], "{report:?}");
+    assert_eq!(
+        pool.endpoints(),
+        addresses,
+        "a replacement is handed the same address"
+    );
+    assert_ne!(pool.pids(), before);
+
+    let response = pool
+        .request(&request_for(&root, &script, "after"))
+        .expect("a request after the sweep");
+    response.check_protocol().expect("completed");
+    assert!(String::from_utf8_lossy(&response.stdout).contains("after"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}

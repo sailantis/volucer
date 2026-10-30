@@ -50,6 +50,7 @@ use volucer_fcgi::{Client, Endpoint, Request, Response};
 
 use crate::error::{Hint, Result, ServerError};
 use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
+use crate::respawn::RespawnReport;
 
 /// How long to wait for a slot to start accepting connections.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -664,6 +665,17 @@ impl SlotPermits {
         *in_flight = in_flight.saturating_sub(1);
         self.released.notify_one();
     }
+
+    /// How many requests the slot is serving right now, or `None` if even reading that would
+    /// block.
+    ///
+    /// `try_lock`, because the answer is only wanted by a rolling restart, and a sweep that
+    /// waited here would be waiting for the requests it is supposed to leave alone. `None` means
+    /// "not knowable from here", which the caller treats as busy — the conservative direction.
+    fn in_flight(&self) -> Option<usize> {
+        self.state.try_lock().ok().map(|in_flight| *in_flight)
+    }
+
 }
 
 impl CgiPool {
@@ -1080,6 +1092,63 @@ impl CgiPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.replace_locked(&mut slot)
+    }
+
+    /// Replace every slot's process that is not serving a request, and report what was left.
+    ///
+    /// The FastCGI half of a rolling restart of application code. It is the same shape as
+    /// [`WorkerPool::respawn_idle`](crate::WorkerPool::respawn_idle) and deliberately the same
+    /// conservative test: a slot is skipped unless it is *known* idle, because replacing one
+    /// mid-request truncates the response and looks, from the client, like an application bug.
+    ///
+    /// # What "idle" means here, and why it is two conditions
+    ///
+    /// A slot's concurrency is `children` (or `concurrency`), so "the slot lock is free" is not
+    /// enough: with a preforked master the lock is only held for bookkeeping and *several*
+    /// requests may be in flight against one address. [`SlotPermits`] is where that is counted, so
+    /// a slot is idle when its permit count is zero **and** its lock is uncontended. Both are read
+    /// with `try_lock`, so a sweep never waits for a request to finish; either one failing is a
+    /// skip.
+    ///
+    /// # The address is the reason this stops the old process first
+    ///
+    /// [`CgiPool::replace_locked`] already explains it: a slot keeps its address, and a port can
+    /// only be bound once. Nothing about a sweep changes that, so a sweep is not "boot the new one
+    /// beside the old one" — it is "stop, then boot", on the same address, one slot at a time.
+    pub fn respawn_idle(&self) -> RespawnReport {
+        let mut report = RespawnReport::new(self.name.clone());
+        for index in 0..self.slots.len() {
+            // Both probes first, and neither waits: a request that is starting right now has
+            // already taken a permit, so the window between this check and the replacement below
+            // is a window in which the slot has been counted as idle and nothing else can have
+            // claimed it — `replace_locked` holds the slot lock across the whole stop-and-spawn,
+            // and a request needs that lock to take a connection.
+            if self.permits[index].in_flight().unwrap_or(1) != 0 {
+                report.skipped_busy.push(index);
+                continue;
+            }
+            let mut slot = match self.slots[index].try_lock() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    report.skipped_busy.push(index);
+                    continue;
+                }
+            };
+            match self.replace_locked(&mut slot) {
+                Ok(()) => report.replaced.push(index),
+                Err(err) => {
+                    tracing::error!(
+                        backend = %self.name,
+                        slot = index,
+                        %err,
+                        "could not replace a FastCGI slot during a rolling restart; the next \
+                         request through this slot will retry"
+                    );
+                    report.failed.push(index);
+                }
+            }
+        }
+        report
     }
 
     /// Replace a locked slot's process with a fresh one on the same address.

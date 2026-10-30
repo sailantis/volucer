@@ -395,6 +395,13 @@ struct FakeControl {
     asked: Mutex<Vec<usize>>,
     /// How long a reset pretends to take, so a test can prove it did not block the listener.
     delay: Duration,
+    /// What `respawn_idle` answers, and how many times it was called.
+    ///
+    /// The count is separate from the report because the questions are different: a report says what
+    /// a sweep did, and a test that asserts "the route must not reach the pools" needs the call to
+    /// have happened *at all*, which an empty report cannot distinguish from one that did nothing.
+    sweep: Mutex<Vec<volucer_server::RespawnReport>>,
+    sweeps: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeControl {
@@ -415,6 +422,14 @@ impl FakeControl {
             outcome: Mutex::new(outcome),
             asked: Mutex::new(Vec::new()),
             delay: Duration::ZERO,
+            // A complete sweep by default, so a test that only cares about the route does not have to
+            // build a report.
+            sweep: Mutex::new(vec![volucer_server::RespawnReport {
+                backend: "app".to_string(),
+                replaced: (0..workers).collect(),
+                ..volucer_server::RespawnReport::default()
+            }]),
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -430,6 +445,12 @@ impl WorkerControl for FakeControl {
             std::thread::sleep(self.delay);
         }
         self.outcome.lock().expect("not poisoned").clone()
+    }
+
+    fn respawn_idle(&self) -> Vec<volucer_server::RespawnReport> {
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.sweep.lock().expect("not poisoned").clone()
     }
 }
 
@@ -481,6 +502,7 @@ fn a_shut_gate_removes_the_worker_routes_entirely() {
     let gate = Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
         list: true,
         reset: true,
+        restart: false,
     }));
     let running = RunningStatus::start(
         "127.0.0.1:0",
@@ -534,6 +556,7 @@ fn the_list_may_be_granted_alone() {
     let gate = Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
         list: true,
         reset: false,
+        restart: false,
     }));
     let running = RunningStatus::start(
         "127.0.0.1:0",
@@ -797,4 +820,244 @@ fn a_malformed_reset_path_is_not_a_route() {
         "no malformed path may reach the pool"
     );
     running.stop();
+}
+
+/// **A sweep is `200` when it finished and `202` when it did not**, and the difference is the exit
+/// status a deploy script reads.
+///
+/// The route could have answered `200` for both and put `complete` in the body, but a pipeline that
+/// shells out to `curl` reads the code and not the document — and "accepted but incomplete" is the
+/// one answer it must not mistake for done, because a sweep that left a busy slot behind has not
+/// deployed everything yet.
+#[test]
+fn a_complete_sweep_is_200_and_a_partial_one_is_202() {
+    for (reports, expected) in [
+        (
+            vec![volucer_server::RespawnReport {
+                backend: "app".to_string(),
+                replaced: vec![0, 1],
+                ..volucer_server::RespawnReport::default()
+            }],
+            "HTTP/1.1 200",
+        ),
+        (
+            vec![volucer_server::RespawnReport {
+                backend: "app".to_string(),
+                replaced: vec![0],
+                skipped_busy: vec![1],
+                ..volucer_server::RespawnReport::default()
+            }],
+            "HTTP/1.1 202",
+        ),
+        // An unmanaged backend has nothing replaced, so it is not a finished deploy either — a
+        // php-fpm pool is rolled by php-fpm, and saying 200 would tell a pipeline it was done.
+        (
+            vec![volucer_server::RespawnReport::unmanaged_by(
+                "fpm",
+                4,
+                "php-fpm owns this pool",
+            )],
+            "HTTP/1.1 202",
+        ),
+    ] {
+        let mut control = FakeControl::with(2, Ok(()));
+        control.sweep = Mutex::new(reports.clone());
+        let running = RunningStatus::start("127.0.0.1:0", worker_services(Arc::new(control)))
+            .expect("start");
+
+        let (head, body) = request(running.local_addr(), "POST", "/workers/restart");
+        assert!(
+            head.starts_with(expected),
+            "{reports:?} must be {expected}: {head}"
+        );
+        let answer: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        assert_eq!(
+            answer["complete"],
+            expected == "HTTP/1.1 200",
+            "the body and the status must agree: {body}"
+        );
+        assert!(
+            answer["backends"].as_array().is_some_and(|b| !b.is_empty()),
+            "the per-backend report is returned, because it is what says which slot to sweep next: \
+             {body}"
+        );
+        running.stop();
+    }
+}
+
+/// **The sweep route exists only when it is granted, separately from the reset.**
+///
+/// The point of a third method rather than an alias: a deploy pipeline wants the sweep and has no
+/// business picking a worker off by index, so granting one must not grant the other.
+#[test]
+fn the_sweep_route_is_granted_separately_from_the_reset() {
+    let control = Arc::new(FakeControl::with(2, Ok(())));
+    let gate = Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
+        list: false,
+        reset: false,
+        restart: true,
+    }));
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            workers: Some(Arc::clone(&control) as Arc<dyn WorkerControl>),
+            reset_gate: Some(Arc::clone(&gate)),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+
+    // Granted: the sweep answers, and `restart` is never read as an index.
+    let (head, _) = request(running.local_addr(), "POST", "/workers/restart");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        control
+            .sweeps
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the sweep reached the pools"
+    );
+
+    // Not granted: `reset` and `list` were never asked for, so their routes do not exist — and the
+    // sweep is not an alias for the reset in either direction.
+    let (head, _) = request(running.local_addr(), "POST", "/workers/0/reset");
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "granting the sweep must not grant a per-worker reset: {head}"
+    );
+    let (head, _) = get(running.local_addr(), "/workers");
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+
+    // A `GET` on the sweep path is a 405 rather than a 404: the path *is* routed, which is what
+    // tells a caller who typed `curl` instead of `curl -XPOST` what they did wrong.
+    let (head, _) = get(running.local_addr(), "/workers/restart");
+    assert!(head.starts_with("HTTP/1.1 405"), "{head}");
+    running.stop();
+}
+
+/// An ungranted sweep is a 404 on the whole gate, which is the safe direction.
+#[test]
+fn the_sweep_route_is_absent_until_it_is_granted() {
+    let control = Arc::new(FakeControl::with(2, Ok(())));
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            workers: Some(Arc::clone(&control) as Arc<dyn WorkerControl>),
+            reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(
+                WorkerGrant {
+                    list: true,
+                    reset: true,
+                    restart: false,
+                },
+            ))),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+
+    let (head, _) = request(running.local_addr(), "POST", "/workers/restart");
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "a sweep the file did not grant must not exist, not refuse: {head}"
+    );
+    assert_eq!(
+        control
+            .sweeps
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "and it must not have reached the pools"
+    );
+    running.stop();
+}
+
+/// **A deployment with no worker pool still answers the sweep**, because a `spawn_cgi` pool and a
+/// supervised `upstream` origin are both swept and neither holds a `WorkerPool`.
+///
+/// This is the defect the live `upstream` run found: the whole worker surface was gated on the pool
+/// handle, so `POST /workers/restart` answered `405` on exactly the deployments whose code it is able
+/// to roll. The list and the reset stay absent — they act on a slot by index and there is none — and
+/// that difference is asserted here rather than described.
+#[test]
+fn a_deployment_with_no_worker_pool_still_answers_the_sweep() {
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            // `workers: None`, which is what `workers_control` returns when the dispatcher has no
+            // `worker` or `attach` backend.
+            workers: None,
+            reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
+                list: false,
+                reset: false,
+                restart: true,
+            }))),
+            ..StatusServices::default()
+        },
+    )
+    .expect("start");
+
+    let (head, body) = request(running.local_addr(), "POST", "/workers/restart");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "an empty sweep left nothing behind, so it is complete rather than in progress: {head}"
+    );
+    let answer: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+    assert_eq!(
+        answer["complete"], true,
+        "there is nothing to roll, so nothing is left half-rolled: {body}"
+    );
+    assert!(
+        answer["backends"].as_array().is_some_and(|b| b.is_empty()),
+        "and it says so rather than inventing a backend: {body}"
+    );
+
+    // The two routes that need a pool stay absent, and they are 404 rather than 405 for the reason
+    // an ungranted route is: a path that cannot be honoured does not exist.
+    let (head, _) = get(running.local_addr(), "/workers");
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    let (head, _) = request(running.local_addr(), "POST", "/workers/0/reset");
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    running.stop();
+}
+
+/// A sweep on a deployment with no pool is still ungranted when the file did not grant it.
+///
+/// The answer is the same one any ungranted route gives — `404` when the router knows the path but
+/// not the method, `405` when the grant is absent altogether and the path never reaches the router —
+/// and never a `403`. Asserting "not 200 and no `403`" is what the property actually is; pinning one
+/// of the two codes would be pinning which layer happened to answer.
+#[test]
+fn a_sweep_with_no_pool_is_still_a_404_when_it_is_ungranted() {
+    for gate in [
+        WorkerGrant::NONE,
+        WorkerGrant {
+            list: true,
+            reset: true,
+            restart: false,
+        },
+    ] {
+        let running = RunningStatus::start(
+            "127.0.0.1:0",
+            StatusServices {
+                workers: None,
+                reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(gate))),
+                ..StatusServices::default()
+            },
+        )
+        .expect("start");
+
+        let (head, _) = request(running.local_addr(), "POST", "/workers/restart");
+        assert!(
+            !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.1 202"),
+            "an ungranted sweep must not have run for {gate:?}: {head}"
+        );
+        assert!(
+            !head.starts_with("HTTP/1.1 403"),
+            "an endpoint that exists and refuses is one an attacker can enumerate: {head}"
+        );
+        assert!(
+            head.starts_with("HTTP/1.1 404") || head.starts_with("HTTP/1.1 405"),
+            "{gate:?}: {head}"
+        );
+        running.stop();
+    }
 }

@@ -65,6 +65,17 @@ pub trait WorkerControl: Send + Sync {
     /// inline. The bound is the worker protocol's own handshake deadline, so "how long may this
     /// take" is already answered by the pool and is not this trait's question.
     fn restart(&self, index: usize) -> std::result::Result<(), volucer_server::ResetRefusal>;
+
+    /// Replace every application process that is not serving a request.
+    ///
+    /// The rolling restart. Blocking for the same reason `restart` is — and for longer, since it
+    /// may boot several workers — so it crosses the same `spawn_blocking` boundary.
+    ///
+    /// A default implementation returning an empty sweep rather than a required method: this trait
+    /// has fixtures with no pools at all, and "no pools were swept" is the honest answer for them.
+    fn respawn_idle(&self) -> Vec<volucer_server::RespawnReport> {
+        Vec::new()
+    }
 }
 
 /// The routes the worker-control surface adds, and what they answer.
@@ -77,6 +88,14 @@ struct WorkerRoutes;
 impl WorkerRoutes {
     /// `GET` returns every worker; nothing else is allowed here.
     const PATH: &'static str = "/workers";
+
+    /// `POST /workers/restart`, the rolling restart.
+    ///
+    /// A literal rather than the `{index}` shape below, and it is checked *first* so that
+    /// `restart` is never read as an index. `reset_index` would refuse it — every byte has to be a
+    /// digit — but relying on that would make the route's existence a consequence of a parser's
+    /// strictness rather than of a declaration.
+    const RESTART: &'static str = "/workers/restart";
 
     /// `POST /workers/{index}/reset`, whose prefix and suffix bracket the index.
     const RESET_PREFIX: &'static str = "/workers/";
@@ -201,9 +220,17 @@ pub struct StatusServices {
     /// The worker-control routes' implementation, or `None` to serve none of them.
     ///
     /// This is `None` exactly when the process has no worker pool: there is nothing to list, and
-    /// `/workers` would be an empty array that looks like a pool with no workers. Whether a grant of
-    /// `[status.workers]` reaches it is [`StatusServices::reset_gate`]'s answer, asked per request —
-    /// this field answers "is there a pool to control", the gate answers "may a caller reach it now".
+    /// `/workers` would be an empty array that looks like a pool with no workers.
+    ///
+    /// **`None` does not disable `POST /workers/restart`**, and that asymmetry is deliberate. The
+    /// list and the reset act on a pool slot by index, so without a pool they are meaningless; a
+    /// sweep is defined for every backend kind — a `spawn_cgi` pool is swept and a supervised
+    /// `upstream` origin is restarted, and neither holds a `WorkerPool`. Gating the whole surface on
+    /// this handle answered `405` to the sweep on exactly the deployments whose code it can roll.
+    ///
+    /// Whether a grant of `[status.workers]` reaches any route is [`StatusServices::reset_gate`]'s
+    /// answer, asked per request — this field answers "is there a pool to control", the gate answers
+    /// "may a caller reach it now".
     pub workers: Option<Arc<dyn WorkerControl>>,
     /// Which worker-control routes answer.
     ///
@@ -256,10 +283,12 @@ impl std::fmt::Debug for StatusServices {
 /// the gate adds is the other direction: an operator who granted a reset and then wants it gone no
 /// longer has to restart a serving process to close an unauthenticated mutation surface.
 ///
-/// **Two methods rather than one boolean**, because the two routes are not equally dangerous. A list
+/// **Two methods rather than one boolean**, because the routes are not equally dangerous. A list
 /// is a fact about this process; a reset is a lever on it. A deployment that wants to *see* a pool
 /// should not have to arm the recycle to do it, and `[status.workers] allow = ["workers.list"]` says
-/// exactly that.
+/// exactly that. The third, `restart`, is the rolling deploy — a sweep of every idle slot rather than
+/// a kill switch for one worker — and is separable for the same reason: a pipeline wants the sweep,
+/// not the ability to pick a worker off.
 ///
 /// Deliberately **not** a field of [`StatusServices::workers`]: that is `None` when the deployment
 /// configured no worker pool at all, which is a different answer and must stay a different answer — a
@@ -270,24 +299,35 @@ pub struct WorkerGrant {
     pub list: bool,
     /// `POST /workers/{index}/reset`.
     pub reset: bool,
+    /// `POST /workers/restart` — the rolling restart of application code.
+    ///
+    /// A third method rather than an alias for `reset` because it is a different operation with a
+    /// different contract: a reset names one worker and either replaces it or is refused, while a
+    /// restart sweeps every idle slot and is *expected* to be incomplete. Separating them is what
+    /// lets a deployment grant the rolling form while withholding a per-worker kill switch, and it
+    /// is the direction the two are usually wanted in — a deploy pipeline wants the sweep, not the
+    /// ability to pick a worker off.
+    pub restart: bool,
 }
 
 impl WorkerGrant {
-    /// Both routes, which is what a grant of the whole namespace means.
+    /// Every route, which is what a grant of the whole namespace means.
     pub const ALL: Self = WorkerGrant {
         list: true,
         reset: true,
+        restart: true,
     };
 
-    /// Neither, which is what a deployment that never wrote `[status.workers]` gets.
+    /// None, which is what a deployment that never wrote `[status.workers]` gets.
     pub const NONE: Self = WorkerGrant {
         list: false,
         reset: false,
+        restart: false,
     };
 
     /// Whether any route exists, which is the question the listener asks about the surface as a whole.
     pub fn any(self) -> bool {
-        self.list || self.reset
+        self.list || self.reset || self.restart
     }
 }
 
@@ -496,15 +536,27 @@ async fn answer(
     // The gate is consulted per request rather than baked into `workers`, so `[status.workers] allow`
     // can be changed by a reload. A method the file does not grant does not exist, which is the same
     // answer a deployment that never asked for it gives.
-    if let Some(workers) = &services.workers {
-        let grant = services
-            .reset_gate
-            .as_ref()
-            .map_or(WorkerGrant::NONE, |gate| gate.routes());
-        if grant.any() {
-            if let Some(response) = worker_route(request.method(), path, workers, grant).await {
-                return response;
-            }
+    //
+    // **A deployment with no worker pool is still consulted for the sweep**, and that is not a
+    // widening of the surface: `GET /workers` and a reset act on a pool slot by index, so they are
+    // meaningless without one, while a sweep is defined for every backend kind — a `spawn_cgi` pool
+    // is swept, and a supervised `upstream` origin is restarted. Gating the whole surface on
+    // `services.workers` made `POST /workers/restart` a `405` on exactly those deployments, which
+    // was found by running it against one.
+    let grant = services
+        .reset_gate
+        .as_ref()
+        .map_or(WorkerGrant::NONE, |gate| gate.routes());
+    if grant.any() {
+        if let Some(response) = worker_route(
+            request.method(),
+            path,
+            services.workers.as_ref(),
+            grant,
+        )
+        .await
+        {
+            return response;
         }
     }
 
@@ -581,17 +633,39 @@ async fn answer(
 /// listener, so an unmatched path has to be the last word rather than this function's.
 ///
 /// **A path this function owns but was not granted a method for is still answered**, and that is the
-/// point of taking [`WorkerGrant`] rather than assuming both. `/workers` with only `workers.reset`
-/// granted is a 404 on `GET` — the route does not exist — but the path is this listener's own, so it
-/// does not silently fall through to a readiness lookup that would answer the same 404 for a
-/// different reason. `/workers/{i}/reset` with only `workers.list` granted answers 405, matching
-/// what an ungranted `POST` has always answered.
+/// point of taking [`WorkerGrant`] rather than assuming all three. `/workers` with only
+/// `workers.reset` granted is a 404 on `GET` — the route does not exist — but the path is this
+/// listener's own, so it does not silently fall through to a readiness lookup that would answer the
+/// same 404 for a different reason. `/workers/{i}/reset` with only `workers.list` granted answers
+/// 405, matching what an ungranted `POST` has always answered.
+///
+/// **`workers` is `None` for a deployment with no worker pool, and that is not the same as "no
+/// route".** The list and the reset act on a pool slot by index, so without one they are meaningless
+/// and answer 404 — the answer the surface has always given for a deployment that cannot honour it.
+/// The sweep is different in kind: a `spawn_cgi` pool and a supervised `upstream` origin are both
+/// swept, and neither holds a [`WorkerPool`](volucer_server::WorkerPool). Gating the sweep on the
+/// pool handle made it a 405 on exactly those deployments, which is how this was found.
 async fn worker_route(
     method: &hyper::Method,
     path: &str,
-    workers: &Arc<dyn WorkerControl>,
+    workers: Option<&Arc<dyn WorkerControl>>,
     grant: WorkerGrant,
 ) -> Option<Response<Full<Bytes>>> {
+    let Some(workers) = workers else {
+        // No pool: the sweep is still answered — it is a question about the *deployment* rather than
+        // about a pool slot — and everything else is the 404 the surface always gave here.
+        if path == WorkerRoutes::RESTART {
+            if !grant.restart {
+                return Some(not_found());
+            }
+            return Some(sweep_response(method, None).await);
+        }
+        if path == WorkerRoutes::PATH || WorkerRoutes::reset_index(path).is_some() {
+            return Some(not_found());
+        }
+        return None;
+    };
+
     if path == WorkerRoutes::PATH {
         if !grant.list {
             return Some(not_found());
@@ -618,6 +692,16 @@ async fn worker_route(
             ),
             _ => method_not_allowed(),
         });
+    }
+
+    // **Before the index route**, so `restart` is a declared path rather than a parse that happens to
+    // fail. An ungranted restart is a 404 for the same reason an ungranted reset is: a route the file
+    // did not grant does not exist, and a 405 would tell a caller it does.
+    if path == WorkerRoutes::RESTART {
+        if !grant.restart {
+            return Some(not_found());
+        }
+        return Some(sweep_response(method, Some(workers)).await);
     }
 
     let index = WorkerRoutes::reset_index(path)?;
@@ -681,6 +765,69 @@ async fn worker_route(
         status,
         &serde_json::json!({ "error": refusal.to_string(), "index": refusal.index() }),
     ))
+}
+
+/// The sweep, answered for the grant the deployment made.
+///
+/// A function of its own rather than two arms in [`worker_route`], because the sweep is the one route
+/// that must answer when there is no worker pool — so it is reached from two places and has to mean
+/// the same thing in both.
+///
+/// **`reports` is what the caller resolved**, rather than the control being called here: a deployment
+/// with no worker backend has an empty report, and an empty report is deliberately *complete*. The
+/// distinction `is_complete` draws is "was anything left behind", not "did a backend exist" — a sweep
+/// over nothing left nothing behind, and calling that `202` would make a static-only deployment's
+/// route report a roll in progress for ever.
+///
+/// **`spawn_blocking` for the reason `reset` uses it, and more so**: one sweep may boot every worker
+/// in every pool, and a supervised `upstream` origin is waited out for its own readiness gate, which
+/// is the longest thing this listener can be asked to do.
+async fn sweep_response(
+    method: &hyper::Method,
+    workers: Option<&Arc<dyn WorkerControl>>,
+) -> Response<Full<Bytes>> {
+    if *method != hyper::Method::POST {
+        return method_not_allowed();
+    }
+    let reports = match workers {
+        Some(workers) => {
+            // Cloned because `spawn_blocking` needs a `'static` handle; `Arc::clone` of the trait
+            // object, so this is the same implementation rather than a second one.
+            let workers = Arc::clone(workers);
+            match tokio::task::spawn_blocking(move || workers.respawn_idle()).await {
+                Ok(reports) => reports,
+                // A panic in the pool, reported rather than dropped, for the reason `reset` reports
+                // one.
+                Err(err) => {
+                    return json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &serde_json::json!({ "error": format!("the restart task failed: {err}") }),
+                    )
+                }
+            }
+        }
+        // No pool: nothing to roll, and nothing left behind either.
+        None => Vec::new(),
+    };
+
+    let complete = reports.iter().all(volucer_server::RespawnReport::is_complete);
+    // **`200` for a complete sweep and `202` for one that is not**, which is the honest pair rather
+    // than one code for both. A sweep that skipped a busy slot has not deployed everything yet;
+    // answering `200` would tell a pipeline the rollout is done and it would stop sweeping, leaving
+    // the old code in front of traffic until the next unrelated deploy. `curl -f` still succeeds on
+    // both, because it was accepted and it did work.
+    let status = if complete {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    json(
+        status,
+        &serde_json::json!({
+            "complete": complete,
+            "backends": reports,
+        }),
+    )
 }
 
 /// The listener's own 404, so an ungranted route and an unknown path read the same.

@@ -569,6 +569,72 @@ impl Backend {
         }
     }
 
+    /// Replace the processes that run this backend's application, where that is possible without
+    /// dropping a request.
+    ///
+    /// The one implementation of a rolling restart's *per-backend* half, so that a `SIGUSR2`, a
+    /// `workers.restart` call and the `volucer workers restart` command cannot disagree about what
+    /// a sweep is. What differs between the four kinds is genuinely different, and is stated here
+    /// rather than left for a caller to discover:
+    ///
+    /// | Kind | What a sweep does |
+    /// |---|---|
+    /// | `worker` / `attach` | each idle slot is respawned in place; `attach` is refused as unmanaged |
+    /// | `spawn_cgi` | each idle slot's process is replaced on its own address |
+    /// | `external` (`php-fpm`) | nothing — reported as unmanaged, with the reason |
+    /// | `upstream` | the origin is restarted if volucer supervises it; in-flight requests are lost |
+    ///
+    /// The `upstream` arm is the one that is not a slot sweep and does not pretend to be: an HTTP
+    /// origin has no slots, so there is no idle state to wait for, and the report says one process
+    /// was replaced rather than inventing a slot index. An origin volucer does not supervise is
+    /// unmanaged like `php-fpm` — the process is somebody else's, which is the default shape of an
+    /// `upstream`.
+    pub fn respawn_idle(&self) -> crate::respawn::RespawnReport {
+        match self {
+            Backend::Worker { pool, .. } => pool.respawn_idle(),
+            Backend::SpawnCgi { pool, .. } => pool.respawn_idle(),
+            Backend::External { name, pool } => crate::respawn::RespawnReport::unmanaged_by(
+                name.clone(),
+                0,
+                format!(
+                    "this backend points at an already-running FastCGI server ({}), which \
+                     volucer does not start, so it has no process to replace; reload it with \
+                     php-fpm's own `kill -USR2`, or restart its service",
+                    pool.endpoint()
+                ),
+            ),
+            Backend::Upstream {
+                name,
+                supervisor: Some(supervisor),
+                ..
+            } => {
+                let mut report = crate::respawn::RespawnReport::new(name.clone());
+                let supervisor = supervisor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match supervisor.restart() {
+                    Ok(()) => report.replaced.push(0),
+                    Err(err) => {
+                        tracing::error!(backend = %name, %err, "could not restart the origin");
+                        report.failed.push(0);
+                    }
+                }
+                report
+            }
+            Backend::Upstream {
+                name,
+                supervisor: None,
+                ..
+            } => crate::respawn::RespawnReport::unmanaged_by(
+                name.clone(),
+                0,
+                "this backend proxies to an origin volucer did not start (no `command` is \
+                 configured), so restarting it is the origin's own deploy's job"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Serve a request from an externally managed FastCGI server.
     ///
     /// A connection is taken from the pool for the duration of one request, so
