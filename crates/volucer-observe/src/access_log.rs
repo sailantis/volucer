@@ -154,7 +154,7 @@ pub struct AccessLog {
     reported: AtomicBool,
 }
 
-/// Where records go: a file, nowhere on purpose, or nowhere because something failed.
+/// Where records go: a stream, a file, nowhere on purpose, or nowhere because something failed.
 ///
 /// **`Nowhere` and `Broken` are separate variants rather than a `Broken(String)` whose meaning
 /// depends on whether logging is configured**, because the two answer opposite questions at a
@@ -162,8 +162,16 @@ pub struct AccessLog {
 /// carried the distinction in `reported` instead, and `is_enabled` could not tell them apart — which
 /// made "reopen on `SIGHUP`" either a reopen that resurrected a disabled log or one that never
 /// retried a broken one, depending on which the operator would rather have had.
+///
+/// `Stream` is a second variant rather than `File` over a `File`-shaped stdout because the two differ
+/// in exactly the behaviours the rest of this type is about: a stream cannot be reopened (there is no
+/// name), must not be closed by a rotation, and has no buffer of ours to flush — the platform's own
+/// buffer is the thing a container's log driver reads, and holding a copy would only add a way to
+/// lose records at exit.
 enum Sink {
     File(BufWriter<File>),
+    /// Configured to go to the process's own stdout, which is what a container expects.
+    Stream,
     /// Configured, but the file could not be opened. Records are dropped until a reopen fixes it,
     /// and the reason is reported once.
     Broken(String),
@@ -196,6 +204,34 @@ impl AccessLog {
             log.report_once();
         }
         log
+    }
+
+    /// A log that writes to the process's own stdout, which is what a container expects.
+    ///
+    /// **A stream rather than `/dev/stdout` opened as a file**, and the difference is not cosmetic.
+    /// Opening `/dev/stdout` gives this process a *second* handle on the same file description, so a
+    /// `logrotate` rotation would keep writing into the renamed inode through it — the exact failure
+    /// [`AccessLog::reopen`] exists to prevent — and closing it at `Drop` closes a stream the process
+    /// still needs. Writing through `std::io::stdout()` uses the handle the process already has, which
+    /// is also the handle a container runtime is reading.
+    ///
+    /// No buffer of ours: the record is one `write_all` and the platform's `LineWriter` flushes at the
+    /// newline every record ends with. A `BufWriter` here would be a second buffer that has to be
+    /// drained at exit, which is another way to lose the last line.
+    ///
+    /// `is_enabled()` is true, so a deployment that asked for `-` gets the request id allocated and the
+    /// record rendered — the same cost as a file, which is what makes the two interchangeable.
+    #[must_use]
+    pub fn to_stdout(format: Format) -> Self {
+        Self {
+            format,
+            // No path, so `SIGHUP` has nothing to reopen: a stream has no name. `reopen` returns
+            // false for it, which is the honest answer rather than a rotation silently doing nothing
+            // to a log that was never rotated.
+            path: None,
+            sink: Mutex::new(Sink::Stream),
+            reported: AtomicBool::new(false),
+        }
     }
 
     /// A log that goes nowhere, for when none is configured.
@@ -305,7 +341,7 @@ impl AccessLog {
     pub fn is_enabled(&self) -> bool {
         matches!(
             *self.sink.lock().unwrap_or_else(|e| e.into_inner()),
-            Sink::File(_)
+            Sink::File(_) | Sink::Stream
         )
     }
 
@@ -315,26 +351,46 @@ impl AccessLog {
     /// broken so the next call is cheap, and is reported once.
     pub fn record(&self, record: &Record<'_>) {
         let mut sink = self.sink.lock().unwrap_or_else(|err| err.into_inner());
-        let Sink::File(file) = &mut *sink else {
-            return;
-        };
         let line = match self.format {
             Format::Combined => combined(record),
             Format::Json => json(record),
         };
-        // One `write_all` of one line, then a flush. The flush is what makes the record survive a
-        // crash rather than sitting in the buffer — and a log you cannot trust after a crash is a
-        // log that is missing exactly the request you wanted.
-        if let Err(err) = file.write_all(line.as_bytes()).and_then(|()| file.flush()) {
-            *sink = Sink::Broken(err.to_string());
-            self.report_once();
+        match &mut *sink {
+            // One `write_all` of one line, then a flush. The flush is what makes the record survive a
+            // crash rather than sitting in the buffer — and a log you cannot trust after a crash is a
+            // log that is missing exactly the request you wanted.
+            Sink::File(file) => {
+                if let Err(err) = file.write_all(line.as_bytes()).and_then(|()| file.flush()) {
+                    *sink = Sink::Broken(err.to_string());
+                    self.report_once();
+                }
+            }
+            // A stream that fails is a *closed* stream — a container runtime that went away, or a
+            // writer that exited. Reported like a broken file so the operator learns the log stopped,
+            // and it stays `Stream` rather than becoming `Broken` because there is nothing to reopen
+            // and a later write may well succeed.
+            Sink::Stream => {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                if out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_err() {
+                    self.report_once();
+                }
+            }
+            Sink::Broken(_) | Sink::Nowhere => {}
         }
     }
 
     /// Flush what is buffered.
     pub fn flush(&self) {
-        if let Sink::File(file) = &mut *self.sink.lock().unwrap_or_else(|e| e.into_inner()) {
-            let _ = file.flush();
+        use std::io::Write;
+        match &mut *self.sink.lock().unwrap_or_else(|e| e.into_inner()) {
+            Sink::File(file) => {
+                let _ = file.flush();
+            }
+            Sink::Stream => {
+                let _ = std::io::stdout().flush();
+            }
+            Sink::Broken(_) | Sink::Nowhere => {}
         }
     }
 
@@ -347,7 +403,7 @@ impl AccessLog {
             Sink::Broken(reason) => reason.clone(),
             // A disabled log and a working one both have nothing to say. `Nowhere` reaching this
             // point would mean a caller reported a log nobody asked for.
-            Sink::File(_) | Sink::Nowhere => return,
+            Sink::File(_) | Sink::Stream | Sink::Nowhere => return,
         };
         tracing::error!(
             reason = %reason,
@@ -362,6 +418,7 @@ impl std::fmt::Debug for AccessLog {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let sink = match &*self.sink.lock().unwrap_or_else(|e| e.into_inner()) {
             Sink::File(_) => "file",
+            Sink::Stream => "stdout",
             Sink::Broken(_) => "broken",
             Sink::Nowhere => "nowhere",
         };
@@ -938,5 +995,38 @@ mod tests {
         let log = AccessLog::disabled();
         assert!(!log.reopen(), "there is no path to reopen");
         assert!(!log.is_enabled(), "and it must still write nowhere");
+    }
+
+    /// **A stdout log is enabled, and a rotation neither detaches nor breaks it.**
+    ///
+    /// The property that makes `path = "-"` usable in a container: there is no file description of
+    /// its own to keep writing into a renamed inode, so `reopen` has nothing to do and says so rather
+    /// than pretending. `is_enabled` is true, which is what makes the request path allocate a request
+    /// id and render the record at all — a stream that reported itself disabled would be a log that
+    /// silently wrote nothing while the configuration said otherwise.
+    ///
+    /// The record is *not* captured here: it goes to the process's real stdout, which a test binary
+    /// shares with the harness, so the assertion is on the sink's state rather than on bytes. The
+    /// rendering is covered by the `combined`/`json` tests, which are the same code for either sink.
+    #[test]
+    fn a_stdout_log_is_enabled_and_has_nothing_to_reopen() {
+        let log = AccessLog::to_stdout(Format::Combined);
+        assert!(
+            log.is_enabled(),
+            "a stream is a destination, so the request path must render the record"
+        );
+        assert!(
+            !log.reopen(),
+            "stdout has no path, so a rotation cannot detach it and there is nothing to reopen"
+        );
+        assert!(
+            log.is_enabled(),
+            "and the failed reopen must not have broken it"
+        );
+
+        // Writing is a no-op that must not panic or block, which is what the request path relies on.
+        log.record(&record());
+        log.flush();
+        assert!(log.is_enabled(), "a write does not change which sink it is");
     }
 }

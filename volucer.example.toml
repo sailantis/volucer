@@ -415,8 +415,7 @@ fastcgi = "127.0.0.1:9080"
 # [server.access_log]
 # path = "logs/access.log"
 # format = "combined"            # "combined" (nginx's shape + two timings) or "json"
-# request_id_header = "X-Request-Id"
-#   The header an inbound request id is adopted from, and echoed back on. Adopting
+# request_id_header = "X-Request-Id"#   The header an inbound request id is adopted from, and echoed back on. Adopting
 #   is the default because "one id across the tiers" is the feature: a request id
 #   that changes at every hop cannot correlate a client's log with this one.
 #   Set it to "" to always generate a fresh one instead, which is what nginx does.
@@ -457,6 +456,15 @@ fastcgi = "127.0.0.1:9080"
 # retention policy, and a second rotator is a second schedule to get wrong. SIGHUP
 # does not change path, format or request_id_header either -- those are chosen at
 # startup, and `restart_only` says so on every reload.
+#
+# path = "-" WRITES TO STDOUT instead of a file, which is what a container expects:
+# the runtime's log driver captures it, no volume is needed, and `docker logs` shows
+# the access log beside the diagnostics (which go to stderr). Nothing about rotation
+# applies -- a stream has no path, so a rotation cannot detach it and SIGHUP has
+# nothing to reopen. volucer writes through the handle it already has rather than
+# opening /dev/stdout, because a second handle would keep writing into the renamed
+# inode after a rotation, which is the failure the reopen exists to prevent. A file
+# genuinely named "-" is written as "./-".
 # ---------------------------------------------------------------------------
 # Behind a reverse proxy: whose word for the client's address is believed.
 #

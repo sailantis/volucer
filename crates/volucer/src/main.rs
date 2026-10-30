@@ -533,16 +533,27 @@ fn build_observability_with_exporter(
                 "" => None,
                 name => Some(name.to_string()),
             };
-            tracing::info!(
-                path = %path.display(),
-                format = ?log.format,
-                adopt = header.as_deref().unwrap_or("(never)"),
-                "access logging enabled"
-            );
-            volucer_observe::Observability::new(
-                volucer_observe::access_log::AccessLog::open(&path, format),
-                header,
-            )
+            // **`-` is the process's stdout**, which is what a container expects and what nginx
+            // spells the same way. The decision is made here rather than in `AccessLog::open`
+            // because opening a file named `-` would succeed on every platform and produce a log
+            // nobody reads — a failure that looks like logging being off.
+            let logging = if volucer_core::config::is_stdout_log(&path) {
+                tracing::info!(
+                    format = ?log.format,
+                    adopt = header.as_deref().unwrap_or("(never)"),
+                    "access logging enabled to stdout"
+                );
+                volucer_observe::access_log::AccessLog::to_stdout(format)
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    format = ?log.format,
+                    adopt = header.as_deref().unwrap_or("(never)"),
+                    "access logging enabled"
+                );
+                volucer_observe::access_log::AccessLog::open(&path, format)
+            };
+            volucer_observe::Observability::new(logging, header)
         }
         // Not `disabled()` and then patched: a deployment with spans and no access log is a
         // supported shape, and this is where that is expressed.
@@ -4705,8 +4716,18 @@ fn check(
     match &config.server.access_log {
         Some(log) => {
             let resolved = resolve_access_log_path(&log.path, &config_dir);
+            let to_stdout = volucer_core::config::is_stdout_log(&resolved);
             println!("  access log:");
-            println!("    path:   {}", resolved.display());
+            println!(
+                "    path:   {}",
+                if to_stdout {
+                    "- (the process's stdout; a container's log driver reads it, and the process \
+                     keeps the handle so a rotation cannot detach it)"
+                        .to_string()
+                } else {
+                    resolved.display().to_string()
+                }
+            );
             println!(
                 "    format: {}",
                 match log.format {
@@ -4724,22 +4745,38 @@ fn check(
             // Reported rather than warned about, because serving without an access log is a valid
             // outcome and the runtime already says so once — this is the *pre-start* answer, which
             // is what `check` is for.
-            if let Some(parent) = resolved.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    println!(
-                        "    note:   {} does not exist; requests will be served without an access \
-                         log until it does",
-                        parent.display()
-                    );
+            //
+            // Skipped for stdout: `-` has no parent that could be missing, and `Path::new("-")`'s
+            // parent is the empty path, which the check below would have to special-case anyway.
+            if !to_stdout {
+                if let Some(parent) = resolved.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                        println!(
+                            "    note:   {} does not exist; requests will be served without an \
+                             access log until it does",
+                            parent.display()
+                        );
+                    }
                 }
             }
             // Printed because it is the one thing a deployment must do *after* configuring a log,
             // and because the alternative is finding out during an incident that `logrotate` detached
             // the log silently. The path and format above are restart-only; the reopen is not.
-            println!(
-                "    rotate: send SIGHUP (or `systemctl reload`) after logrotate renames the file — \
-                 volucer closes and reopens it, so the new file is the one written"
-            );
+            //
+            // Not for stdout: a stream has no name to reopen, so a rotation cannot detach it and
+            // there is nothing to do. Saying "send SIGHUP" would be an instruction that changes
+            // nothing.
+            if to_stdout {
+                println!(
+                    "    rotate: nothing to do — stdout has no path, so a rotation cannot detach \
+                     it; the container runtime's own log driver rotates what it captured"
+                );
+            } else {
+                println!(
+                    "    rotate: send SIGHUP (or `systemctl reload`) after logrotate renames the \
+                     file — volucer closes and reopens it, so the new file is the one written"
+                );
+            }
         }
         None => println!("  access log: none (server.access_log is unset)"),
     }

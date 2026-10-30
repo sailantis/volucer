@@ -608,6 +608,17 @@ impl Config {
                     log.request_id_header
                 )));
             }
+            // **A `-` path is stdout, and that is legal.** Checked only so the *refusal* of an empty
+            // path can name it: an empty `path` is a key an operator wrote expecting a destination,
+            // and it used to be accepted and then fail at startup as "the access log could not be
+            // written" — a warning about a file nobody tried to name.
+            if log.path.as_os_str().is_empty() {
+                return Err(Error::Config(
+                    "[server.access_log] has an empty `path`, so there is no destination; write a \
+                     file path, or \"-\" for the process's stdout"
+                        .to_string(),
+                ));
+            }
         }
 
         for (name, backend) in &self.backends {

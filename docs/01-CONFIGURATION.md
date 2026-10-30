@@ -569,12 +569,19 @@ Use this to prepare contact details or pause an order without removing the confi
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `path` | path | **required** | Where the log is written. |
+| `path` | path | **required** | Where the log is written. `-` means the process's stdout. |
 | `format` | string | `"combined"` | `"combined"` or `"json"`. |
 | `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from. |
 
 The `combined` format follows nginx's log format and appends request and origin timings.
 The `json` format writes one JSON object per line.
+
+**`path = "-"` writes to the process's stdout**, which is what a container expects: the
+runtime's log driver captures it, no volume is needed, and `docker logs` shows the access
+log beside the diagnostics. Volucer does not open a second handle on the stream — it writes
+through the one it already has — so a rotation can never detach it, and `SIGHUP` has nothing
+to do for it (with a file, `SIGHUP` closes and reopens it). A file genuinely named `-` is
+written as `./-`.
 
 Set `request_id_header` to an empty string to always generate a new request ID instead of
 adopting one from a request header.

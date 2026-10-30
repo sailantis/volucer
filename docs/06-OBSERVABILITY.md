@@ -16,16 +16,37 @@ format = "combined"               # or "json"
 request_id_header = "X-Request-Id"
 ```
 
-| Key                 | Type   | Default          | What it does                           |
-| ------------------- | ------ | ---------------- | -------------------------------------- |
-| `path`              | path   | **required**     | Where the log is written.              |
-| `format`            | string | `"combined"`     | `"combined"` or `"json"`.              |
-| `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from. |
+| Key                 | Type   | Default          | What it does                                            |
+| ------------------- | ------ | ---------------- | ------------------------------------------------------- |
+| `path`              | path   | **required**     | Where the log is written. `-` means the process's stdout. |
+| `format`            | string | `"combined"`     | `"combined"` or `"json"`.                               |
+| `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from.                  |
 
 Volucer does not create the parent directory. If it does not exist or cannot be opened,
 startup reports the problem once and the server continues without writing the access log.
 Requests continue to be served even if a later write fails. Create the directory and ensure
 the service account can write to it before starting Volucer.
+
+### Writing to stdout
+
+`path = "-"` sends records to the process's **stdout**, which is what a container expects:
+
+```toml
+[server.access_log]
+path = "-"
+format = "json"
+```
+
+No volume is needed, the container runtime's log driver captures the records, and `docker logs`
+or `kubectl logs` shows the access log beside the diagnostics (which go to stderr). Two
+consequences worth knowing:
+
+- **There is nothing to rotate.** A stream has no path, so a rotation cannot detach it and
+  `SIGHUP` does not reopen it — the runtime's own driver rotates what it captured. `volucer
+  check` says so rather than printing the usual `logrotate` instruction.
+- **Volucer writes through the handle it already has**, not a second one on `/dev/stdout`. The
+  difference matters: a second handle would keep writing into a renamed inode after a rotation,
+  which is exactly the failure the reopen exists to prevent.
 
 ### The format
 

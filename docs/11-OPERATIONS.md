@@ -130,8 +130,7 @@ The following settings require a restart. Volucer reports them during reload:
 | `[server.env]` and a backend's `env`                    | Existing processes retain their environment; replacement workers could otherwise receive different values from running workers |
 | `[server.tls]` `min_version` and `alpn`                 | They are baked into the `rustls` server config the acceptor holds                                                              |
 | `[server.proxy]`                                        | Whose forwarded headers are believed is a statement about this deployment's topology                                           |
-| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   |
-| `[status]` `listen`                                     | The listener is bound                                                                                                          |
+| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   || `[status]` `listen`                                     | The listener is bound                                                                                                          |
 
 ### A reload is whole-or-nothing
 

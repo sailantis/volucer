@@ -33,6 +33,58 @@ fn an_access_log_path_resolves_against_the_config_directory() {
     assert_eq!(absolute, PathBuf::from("/var/log/a.log"));
 }
 
+/// **`-` is the process's stdout, not a file named `-` beside the configuration.**
+///
+/// The failure this prevents is quiet in the worst way: `config_dir.join("-")` is a perfectly
+/// writable path, so the server would start, log to a file nobody opens, and a container's own log
+/// would be empty — indistinguishable from logging being off. `is_stdout_log` is the one predicate
+/// the resolver and the sink choice share, so the two cannot disagree about what `-` means.
+#[test]
+fn a_dash_log_path_is_stdout_and_is_not_resolved_against_the_config_directory() {
+    assert!(is_stdout_log(Path::new("-")));
+    // Only the bare dash. A file genuinely named `-` is written `./-` or by absolute path, and a
+    // deployment that means a file must be able to say so.
+    assert!(!is_stdout_log(Path::new("./-")));
+    assert!(!is_stdout_log(Path::new("/var/log/app/-")));
+
+    assert_eq!(
+        resolve_access_log_path(Path::new("-"), Path::new("/etc/volucer")),
+        PathBuf::from("-"),
+        "a dash is a stream, not a relative file name"
+    );
+}
+
+/// A `-` destination parses and validates, and an empty one is refused by name.
+#[test]
+fn a_stdout_access_log_is_configurable_and_an_empty_path_is_refused() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access_log]
+path = "-"
+format = "json"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("stdout is a valid destination");
+    assert_eq!(
+        config.server.access_log.expect("present").path,
+        PathBuf::from("-")
+    );
+
+    // An empty path is a key an operator wrote expecting a destination. It used to be accepted and
+    // then reported at startup as a file that could not be written, which named no file because
+    // there was none.
+    let text = text.replace("path = \"-\"", "path = \"\"");
+    let config = Config::from_toml(&text).expect("parses");
+    let err = config.validate().expect_err("an empty path must be refused");
+    assert!(err.to_string().contains("empty `path`"), "{err}");
+    assert!(
+        err.to_string().contains("\"-\""),
+        "the refusal has to name the spelling that means stdout: {err}"
+    );
+}
+
 #[test]
 fn a_proxy_table_parses_and_an_absent_one_means_the_feature_is_off() {
     let text = r#"

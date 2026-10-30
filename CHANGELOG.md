@@ -9,6 +9,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[server.access_log] path = "-"` writes the access log to the process's stdout.** This is what
+  a container expects: the runtime's log driver captures the records, no volume is needed, and
+  `docker logs` shows the access log beside the diagnostics, which go to stderr. nginx spells the
+  same destination the same way.
+
+  A stream is a distinct sink rather than a file, because the two differ in exactly the behaviours
+  the access log is about. There is no path, so `SIGHUP` does not reopen it — a rotation cannot
+  detach what has no name, and `volucer check` says so instead of printing the usual `logrotate`
+  instruction. And it writes through the handle the process already has rather than opening
+  `/dev/stdout`, which is not cosmetic: a second handle on the same file description keeps writing
+  into the renamed inode after a rotation, which is the failure the reopen exists to prevent.
+
+  `-` is also no longer resolved against the configuration directory. `config_dir.join("-")` is a
+  perfectly writable path, so the previous resolution would have started cleanly, logged to a file
+  nobody opens, and left a container's own log empty — indistinguishable from logging being off. An
+  empty `path` is now refused by name and points at `-`.
+
 - **A stop now finishes the requests that are already running, bounded by
   `server.shutdown_timeout_ms`.** The listener stops accepting immediately, asks every open
   connection to complete its current request through `hyper`'s `graceful_shutdown`, and waits up to
