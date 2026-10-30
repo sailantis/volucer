@@ -9,6 +9,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+### Added
+
+- **The worker protocol can describe a response whose length is not known.** A worker that generates
+  its body as it goes — a CSV export, an SSE feed — could not previously say so: `ResponseHead.body_len`
+  was authoritative, so the body had to be assembled before the first byte could be sent. The head now
+  carries a `STREAMED` flag (`0x0020`) meaning *this body declares no length, and its only end signal
+  is the `LAST`-flagged `BODY` frame*.
+
+  This is the protocol half of streaming a worker response; the pool and listener halves follow. It is
+  deliberately landed and tested on its own, because the wire change is the part that must not be got
+  wrong — every other piece can be added without invalidating a running worker.
+
+  **A flag rather than "a zero `body_len` means unknown"**, and that distinction is load-bearing: a
+  zero length with the flag clear is a correctly empty body — a `204`, a `HEAD` — so a reader that
+  treated every zero as "stream me bytes" would consume the next request's frames as this response's
+  body. The same reasoning `NO_CHECKSUM` documents for its own sentinel.
+
+  Because there is no declared length to check a streamed body against, `END` arriving without a
+  preceding `LAST` is reported as a **truncation** rather than accepted as a short body. That check is
+  what replaces the length check, and the test for it fails if the check is removed.
+
+  Existing workers need no change: both the Rust reader and the PHP SDK ignore flag bits they do not
+  know, so a worker that declares a length is unaffected — and a worker that declares one when a
+  stream was asked for is still read in full and returned buffered, because which shape a response
+  takes belongs to the worker.
+
 - **`volucer workers restart` reports why a sweep was incomplete instead of assuming it was busy.**
   The command explained exit `1` with a fixed sentence — *"at least one slot was serving a request"* —
   which is only one of the three ways the route answers `202`. For the most serious of the other two
@@ -30,8 +56,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unchanged, so a deploy script written against it needs no change — but one that loops unconditionally
   on `failed` will spin, which `docs/14-DEPLOYING.md` now says out loud.
 
-### Changed
-
 - **A backend response is moved into the HTTP body instead of copied.** `Response::stdout` already
   holds the whole payload — the `Status:` block, the headers and the body in one `Vec<u8>` — and
   `from_cgi` used to copy the body out of it, so a 30 MiB worker response existed twice at the moment
@@ -48,8 +72,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   version did not have: a stale handle on the original would keep the 4 MiB alive for the whole of a
   200-byte response. That test asserts the conversion both allocates less than the input **and**
   actually compressed it, so neither half can pass on its own.
-
-### Added
 
 - **`docs/14-DEPLOYING.md` documents the rolling deploy end to end.** The operations guide
   describes the three verbs and what each backend kind does during a sweep, but the deployment

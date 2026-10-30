@@ -141,6 +141,17 @@ pub struct ResponseHead {
     #[serde(default)]
     pub headers: Vec<(String, String)>,
     /// How many body bytes follow in `Body` frames.
+    ///
+    /// **Authoritative for a buffered response, and ignored for a streamed one.** A worker that
+    /// knows its body's length declares it, and the reader then checks the declaration against what
+    /// actually arrives — an error rather than a truncated response read as a complete one.
+    ///
+    /// A worker that does *not* know the length, because it is generating the body as it goes,
+    /// declares `0` and sets [`flags::STREAMED`](crate::header::flags::STREAMED) on the header
+    /// frame instead. The two spellings are kept apart deliberately: `body_len: 0` with no flag is a
+    /// genuinely empty body, so a reader that treated a zero length as "unknown" would read the
+    /// *next request's* frames as this response's body. That is the failure the explicit flag
+    /// exists to prevent.
     #[serde(default)]
     pub body_len: u64,
 }

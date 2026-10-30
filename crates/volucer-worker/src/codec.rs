@@ -366,6 +366,12 @@ pub struct WorkerChannel<W: Write, R: Read> {
     /// out of it (into the body, or decoded) before the next read, because the next read
     /// overwrites it.
     scratch: Vec<u8>,
+    /// Set while a streamed response is being drained.
+    ///
+    /// The body frames are still on this channel's pipe, so nothing else may be sent until it is
+    /// drained or the channel is closed. Kept here rather than in a sink value because that would
+    /// make [`Delivery`] generic over the channel's `W`/`R` — see [`StreamedHead`].
+    streaming: Option<Streaming>,
     /// The agreed checksum policy, in force after the handshake.
     ///
     /// [`Checksum::Required`] until [`WorkerChannel::handshake`] has agreed otherwise, which
@@ -417,6 +423,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             metrics: Vec::new(),
             payload: Vec::new(),
             scratch: Vec::new(),
+            streaming: None,
             checksum: Checksum::Required,
             offer_no_checksum: false,
             call_handler: None,
@@ -1139,6 +1146,432 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             Err(err) => tracing::warn!(%err, "ignoring an unreadable worker metric"),
         }
     }
+
+    /// Read one frame, answering the parts of the protocol that are not the response's.
+    ///
+    /// One implementation for the buffered and the streamed loop, because the four things it absorbs
+    /// — telemetry, events, calls and recoverable errors — have to behave identically in both.
+    /// Written twice they would eventually differ, and the difference would be a call that is
+    /// answered while a body is buffered and dropped while it is streamed.
+    ///
+    /// `what` names the exchange in the closed-stream error, so a job and a request each say which
+    /// one ended. `Ok(None)` is a frame that was entirely absorbed.
+    fn read_one(
+        &mut self,
+        request_id: u32,
+        frame_buffer: &mut Vec<u8>,
+        what: &str,
+    ) -> Result<Option<ResponseFrame>> {
+        let policy = self.checksum;
+        let Some((header, len)) = Header::read_into_with(&mut self.reader, frame_buffer, policy)?
+        else {
+            return Err(WorkerError::Closed(format!(
+                "the worker closed its output while {what} request {request_id}"
+            )));
+        };
+        // Copied out where the caller keeps it, because the next read overwrites the buffer.
+        let payload = frame_buffer[..len].to_vec();
+
+        let answer = match header.message_type {
+            MessageType::Response => {
+                if header.request_id != request_id {
+                    return Err(WorkerError::WrongRequestId {
+                        expected: request_id,
+                        actual: header.request_id,
+                    });
+                }
+                Some(ResponseFrame::Response(
+                    Json::decode(&payload)?,
+                    header.flags & flags::STREAMED != 0,
+                ))
+            }
+            MessageType::Body => {
+                if header.request_id != request_id {
+                    return Err(WorkerError::WrongRequestId {
+                        expected: request_id,
+                        actual: header.request_id,
+                    });
+                }
+                Some(ResponseFrame::Body(payload, header.flags & flags::LAST != 0))
+            }
+            MessageType::End => {
+                if header.request_id != request_id {
+                    return Err(WorkerError::WrongRequestId {
+                        expected: request_id,
+                        actual: header.request_id,
+                    });
+                }
+                Some(ResponseFrame::End(Json::decode(&payload)?))
+            }
+            MessageType::Log => {
+                self.absorb_log(&payload);
+                None
+            }
+            MessageType::Metric => {
+                self.absorb_metric(&payload);
+                None
+            }
+            MessageType::Event => {
+                tracing::trace!(request_id = header.request_id, "worker sent an event");
+                None
+            }
+            MessageType::Call => {
+                self.answer_call(&header, &payload)?;
+                None
+            }
+            MessageType::Error => {
+                let report: ErrorReport = Json::decode(&payload)?;
+                if report.recoverable {
+                    tracing::warn!(%report.message, "worker reported a recoverable error");
+                    None
+                } else {
+                    return Err(WorkerError::Remote {
+                        message: report.message,
+                    });
+                }
+            }
+            other => {
+                return Err(WorkerError::NotA {
+                    expected: "a response frame",
+                    actual: other,
+                })
+            }
+        };
+        Ok(answer)
+    }
+
+    /// Serve a `CALL` that arrived while a request was in flight.
+    fn answer_call(&mut self, header: &Header, payload: &[u8]) -> Result<()> {
+        let call: Call = Json::decode(payload)?;
+        let answer = match &self.call_handler {
+            Some(handler) if header.request_id >= crate::FIRST_CALL_ID_HALF => {
+                // `catch_unwind` because the handler runs *here*, on the exchange thread that owns
+                // this worker's pipes for its whole life: an escaping panic would poison the channel
+                // and take the worker with it, and the failure mode would be a request path that
+                // dies with no log line saying why.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&call)))
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            call = %call.name,
+                            "a call handler panicked; the call is refused"
+                        );
+                        Return::refused("the call handler panicked")
+                    })
+            }
+            Some(_) => Return::refused(format!(
+                "call {} arrived with request id {}, which is a request's range",
+                call.name, header.request_id
+            )),
+            None => Return::refused(format!(
+                "no call handler is installed, so {} cannot be served",
+                call.name
+            )),
+        };
+        self.send_json(MessageType::Return, header.request_id, &answer, 0)
+    }
+
+    /// Send a request and return as soon as its head has arrived, leaving the body to drain.
+    ///
+    /// # Why this is two phases and not one
+    ///
+    /// A streamed response has to let the front-end choose a status, a content type and a framing
+    /// **before** the first body byte reaches the client. That is the point of streaming, and it is
+    /// impossible if the head is only known once the body is complete — which is exactly what
+    /// [`WorkerChannel::request`] waits for.
+    ///
+    /// # The buffered answer is not refused
+    ///
+    /// A worker that declares a length still has its response read in full and returned as
+    /// [`Delivery::Buffered`]. Which arm is taken belongs to the worker and the application, not to
+    /// a server guess, so one worker can serve both kinds and the caller never has to know.
+    pub fn request_streamed(
+        &mut self,
+        head: Vec<u8>,
+        body: &[u8],
+        mut on_stage: impl FnMut(RequestStage),
+    ) -> Result<Delivery> {
+        let request_id = self.take_request_id();
+
+        on_stage(RequestStage::Sending);
+        self.send_frame(MessageType::Request, request_id, &head, 0)?;
+        self.send_body(request_id, body)?;
+
+        on_stage(RequestStage::Reading);
+
+        // Read up to and including the head, then stop. Telemetry and calls before it are answered
+        // in place by `read_one`, so a worker that logs on the way to its first byte is unaffected.
+        loop {
+            let mut frame_buffer = std::mem::take(&mut self.scratch);
+            let outcome = self.read_one(request_id, &mut frame_buffer, "answering");
+            self.scratch = frame_buffer;
+
+            match outcome? {
+                Some(ResponseFrame::Response(head, true)) => {
+                    if head.body_len != 0 {
+                        // Both spellings at once is a worker bug that must not be resolved by
+                        // preferring one: the sender and the reader disagree about the body's end
+                        // signal, and guessing produces either a truncated body or a frame read as
+                        // payload.
+                        return Err(WorkerError::Remote {
+                            message: format!(
+                                "request {request_id} set STREAMED and declared {} body bytes; a \
+                                 streamed response declares no length",
+                                head.body_len
+                            ),
+                        });
+                    }
+                    self.streaming = Some(Streaming {
+                        request_id,
+                        seen_last: false,
+                        ended: None,
+                    });
+                    return Ok(Delivery::Streamed(StreamedHead { head, request_id }));
+                }
+                Some(ResponseFrame::Response(head, false)) => {
+                    self.streaming = None;
+                    let mut response = self.collect_body(request_id, head, false)?;
+                    response.logs = std::mem::take(&mut self.logs);
+                    response.metrics = std::mem::take(&mut self.metrics);
+                    return Ok(Delivery::Buffered(response));
+                }
+                Some(ResponseFrame::Body(_, _)) => return Err(body_before_head(request_id)),
+                Some(ResponseFrame::End(end)) => {
+                    return Err(WorkerError::Remote {
+                        message: format!(
+                            "request {request_id} ended without a response head (app status {})",
+                            end.app_status
+                        ),
+                    })
+                }
+                None => continue,
+            }
+        }
+    }
+
+    /// Whether a streamed body is still on this channel's pipe.
+    ///
+    /// **A channel mid-stream must not be used for another request**, and must not be returned to a
+    /// pool: the frames still on the pipe belong to the response being drained, and the next
+    /// exchange would read them as its own. A caller that abandons a stream has to close the channel
+    /// — which is what tells the worker its client went away.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming.is_some()
+    }
+
+    /// Whether the streamed response reached its `END` frame.
+    ///
+    /// A streamed body ends at `LAST`, and `END` follows it, so **`false` means the body was
+    /// truncated**. A front-end must not present that as complete: for HTTP/1.1 the only honest
+    /// signal left is closing the connection without the terminating chunk.
+    pub fn stream_finished(&self) -> bool {
+        self.streaming
+            .as_ref()
+            .is_some_and(Streaming::is_finished)
+    }
+
+    /// The terminal frame of a drained stream, once it has been read.
+    pub fn stream_end(&self) -> Option<&crate::RequestEnd> {
+        self.streaming.as_ref()?.ended.as_ref()
+    }
+
+    /// The next non-empty body chunk, or `None` when the streamed body is over.
+    ///
+    /// `None` means `LAST` was seen **and** the terminal `END` was read, so a `None` is the only
+    /// signal a caller needs. An empty chunk is never returned: a `BODY` frame with no payload is
+    /// legal and carries only `LAST`, and forwarding a zero-length write per chunk is a framing
+    /// error to some clients.
+    pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(request_id) = self.streaming.as_ref().map(|s| s.request_id) else {
+            return Err(WorkerError::Remote {
+                message: "next_chunk was called with no streamed response in progress".to_string(),
+            });
+        };
+
+        loop {
+            if self.streaming.as_ref().is_some_and(Streaming::is_finished) {
+                return Ok(None);
+            }
+            let mut frame_buffer = std::mem::take(&mut self.scratch);
+            let outcome = self.read_one(request_id, &mut frame_buffer, "streaming");
+            self.scratch = frame_buffer;
+
+            match outcome? {
+                Some(ResponseFrame::Body(chunk, last)) => {
+                    if let Some(state) = self.streaming.as_mut() {
+                        state.seen_last |= last;
+                    }
+                    if !chunk.is_empty() {
+                        return Ok(Some(chunk));
+                    }
+                }
+                // A second head mid-body means the worker began answering a different request on
+                // this stream, which is a protocol error rather than something to tolerate.
+                Some(ResponseFrame::Response(_, _)) => {
+                    return Err(WorkerError::Remote {
+                        message: format!("request {request_id} was answered twice"),
+                    })
+                }
+                Some(ResponseFrame::End(end)) => {
+                    let seen_last = self.streaming.as_ref().is_some_and(|s| s.seen_last);
+                    if !seen_last {
+                        // `END` without `LAST` is a worker that did not flag the end of a body it
+                        // was streaming. Reported rather than accepted, because accepting it would
+                        // make a truncated body look complete — the one thing streaming must never
+                        // do.
+                        return Err(WorkerError::Remote {
+                            message: format!(
+                                "request {request_id} ended a streamed body without a LAST frame"
+                            ),
+                        });
+                    }
+                    if let Some(state) = self.streaming.as_mut() {
+                        state.ended = Some(end);
+                    }
+                    return Ok(None);
+                }
+                None => continue,
+            }
+        }
+    }
+
+    /// Read a response body to its `END`, given a head already decoded.
+    ///
+    /// The shared buffered tail, including the two independent truncation checks that are the reason
+    /// a short body is *detected* rather than presented as complete. `streamed` says the worker sent
+    /// `STREAMED`, in which case there is no declared length to check against and the body's size is
+    /// whatever arrived.
+    fn collect_body(
+        &mut self,
+        request_id: u32,
+        head: ResponseHead,
+        streamed: bool,
+    ) -> Result<WorkerResponse> {
+        let mut response = WorkerResponse {
+            head,
+            ..WorkerResponse::default()
+        };
+        let mut body = Vec::new();
+        let mut seen_last_body = false;
+        if !streamed {
+            // The head arrives before the body, so the body can be sized once instead of regrowing
+            // frame by frame. The reservation is capped, so a worker that declares a length it does
+            // not send cannot make this allocate it.
+            let declared = usize::try_from(response.head.body_len).unwrap_or(usize::MAX);
+            if declared <= BODY_RESERVE_LIMIT {
+                body.reserve(declared);
+            }
+        }
+        let expected_body = if streamed { 0 } else { response.head.body_len };
+
+        loop {
+            let mut frame_buffer = std::mem::take(&mut self.scratch);
+            let outcome = self.read_one(request_id, &mut frame_buffer, "answering");
+            self.scratch = frame_buffer;
+
+            match outcome? {
+                Some(ResponseFrame::Body(chunk, last)) => {
+                    body.extend_from_slice(&chunk);
+                    if last {
+                        seen_last_body = true;
+                    }
+                }
+                Some(ResponseFrame::End(end)) => {
+                    response.end = end;
+                    break;
+                }
+                Some(ResponseFrame::Response(_, _)) => {
+                    return Err(WorkerError::Remote {
+                        message: format!("request {request_id} was answered twice"),
+                    })
+                }
+                None => continue,
+            }
+        }
+
+        if body.len() as u64 != expected_body {
+            return Err(WorkerError::Remote {
+                message: format!(
+                    "request {request_id} declared {expected_body} body bytes but sent {}",
+                    body.len()
+                ),
+            });
+        }
+        if expected_body > 0 && !seen_last_body {
+            return Err(WorkerError::Remote {
+                message: format!("request {request_id} did not flag its last body frame"),
+            });
+        }
+
+        response.body = body;
+        Ok(response)
+    }
+}
+
+/// A body frame arrived before the head that describes it.
+fn body_before_head(request_id: u32) -> WorkerError {
+    WorkerError::Remote {
+        message: format!("request {request_id} sent a body before its head"),
+    }
+}
+
+/// One frame a response loop cares about, after the rest have been absorbed.
+enum ResponseFrame {
+    /// A response head, and whether it declared its body's length.
+    Response(ResponseHead, bool),
+    /// One body chunk, and whether it carried `LAST`.
+    Body(Vec<u8>, bool),
+    /// The terminal frame.
+    End(crate::RequestEnd),
+}
+
+/// What a request answered with.
+///
+/// An enum rather than a flag on `WorkerResponse` because the two shapes are genuinely different:
+/// one owns the bytes, the other is a state on the channel that the caller drains.
+#[derive(Debug)]
+pub enum Delivery {
+    /// Every byte was read before this was returned. The request is complete.
+    Buffered(WorkerResponse),
+    /// The head is known and the body is still on the pipe. Drain it with
+    /// [`WorkerChannel::next_chunk`], or close the channel.
+    Streamed(StreamedHead),
+}
+
+/// A response whose body has not been read yet.
+///
+/// # Why a value rather than a sink holding the channel
+///
+/// A sink that borrowed the channel would be generic over its `W`/`R`, which would put those
+/// parameters into [`Delivery`] and from there into every caller and test — for a type whose only
+/// interesting content is a status and some headers. So the pending state lives **on the channel**:
+/// this is the head the caller decides framing from, and [`WorkerChannel::next_chunk`] pulls the
+/// body through the same channel that serves the next request afterwards. No borrow, no generics,
+/// and only one thing can read the pipe either way.
+#[derive(Debug, Clone)]
+pub struct StreamedHead {
+    /// The status and headers, available before any body byte.
+    pub head: ResponseHead,
+    /// The request id the body frames carry.
+    pub request_id: u32,
+}
+
+/// Where a channel is in draining a streamed body.
+///
+/// `None` on the channel means it is not mid-stream, which is the state every buffered request
+/// leaves it in.
+#[derive(Debug)]
+struct Streaming {
+    request_id: u32,
+    /// Whether the `LAST`-flagged body frame has arrived.
+    seen_last: bool,
+    /// The terminal frame, once it has been read.
+    ended: Option<crate::RequestEnd>,
+}
+
+impl Streaming {
+    fn is_finished(&self) -> bool {
+        self.ended.is_some()
+    }
 }
 
 /// Writes the low-level helpers tests need.
@@ -1228,9 +1661,166 @@ mod tests {
         script
     }
 
+    /// A worker script that streams `chunks` for request 1, declaring no length.
+    fn streaming(chunks: &[&str], last: bool) -> WorkerScript {
+        let mut script = WorkerScript::default();
+        // The head carries `STREAMED`, which is the only thing that distinguishes "unknown
+        // length" from "empty body" — a zero `body_len` alone means a 204.
+        let payload = Json::encode(&ResponseHead {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+            body_len: 0,
+        })
+        .unwrap();
+        let mut header = Header::new(MessageType::Response, 1, &payload).unwrap();
+        header.flags |= flags::STREAMED;
+        write_frame(&mut script.bytes, &header, &payload).unwrap();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let is_last = last && index + 1 == chunks.len();
+            script.body(1, chunk.as_bytes(), is_last);
+        }
+        script.json(MessageType::End, 1, &RequestEnd::default());
+        script
+    }
+
     #[test]
-    fn a_request_and_its_response_round_trip_over_one_channel() {
+    fn a_streamed_response_returns_its_head_before_its_body_is_read() {
+        let script = streaming(&["one", "two", "three"], true);
+        let mut channel = script.channel();
+
+        let delivery = channel
+            .request_streamed(b"{}".to_vec(), b"", |_| {})
+            .expect("a streamed response must be accepted");
+
+        let head = match delivery {
+            Delivery::Streamed(head) => head,
+            Delivery::Buffered(_) => panic!("a STREAMED head must not be buffered"),
+        };
+        assert_eq!(head.head.status, 200);
+        assert_eq!(head.head.body_len, 0, "a streamed head declares no length");
+        assert!(
+            channel.is_streaming(),
+            "the body is still on the pipe, and the channel must know it"
+        );
+        assert!(!channel.stream_finished(), "nothing has been drained yet");
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = channel.next_chunk().expect("draining must succeed") {
+            chunks.push(String::from_utf8(chunk).unwrap());
+        }
+        assert_eq!(chunks, ["one", "two", "three"]);
+        assert!(channel.stream_finished(), "END arrived after the last chunk");
+        assert!(
+            !channel.is_streaming() || channel.stream_end().is_some(),
+            "a finished stream carries its terminal frame"
+        );
+    }
+
+    /// **A streamed body that ends without `LAST` is an error, not a short success.**
+    ///
+    /// This is the whole reason `LAST` is checked for a streamed response: the length cannot be, so
+    /// `LAST` is the only thing distinguishing a complete body from a worker that died half way. A
+    /// reader that accepted `END` without it would present a truncated 1 GB download as complete.
+    #[test]
+    fn a_streamed_body_without_last_is_a_truncation_rather_than_a_short_body() {
+        let script = streaming(&["one", "two"], false);
+        let mut channel = script.channel();
+        channel.request_streamed(b"{}".to_vec(), b"", |_| {}).unwrap();
+
+        let mut seen = Vec::new();
+        let error = loop {
+            match channel.next_chunk() {
+                Ok(Some(chunk)) => seen.push(String::from_utf8(chunk).unwrap()),
+                Ok(None) => panic!("a body with no LAST frame must not read as complete"),
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(seen, ["one", "two"], "every byte arrived before the error");
+        assert!(
+            error.to_string().contains("without a LAST frame"),
+            "the error has to name the missing frame: {error}"
+        );
+        assert!(!channel.stream_finished());
+    }
+
+    /// A `STREAMED` head that also declares a length is refused rather than resolved by guessing.
+    #[test]
+    fn a_streamed_head_must_not_also_declare_a_length() {
+        let mut script = WorkerScript::default();
+        let payload = Json::encode(&ResponseHead {
+            status: 200,
+            headers: Vec::new(),
+            body_len: 7,
+        })
+        .unwrap();
+        let mut header = Header::new(MessageType::Response, 1, &payload).unwrap();
+        header.flags |= flags::STREAMED;
+        write_frame(&mut script.bytes, &header, &payload).unwrap();
+        script
+            .body(1, b"nothing", true)
+            .json(MessageType::End, 1, &RequestEnd::default());
+
+        let mut channel = script.channel();
+        let error = channel
+            .request_streamed(b"{}".to_vec(), b"", |_| {})
+            .expect_err("both end signals at once is a worker bug");
+        assert!(
+            error.to_string().contains("declares no length"),
+            "{error}"
+        );
+    }
+
+    /// A worker that declares a length when streaming was asked for is still read in full.
+    ///
+    /// Which arm a response takes belongs to the worker, not to the server's guess, so one worker can
+    /// serve both kinds and a caller that asked for a stream must cope with a buffered answer.
+    #[test]
+    fn a_declared_length_under_request_streamed_is_still_buffered() {
         let script = echoing("hello");
+        let mut channel = script.channel();
+
+        let delivery = channel
+            .request_streamed(b"{}".to_vec(), b"", |_| {})
+            .expect("a buffered answer to a streaming request is not a failure");
+        match delivery {
+            Delivery::Buffered(response) => assert_eq!(response.body, b"hello"),
+            Delivery::Streamed(_) => panic!("a head without STREAMED must be buffered"),
+        }
+        assert!(
+            !channel.is_streaming(),
+            "a buffered answer leaves nothing on the pipe"
+        );
+    }
+
+    /// `body_len: 0` with no flag is an empty body, and must not be read as a stream.
+    ///
+    /// The distinction the `STREAMED` flag exists for: reading every zero length as "unknown" would
+    /// make a `204` consume the next request's frames as this response's body.
+    #[test]
+    fn a_zero_length_without_the_flag_is_an_empty_body_not_a_stream() {
+        let mut script = WorkerScript::default();
+        script
+            .head(1, 204, 0)
+            .json(MessageType::End, 1, &RequestEnd::default());
+        let mut channel = script.channel();
+
+        let delivery = channel
+            .request_streamed(b"{}".to_vec(), b"", |_| {})
+            .expect("an empty body is a complete response");
+        match delivery {
+            Delivery::Buffered(response) => {
+                assert_eq!(response.status(), 204);
+                assert!(response.body.is_empty());
+            }
+            Delivery::Streamed(_) => {
+                panic!("a zero length without STREAMED is an empty body, not an unknown one")
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_and_its_response_round_trip_over_one_channel() {        let script = echoing("hello");
         let mut channel = script.channel();
 
         let response = channel

@@ -161,9 +161,18 @@ unnecessary per-byte encoding work.
 | `0x0004` | `LAST` | This is the last chunk of a logical message |
 | `0x0008` | `ERROR` | The sender is reporting a failure |
 | `0x0010` | `NO_CHECKSUM` | The `crc32c` field is **not** a checksum and must not be verified |
+| `0x0020` | `STREAMED` | On `RESPONSE`: the body's length is not declared, and `LAST` is its only end signal |
 
 `NO_CHECKSUM` is a flag rather than a zero checksum value. Zero is a valid checksum:
 `crc32c("") == 0`, including for frames with an empty payload.
+
+`STREAMED` is a flag rather than reading `body_len: 0` as "unknown", for the same kind of reason:
+a zero length is already a real answer — an empty body, a `204`, a `HEAD` — so a reader that treated
+every zero as "stream me bytes" would consume the next request's frames as this response's body. A
+streamed response declares `body_len: 0` *and* this bit, ends at the `LAST`-flagged `BODY` frame,
+and has no length to check the body against — which is why `END` without `LAST` is a truncation
+rather than a short body. The full rule is in the
+[protocol specification](https://github.com/sailantis/volucer/blob/main/docs/worker-protocol.md#a-response-whose-length-is-not-known).
 
 ## Checksum
 

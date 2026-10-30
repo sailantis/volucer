@@ -122,7 +122,7 @@ The numbering is part of the protocol. These values must never be reordered or r
 | 1 | `HELLO` | server → worker | no | Protocol version, for the handshake |
 | 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime` (see below) |
 | 3 | `REQUEST` | server → worker | yes | Request metadata (JSON). The body follows in `BODY` frames |
-| 4 | `RESPONSE` | worker → server | yes | Response head: `status`, `headers`, `body_len` |
+| 4 | `RESPONSE` | worker → server | yes | Response head: `status`, `headers`, `body_len`. `body_len` is authoritative unless the frame carries `STREAMED`, which declares no length |
 | 5 | `BODY` | either direction | yes | Raw bytes of the request or response body |
 | 6 | `EVENT` | worker → server | no | Application-level telemetry. Currently traced and dropped |
 | 7 | `LOG` | worker → server | no | One log record: `level`, `message`, `request_id` |
@@ -259,6 +259,41 @@ Two invariants apply, and a reader must enforce both:
 
 A body of zero length sends **no** `BODY` frames at all.
 
+### A response whose length is not known
+
+A worker that generates its body as it goes — a CSV export, an SSE feed — cannot declare a
+length. It sets `STREAMED` on its `RESPONSE` frame and declares `body_len: 0`:
+
+```
+◄─RESPONSE (id, status, headers, body_len = 0)   flags: STREAMED
+◄─BODY (id, chunk)                                flags: —
+◄─BODY (id, chunk)                                flags: —
+◄─BODY (id, chunk)                                flags: LAST
+◄─END (id, app_status, …)
+```
+
+For such a response:
+
+- **`body_len` is not authoritative**, and must be `0`. A `STREAMED` frame that also declares a
+  non-zero length is malformed: the sender and the reader disagree about the body's end signal,
+  and resolving it by preferring either one produces a truncated body or a frame read as payload.
+- **`LAST` is the only end signal.** `END` without a preceding `LAST` is a **truncation** and must
+  be reported as one, not accepted as a short body. This is the invariant that replaces the length
+  check, and it is the reason a streamed response can still be detected as incomplete.
+- **`STREAMED` is a flag rather than "a zero `body_len` means unknown".** `body_len: 0` with the
+  flag clear is a correctly empty body — a `204`, a `HEAD` — and a reader that took every zero as
+  "stream me bytes" would consume the next request's frames as this response's body. The same
+  reasoning the `NO_CHECKSUM` flag documents: a value that already means something cannot also
+  mean "absent".
+
+A server that asked for a stream but is answered with a declared length reads it as an ordinary
+buffered response. Which shape a response takes belongs to the worker, so a worker may serve both
+kinds and a client never has to know in advance which it will get.
+
+A worker that streams is expected to forward each chunk as it is produced. **A buffered runtime can
+still stream** — it just emits one `BODY` frame, which is correct rather than wasteful — so
+`STREAMED` is a statement about the body's *length*, never a promise of many frames.
+
 Bodies are never JSON. Base64 inside JSON inflates an upload by a third and makes the runtime do
 work per byte on the hot path, so bytes travel as bytes.
 
@@ -271,6 +306,7 @@ work per byte on the hot path, so bytes travel as bytes.
 | `0x0004` | `LAST` | This is the last chunk of a logical message |
 | `0x0008` | `ERROR` | The sender is reporting a failure |
 | `0x0010` | `NO_CHECKSUM` | The `crc32c` field is **not** a checksum and must not be verified. Only legal once the handshake has agreed to it |
+| `0x0020` | `STREAMED` | Set on `RESPONSE`: the body's length is not declared, and `LAST` is its only end signal. See [Body framing](#a-response-whose-length-is-not-known) |
 
 `NO_CHECKSUM` is a **flag rather than a zero checksum**, and the reason is that zero is already
 a real checksum: `crc32c("") == 0`, which every empty-payload frame carries. Using the value

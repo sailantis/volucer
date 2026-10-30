@@ -58,6 +58,22 @@ pub mod flags {
     /// disable the check — the one field whose value must never decide whether it is
     /// verified.
     pub const NO_CHECKSUM: u16 = 0b0001_0000;
+    /// The `RESPONSE` head describes a body whose length is **not** declared.
+    ///
+    /// A worker that generates its body as it goes — a CSV export, an SSE feed — does not know how
+    /// many bytes it will produce, so `body_len` cannot be authoritative. It declares `0` and sets
+    /// this bit on the `RESPONSE` frame, and the body then ends at the `BODY` frame carrying
+    /// [`LAST`], which becomes the *only* end signal.
+    ///
+    /// **A flag rather than "a zero `body_len` means unknown"**, and that distinction is
+    /// load-bearing: `body_len: 0` with this bit clear is a correctly empty body (a `204`, a
+    /// `HEAD`), and a reader that read every zero as "stream me bytes" would consume the next
+    /// request's frames as this response's body. The same reasoning [`NO_CHECKSUM`] documents for
+    /// its own sentinel: a value that already means something cannot also mean "absent".
+    ///
+    /// Only legal on a `RESPONSE` frame, and a worker must not set both this and a non-zero
+    /// `body_len` — that pair is refused rather than resolved by preferring one.
+    pub const STREAMED: u16 = 0b0010_0000;
 }
 
 /// Whether a frame's `crc32c` field must be verified.
