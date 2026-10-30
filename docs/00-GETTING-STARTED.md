@@ -118,6 +118,9 @@ address from `[status]`, so it also works in the `scratch` image, which contains
 or `curl`. See [Docker operations](11-OPERATIONS.md#docker) for `docker run`, Compose,
 and guidance on when to use `/health` or `/ready`.
 
+Those images do not include PHP, so the `worker` configuration does not run as written.
+[Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image) shows how to build on a PHP base image.
+
 ### Directly
 
 Download the archive for your platform from the

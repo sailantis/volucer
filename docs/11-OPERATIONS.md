@@ -429,6 +429,119 @@ listen = "0.0.0.0:9080"        # what `docker exec ... health` probes, and what 
 Listeners bound to `127.0.0.1` are reachable only within the container's network namespace.
 Publishing such a port with `-p` does not make the listener externally reachable.
 
+### Adding PHP to the image
+
+Both images contain only the binary. The `musl` image is `scratch`, with no libc, so PHP cannot run in it. The `glibc` image is Debian-based and has no PHP runtime. A `worker` with `command = "php worker.php"`, as in the [README](../README.md), therefore needs an image that includes PHP. Build one from the official `php` image and copy the binary from the `-glibc` image:
+
+```dockerfile
+# Use `-cli`, not `-fpm` or `-apache`. Those two are built with `--disable-cgi`, so a
+# `spawn_cgi` pool would have no `php-cgi` to start. `-cli` builds both SAPIs, so this one base
+# supports a `worker` (`php worker.php`) and a `spawn_cgi` pool (`php-cgi -b …`).
+# The Debian suite is named explicitly. The plain `8.5-cli` tag follows Debian's default, which
+# currently resolves to `-trixie`. Naming the suite avoids a surprise when that default changes.
+FROM php:8.5-cli-bookworm
+
+# Use the `-glibc` image, not the default `musl` tag. This base is Debian, and the `glibc` stage
+# of `packaging/docker/Dockerfile` builds the matching binary. Pin the version.
+COPY --from=ghcr.io/sailantis/volucer:0.3.0-glibc /usr/local/bin/volucer /usr/local/bin/volucer
+
+# Add the extensions the application needs. Each one is a compile step in this Dockerfile,
+# not a version in this project's release matrix.
+RUN docker-php-ext-install pdo_mysql
+
+# Composer is not in the base image. Copying its binary avoids a separate installer step.
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /srv/app
+
+# Copy the application. Exclude `vendor/` and local environment files in `.dockerignore`, so
+# dependencies are installed inside the image.
+COPY . /srv/app
+RUN composer install --no-dev --no-interaction --optimize-autoloader
+
+# Match the published image's contract, so an argument after the image name is passed to Volucer.
+# This replaces the base image's `docker-php-entrypoint`, which would treat `docker run … version`
+# as a program named `version`. `php` remains available through `docker exec` and a backend's
+# `command`.
+EXPOSE 8080 9080
+
+# The base image defines no health check, and the binary serves as its own probe. Use `/health`
+# rather than `/ready`, as the published images do: a slow worker pool must not fail the check
+# and restart the container. The variable tells the probe where the file is, because the working
+# directory belongs to the application, not the configuration.
+ENV VOLUCER_HEALTH_CONFIG=/etc/volucer/volucer.toml
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/volucer", "health"]
+
+ENTRYPOINT ["/usr/local/bin/volucer"]
+CMD ["serve", "--config", "/etc/volucer/volucer.toml"]
+```
+
+The configuration then refers to `php` by name. Both binaries are already on `PATH`
+(`/usr/local/bin/php` and `/usr/local/bin/php-cgi`), so no path needs to be written into it:
+
+```toml
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/app/public"    # the WORKDIR above, plus the application's own public/
+front_controller = "index.php"
+
+# Address that `volucer health` probes. Use `0.0.0.0` in both places, so the probe reaches the
+# listener inside the container and `-p` reaches it from outside.
+[status]
+listen = "0.0.0.0:9080"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+working_dir = "/srv/app"
+```
+
+Bind both listeners to `0.0.0.0`, as explained in [Running it](#running-it). Run it the same way:
+
+```sh
+docker run --rm -p 8080:8080 -p 9080:9080 \
+    -v "$PWD/volucer.toml:/etc/volucer/volucer.toml:ro" \
+    my-app
+```
+
+The document root and application are already in the image, so only the configuration is
+mounted. An edit takes effect on `docker restart`, without a rebuild.
+
+Review these details before the first build:
+
+- **PHP 8.5 builds OPcache into the binary.** Do not run `docker-php-ext-install opcache`.
+  From 8.5, the extension is always compiled in and loaded, the `--enable-opcache` configure
+  flags are removed, and no `opcache.so` is produced for that command to install. A
+  `spawn_cgi` pool uses it through `opcache.enable`, which defaults to on. A `worker` runs
+  under the CLI SAPI, where `opcache.enable_cli` defaults to off. Leaving it off has no cost,
+  because a resident worker compiles its code once at boot. On PHP 8.4 and older, the
+  extension must still be installed.
+- **Extensions that link a system library need that library's `-dev` package first.** For
+  example, `intl` requires `libicu-dev`, and `gd` requires `libpng-dev libjpeg62-turbo-dev
+libfreetype6-dev`. Install these with `apt-get install` in a layer before
+  `docker-php-ext-install`. The image includes `ca-certificates`, so ACME issuance and outbound
+  TLS work without changes. Place settings in `$PHP_INI_DIR/conf.d/`
+  (`/usr/local/etc/php/conf.d`), starting from the `php.ini-production` file the image ships.
+- **A copied binary does not bring a user with it.** This image runs as `root` unless
+  configured otherwise. The published `glibc` image, by contrast, creates a `volucer` user. To
+  drop privileges, add `USER www-data` after the `RUN composer install` line, and `chown` the
+  application directory to that user. In an Azera application, `writable/` must remain
+  writable by the user the workers run as.
+
+The base image defines no `HEALTHCHECK`, so the recipe adds one, using the line from
+[Health checks in the image](#health-checks-in-the-image). It works here for the same reason it
+works there: the check runs the binary, not `curl`.
+
+The recipe also replaces the base image's `ENTRYPOINT`, so an argument after the image name is
+passed to Volucer. To run PHP in that container, name the program explicitly:
+
+```sh
+docker run --rm --entrypoint php my-app -m
+docker exec my-app php -m                 # in a running container
+```
+
 ### Health checks in the image
 
 Both images define a `HEALTHCHECK` that runs the Volucer binary directly:

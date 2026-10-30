@@ -94,6 +94,9 @@ The Docker `HEALTHCHECK` runs `volucer health` and reads its probe address from
 `[status]`. This works in the `scratch` image, which does not include a shell or `curl`.
 See [Docker operations](docs/11-OPERATIONS.md#docker) for `docker run`, Compose, and guidance on choosing `/health` or `/ready`.
 
+Those images do not include PHP, so the `worker` configuration does not run as written.
+[Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image) shows how to build on a PHP base image.
+
 ### Build from source
 
 ```sh

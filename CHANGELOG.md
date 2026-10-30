@@ -55,6 +55,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by a crash is unlinked before binding and removed again once the listener has drained, so an
   unclean shutdown does not need manual cleanup and a clean one leaves nothing behind.
 
+- **Operations documents how to add PHP to a container image.** The published images include no
+  PHP runtime, so the guide shows how to combine the `-glibc` binary with
+  `php:8.5-cli-bookworm` for `worker` and `spawn_cgi`. It covers required extension packages,
+  built-in OPcache, the default root user, replacing the base entrypoint, and adding a
+  `HEALTHCHECK`. See [Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image).
+
 - **A configuration can be split across files with `include`**, the way MariaDB's `!include` and
   `!includedir` split `my.cnf` — in one list where MariaDB needs two directives:
 
