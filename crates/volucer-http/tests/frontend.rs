@@ -716,9 +716,23 @@ fn read_one_response(reader: &mut BufReader<TcpStream>) -> u16 {
 // no file must still reach the backend, and that is what the 502s below prove.
 
 /// A document root with the files a static test needs.
+///
+/// The directory used to be `volucer-http-static-{name}-{pid}`, so two callers that passed the same
+/// `name` shared one directory — and this function begins by deleting it. `rate_limited_server` takes
+/// a fixed `"rate-limit"` and is called by two tests, so under a parallel run one of them deleted the
+/// root while the other was writing `assets/app.css` into it, and the loser failed with
+/// `Os { code: 3, kind: NotFound }` on a write into a directory that had just been recreated without
+/// its `assets/` subdirectory. The symptom pointed at the filesystem; the cause was a name.
+///
+/// `roots_named_the_same_are_still_separate` is what pins the fix, so this cannot regress the next
+/// time somebody makes a helper take a fixed name.
 fn static_root(name: &str) -> PathBuf {
-    let root =
-        std::env::temp_dir().join(format!("volucer-http-static-{name}-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "volucer-http-static-{name}-{}-{unique}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("assets")).expect("create the root");
     std::fs::write(root.join("index.html"), "<h1>home</h1>").expect("write index.html");
@@ -736,6 +750,39 @@ fn static_root(name: &str) -> PathBuf {
         .expect("write a front controller");
     std::fs::write(root.join("big.bin"), vec![b'x'; 256 * 1024]).expect("write a binary file");
     root
+}
+
+/// Two roots asked for under the same name must not be the same directory.
+///
+/// This is the regression test for a real intermittent failure: `rate_limited_server` calls
+/// [`static_root`] with a fixed `"rate-limit"`, and two tests use it, so before the per-call counter
+/// both got one path — and the second call deleted the first's files from under a running test. It
+/// surfaced as `NotFound` on a write, under parallel load only, which is the shape of a flake nobody
+/// can reproduce on demand.
+///
+/// Asserted on the *paths*, which is what actually broke, rather than by racing the two servers: the
+/// bug is the shared name, and a test that only sometimes catches a shared name is the flake again.
+#[test]
+fn roots_named_the_same_are_still_separate() {
+    let first = static_root("collides");
+    let second = static_root("collides");
+
+    assert_ne!(
+        first, second,
+        "two roots asked for under one name are the same directory, so the second call's \
+         `remove_dir_all` would delete the first test's files"
+    );
+    // And both are usable, which is the property a running test depends on.
+    assert!(first.join("assets/app.css").exists(), "{first:?}");
+    assert!(second.join("assets/app.css").exists(), "{second:?}");
+    // The second call must not have deleted the first's files, which is what it did before.
+    assert!(
+        first.join("index.html").exists(),
+        "creating the second root removed files the first still depends on: {first:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&first);
+    let _ = std::fs::remove_dir_all(&second);
 }
 
 /// A server that serves files from `root`, with a backend nothing can reach.
@@ -3074,8 +3121,14 @@ impl Drop for ProtoFixture {
 }
 
 fn proto_fixture(name: &str) -> ProtoFixture {
-    let path =
-        std::env::temp_dir().join(format!("volucer-http-proto-{name}-{}", std::process::id()));
+    // Unique per call for the reason `static_root` documents: the name alone did not keep two
+    // fixtures apart, and this function deletes the directory it is about to reuse.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "volucer-http-proto-{name}-{}-{unique}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("create the fixture");
     ProtoFixture(path)
