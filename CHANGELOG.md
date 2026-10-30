@@ -9,6 +9,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A large response is relayed instead of buffered, past `server.stream_threshold_bytes`.** Every
+  FastCGI response used to be assembled whole before a client saw a byte: `Client::receive` extended
+  one `Vec<u8>` until `END_REQUEST`, and `from_cgi` copied all of it a second time. A 1 GB export
+  therefore peaked at roughly 2 GB of resident memory, and a client that gave up half way through
+  still paid for all of it.
+
+  ```toml
+  [server]
+  stream_threshold_bytes = 1048576   # 1 MiB; 0 disables relaying
+  ```
+
+  Above the threshold the header block is answered immediately and each subsequent FastCGI record is
+  forwarded as it arrives, so the peak is one 64 KiB record rather than the response — verified
+  against real `php-cgi` with a 1 MiB body and a 4 MiB one, byte for byte and in order. It works on
+  both FastCGI backends (`spawn_cgi` and `external`) and on both front-ends, because a deployment
+  behind nginx usually has no `[server.http]` at all.
+
+  **Three things are never relayed, each because the alternative is worse.** A response stating a
+  `Content-Length` is left alone — the backend measured it, and re-framing a measured response throws
+  that measurement away; disabling the rule makes the test that pins it fail with a relayed
+  `Content-Length` response. A non-2xx response is answered whole, because `error_pages` reads its
+  body and a status already on the wire cannot be rewritten. An `X-Sendfile` answer is an
+  *instruction* rather than a body, so the static layer answers it with the validators a relayed
+  stream could not carry.
+
+  Two costs are deliberate and documented: a relayed response **is not compressed** and **declares no
+  `Content-Length`** (it does not exist yet), so `hyper` frames it chunked. Both follow from the same
+  fact — compressing or measuring needs the whole body. A truncated backend response now ends the
+  connection **without** the terminating chunk, so a short download is distinguishable from a
+  complete one instead of arriving as a `200` with less data than promised.
+
+  The permit a slot lent the request is released by the reader thread rather than at return time,
+  which is what keeps a rolling restart from killing a slot mid-download — `respawn_idle` reads the
+  permit count to decide idleness, so releasing it early would report a slot streaming 4 MiB as idle.
+  Verified by moving the release and watching that test replace a slot that was still serving.
+
 - **A backend can serve a large file by naming it: `X-Sendfile` / `X-Accel-Redirect`.** A worker,
   `spawn_cgi` or `external` backend buffers its whole response, so a 1 GB download cost the file twice
   in memory — once in PHP and once in `from_cgi`'s copy — and a `memory_limit` failure somewhere in

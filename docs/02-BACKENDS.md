@@ -490,6 +490,33 @@ run resets the count.
 - Backends are restart-only during reload. See [Operations](11-OPERATIONS.md).
 - WebSockets are not supported; SSE is supported.
 
+## Large responses: what each backend does
+
+A 1 GB download does not behave the same way on all five backends, and the difference is worth
+knowing before choosing one for an application that serves files.
+
+| Backend | Request body | Response body | A 1 GB download |
+|---|---|---|---|
+| `upstream` | streams | streams | ✅ forwarded as it arrives |
+| `spawn_cgi` | buffered | relayed above `stream_threshold_bytes` | ✅ 64 KiB records, relayed |
+| `external` (php-fpm) | buffered | relayed above `stream_threshold_bytes` | ✅ 64 KiB records, relayed |
+| `worker` | buffered | buffered | ❌ the whole response in memory |
+| static files | n/a | streams | ✅ 64 KiB reads, ranges supported |
+
+The two FastCGI kinds **relay** a response larger than
+[`server.stream_threshold_bytes`](01-CONFIGURATION.md#stream_threshold_bytes): the header block is
+answered at once and each subsequent FastCGI record is forwarded as it arrives, so the peak memory
+is one record rather than two copies of the response.
+
+**`worker` mode still buffers**, because its protocol frames a response with a declared length before
+the body. That is the next change, and until it lands an application in worker mode should either use
+`X-Sendfile` for files it holds (see [Static Files](04-STATIC-FILES.md#x-sendfile)) or be served on a
+FastCGI backend.
+
+`X-Sendfile` is the best answer for a download that is a *file*, on any backend: the static layer
+serves it with ranges and validators, and costs 64 KiB whatever the size. Relaying is for a body the
+application generates — a CSV export, a log, a media file it streams itself.
+
 ## TLS to an upstream origin
 
 HTTPS upstreams are always certificate-verified. There is no `verify = false` option.

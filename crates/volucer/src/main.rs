@@ -2491,6 +2491,7 @@ fn serve(
                 Limits {
                     max_connections,
                     max_body_bytes: config.server.max_body_bytes(),
+                    max_stream_bytes: config.server.stream_threshold_bytes(),
                 },
             )?
             .with_observability(Arc::clone(&observe))
@@ -2802,6 +2803,7 @@ fn serve(
                 HttpLimits {
                     max_connections: http3_config.max_connections,
                     max_body_bytes: config.server.max_body_bytes(),
+                    max_stream_bytes: config.server.stream_threshold_bytes(),
                 },
                 volucer_http::ListenerSettings {
                     tls: Some(volucer_http::TlsSettings {
@@ -2858,6 +2860,7 @@ fn serve(
                 HttpLimits {
                     max_connections,
                     max_body_bytes: config.server.max_body_bytes(),
+                    max_stream_bytes: config.server.stream_threshold_bytes(),
                 },
                 http_settings,
             )
@@ -2886,6 +2889,7 @@ fn serve(
                 HttpLimits {
                     max_connections,
                     max_body_bytes: config.server.max_body_bytes(),
+                    max_stream_bytes: config.server.stream_threshold_bytes(),
                 },
                 // TLS only: this listener is already the https endpoint, so a redirect here
                 // would send a client to where it came from.
@@ -4088,6 +4092,21 @@ fn check(
         "    shutdown: {} ms drain budget (0 = do not wait; must be under the supervisor's kill timeout)",
         config.server.shutdown_timeout().as_millis()
     );
+    // **Printed for the same two reasons, and it is the one number that decides whether a 1 GB
+    // download is possible at all.** A deployment with no key has a 1 MiB threshold that appears
+    // nowhere in its file, and an operator reading it can tell instantly whether their export will
+    // be buffered.
+    match config.server.stream_threshold_bytes() {
+        0 => println!(
+            "    stream above:     never (every response is buffered; a response larger than \
+             memory cannot be served)"
+        ),
+        threshold => println!(
+            "    stream above:     {threshold} bytes ({} KiB; larger responses are relayed \
+             uncompressed, with no Content-Length)",
+            threshold / 1024
+        ),
+    }
     // And the connection ceiling, for the same reason: it used to exist only as a flag, so a
     // deployment driven by a file could not see that the value was 512 rather than its own.
     println!(

@@ -394,6 +394,212 @@ pub fn split_response_body(stdout: &[u8]) -> &[u8] {
     }
 }
 
+/// Which responses a caller is willing to receive in pieces.
+///
+/// A type rather than a `bool`, because the two rules it carries are the interesting part and a
+/// `bool` at a call site cannot carry either:
+///
+/// - **A response that already states its own length is left alone by default.** `Content-Length`
+///   is the backend telling the client how much to expect, and re-framing it as a chunked stream
+///   throws that away for no gain. A `.php` that reads a 2 MB file and `echo`s it has already paid
+///   for the buffering; a `.php` that generates a CSV does not know its length, which is exactly the
+///   case that has to stream.
+/// - **An error is never relayed.** A `502`/`500` page has to be answered as one, with its body
+///   available to the front-end's error-page machinery, and a status the server may want to rewrite
+///   must not already be on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relay {
+    enabled: bool,
+    only_without_length: bool,
+}
+
+impl Relay {
+    /// Relay nothing: every response is buffered, whatever its size.
+    pub fn never() -> Self {
+        Relay {
+            enabled: false,
+            only_without_length: false,
+        }
+    }
+
+    /// Relay any response larger than the caller's buffer, whatever its declared length.
+    pub fn above_budget() -> Self {
+        Relay {
+            enabled: true,
+            only_without_length: false,
+        }
+    }
+
+    /// Relay a response larger than the buffer **only when it declares no length**.
+    ///
+    /// The default, and the one that matches what every other server does: a response the backend
+    /// measured is sent as it was measured, and only a response of unknown length is re-framed.
+    pub fn unknown_length() -> Self {
+        Relay {
+            enabled: true,
+            only_without_length: true,
+        }
+    }
+
+    /// The relay a deployment's `stream_threshold_bytes` asks for.
+    ///
+    /// **The threshold and "may I relay" are one decision, not two**, and this is where that is made.
+    /// A budget of zero means "buffer everything", which is the escape hatch an operator uses to keep
+    /// compression and a declared length at the cost of unbounded downloads — and it would be a lie if
+    /// the budget were zero *and* relaying were still enabled, because every response is larger than
+    /// zero bytes.
+    pub fn for_threshold(budget: usize) -> Self {
+        if budget == 0 {
+            Relay::never()
+        } else {
+            Relay::unknown_length()
+        }
+    }
+
+    /// Whether this status and header block may be relayed at all.
+    ///
+    /// The decision reads the *parsed* head rather than the raw bytes, because the question is about
+    /// what the response says — a `Status:` line, a `Content-Length`, a file name — not about its
+    /// spelling.
+    ///
+    /// **Three refusals, each for its own reason:**
+    ///
+    /// - **A non-2xx status**, because an error page has to reach the front-end whole: it is the
+    ///   answer `error_pages` and the gRPC translation both read, and a status already on the wire
+    ///   cannot be rewritten.
+    /// - **A declared `Content-Length`**, when the caller asked for `unknown_length` only. The
+    ///   backend measured its response; re-framing it as a chunked stream throws that measurement
+    ///   away for no gain.
+    /// - **A `X-Sendfile`/`X-Accel-Redirect` name.** Such a response is an *instruction*, and the
+    ///   front-end answers it from the static layer — which needs the head and nothing else. Relaying
+    ///   it would put the reader thread and the file in a race over one slot, so it is answered
+    ///   buffered as it always was. The body of such a response is a placeholder of a few bytes, so
+    ///   buffering it costs nothing.
+    fn admits(&self, status: u16, headers: &ParsedHeaders<'_>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if !(200..300).contains(&status) {
+            return false;
+        }
+        if headers.iter().any(|(name, _)| {
+            volucer_core::SENDFILE_HEADERS
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        }) {
+            return false;
+        }
+        if !self.only_without_length {
+            return true;
+        }
+        !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    }
+}
+
+/// What became of a response the caller asked to receive incrementally.
+///
+/// Two shapes rather than a flag on [`Response`], because the caller's obligations differ: a
+/// buffered answer has no lifecycle left to respect, while a streamed one means bytes have already
+/// been handed over and the connection is only reusable if the backend finished.
+///
+/// **A streamed response is not complete when this value is returned, and that is the contract.**
+/// The head is known and the body is still on the wire, so the caller receives the head as part of
+/// [`StreamHead`] and drains the rest with [`ResponseStream`] — which is what lets it decide a `Content-Type`
+/// and a framing before the first body byte, exactly as an origin's response allows.
+#[derive(Debug)]
+pub enum Delivery {
+    /// The whole response stayed within the caller's buffer, so this is the ordinary [`Response`] —
+    /// still compressible, still carrying its own `Content-Length`, still checked for truncation.
+    Buffered(Response),
+    /// The response outgrew the buffer, or the caller asked for every answer to be relayed.
+    ///
+    /// The header block has been read and split off; the body has not been touched beyond the
+    /// records already sitting in the client's own buffer.
+    Streamed(ResponseStream),
+}
+
+impl Delivery {
+    /// Whether the backend delivered a whole response within the caller's budget.
+    pub fn is_buffered(&self) -> bool {
+        matches!(self, Delivery::Buffered(_))
+    }
+}
+
+/// A response being relayed: the head is known, the body is not.
+///
+/// Holds nothing but the client it came from and the position it has reached, so what the caller
+/// owns is "a connection mid-response" — which is why it must be drained or dropped and never
+/// abandoned: dropping it closes the connection, which is the correct end for one that still has
+/// records in the pipe.
+#[derive(Debug)]
+pub struct ResponseStream {
+    /// The header block, `\r\n\r\n` included, so [`parse_response`] works on it unchanged.
+    head: Vec<u8>,
+    /// One already-read record, when the switch happened part-way through the buffer.
+    pending: Option<Vec<u8>>,
+    /// Whether every byte has been relayed and `END_REQUEST` was seen.
+    finished: bool,
+    /// `STDERR` seen so far. Grows as the body is drained, because a backend writes both.
+    stderr: Vec<u8>,
+    /// The `END_REQUEST` body, once it arrives.
+    end: Option<EndRequest>,
+    /// How long the backend had taken when the head came back.
+    ///
+    /// Recorded there rather than at the end because it is the figure that matters for a stream:
+    /// time-to-first-byte. A total is not knowable until the client stops reading.
+    started: Instant,
+    head_duration: Duration,
+    /// Whether the backend agreed to keep the connection.
+    keep_conn_requested: bool,
+}
+
+impl ResponseStream {
+    /// The header block, `\r\n\r\n` included.
+    pub fn head(&self) -> &[u8] {
+        &self.head
+    }
+
+    /// `STDERR` seen so far.
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+
+    /// Time to first byte.
+    pub fn head_duration(&self) -> Duration {
+        self.head_duration
+    }
+
+    /// The total time so far, which is only the total if the stream has finished.
+    pub fn duration(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Whether every byte has arrived.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Whether the connection can serve another request.
+    ///
+    /// False until the stream has been drained to `END_REQUEST`, and false for a backend that
+    /// declared `FCGI_KEEP_CONN` but refused to honour it.
+    pub fn is_reusable(&self) -> bool {
+        self.finished && self.keep_conn_requested
+    }
+
+    /// The application status, once `END_REQUEST` has arrived.
+    pub fn app_status(&self) -> Option<u32> {
+        self.end.map(|end| end.app_status)
+    }
+
+    /// The protocol status, once `END_REQUEST` has arrived.
+    pub fn protocol_status(&self) -> Option<ProtocolStatus> {
+        self.end.map(|end| end.protocol_status)
+    }
+}
+
 /// A client bound to one backend connection.
 ///
 /// Generic over the transport so the protocol can be tested without a socket.
@@ -439,6 +645,12 @@ pub struct Client<T = Stream> {
     keep_conn_requested: bool,
     /// Set once reuse is known to be unsafe.
     closed_by_backend: bool,
+    /// Set while a [`ResponseStream`] taken from this client has not been drained.
+    ///
+    /// A returned stream owns a response the connection is still in the middle of, so `is_reusable`
+    /// has to answer `false` until it has been read to `END_REQUEST` — otherwise a pool would hand
+    /// the socket to the next request with the previous response's records still in front of it.
+    stream_open: bool,
 }
 
 impl Client<Stream> {
@@ -450,8 +662,13 @@ impl Client<Stream> {
 
 impl<T> Client<T> {
     /// Whether the connection is still usable.
+    ///
+    /// **`false` while a streamed response is still being relayed.** The stream owns records this
+    /// connection has not read yet, so handing the socket to the next request would prepend the
+    /// previous response to it — the worst class of bug a pool can have, because it is
+    /// intermittent and looks like the backend's fault.
     pub fn is_reusable(&self) -> bool {
-        !self.closed_by_backend && self.keep_conn_requested
+        !self.closed_by_backend && !self.stream_open && self.keep_conn_requested
     }
 }
 
@@ -470,6 +687,7 @@ impl<T: Read + Write> Client<T> {
             params: Vec::with_capacity(512),
             keep_conn_requested: false,
             closed_by_backend: false,
+            stream_open: false,
         }
     }
 
@@ -563,6 +781,195 @@ impl<T: Read + Write> Client<T> {
         response.keep_conn = self.keep_conn_requested && !self.closed_by_backend;
         Ok(response)
     }
+
+    /// Send one request and decide, from its header block, whether to buffer or to relay.
+    ///
+    /// `buffer` is how many bytes of `STDOUT` the caller is willing to hold before the response
+    /// stops being buffered. Below it the answer is an ordinary [`Delivery::Buffered`] and nothing
+    /// about the request path changes — which matters, because compression, `Content-Length` and the
+    /// truncation check all want a whole body. Above it the call returns as soon as the header block
+    /// is complete, with the rest of the response still in the pipe.
+    ///
+    /// # Why the head is a return value and the body is not
+    ///
+    /// A caller that relays has to decide `Content-Type`, framing and the compression question
+    /// *before* the first body byte, and it cannot be handed the whole body to make that decision.
+    /// So the head is read eagerly — it is a few hundred bytes by definition — and the body is left
+    /// where it is. The alternative, waiting for a threshold to be crossed, means the caller cannot
+    /// answer anything until an arbitrary amount of the response has been produced.
+    ///
+    /// For the same reason a response [`Relay`] does not admit is never relayed even above the
+    /// budget: an error page has to be answered as one, and a `500` whose head arrived before its
+    /// body is a decision the front-end would have to make blind. The filter is applied here rather
+    /// than at the call site so it cannot be forgotten.
+    ///
+    /// # Draining
+    ///
+    /// A returned [`ResponseStream`] **must** be drained or dropped, and it is drained by
+    /// [`Client::next_chunk`] or [`Client::drain_stream`]. Dropping one closes the connection, which
+    /// is the correct end for a client that still has records in the pipe.
+    pub fn request_streaming(
+        &mut self,
+        request: &Request,
+        buffer: usize,
+        relay: Relay,
+    ) -> Result<Delivery> {
+        let started = Instant::now();
+        self.keep_conn_requested = request.keep_conn;
+        self.send(request)?;
+
+        let mut head_block: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut head_len = 0usize;
+
+        let end = loop {
+            let Some(record) = record::read_record(&mut self.stream)? else {
+                return Err(FcgiError::IncompleteResponse {
+                    request_id: REQUEST_ID,
+                    complete: true,
+                });
+            };
+
+            match record.header.record_type {
+                RecordType::Stdout => {
+                    if record.content.is_empty() {
+                        continue;
+                    }
+                    head_block.extend_from_slice(&record.content);
+                    if head_len == 0 {
+                        if let Some((at, separator)) = find_header_end(&head_block) {
+                            head_len = at + separator;
+                        }
+                    }
+                    if head_len == 0 {
+                        // Still assembling the header block. A block larger than the caller's whole
+                        // budget is refused rather than held without limit — the budget exists to
+                        // bound exactly this.
+                        if head_block.len() > buffer {
+                            self.closed_by_backend = true;
+                            return Err(FcgiError::BadRequest(format!(
+                                "the response header block exceeded the {buffer} byte streaming \
+                                 budget before it terminated, so it cannot be parsed or relayed"
+                            )));
+                        }
+                        continue;
+                    }
+
+                    let body_so_far = head_block.len() - head_len;
+                    if body_so_far > buffer {
+                        let (status, headers, _) = parse_response(&head_block);
+                        if relay.admits(status, &headers) {
+                            let head = head_block[..head_len].to_vec();
+                            let rest = head_block.split_off(head_len);
+                            self.stream_open = true;
+                            return Ok(Delivery::Streamed(ResponseStream {
+                                head,
+                                pending: (!rest.is_empty()).then_some(rest),
+                                finished: false,
+                                stderr,
+                                end: None,
+                                started,
+                                head_duration: started.elapsed(),
+                                keep_conn_requested: self.keep_conn_requested,
+                            }));
+                        }
+                    }
+                }
+                RecordType::Stderr => {
+                    if !record.content.is_empty() {
+                        stderr.extend_from_slice(&record.content);
+                    }
+                }
+                RecordType::EndRequest => {
+                    break Some(EndRequest::decode(&record.content)?);
+                }
+                _ => continue,
+            }
+        };
+
+        let keep_conn = self.keep_conn_requested && !self.closed_by_backend;
+        if !keep_conn {
+            self.closed_by_backend = true;
+        }
+        Ok(Delivery::Buffered(Response {
+            stdout: head_block,
+            stderr,
+            end,
+            keep_conn,
+            duration: started.elapsed(),
+        }))
+    }
+
+    /// Read the next piece of a streamed response, ending it at `END_REQUEST`.
+    ///
+    /// Returns `Ok(None)` once the response is over. Every byte the backend sent is returned exactly
+    /// once and in order, including whatever had already been read past the head.
+    ///
+    /// # This blocks
+    ///
+    /// For one record — as long as the backend takes to produce the next body chunk. It must be
+    /// called from the thread that owns the connection, never from a runtime worker waiting on a
+    /// channel that only this call can make progress: that is a deadlock rather than a stall.
+    pub fn next_chunk(&mut self, stream: &mut ResponseStream) -> Result<Option<Vec<u8>>> {
+        if stream.finished {
+            return Ok(None);
+        }
+        if let Some(pending) = stream.pending.take() {
+            if !pending.is_empty() {
+                return Ok(Some(pending));
+            }
+        }
+
+        loop {
+            let Some(record) = record::read_record(&mut self.stream)? else {
+                // A stream that stops mid-response is never reported as complete: the caller would
+                // hand a truncated body to the client as if it were the whole thing.
+                stream.finished = false;
+                self.closed_by_backend = true;
+                return Err(FcgiError::IncompleteResponse {
+                    request_id: REQUEST_ID,
+                    complete: true,
+                });
+            };
+
+            match record.header.record_type {
+                RecordType::Stdout => {
+                    if record.content.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(record.content));
+                }
+                RecordType::Stderr => {
+                    if !record.content.is_empty() {
+                        stream.stderr.extend_from_slice(&record.content);
+                    }
+                }
+                RecordType::EndRequest => {
+                    let end = EndRequest::decode(&record.content)?;
+                    stream.finished = end.protocol_status.is_complete();
+                    stream.end = Some(end);
+                    self.stream_open = false;
+                    if !stream.finished {
+                        self.closed_by_backend = true;
+                    }
+                    return Ok(None);
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Read a streamed response to its end, discarding the body.
+    ///
+    /// What a caller does when the client went away, or when it changed its mind about relaying.
+    /// Only after this is the connection reusable — and skipping it *silently* is how a pool fills
+    /// with slots nobody can use, which is why `CgiPool` calls this rather than dropping a client it
+    /// has already asked for a stream.
+    pub fn drain_stream(&mut self, stream: &mut ResponseStream) -> Result<()> {
+        while self.next_chunk(stream)?.is_some() {}
+        Ok(())
+    }
+
 
     /// Read backend variables with `GET_VALUES`.
     ///
@@ -663,6 +1070,321 @@ mod tests {
 
     fn client_for(reply: Vec<u8>) -> Client<Loopback> {
         Client::from_stream(Loopback::replying(reply))
+    }
+
+    /// A request that only has to be sendable: the reply is what the test is about.
+    fn a_request() -> Request {
+        Request {
+            params: vec![(b"REQUEST_METHOD".to_vec(), b"GET".to_vec())],
+            body: Vec::new(),
+            keep_conn: true,
+        }
+    }
+
+    /// Split a payload into `size`-byte `STDOUT` records, the way a backend flushing in chunks does.
+    fn stdout_in_chunks(payload: &[u8], size: usize, request_id: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in payload.chunks(size) {
+            let header = Header::new(RecordType::Stdout, request_id, chunk.len() as u16);
+            header.write(&mut out).unwrap();
+            out.extend_from_slice(chunk);
+            out.extend(std::iter::repeat_n(0u8, header.padding_length as usize));
+        }
+        out
+    }
+
+    #[test]
+    fn a_response_within_budget_is_delivered_whole() {
+        let mut reply = framed(RecordType::Stdout, b"Status: 200 OK\r\n\r\nsmall");
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let delivery = client
+            .request_streaming(&a_request(), 1024, Relay::above_budget())
+            .unwrap();
+
+        let Delivery::Buffered(response) = delivery else {
+            panic!("a small response must stay buffered");
+        };
+        assert_eq!(response.stdout, b"Status: 200 OK\r\n\r\nsmall");
+        response.check_protocol().unwrap();
+        // Complete, so the connection is reusable exactly as an ordinary request leaves it.
+        assert!(client.is_reusable());
+    }
+
+    #[test]
+    fn a_response_over_budget_returns_its_head_and_relays_the_body_in_order() {
+        let head = b"Status: 200 OK\r\nContent-Type: text/csv\r\n\r\n";
+        let body: Vec<u8> = (0..900u32)
+            .flat_map(|n| format!("{n:04},").into_bytes())
+            .collect();
+        let mut payload = head.to_vec();
+        payload.extend_from_slice(&body);
+
+        let mut reply = stdout_in_chunks(&payload, 300, REQUEST_ID);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        // Smaller than the payload, larger than the head: the switch is possible.
+        let delivery = client
+            .request_streaming(&a_request(), 512, Relay::above_budget())
+            .unwrap();
+
+        let Delivery::Streamed(mut stream) = delivery else {
+            panic!("expected a streamed delivery");
+        };
+        assert_eq!(
+            stream.head(),
+            head,
+            "the head is the header block and its own separator, and nothing else"
+        );
+        let (status, headers, _) = parse_response(stream.head());
+        assert_eq!(status, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| *name == "Content-Type" && *value == "text/csv"),
+            "the head is parseable as a header block: {headers:?}"
+        );
+
+        let mut relayed = Vec::new();
+        while let Some(chunk) = client.next_chunk(&mut stream).unwrap() {
+            relayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(relayed, body, "every body byte, in order, and none of the head twice");
+        assert!(stream.is_finished(), "the backend reached END_REQUEST");
+        assert!(
+            client.is_reusable(),
+            "a drained stream leaves the connection usable"
+        );
+    }
+
+    #[test]
+    fn an_undrained_stream_leaves_the_connection_unusable() {
+        let mut payload = b"Status: 200 OK\r\n\r\n".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', 4096));
+        let mut reply = stdout_in_chunks(&payload, 512, REQUEST_ID);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let Delivery::Streamed(stream) = client
+            .request_streaming(&a_request(), 1024, Relay::above_budget())
+            .unwrap()
+        else {
+            panic!("expected a streamed delivery");
+        };
+
+        assert!(!stream.is_finished());
+        // Abandoning the body leaves records in the pipe, so the connection must not be reused.
+        assert!(!client.is_reusable());
+    }
+
+    #[test]
+    fn draining_a_stream_discards_the_body_and_frees_the_connection() {
+        let mut payload = b"Status: 200 OK\r\n\r\n".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', 4096));
+        let mut reply = stdout_in_chunks(&payload, 512, REQUEST_ID);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let Delivery::Streamed(mut stream) = client
+            .request_streaming(&a_request(), 1024, Relay::above_budget())
+            .unwrap()
+        else {
+            panic!("expected a streamed delivery");
+        };
+        client.drain_stream(&mut stream).unwrap();
+        assert!(stream.is_finished());
+        assert!(
+            client.is_reusable(),
+            "draining to END_REQUEST is what makes the slot usable again"
+        );
+    }
+
+    #[test]
+    fn a_body_arriving_with_the_head_is_relayed_in_full() {
+        // One record holding the header block *and* a body larger than the whole budget. php-cgi
+        // flushes in 8 KiB pages, so this is the ordinary shape of a large response, not a corner.
+        let head = b"Status: 200 OK\r\n\r\n";
+        let body: Vec<u8> = std::iter::repeat_n(b'y', 2048).collect();
+        let mut payload = head.to_vec();
+        payload.extend_from_slice(&body);
+
+        let mut reply = framed(RecordType::Stdout, &payload);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let Delivery::Streamed(mut stream) = client
+            .request_streaming(&a_request(), 256, Relay::above_budget())
+            .unwrap()
+        else {
+            panic!("expected a streamed delivery");
+        };
+        assert_eq!(stream.head(), head, "the body that shared the record is not in the head");
+
+        let mut relayed = Vec::new();
+        while let Some(chunk) = client.next_chunk(&mut stream).unwrap() {
+            relayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(relayed, body);
+        assert!(stream.is_finished());
+    }
+
+    #[test]
+    fn a_declared_length_is_left_alone_unless_the_caller_asked_otherwise() {
+        // A backend that measured its response is not re-framed: `Content-Length` is information the
+        // client can use, and turning it into a chunked stream throws it away.
+        let head = b"Status: 200 OK\r\nContent-Length: 9000\r\n\r\n";
+        let mut payload = head.to_vec();
+        payload.extend(std::iter::repeat_n(b'c', 9000));
+        let mut reply = framed(RecordType::Stdout, &payload);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply.clone());
+        let delivery = client
+            .request_streaming(&a_request(), 512, Relay::unknown_length())
+            .unwrap();
+        assert!(delivery.is_buffered(), "a measured response stays buffered");
+        let Delivery::Buffered(response) = delivery else {
+            unreachable!()
+        };
+        assert_eq!(response.stdout.len(), head.len() + 9000);
+
+        let mut client = client_for(reply);
+        let delivery = client
+            .request_streaming(&a_request(), 512, Relay::above_budget())
+            .unwrap();
+        assert!(
+            !delivery.is_buffered(),
+            "the same response is relayed when the caller says size is the only question"
+        );
+    }
+
+    #[test]
+    fn an_error_is_never_relayed_even_over_budget() {
+        // A 500 has to reach the front-end's error-page machinery whole. Relaying it would put a
+        // status on the wire that the server may still want to rewrite.
+        let head = b"Status: 500 Internal Server Error\r\n\r\n";
+        let mut payload = head.to_vec();
+        payload.extend(std::iter::repeat_n(b'e', 8192));
+        let mut reply = framed(RecordType::Stdout, &payload);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let delivery = client
+            .request_streaming(&a_request(), 256, Relay::above_budget())
+            .unwrap();
+        assert!(delivery.is_buffered(), "a non-2xx response is answered as one");
+        let Delivery::Buffered(response) = delivery else {
+            unreachable!()
+        };
+        assert_eq!(response.parse().0, 500);
+    }
+
+    #[test]
+    fn relay_never_relays_anything() {
+        let mut payload = b"Status: 200 OK\r\n\r\n".to_vec();
+        payload.extend(std::iter::repeat_n(b'n', 8192));
+        let mut reply = framed(RecordType::Stdout, &payload);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let delivery = client
+            .request_streaming(&a_request(), 16, Relay::never())
+            .unwrap();
+        assert!(delivery.is_buffered());
+    }
+
+    #[test]
+    fn a_streamed_response_keeps_its_stderr() {
+        let mut payload = b"Status: 200 OK\r\n\r\n".to_vec();
+        payload.extend(std::iter::repeat_n(b'z', 4096));
+        let mut reply = framed(RecordType::Stdout, &payload);
+        reply.extend(framed(RecordType::Stderr, b"a warning"));
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let Delivery::Streamed(mut stream) = client
+            .request_streaming(&a_request(), 1024, Relay::above_budget())
+            .unwrap()
+        else {
+            panic!("expected a streamed delivery");
+        };
+        client.drain_stream(&mut stream).unwrap();
+        // STDOUT is relayed, STDERR is not: it is this server's to log, and a caller that dropped it
+        // would eventually block the backend on a full pipe.
+        assert_eq!(stream.stderr(), b"a warning");
+    }
+
+    #[test]
+    fn a_header_block_larger_than_the_budget_is_refused_rather_than_buffered_without_limit() {
+        // No terminator anywhere, so there is no head to hand over and no body to relay. Buffering
+        // it anyway would make the budget a suggestion.
+        let payload: Vec<u8> = std::iter::repeat_n(b'h', 4096).collect();
+        let mut reply = framed(RecordType::Stdout, &payload);
+        reply.extend(end_record());
+
+        let mut client = client_for(reply);
+        let err = client
+            .request_streaming(&a_request(), 128, Relay::above_budget())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("header block exceeded"),
+            "the refusal has to say what happened: {err}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_response_is_an_error_not_a_short_body() {
+        // STDOUT only, no END_REQUEST: the backend died mid-response. Reporting that as a whole
+        // body is how a truncated download reaches a client with a 200.
+        let reply = framed(RecordType::Stdout, b"Status: 200 OK\r\n\r\npartial");
+
+        let mut client = client_for(reply);
+        let err = client
+            .request_streaming(&a_request(), 4096, Relay::above_budget())
+            .unwrap_err();
+        assert!(matches!(err, FcgiError::IncompleteResponse { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_incomplete_stream_is_reported_when_the_body_ends_early() {
+        let mut payload = b"Status: 200 OK\r\n\r\n".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', 4096));
+        // No END_REQUEST.
+        let reply = framed(RecordType::Stdout, &payload);
+
+        let mut client = client_for(reply);
+        let Delivery::Streamed(mut stream) = client
+            .request_streaming(&a_request(), 256, Relay::above_budget())
+            .unwrap()
+        else {
+            panic!("expected a streamed delivery");
+        };
+        let err = client.drain_stream(&mut stream).unwrap_err();
+        assert!(matches!(err, FcgiError::IncompleteResponse { .. }), "{err}");
+        assert!(!stream.is_finished());
+        assert!(!client.is_reusable());
+    }
+
+    #[test]
+    fn the_streaming_and_buffered_paths_agree_below_the_budget() {
+        // The property that makes this safe to adopt: same request, same reply, same bytes.
+        let payload = b"Status: 200 OK\r\nX-Test: 1\r\n\r\nhello there";
+        let mut reply = framed(RecordType::Stdout, payload);
+        reply.extend(end_record());
+
+        let buffered = client_for(reply.clone()).receive().unwrap();
+        let mut client = client_for(reply);
+        let delivery = client
+            .request_streaming(&a_request(), 4096, Relay::above_budget())
+            .unwrap();
+        let Delivery::Buffered(streamed) = delivery else {
+            panic!("expected a buffered delivery");
+        };
+        assert_eq!(streamed.stdout, buffered.stdout);
+        assert_eq!(streamed.stderr, buffered.stderr);
+        assert_eq!(streamed.end, buffered.end);
     }
 
     #[test]

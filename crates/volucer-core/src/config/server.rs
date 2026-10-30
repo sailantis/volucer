@@ -83,6 +83,28 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
 
+    /// How many bytes of a backend's response this server is willing to hold before it stops
+    /// buffering it and relays it instead.
+    ///
+    /// **The size past which a response is streamed**, and the one number that decides whether a
+    /// 1 GB download costs 1 GB of memory or a few hundred kilobytes. Below it nothing changes: the
+    /// response is compressed, `Content-Length` is declared, and a truncated body is caught before a
+    /// byte reaches the client. Above it the header block is answered immediately and the body is
+    /// relayed in `CHUNKS_IN_FLIGHT` chunks with no declared length — which is the only way a
+    /// response larger than memory can be served at all.
+    ///
+    /// The trade is explicit and it is why this is a threshold rather than a switch. A relayed
+    /// response is **not compressed** and **cannot declare its length**, because both need the whole
+    /// body; a buffered one can do both. So the default is deliberately far above an ordinary page:
+    /// 1 MiB, which is past every HTML response a PHP application produces and well below the point
+    /// where a second copy of the body matters.
+    ///
+    /// `0` disables relaying entirely — every response is buffered, exactly as before this key
+    /// existed — which is a legitimate way to say "I would rather have compression and a length than
+    /// unbounded downloads".
+    #[serde(default)]
+    pub stream_threshold_bytes: Option<usize>,
+
     /// How long a stop signal may spend finishing requests that are already in flight.
     ///
     /// A stop is not an abort: the listener stops accepting immediately, then lets each open
@@ -658,6 +680,18 @@ impl ErrorPages {
 /// deliberately: an unconfigured deployment must not change behaviour because the key was added.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+/// The response size past which a backend's answer is relayed rather than buffered.
+///
+/// One mebibyte, and the figure is a boundary rather than a measurement. Every HTML response a
+/// request-scoped application produces is far below it — a 1 MiB page is 200,000 words — so an
+/// ordinary deployment never takes the streaming path and therefore keeps compression and a declared
+/// length for every answer it does produce. Files and generated exports are far above it, and they are
+/// exactly the responses that cannot afford to be buffered twice.
+///
+/// It is *one* number for both front-ends, so `[server.http]` and a deployment behind nginx cannot
+/// disagree about when a response stops being buffered.
+pub const DEFAULT_STREAM_THRESHOLD_BYTES: usize = 1024 * 1024;
+
 /// How long a stop may spend finishing in-flight requests, when configuration says nothing.
 ///
 /// Thirty seconds, which is the value `docker stop` sends and `systemd`'s
@@ -755,6 +789,16 @@ impl ServerConfig {
     /// that only one of them had an answer at all.
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES)
+    }
+
+    /// The response size past which a backend's answer is relayed instead of buffered.
+    ///
+    /// Reads through to [`DEFAULT_STREAM_THRESHOLD_BYTES`] so the two front-ends cannot disagree
+    /// about the threshold — the same rule [`Self::max_body_bytes`] and
+    /// [`Self::shutdown_timeout`] follow, and for the same reason.
+    pub fn stream_threshold_bytes(&self) -> usize {
+        self.stream_threshold_bytes
+            .unwrap_or(DEFAULT_STREAM_THRESHOLD_BYTES)
     }
 
     /// How long a stop may spend draining in-flight requests.

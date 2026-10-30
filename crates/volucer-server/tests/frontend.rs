@@ -755,6 +755,7 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
         Limits {
             max_connections: 8,
             max_body_bytes: config.server.max_body_bytes(),
+            max_stream_bytes: config.server.stream_threshold_bytes(),
         },
     )
     .expect("bind the fastcgi listener");
@@ -1605,4 +1606,384 @@ fn a_backend_that_grants_nothing_is_handed_neither_an_address_nor_a_token() {
         "a backend with an empty services list is handed nothing at all, through the same listener \
          that hands the other backend both: {body}"
     );
+}
+
+
+/// A response far above the streaming threshold, read chunk by chunk as it arrives.
+///
+/// Three claims, and each is one this feature would silently fail:
+///
+/// 1. **Every byte arrives, in order, exactly once.** A relay that duplicated or dropped a record is
+///    the failure mode that makes a download corrupt rather than fail, so the content is checked by
+///    value rather than by length.
+/// 2. **The head arrives before the body.** That is the whole point: a client sees the status and the
+///    headers while the application is still generating the body.
+/// 3. **A response the backend measured is not relayed.** `Content-Length` is information, and
+///    re-framing a measured response as a chunked stream throws it away.
+#[test]
+fn a_large_response_is_relayed_chunk_by_chunk_and_never_assembled() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-relay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+
+    // A megabyte of `f` characters, produced in 4 KiB writes, and an explicitly *absent* length: PHP
+    // cannot know one, which is exactly the case that has to stream. `flush()` is what makes the
+    // bytes arrive incrementally rather than all at the end — `php-cgi` buffers by default, and the
+    // documentation for this feature says so.
+    write_script(
+        &root,
+        "index.php",
+        r#"<?php
+header('Content-Type: text/plain');
+$chunk = str_repeat('f', 4096);
+for ($i = 0; $i < 256; $i++) { echo $chunk; flush(); }
+"#,
+    );
+    // A measured response, to prove the threshold does not re-frame one. The length has to be stated
+    // by the application: `php-cgi` does not infer a `Content-Length` for `echo`, and a response
+    // without one is correctly treated as being of unknown size.
+    write_script(
+        &root,
+        "measured.php",
+        r#"<?php
+header('Content-Type: text/plain');
+header('Content-Length: 8192');
+echo str_repeat('m', 8192);
+"#,
+    );
+
+    let dispatcher = chain(&root, &binary, base);
+
+    // 4 KiB of threshold, so a 1 MiB response is unambiguously above it.
+    let request = |uri: &str| {
+        let info = volucer_fcgi::RequestInfo {
+            method: "GET".to_string(),
+            uri: uri.to_string(),
+            ..volucer_fcgi::RequestInfo::default()
+        };
+        let routing = volucer_fcgi::Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..volucer_fcgi::Routing::default()
+        };
+        let params = volucer_fcgi::build_params(&info, &routing).expect("params build");
+        Request {
+            params,
+                        ..Request::default()
+        }
+    };
+
+    let mut relayed = match dispatcher
+        .dispatch_to_relayed(
+            "cgi",
+            &request("/"),
+            4096,
+            volucer_fcgi::Relay::unknown_length(),
+        )
+        .expect("the backend answered")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(_) => {
+            panic!("a 1 MiB response with no length must be relayed, not buffered")
+        }
+    };
+
+    // **The head is available now**, before a single body byte has been forwarded — which is the
+    // property that distinguishes a relayed response from a buffered one.
+    let (status, headers) = relayed.parse();
+    assert_eq!(status, 200);
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
+                && value.starts_with("text/plain")),
+        "the head carries the application's own headers: {headers:?}"
+    );
+
+    let mut received = Vec::new();
+    while let Some(chunk) = relayed.body.blocking_recv() {
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received.len(),
+        1024 * 1024,
+        "every byte of the body arrived, in order and exactly once"
+    );
+    assert!(
+        received.iter().all(|byte| *byte == b'f'),
+        "and the bytes are the ones the application wrote, not padding or a duplicate"
+    );
+    assert!(
+        relayed.finished(),
+        "the backend reached END_REQUEST, so the client may be told the response is complete"
+    );
+
+    // The measured response takes the other branch, and it must: its `Content-Length` is a fact the
+    // client can use, and re-framing it as chunked would throw that away.
+    let measured = dispatcher
+        .dispatch_to_relayed(
+            "cgi",
+            &request("/measured.php"),
+            4096,
+            volucer_fcgi::Relay::unknown_length(),
+        )
+        .expect("the backend answered");
+    match measured {
+        volucer_server::Delivery::Buffered(response) => {
+            assert!(
+                response.stdout.len() > 8192,
+                "a measured response is returned whole: {} bytes",
+                response.stdout.len()
+            );
+        }
+        volucer_server::Delivery::Relayed(_) => {
+            panic!("a response that declares Content-Length must not be relayed")
+        }
+    }
+}
+
+
+/// A large response relayed through the FastCGI front-end, record by record.
+///
+/// This is the deployment behind nginx, which is the case the threshold exists for at all: a
+/// production volucer in front of `php-fpm` almost never has `[server.http]`, so a feature that only
+/// the HTTP listener honoured would be absent from the common deployment.
+///
+/// What is asserted is that the *frames* arrive as the backend produced them rather than as one
+/// assembled record — the count is what distinguishes a relay from a buffer, because a buffered
+/// response is one record however large it is.
+#[test]
+fn a_large_response_is_relayed_through_the_fastcgi_front_end_as_separate_records() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-fcgi-relay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    write_script(
+        &root,
+        "index.php",
+        r#"<?php
+header('Content-Type: text/plain');
+$chunk = str_repeat('g', 4096);
+for ($i = 0; $i < 128; $i++) { echo $chunk; flush(); }
+"#,
+    );
+
+    let dispatcher = chain(&root, &binary, base);
+    let request = |uri: &str| {
+        let info = volucer_fcgi::RequestInfo {
+            method: "GET".to_string(),
+            uri: uri.to_string(),
+            ..volucer_fcgi::RequestInfo::default()
+        };
+        let routing = volucer_fcgi::Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..volucer_fcgi::Routing::default()
+        };
+        let params = volucer_fcgi::build_params(&info, &routing).expect("params build");
+        Request {
+            params,
+            keep_conn: true,
+                        ..Request::default()
+        }
+    };
+
+    let mut relayed = match dispatcher
+        .dispatch_to_relayed(
+            "cgi",
+            &request("/"),
+            4096,
+            volucer_fcgi::Relay::for_threshold(4096),
+        )
+        .expect("the backend answered")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(_) => {
+            panic!("a 512 KiB response with no length must be relayed")
+        }
+    };
+
+    // Re-frame it exactly as the listener does, and read the records back.
+    let head_len = relayed.head.len();
+    let mut wire = Vec::new();
+    let (status, body_bytes) =
+        volucer_server::frontend::write_relayed(&mut wire, 1, &mut relayed).expect("relayed");
+    assert_eq!(status, 200);
+    assert_eq!(body_bytes, 128 * 4096, "every byte was forwarded");
+
+    let mut reader = wire.as_slice();
+    let mut stdout = Vec::new();
+    let mut records = 0usize;
+    let mut end = None;
+    while let Some(record) = record::read_record(&mut reader).expect("a readable record") {
+        match record.record_type() {
+            RecordType::Stdout => {
+                stdout.extend_from_slice(&record.content);
+                if !record.content.is_empty() {
+                    records += 1;
+                }
+            }
+            RecordType::EndRequest => {
+                end = Some(volucer_fcgi::EndRequest::decode(&record.content).expect("a decodable END_REQUEST"));
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    assert_eq!(
+        stdout.len(),
+        head_len + 128 * 4096,
+        "the client receives the header block and then the whole body"
+    );
+    assert_eq!(
+        &stdout[..head_len],
+        &relayed.head,
+        "the head is forwarded verbatim, so nginx reads the application's own headers"
+    );
+    let body = &stdout[head_len..];
+    assert!(
+        body.iter().all(|byte| *byte == b'g'),
+        "and the body is the application's own bytes"
+    );
+    assert!(
+        records > 1,
+        "a relayed response arrives as more than one record — that is what distinguishes it from a \
+         buffered one, which php-cgi would have sent as a single 512 KiB sequence: {records} records"
+    );
+    assert_eq!(
+        end,
+        Some(volucer_fcgi::EndRequest::complete()),
+        "and a complete response ends with END_REQUEST, which is what tells nginx it has everything"
+    );
+}
+
+/// A slot mid-relay is **not** idle, so a rolling restart leaves it alone.
+///
+/// This is the property that had to be pinned rather than the release itself, and the reason is that
+/// releasing the permit is easy to get right by accident and impossible to get *wrong* safely: a
+/// permit given back at return time also lets the next request through, so a test that only asks "did
+/// the slot come back" passes either way. What a permit given back too early actually breaks is the
+/// rolling restart — `respawn_idle` reads the permit count to decide whether a slot is busy, so a slot
+/// streaming a 4 MiB response would be reported as idle and killed mid-download.
+///
+/// So the assertion is on the report: while a relay is in flight the slot must be `skipped_busy`, and
+/// only after the body is drained may a sweep replace it.
+#[test]
+fn a_slot_serving_a_relayed_response_is_not_idle() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-relay-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    // Far more than the channel can hold, so the reader is still working when the sweep runs.
+    write_script(
+        &root,
+        "index.php",
+        r#"<?php
+header('Content-Type: text/plain');
+$chunk = str_repeat('h', 8192);
+for ($i = 0; $i < 512; $i++) { echo $chunk; flush(); }
+"#,
+    );
+
+    let dispatcher = chain(&root, &binary, base);
+    let info = volucer_fcgi::RequestInfo {
+        method: "GET".to_string(),
+        uri: "/".to_string(),
+        ..volucer_fcgi::RequestInfo::default()
+    };
+    let routing = volucer_fcgi::Routing {
+        document_root: root.clone(),
+        front_controller: Some("index.php".to_string()),
+        ..volucer_fcgi::Routing::default()
+    };
+    let params = volucer_fcgi::build_params(&info, &routing).expect("params build");
+    let request = Request {
+            params,
+            keep_conn: true,
+            ..Request::default()
+        };
+
+    let mut relayed = match dispatcher
+        .dispatch_to_relayed(
+            "cgi",
+            &request,
+            4096,
+            volucer_fcgi::Relay::for_threshold(4096),
+        )
+        .expect("the backend answered")
+    {
+        volucer_server::Delivery::Relayed(relayed) => relayed,
+        volucer_server::Delivery::Buffered(_) => panic!("a 4 MiB response must be relayed"),
+    };
+
+    // **The sweep must skip it, and for the right reason.** A slot replaced here would truncate a
+    // download that a client is in the middle of receiving — the exact failure the conservative
+    // idleness test in `respawn_idle` exists to prevent.
+    let reports = dispatcher.respawn_idle();
+    let report = reports
+        .iter()
+        .find(|report| report.backend == "cgi")
+        .expect("the cgi backend is in the report");
+    assert!(
+        report.replaced.is_empty(),
+        "a slot streaming a response must not be replaced: {report:?}"
+    );
+    assert_eq!(
+        report.skipped_busy,
+        vec![0],
+        "and it has to be reported as busy rather than silently ignored: {report:?}"
+    );
+
+    // Drain it, and now the same sweep replaces it: the skip was about the response, not about the
+    // pool.
+    while relayed.body.blocking_recv().is_some() {}
+    assert!(relayed.finished(), "the response completed");
+
+    // The reader thread releases the permit *after* publishing the verdict, so this waits for it
+    // rather than assuming the ordering.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let reports = dispatcher.respawn_idle();
+        let report = reports
+            .iter()
+            .find(|report| report.backend == "cgi")
+            .expect("the cgi backend is in the report");
+        if !report.replaced.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot never became idle after its response was drained: {report:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

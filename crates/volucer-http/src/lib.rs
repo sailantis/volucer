@@ -54,6 +54,7 @@ pub mod error;
 #[cfg(feature = "http3")]
 pub mod http3;
 pub mod listener;
+pub mod relay_body;
 pub mod static_files;
 pub mod status;
 pub mod tls;

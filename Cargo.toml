@@ -122,7 +122,17 @@ x509-parser = { version = "0.18", default-features = false }
 # footgun rather than a convenience, and leaving it unlinked is the cheapest way to say so.
 rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }
 
-tokio = { version = "1", features = ["net", "fs", "io-util", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = [
+    "net",
+    "fs",
+    "io-util",
+    "rt-multi-thread",
+    "time",
+    # `sync::mpsc` carries a streamed response body from the blocking thread that reads the
+    # backend to the async task that writes the client. Bounded, because the bound *is* the
+    # back-pressure: it is what stops a fast backend filling memory for a slow client.
+    "sync",
+] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 # HTTP/3, behind the `http3` feature and only reachable from `volucer-http`.

@@ -357,16 +357,58 @@ fn parse(raw: &[u8]) -> Exchange {
         .unwrap_or_else(|| panic!("no status in {status_line:?}"));
     let reason = parts.next().unwrap_or_default().to_string();
 
-    let headers = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
         .collect();
+
+    // **A chunked body is de-framed here, and it has to be.** `hyper` frames a relayed response with
+    // `Transfer-Encoding: chunked` because its length is not known, so the raw bytes below the header
+    // block carry chunk sizes and separators. A parser that skipped this would compare the chunk
+    // framing against the expected body and report a size mismatch on a response that was correct.
+    let chunked = headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("transfer-encoding") && value == "chunked");
+    let body = if chunked {
+        dechunk(&body)
+    } else {
+        body
+    };
 
     Exchange {
         status,
         reason,
         headers,
         body,
+    }
+}
+
+/// Remove chunk framing from a body, returning the bytes the client would actually receive.
+///
+/// Tolerates a truncated stream by returning what it decoded, which is what makes an assertion on
+/// length meaningful: a relay that stopped early produces a *short* body here rather than a panic.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    loop {
+        let Some(end) = rest.windows(2).position(|window| window == b"\r\n") else {
+            return out;
+        };
+        let size = std::str::from_utf8(&rest[..end])
+            .ok()
+            .and_then(|line| usize::from_str_radix(line.trim(), 16).ok());
+        let Some(size) = size else {
+            return out;
+        };
+        let start = end + 2;
+        if size == 0 {
+            return out;
+        }
+        let Some(chunk) = rest.get(start..start + size) else {
+            return out;
+        };
+        out.extend_from_slice(chunk);
+        rest = rest.get(start + size + 2..).unwrap_or(&[]);
     }
 }
 
@@ -4224,5 +4266,196 @@ fn a_clients_token_header_cannot_survive_to_the_origin() {
         token.len(),
         32,
         "the origin received this server's token: {body}"
+    );
+}
+
+// ------------------------------------------------------------ relayed responses
+
+/// A backend that answers with `body` as a stream, and never declares a length.
+///
+/// A real listener, for the reason `one_shot_fastcgi_backend` gives: the response has to travel the
+/// whole path — records in, split at the head, relayed through a channel, framed by `hyper` — and a
+/// test that short-circuited any of those would not be testing the feature.
+fn streaming_fastcgi_backend(head: &'static str, body: &'static [u8], chunk: usize) -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a backend port");
+    let address = listener.local_addr().expect("address").to_string();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch);
+
+        let mut wire = Vec::new();
+        // The head and the first fragment together, which is the shape `php-cgi` produces when a
+        // response is smaller than one of its 8 KiB flushes.
+        volucer_fcgi::record::append_records(
+            &mut wire,
+            volucer_fcgi::RecordType::Stdout,
+            1,
+            head.as_bytes(),
+            false,
+        );
+        for piece in body.chunks(chunk) {
+            volucer_fcgi::record::append_records(
+                &mut wire,
+                volucer_fcgi::RecordType::Stdout,
+                1,
+                piece,
+                false,
+            );
+        }
+        volucer_fcgi::record::append_records(
+            &mut wire,
+            volucer_fcgi::RecordType::Stdout,
+            1,
+            &[],
+            true,
+        );
+        wire.extend_from_slice(
+            &volucer_fcgi::Header::new(volucer_fcgi::RecordType::EndRequest, 1, 8).encode(),
+        );
+        wire.extend_from_slice(
+            &volucer_fcgi::EndRequest {
+                app_status: 0,
+                protocol_status: volucer_fcgi::ProtocolStatus::RequestComplete,
+            }
+            .encode(),
+        );
+        let _ = stream.write_all(&wire);
+        let _ = stream.flush();
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    address
+}
+
+/// A server in front of a streaming fixture, with a threshold of `threshold` bytes.
+fn streaming_server(
+    head: &'static str,
+    body: &'static [u8],
+    chunk: usize,
+    threshold: usize,
+) -> Option<Server> {
+    let socket = streaming_fastcgi_backend(head, body, chunk);
+    let mut config = unreachable_config();
+    config.backends.insert(
+        "fpm".to_string(),
+        BackendConfig::External(volucer_core::config::ExternalConfig {
+            socket,
+            max_connections: None,
+            services: Vec::new(),
+        }),
+    );
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&config, routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(sites_for(&routing, static_config()));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )));
+    let limits = HttpLimits {
+        max_stream_bytes: threshold,
+        ..HttpLimits::default()
+    };
+    Server::start_with_handles(dispatcher, limits, handles)
+}
+
+#[test]
+fn a_response_above_the_threshold_is_chunked_rather_than_length_delimited() {
+    // The property `hyper` derives from the body's size hint: a relayed body has no length, so the
+    // response is framed with `Transfer-Encoding: chunked` and carries no `Content-Length`. A response
+    // that declared a length would have to be buffered, which is the thing this avoids.
+    let body: &'static [u8] = Box::leak(vec![b'r'; 64 * 1024].into_boxed_slice());
+    let head: &'static str = "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+    let Some(server) = streaming_server(head, body, 8192, 4096) else {
+        return;
+    };
+
+    let served = get(&server.address, "/export");
+    assert_eq!(served.status, 200, "{served:?}");
+    assert_eq!(
+        served.body.len(),
+        64 * 1024,
+        "every relayed byte arrived, and the connection was not closed early"
+    );
+    assert!(
+        served.body.iter().all(|byte| *byte == b'r'),
+        "the bytes are the application's, in order"
+    );
+    let header = |name: &str| {
+        served
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert!(
+        header("content-length").is_none(),
+        "a relayed response cannot know its length: {served:?}"
+    );
+    assert_eq!(
+        header("transfer-encoding").as_deref(),
+        Some("chunked"),
+        "so hyper frames it as chunked: {served:?}"
+    );
+}
+
+#[test]
+fn a_response_below_the_threshold_keeps_its_length_and_is_never_chunked() {
+    // The other half of the same decision, and the one that matters for every ordinary page: a small
+    // response is buffered, so it declares a length, and compression is still available for it.
+    let body: &'static [u8] = Box::leak(vec![b's'; 512].into_boxed_slice());
+    let head: &'static str = "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+    let Some(server) = streaming_server(head, body, 256, 65536) else {
+        return;
+    };
+
+    let served = get(&server.address, "/page");
+    assert_eq!(served.status, 200, "{served:?}");
+    assert_eq!(served.body.len(), 512);
+    let header = |name: &str| {
+        served
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        header("content-length").as_deref(),
+        Some("512"),
+        "a buffered response still declares its length: {served:?}"
+    );
+    assert!(
+        header("transfer-encoding").is_none(),
+        "and is therefore not chunked: {served:?}"
+    );
+}
+
+#[test]
+fn a_threshold_of_zero_buffers_everything_as_before() {
+    // The escape hatch has to actually work: `stream_threshold_bytes = 0` is how an operator says "I
+    // would rather have compression and a declared length than unbounded downloads".
+    let body: &'static [u8] = Box::leak(vec![b'z'; 64 * 1024].into_boxed_slice());
+    let head: &'static str = "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+    let Some(server) = streaming_server(head, body, 8192, 0) else {
+        return;
+    };
+
+    let served = get(&server.address, "/export");
+    assert_eq!(served.status, 200, "{served:?}");
+    assert_eq!(served.body.len(), 64 * 1024);
+    let header = |name: &str| {
+        served
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        header("content-length").as_deref(),
+        Some("65536"),
+        "with relaying off, even a large response is buffered and measured: {served:?}"
     );
 }

@@ -57,6 +57,17 @@ pub struct Limits {
     /// `client_max_body_size` on somebody else's configuration. The two front-ends now read the
     /// same `server.max_body_bytes`.
     pub max_body_bytes: usize,
+    /// How many bytes of a backend's response may be buffered before it is relayed instead.
+    ///
+    /// **The other half of the same decision the HTTP front-end makes**, and it has to be here for
+    /// the same reason `max_body_bytes` is: a deployment behind nginx almost never has
+    /// `[server.http]` at all, so a threshold that only the HTTP listener honoured would leave the
+    /// common deployment buffering every large response. FastCGI's framing makes the relay cheap —
+    /// each arriving record becomes one `STDOUT` record — which is why this is a threshold on the
+    /// bytes rather than on anything protocol-shaped.
+    ///
+    /// `0` means never relay.
+    pub max_stream_bytes: usize,
 }
 
 impl Default for Limits {
@@ -66,6 +77,7 @@ impl Default for Limits {
             // Through the one constant the HTTP front-end's `HttpLimits::default()` also uses, so
             // "the default" is a single number rather than two that agree today.
             max_body_bytes: volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+            max_stream_bytes: volucer_core::config::DEFAULT_STREAM_THRESHOLD_BYTES,
         }
     }
 }
@@ -1067,9 +1079,14 @@ fn serve_connection(
 
         dispatcher.inject_rpc_params(&selected, &mut request);
 
-        let response = dispatcher.dispatch_with_routes(&site.routes, &request);
+        let response = dispatcher.dispatch_to_relayed(
+            &selected,
+            &request,
+            limits.max_stream_bytes,
+            volucer_fcgi::Relay::for_threshold(limits.max_stream_bytes),
+        );
         match response {
-            Ok(response) => {
+            Ok(crate::pool::Delivery::Buffered(response)) => {
                 stats.requests.fetch_add(1, Ordering::Relaxed);
                 requests_string = stats.requests.load(Ordering::Relaxed).to_string();
                 if !response.stderr.is_empty() {
@@ -1100,6 +1117,35 @@ fn serve_connection(
                         &request,
                         status,
                         body.len() as u64,
+                        started.elapsed(),
+                    );
+                }
+            }
+            Ok(crate::pool::Delivery::Relayed(mut relayed)) => {
+                stats.requests.fetch_add(1, Ordering::Relaxed);
+                requests_string = stats.requests.load(Ordering::Relaxed).to_string();
+                let stderr = relayed.stderr();
+                if !stderr.is_empty() {
+                    tracing::debug!(
+                        stderr = %String::from_utf8_lossy(&stderr).trim_end(),
+                        "backend wrote to STDERR"
+                    );
+                }
+                // The status and the header block are read from the head *before* the body is
+                // relayed, so the access record can name the status the client will read without
+                // waiting for a 1 GB response to finish. The byte count is the one the access log
+                // already reports as `0` for a body of unknown size.
+                let (status, _) = relayed.parse();
+                let (relayed_status, relayed_len) =
+                    fastcgi::write_relayed(stream.get_mut(), request_id, &mut relayed)?;
+                debug_assert_eq!(relayed_status, status);
+                if observe.is_active() {
+                    record_fastcgi(
+                        &observe,
+                        &context,
+                        &request,
+                        status,
+                        relayed_len,
                         started.elapsed(),
                     );
                 }

@@ -320,6 +320,7 @@ its certificate or ACME settings.
 | `script_extensions` | array of strings | `["php", "php3", "phtml"]` | Which extensions are executed as PHP. |
 | `max_body_bytes` | integer | `33554432` (32 MiB) | The largest request body either front-end accepts. |
 | `shutdown_timeout_ms` | integer | `30000` | How long a stop may spend finishing in-flight requests. `0` means do not wait. See [Operations](11-OPERATIONS.md#systemd). |
+| `stream_threshold_bytes` | integer | `1048576` (1 MiB) | The response size past which a backend's answer is relayed rather than buffered. `0` disables relaying. See [Streamed responses](#stream_threshold_bytes). |
 | `max_connections` | integer | `512` | The most concurrent client connections the HTTP front-end accepts. `0` means no ceiling; `--max-connections` overrides it. |
 | `error_pages` | table | absent | A page per error status: `"502" = "pages/502.html"`. Only 400–599 are accepted. |
 | `static_files` | table or bool | enabled | The static file layer. See [Static Files](04-STATIC-FILES.md). |
@@ -409,6 +410,45 @@ the origin instead.
 
 Zero is rejected rather than treated as “unlimited”; it would reject every request with a
 body.
+
+### `stream_threshold_bytes`
+
+**The number that decides whether a large response is possible at all.** Below the threshold a
+backend's answer is buffered whole, which is what makes it compressible and length-declaring.
+Above it the header block is answered immediately and the body is relayed in chunks as the
+backend produces them, so a 1 GB download costs a few kilobytes of memory here rather than two
+gigabytes.
+
+Three things follow from relaying, and they are consequences rather than omissions:
+
+- **A relayed response is not compressed.** `Content-Encoding` has to be chosen before the first
+  byte, and compression needs the whole body to be smaller.
+- **A relayed response declares no `Content-Length`.** It does not exist yet, so `hyper` frames
+  it with `Transfer-Encoding: chunked`. That is the same trade every other server makes for a
+  streamed response.
+- **A truncation is a protocol error, not an end.** If the backend stops before `END_REQUEST` the
+  connection is closed without the terminating chunk, so a client can tell a complete download
+  from a short one.
+
+The three things that never take this path, each because the alternative is worse:
+
+| Not relayed | Why |
+|---|---|
+| A response stating `Content-Length` | The backend measured it. Re-framing a measured response throws that measurement away. |
+| A non-2xx response | An error page has to be answered whole: `error_pages` reads its body, and a status already on the wire cannot be rewritten. |
+| An `X-Sendfile` / `X-Accel-Redirect` answer | It is an *instruction*. The static layer answers it, with ranges, `ETag` and `Last-Modified`. See [Static Files](04-STATIC-FILES.md#x-sendfile). |
+
+`0` disables relaying: every response is buffered, exactly as before this key existed. That is the
+honest spelling of "I would rather have compression and a declared length than unbounded downloads".
+
+**PHP buffers by default.** Volucer stops holding bytes, but it cannot make an application emit
+them early: a response only arrives incrementally if the application calls `flush()` (and its
+output buffers are configured to allow it). A `.php` that builds a 200 MB string and echoes it once
+has already paid for the memory, in PHP, before volucer sees a byte.
+
+This applies to both FastCGI backends — `spawn_cgi` and `external` — and to `[server.http]`. It does
+not apply to an `upstream`, which already streams, or to a `worker`, whose response is framed by
+volucer's own protocol.
 
 ### `serve_only`
 
@@ -712,7 +752,12 @@ should not have to know which server it is running behind. Volucer then serves t
 through the same path a static file takes: **64 KiB reads, ranges, `ETag`, `Last-Modified`,
 `If-Range`, `304` and `HEAD` all work**, so a 1 GB download costs 64 KiB of memory instead of the
 whole file twice. `upstream` is unaffected (it already streams); this is for the `worker`,
-`spawn_cgi` and `external` backends, whose response bodies are otherwise buffered whole.
+`spawn_cgi` and `external` backends.
+
+A `spawn_cgi`/`external` answer that names a file is **never relayed** even above
+[`stream_threshold_bytes`](#stream_threshold_bytes): it is an instruction rather than a body, and the
+static layer answers it with validators a relayed stream could not carry. The relayed path is for a
+body the *application generates* — an export, a media file it reads itself — not for one it delegates.
 
 ### The allow-list is the security boundary
 

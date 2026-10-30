@@ -1182,13 +1182,48 @@ impl Dispatcher {
 
     /// Send a request to a named backend.
     pub fn dispatch_to(&self, name: &str, request: &Request) -> Result<Response> {
-        let backend = self.backends.get(name).ok_or_else(|| {
-            // Two different failures share this lookup, and which one it is decides the
-            // status a client reads. No backends at all is the static-only deployment: the
-            // configuration has no dispatch target and never will, so it is a 500 and the
-            // CLI has already warned about it. A name that does not resolve in a deployment
-            // that *has* backends is the pool being momentarily exhausted, which is a
-            // transient 503.
+        let backend = self.backend_named(name)?;
+        backend.request(request)
+    }
+
+    /// Send a request to a named backend, relaying the response body when it is large.
+    ///
+    /// The same lookup, the same error shapes and the same route decision as [`Self::dispatch_to`]:
+    /// the only difference is what happens to a body that does not fit. Which is why it is a second
+    /// method on the same type rather than a mode on the first — a caller that cannot express a
+    /// stream (the FastCGI front-end, which relays a whole record) asks for the buffered one and gets
+    /// byte-identical behaviour to before this existed.
+    pub fn dispatch_to_relayed(
+        &self,
+        name: &str,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        let backend = self.backend_named(name)?;
+        backend.request_relayed(request, buffer, relay)
+    }
+
+    /// Send a request to the backend its route selects, relaying a large body.
+    pub fn dispatch_relayed(
+        &self,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        let name = self.backend_for(request);
+        self.dispatch_to_relayed(name, request, buffer, relay)
+    }
+
+    /// The named backend, or the error that says which kind of miss this is.
+    ///
+    /// Two different failures share this lookup, and which one it is decides the status a client
+    /// reads. No backends at all is the static-only deployment: the configuration has no dispatch
+    /// target and never will, so it is a 500 and the CLI has already warned about it. A name that
+    /// does not resolve in a deployment that *has* backends is the pool being momentarily exhausted,
+    /// which is a transient 503.
+    fn backend_named(&self, name: &str) -> Result<&Backend> {
+        self.backends.get(name).ok_or_else(|| {
             if self.backends.is_empty() {
                 ServerError::NoBackend
             } else {
@@ -1196,8 +1231,7 @@ impl Dispatcher {
                     backend: name.to_string(),
                 }
             }
-        })?;
-        backend.request(request)
+        })
     }
 
     /// Send a request to the default backend, ignoring the route table.

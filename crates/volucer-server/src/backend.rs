@@ -507,6 +507,28 @@ impl Backend {
         }
     }
 
+    /// Ask this backend for a response, relaying the body when it does not fit in `buffer`.
+    ///
+    /// **The two FastCGI kinds relay; the other two say so by returning a whole response.** A
+    /// worker's answer is framed by volucer's own protocol, which is the next phase's change; an
+    /// upstream already streams and needs nothing here. Returning `Buffered` from those is therefore
+    /// the honest answer, and it is byte-identical to [`Self::request`] — so a caller gets correctness
+    /// either way and streaming is a property of the deployment rather than something it must know.
+    pub fn request_relayed(
+        &self,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        match self {
+            Backend::SpawnCgi { pool, .. } => pool.request_relayed(request, buffer, relay),
+            Backend::External { name, pool } => {
+                Self::external_relayed(name, pool, request, buffer, relay)
+            }
+            _ => self.request(request).map(crate::pool::Delivery::Buffered),
+        }
+    }
+
     /// Whether this backend is the kind a gRPC call can be delivered to.
     ///
     /// **Only a `worker` (or an `attach`, which is a worker reached differently) answers.** The
@@ -694,6 +716,87 @@ impl Backend {
                 complete: false,
             },
         })
+    }
+
+    /// Ask an `external` backend for a response, relaying the body when it does not fit in `buffer`.
+    ///
+    /// # Why the connection is not returned to the pool when it relays
+    ///
+    /// The client is mid-response: the pool would hand it to the next request with the previous
+    /// response's records still in front of it. So a relayed response *takes* the connection for its
+    /// duration, and the retention cap means the pool simply opens another one afterwards — which is
+    /// exactly what `MAX_IDLE_CONNECTIONS` and the `max_connections` permit already model, because the
+    /// permit is held for the whole request rather than for the head.
+    ///
+    /// The permit therefore has to outlive this function, which is why it moves into the reader
+    /// thread. Dropping it here would let the pool exceed `max_connections` for as long as a download
+    /// takes.
+    fn external_relayed(
+        name: &str,
+        pool: &ClientPool,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        let (mut client, permit) = pool.acquire(name)?;
+        let reused = client.is_reusable();
+
+        // One retry, on the same rule as `request_external`: a reused connection the backend has
+        // closed is indistinguishable from a working one until it is written to, and re-establishing
+        // it costs one connect instead of a 502.
+        let mut attempt = 0;
+        let delivery = loop {
+            match client.request_streaming(request, buffer, relay) {
+                Ok(delivery) => break delivery,
+                Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+                    attempt += 1;
+                    tracing::debug!(
+                        backend = %name,
+                        "the backend closed a reused connection; reconnecting"
+                    );
+                    client =
+                        volucer_fcgi::Client::connect(pool.endpoint(), None).map_err(|source| {
+                            ServerError::Worker {
+                                backend: name.to_string(),
+                                source,
+                            }
+                        })?;
+                }
+                Err(source) => {
+                    return Err(ServerError::Worker {
+                        backend: name.to_string(),
+                        source,
+                    })
+                }
+            }
+        };
+
+        match delivery {
+            volucer_fcgi::Delivery::Buffered(response) => {
+                pool.release(client);
+                drop(permit);
+                Ok(crate::pool::Delivery::Buffered(response))
+            }
+            volucer_fcgi::Delivery::Streamed(stream) => {
+                let report = crate::relay::spawn_reader(
+                    name.to_string(),
+                    client,
+                    stream,
+                    move |_client, _stream| {
+                        // The connection is *not* returned to the pool: it is only reusable once
+                        // `FCGI_KEEP_CONN` held and the response finished, and `spawn_reader` has
+                        // already drained it by the time this runs. The permit, which is what
+                        // `max_connections` actually bounds, is given back here and only here.
+                        drop(permit);
+                    },
+                )
+                .map_err(|source| ServerError::Spawn {
+                    binary: std::path::PathBuf::from("volucer-relay"),
+                    source,
+                })?;
+                Ok(crate::pool::Delivery::Relayed(report))
+            }
+        }
     }
 
     /// Whether this backend is a worker pool whose slot contention should be

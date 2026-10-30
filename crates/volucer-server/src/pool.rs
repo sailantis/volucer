@@ -37,8 +37,8 @@ use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use volucer_core::config::{
@@ -50,7 +50,22 @@ use volucer_fcgi::{Client, Endpoint, Request, Response};
 
 use crate::error::{Hint, Result, ServerError};
 use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
+use crate::relay::Relayed;
 use crate::respawn::RespawnReport;
+
+/// What a backend answered with.
+///
+/// The two shapes a request path has to distinguish, and the distinction is a *size* one rather than
+/// a protocol one: a response that fits in the buffer is everything it ever was — compressible,
+/// length-declaring, truncation-checked — and one that does not is relayed as it arrives.
+#[derive(Debug)]
+pub enum Delivery {
+    /// A whole response, in memory.
+    Buffered(Response),
+    /// A response whose body is still being produced. The head is known; see [`Relayed`].
+    Relayed(Relayed),
+}
+
 
 /// How long to wait for a slot to start accepting connections.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,10 +123,15 @@ struct Slot {
     endpoint: Endpoint,
     /// Requests this slot has served, for `max_requests` recycling.
     ///
+    /// **An `AtomicU64` rather than a `u64`**, because a *relayed* response is still being served
+    /// after it has been handed to the front-end: the reader thread counts it, and it can only do so
+    /// through a shared handle. A plain counter would make `max_requests` a suggestion for a
+    /// deployment that streams.
+    ///
     /// **Slot-wide, not per child.** `php-cgi` gives no way to see a child's count from
     /// outside, and the replacement unit is the group — which is the only thing `killpg` can
     /// express. So this counter measures what the pool can act on.
-    served: u64,
+    served: Arc<AtomicU64>,
     /// Live connections, up to the slot's concurrency.
     ///
     /// A `Vec` rather than one `Option` because a preforked master can answer several
@@ -240,9 +260,9 @@ fn is_connection_error(err: &volucer_fcgi::FcgiError) -> bool {
 /// a missed release shrinks the slot permanently — a failure that only shows up as a pool
 /// that gets slower and never recovers.
 #[derive(Debug)]
-struct PermitGuard<'a>(&'a SlotPermits);
+struct PermitGuard(Arc<SlotPermits>);
 
-impl Drop for PermitGuard<'_> {
+impl Drop for PermitGuard {
     fn drop(&mut self) {
         self.0.leave();
     }
@@ -638,7 +658,9 @@ pub struct CgiPool {
     /// Sized to the slot count and created from `config.slot_concurrency()`, so a slot's permit
     /// count and the number of processes the driver was told to start are the same number read
     /// from the same place.
-    permits: Vec<SlotPermits>,
+    /// Behind an `Arc` because a relayed response releases its place from the reader thread, after
+    /// the request that took it has already returned: `&self` cannot own that guard far enough.
+    permits: Vec<Arc<SlotPermits>>,
     /// Round-robin position, so work and therefore memory are spread evenly.
     cursor: AtomicUsize,
     /// How one slot's process is started, resolved once at construction.
@@ -752,7 +774,9 @@ impl CgiPool {
         let mut pool = CgiPool {
             name: name.to_string(),
             slots: Vec::with_capacity(count as usize),
-            permits: (0..count).map(|_| SlotPermits::new(concurrency)).collect(),
+            permits: (0..count)
+                .map(|_| Arc::new(SlotPermits::new(concurrency)))
+                .collect(),
             cursor: AtomicUsize::new(0),
             launch,
             driver: config.driver(),
@@ -1014,7 +1038,7 @@ impl CgiPool {
         let mut slot = Slot {
             child,
             endpoint: address.endpoint(&self.bind_host, &self.name)?,
-            served: 0,
+            served: Arc::new(AtomicU64::new(0)),
             clients: Vec::new(),
         };
         wait_until_listening(&mut slot, self.launch.binary(), STARTUP_TIMEOUT)?;
@@ -1047,7 +1071,7 @@ impl CgiPool {
         }
 
         let index = self.next_slot_index();
-        let permits = &self.permits[index];
+        let permits = Arc::clone(&self.permits[index]);
 
         // Blocking rather than refusing: the front-end's own connection limit is where a
         // request is refused, and turning a full slot into an error here would make a pool
@@ -1082,32 +1106,39 @@ impl CgiPool {
             // per slot and bounded by concurrency, which *is* the number of processes behind the
             // address — so a warm connection is one warm child and cannot starve a sibling.
             slot.clients.push(client);
-            slot.served += 1;
-            slot.served
+            slot.served.fetch_add(1, Ordering::Relaxed) + 1
         };
-
-        // Recycle on the request count, mirroring `pm.max_requests`: this is what
-        // bounds the effect of any leak in the application under test. `0` means
-        // never, as it does for php-fpm — see `WorkerConfig::max_requests`.
-        //
-        // Slot-wide, and deliberately: with children each counts its own requests and php-cgi
-        // offers no way to read those from outside, so the only count that exists is the one
-        // this slot has served. Replacing the slot replaces the group, which is the unit
-        // `killpg` can express anyway.
-        if let Some(max) = self.max_requests.filter(|max| *max > 0) {
-            if served >= max {
-                let mut slot = self.slots[index]
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // Re-checked under the lock: two concurrent requests can both reach the
-                // threshold, and the second must not replace a slot the first has already
-                // replaced — that would kill a group that has served nothing.
-                if slot.served >= max {
-                    self.replace_locked(&mut slot)?;
-                }
-            }
-        }
+        self.recycle_if_needed(index, served)?;
         Ok(response)
+    }
+
+    /// Replace a slot's process when it has reached `max_requests`.
+    ///
+    /// Recycle on the request count, mirroring `pm.max_requests`: this is what bounds the effect of
+    /// any leak in the application. `0` means never, as it does for php-fpm — see
+    /// `WorkerConfig::max_requests`.
+    ///
+    /// Slot-wide, and deliberately: with children each counts its own requests and php-cgi offers no
+    /// way to read those from outside, so the only count that exists is the one this slot has
+    /// served. Replacing the slot replaces the group, which is the unit `killpg` can express anyway.
+    ///
+    /// `served` is the value the caller observed *before* this check, so a concurrent request that
+    /// also crossed the threshold does not replace a slot the first one has already replaced — that
+    /// would kill a group that has served nothing.
+    fn recycle_if_needed(&self, index: usize, served: u64) -> Result<()> {
+        let Some(max) = self.max_requests.filter(|max| *max > 0) else {
+            return Ok(());
+        };
+        if served < max {
+            return Ok(());
+        }
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.served.load(Ordering::Relaxed) >= max {
+            self.replace_locked(&mut slot)?;
+        }
+        Ok(())
     }
 
     /// Pick a slot, preferring a live one.
@@ -1140,6 +1171,114 @@ impl CgiPool {
         }
         // Every slot is gone; the first one will be replaced on the next request.
         0
+    }
+
+    /// Send a request through the pool, relaying the body instead of buffering it.
+    ///
+    /// The same admission, the same slot choice and the same permit accounting as [`Self::request`],
+    /// with one difference at the end: when the response does not fit in `buffer` bytes the body is
+    /// pumped by a thread of its own into a bounded channel, and the caller gets the header block
+    /// immediately.
+    ///
+    /// # Why the permit is released by the reader thread
+    ///
+    /// The slot is *still serving this request* while its body is being relayed — a streamed response
+    /// has not finished when its head arrives. So the permit has to live until `END_REQUEST`, which
+    /// happens on the reader thread. Releasing it at return time would let the pool admit `children`
+    /// more requests than there are processes and queue them invisibly inside the backend.
+    ///
+    /// # The client is not returned to the slot here
+    ///
+    /// It cannot be: it is owned by the reader thread until the response ends. A slot therefore has
+    /// one fewer warm connection for the duration of a streamed response, which is correct — the
+    /// connection genuinely is busy — and it costs one reconnect afterwards, on a path that only a
+    /// large response takes.
+    pub fn request_relayed(
+        &self,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<Delivery> {
+        if self.slots.is_empty() {
+            return Err(ServerError::NoWorker {
+                backend: self.name.clone(),
+            });
+        }
+
+        let index = self.next_slot_index();
+        let permits = Arc::clone(&self.permits[index]);
+        permits.enter();
+        // Moved into the reader thread when the response is streamed, and dropped here otherwise.
+        // Either way it is released exactly once, which is why it is a guard rather than a call.
+        let permit = PermitGuard(permits);
+
+        let (endpoint, taken) = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.prune_dead_clients();
+            (slot.endpoint.clone(), slot.clients.pop())
+        };
+
+        let mut client = match taken {
+            Some(client) if client.is_reusable() => client,
+            _ => Client::connect(&endpoint, Some(self.request_timeout)).map_err(|source| {
+                ServerError::Worker {
+                    backend: self.name.clone(),
+                    source,
+                }
+            })?,
+        };
+
+        let delivery = client
+            .request_streaming(request, buffer, relay)
+            .map_err(|source| {
+                // The slot's connection is mid-response or dead; nothing goes back.
+                ServerError::Worker {
+                    backend: self.name.clone(),
+                    source,
+                }
+            })?;
+
+        match delivery {
+            volucer_fcgi::Delivery::Buffered(response) => {
+                let served = {
+                    let mut slot = self.slots[index]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    slot.clients.push(client);
+                    slot.served.fetch_add(1, Ordering::Relaxed) + 1
+                };
+                self.recycle_if_needed(index, served)?;
+                Ok(Delivery::Buffered(response))
+            }
+            volucer_fcgi::Delivery::Streamed(stream) => {
+                let served = Arc::clone(
+                    &self.slots[index]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .served,
+                );
+                // **Both the permit and the count are released on the reader thread.** The slot
+                // serves this request until its last byte, so releasing either at return time would
+                // let the pool admit more requests than there are processes — and would stop
+                // `max_requests` from ever recycling a slot that only serves large responses.
+                let report = crate::relay::spawn_reader(
+                    self.name.clone(),
+                    client,
+                    stream,
+                    move |_client, _stream| {
+                        drop(permit);
+                        served.fetch_add(1, Ordering::Relaxed);
+                    },
+                )
+                .map_err(|source| ServerError::Spawn {
+                    binary: std::path::PathBuf::from("volucer-relay"),
+                    source,
+                })?;
+                Ok(Delivery::Relayed(report))
+            }
+        }
     }
 
     /// Replace the process in a slot, keeping its address.
@@ -1237,7 +1376,7 @@ impl CgiPool {
         let _ = slot.child.wait();
 
         let mut replacement = self.spawn_slot(&address)?;
-        replacement.served = 0;
+        replacement.served = Arc::new(AtomicU64::new(0));
         *slot = replacement;
         Ok(())
     }
@@ -1744,7 +1883,7 @@ mod tests {
         let mut slot = Slot {
             child,
             endpoint: Endpoint::Tcp(format!("127.0.0.1:{port}")),
-            served: 0,
+            served: Arc::new(AtomicU64::new(0)),
             clients: Vec::new(),
         };
 

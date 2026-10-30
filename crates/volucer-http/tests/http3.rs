@@ -227,6 +227,7 @@ fn start(config: &Config, cert: &Cert) -> RunningHttp3 {
         HttpLimits {
             max_connections: 8,
             max_body_bytes: 1024,
+            max_stream_bytes: 1024,
         },
         ListenerSettings {
             tls: Some(TlsSettings {

@@ -113,7 +113,33 @@ fastcgi = "127.0.0.1:9080"
 #
 # `0` means "do not wait at all": recycle instantly and accept the truncation.
 # shutdown_timeout_ms = 30000
+
+# The response size past which a backend's answer is relayed as it arrives rather
+# than buffered whole.
 #
+# This is the number that decides whether a 1 GB download is possible. Below it
+# nothing changes: the response is compressed, Content-Length is declared, and a
+# truncated body is caught before a byte reaches the client. Above it the header
+# block is answered immediately and the body is relayed in chunks -- which costs
+# two things, deliberately: a relayed response is NOT compressed and CANNOT
+# declare its length (it does not exist yet), so it is framed chunked.
+#
+# The default is 1 MiB, which is past every HTML response a request-scoped
+# application produces and well below where a second copy of the body matters.
+#
+# The three exceptions, each because the alternative is worse:
+#   - a response that states its own Content-Length is never relayed: the backend
+#     measured it, and re-framing a measured response throws that away;
+#   - a non-2xx response is never relayed: an error page has to be answered whole,
+#     and the status may still be rewritten;
+#   - an X-Sendfile / X-Accel-Redirect answer is never relayed: it is an
+#     instruction, and the static layer answers it with ranges and validators.
+#
+# `0` disables relaying entirely: every response is buffered, exactly as before
+# this key existed. That is the honest way to say "I would rather have compression
+# and a declared length than unbounded downloads", and it is a legitimate choice.
+# stream_threshold_bytes = 1048576   # 1 MiB
+
 # The most concurrent client connections the HTTP front-end accepts. It used to
 # be reachable only as `--max-connections`, so a deployment driven by a file
 # could not express it and an operator reading [server] had no way to learn it

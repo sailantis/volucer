@@ -256,6 +256,77 @@ pub fn write_response<W: Write>(
     Ok(())
 }
 
+/// Write a relayed backend response back to the FastCGI client, as it arrives.
+///
+/// # Why this can relay when the HTTP path has to re-frame
+///
+/// FastCGI and FastCGI are the same protocol, so there is nothing to translate: the header block is
+/// one `STDOUT` record group, and every body chunk is one more. The response is *already* a stream of
+/// records on the wire between the backend and here, and this is the same stream on the wire between
+/// here and nginx. That is why the front-end behind a reverse proxy gets streaming for free with a
+/// threshold, while the HTTP listener has to choose a framing.
+///
+/// # The truncation is not hidden
+///
+/// If the backend stopped before `END_REQUEST`, the client is left with a response whose last record
+/// is not followed by one — and then the connection closes without an `END_REQUEST`, which is exactly
+/// how FastCGI says "this response is incomplete". Inventing a clean end would be the one thing that
+/// makes a truncated download indistinguishable from a complete one.
+///
+/// Returns the status the application sent and the number of body bytes relayed.
+pub fn write_relayed<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    relayed: &mut crate::relay::Relayed,
+) -> Result<(u16, u64)> {
+    let (status, _) = relayed.parse();
+
+    // **The head goes out immediately.** That is the whole point of relaying: a client sees the
+    // status line and the headers before the application has finished producing the body, which is
+    // what makes progress visible for a long download.
+    record::write_records(
+        writer,
+        RecordType::Stdout,
+        request_id,
+        &relayed.head,
+        false,
+    )?;
+    writer.flush()?;
+
+    let mut body_bytes = 0u64;
+    // One record at a time, flushed as it goes. `write_records` splits at the 64 KiB boundary, which
+    // a chunk never exceeds; the flush is what stops a chunk sitting in a buffer until the next one,
+    // and for a streamed response that delay is the whole latency of the next chunk.
+    while let Some(chunk) = relayed.body.blocking_recv() {
+        body_bytes += chunk.len() as u64;
+        record::write_records(writer, RecordType::Stdout, request_id, &chunk, false)?;
+        writer.flush()?;
+    }
+
+    let stderr = relayed.stderr();
+    if !stderr.is_empty() {
+        record::write_records(writer, RecordType::Stderr, request_id, &stderr, true)?;
+    }
+
+    if relayed.finished() {
+        // The terminator and `END_REQUEST`, written in one go so the client sees a complete response
+        // exactly as it would from a buffered one.
+        let end = volucer_fcgi::EndRequest::complete();
+        write_assembled(writer, |out| {
+            record::append_records(out, RecordType::Stdout, request_id, &[], true);
+            out.extend_from_slice(&record::Header::new(RecordType::EndRequest, request_id, 8).encode());
+            out.extend_from_slice(&end.encode());
+        })?;
+    } else {
+        // **Deliberately no terminator and no `END_REQUEST`.** The response is incomplete, and
+        // FastCGI's own way of saying so is to stop mid-stream; a client that sees a zero-length
+        // `STDOUT` followed by an `END_REQUEST` would believe it had received the whole thing.
+        writer.flush()?;
+    }
+
+    Ok((status, body_bytes))
+}
+
 /// Build a whole response in a reused per-thread buffer and write it once.
 ///
 /// Every response writer goes through this, because the listener's socket is deliberately

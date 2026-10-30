@@ -136,6 +136,14 @@ pub struct HttpLimits {
     /// own `post_max_size` is a separate, later limit; this one exists so an
     /// unauthenticated client cannot make the server allocate without bound.
     pub max_body_bytes: usize,
+    /// How many bytes of a backend's response may be buffered before it is relayed instead.
+    ///
+    /// **`0` means never relay**, which is the pre-existing behaviour expressed as a setting rather
+    /// than as an absence: an operator who would rather have compression and a declared length than
+    /// unbounded downloads says so here. See
+    /// [`volucer_core::config::ServerConfig::stream_threshold_bytes`] for why the default is a
+    /// threshold rather than a switch.
+    pub max_stream_bytes: usize,
 }
 
 impl Default for HttpLimits {
@@ -146,6 +154,7 @@ impl Default for HttpLimits {
             // `Limits::default()` reads it too, which is what makes "32 MiB" a single decision
             // instead of two that happen to agree.
             max_body_bytes: volucer_core::config::DEFAULT_MAX_BODY_BYTES,
+            max_stream_bytes: volucer_core::config::DEFAULT_STREAM_THRESHOLD_BYTES,
         }
     }
 }
@@ -2853,6 +2862,10 @@ async fn prepare(
     let static_host: Option<String> = request_host(&parts.headers, &parts.uri).map(str::to_string);
     let routing = routing.clone();
     let routes = site.routes.clone();
+    // **How large a response this deployment is willing to buffer**, read once here rather than
+    // inside the blocking task: it is a property of the configuration generation the request is
+    // being served under, and a streamed response has to be started under the same one.
+    let stream_threshold = front_end.limits.max_stream_bytes;
     let blocking =
         tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
             let mut cgi_request = if skips_stat {
@@ -2893,9 +2906,18 @@ async fn prepare(
             // Mapped rather than mapped to an HTTP status here, because *which* mapping applies depends
             // on the protocol and the protocol is not known on this side of the thread: a gRPC failure is
             // a 200 with a status in the trailers, and a `502` is unreadable to a gRPC client.
+            //
+            // **A large response is relayed rather than returned**, and the threshold is the
+            // deployment's own. That is the only branch between the two: a caller that gets
+            // `Relayed` has a header block and a body still being produced.
             front_end
                 .dispatcher
-                .dispatch_with_routes(&routes, &cgi_request)
+                .dispatch_to_relayed(
+                    &selected,
+                    &cgi_request,
+                    stream_threshold,
+                    volucer_fcgi::Relay::for_threshold(stream_threshold),
+                )
                 .map_err(BackendFailure::Backend)
         });
 
@@ -2913,6 +2935,23 @@ async fn prepare(
             return Err(HttpError::BadGateway(format!(
                 "the dispatch task failed: {err}"
             )))
+        }
+    };
+
+    // **A relayed response is answered from its head, then streamed from the channel.** It cannot be
+    // either of the two branches below: `Relay::unknown_length` already refused to relay a response
+    // that declared its own length — which is what a `X-Sendfile` answer does — and refused one that
+    // was not 2xx, so nothing here can be a sendfile or a gRPC reply.
+    let response = match response {
+        volucer_server::Delivery::Buffered(response) => response,
+        volucer_server::Delivery::Relayed(relayed) => {
+            if !relayed.stderr().is_empty() {
+                tracing::debug!(
+                    stderr = %String::from_utf8_lossy(&relayed.stderr()).trim_end(),
+                    "backend wrote to STDERR"
+                );
+            }
+            return relayed_response(relayed, site_compression);
         }
     };
 
@@ -2988,6 +3027,66 @@ async fn prepare(
     }
 
     from_cgi(response, site_compression, &request_headers)
+}
+
+/// Turn a relayed backend response into an HTTP response whose body arrives as it is produced.
+///
+/// # Nothing here can be a sendfile or a gRPC reply, and that is enforced upstream
+///
+/// `Relay::admits` refuses a response that states a `Content-Length` (which a `X-Sendfile` answer
+/// must, and does) or names a file at all, and refuses anything that is not 2xx (which a gRPC
+/// failure never is). So by the time a response reaches this function it is a plain body to forward,
+/// and this function does not have to re-ask.
+///
+/// # Why compression is not offered
+///
+/// Compression needs the whole body: `Content-Encoding` has to be chosen before the first byte, and
+/// `Content-Length` is then whatever the compressed body measures. A relayed response exists
+/// precisely because the whole body is not available, so the honest answer is the application's own
+/// bytes with no `Content-Encoding` of ours. The trade is stated where the threshold is defined — see
+/// [`volucer_core::config::ServerConfig::stream_threshold_bytes`].
+fn relayed_response(
+    relayed: volucer_server::Relayed,
+    compression: &volucer_core::config::CompressionSetting,
+) -> Result<Response<ResponseBody>> {
+    let (status, headers) = relayed.parse();
+    let settings = crate::compress::Settings::from(compression);
+
+    // The application's headers, as a builder sequence because repeats are meaningful: two
+    // `Set-Cookie` headers are two cookies. `Content-Length` is dropped — this response has no length
+    // to declare, and `hyper` frames a body of unknown size as chunked.
+    let mut builder = Response::builder().status(status);
+    let pairs: Vec<(HeaderName, HeaderValue)> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+            if is_hop_by_hop(name.as_str()) || name == CONTENT_LENGTH {
+                return None;
+            }
+            let value = HeaderValue::from_bytes(value.as_bytes()).ok()?;
+            Some((name, value))
+        })
+        .collect();
+    for (name, value) in &pairs {
+        builder = builder.header(name, value);
+    }
+
+    // **`Vary` is still owed to a cache** even though this response is not compressed: a later request
+    // that did not send `Accept-Encoding` must not be answered from it. It is written only when the
+    // deployment compresses at all, because a `Vary: Accept-Encoding` on a server that never varies
+    // by it is a header that splits a cache for nothing.
+    if settings.enabled {
+        if let Some(vary) = crate::compress::vary_value(&pairs) {
+            builder = builder.header(VARY, vary);
+        }
+    }
+
+    let finished = relayed.finished_flag();
+    builder
+        .body(crate::relay_body::RelayBody::new(relayed.body, finished).boxed())
+        .map_err(|err| {
+            HttpError::BadGateway(format!("the backend sent an unusable header: {err}"))
+        })
 }
 
 /// The `X-Sendfile`/`X-Accel-Redirect` a backend's response carries, if any.
