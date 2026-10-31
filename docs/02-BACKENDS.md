@@ -79,6 +79,26 @@ Each worker handles one request at a time. The pool can therefore serve up to
 `workers` requests concurrently; additional requests wait in the queue. `workers = 0`
 starts one worker per logical CPU.
 
+### Uploads and form bodies
+
+A `worker` receives the request body in the `REQUEST` frame's declared length followed by
+`BODY` frames, and the PHP SDK parses `application/x-www-form-urlencoded` and
+`multipart/form-data` itself — incrementally, spooling each file part to disk as its bytes
+arrive. So `$_POST` and `$_FILES` are populated the way a `php-cgi` deployment populates
+them, and peak memory is the size of the largest text field rather than the size of the
+upload.
+
+**One thing is impossible in this mode, and it is a PHP engine boundary rather than a
+missing feature.** `is_uploaded_file()` and `move_uploaded_file()` consult a hash the PHP
+SAPI fills while it parses multipart; a worker is not a SAPI, so both return `false` for a
+file the worker wrote. FrankenPHP gets real `$_FILES` only because it *is* a SAPI —
+RoadRunner has the same limitation. Everything that operates on the temp file's path works,
+and the SDK's `Volucer\Uploads::move()` is the equivalent of `move_uploaded_file()` that
+behaves the same in both modes. See the PHP SDK's README for the full table.
+
+A `spawn_cgi`, `php-fpm` or `upstream` backend has no such difference: PHP parses the body
+inside the request, so `is_uploaded_file()` is true there.
+
 ### Recycling
 
 A worker is replaced when any of the following occurs:
@@ -500,7 +520,7 @@ knowing before choosing one for an application that serves files.
 | `upstream` | streams | streams | ✅ forwarded as it arrives |
 | `spawn_cgi` | buffered | relayed above `stream_threshold_bytes` | ✅ 64 KiB records, relayed |
 | `external` (php-fpm) | buffered | relayed above `stream_threshold_bytes` | ✅ 64 KiB records, relayed |
-| `worker` | buffered | relayed when the worker streams | ✅ forwarded chunk by chunk |
+| `worker` | buffered, but a multipart file part is spooled to disk as it arrives | relayed when the worker streams | ✅ forwarded chunk by chunk |
 | static files | n/a | streams | ✅ 64 KiB reads, ranges supported |
 
 The two FastCGI kinds **relay** a response larger than
@@ -515,6 +535,19 @@ SDK does this for a generator — and the server answers the head before the bod
 each frame as it arrives. A worker that declares a length keeps exactly the behaviour it had: the
 response is buffered, length-checked and compressible. Which one an answer is belongs to the
 application, so one route can stream an export while another returns a page.
+
+The request direction is asymmetric, and the asymmetry is worth knowing before sizing a deployment.
+An `upstream` origin streams because it is an HTTP server reading its own socket; a CGI backend
+cannot, because `CONTENT_LENGTH` has to be known before `php-cgi` will read a byte of `STDIN`; and a
+worker is told `body_len` when its `REQUEST` frame arrives. So the whole body is held up to
+`server.max_body_bytes` (32 MiB by default) on the worker and CGI paths, and a larger upload is
+refused with a 413 by the front-end *before* a backend sees it.
+
+A multipart upload is the exception that makes worker mode usable for files: the SDK parses the
+frames as they arrive and writes each file part to disk, so a 200 MiB attachment costs 200 MiB of
+temporary disk and almost nothing of PHP's memory. What it does not lift is the server's own
+`max_body_bytes` ceiling, which is a separate piece of work — until then, a deployment that must
+accept very large uploads needs `max_body_bytes` raised, or an `upstream` origin.
 
 The relay policy is the same one the FastCGI backends obey, so a non-2xx, an `X-Sendfile`
 instruction and a measured body are all answered as they always were. `stream_threshold_bytes = 0`

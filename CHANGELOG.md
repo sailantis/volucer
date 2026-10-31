@@ -9,6 +9,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A worker-mode request can carry a multipart upload, and the file is spooled to disk as it
+  streams in.** The PHP SDK now parses `application/x-www-form-urlencoded` and
+  `multipart/form-data` itself, so `$_POST` and `$_FILES` are populated exactly as a `php-cgi`
+  deployment populates them — including the transposed shape `$_FILES` really has, where
+  `name="a[b]"` becomes `$_FILES['a']['name']['b']`. The parser consumes `BODY` frames as they
+  arrive and writes each file part straight to its temporary file, so peak memory is the largest
+  text field rather than the size of the upload: measured at **0 MiB of growth for a 128 MiB
+  upload**, against ~130 MiB to hold the same bytes as a string.
+
+  `Volucer\Uploads::move()` is the one call that behaves the same in both modes — it tries
+  `move_uploaded_file()` and falls back to `rename()` — so an application can switch between
+  `php-cgi` and `worker` without changing how it stores an upload. The Laravel, Symfony and Spiral
+  bridges read `$request->files()` instead of refusing multipart.
+
+  **`is_uploaded_file()` and `move_uploaded_file()` remain impossible in worker mode**, and this is
+  a PHP engine boundary rather than a missing feature: they consult a hash the SAPI fills while it
+  parses multipart, and there is no API to add to it. FrankenPHP gets real `$_FILES` only because it
+  is a SAPI; RoadRunner has the same limitation. Everything that operates on the temp file's path
+  works, and the documentation says plainly which two calls do not.
+
+  **A worker keeps the raw body as well**, so `$request->body` is still the multipart bytes *and*
+  `$_FILES` is populated. That is a deliberate superset of PHP, where `php://input` is empty for a
+  multipart request — an application that parses multipart itself, or reads `php://input`, keeps
+  working.
+
 - **A worker-mode response can be streamed, so a generated 1 GB download no longer costs 1 GB.**
   A worker sets `STREAMED` on its response head and declares no length; the server answers the head
   at once and forwards each `BODY` frame as it arrives. In PHP this is `StreamedResponse` — wrap a

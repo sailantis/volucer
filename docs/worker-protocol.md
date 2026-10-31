@@ -431,6 +431,30 @@ that produced a valid error page.
 threshold — the same idea as RoadRunner's `max_worker_memory` — and `keep_alive`. A worker that
 handled a fatal error reports `keep_alive = false` and is replaced instead of reused.
 
+### What a form body is, and what the server does not do with it
+
+`body_len` in `REQUEST` is authoritative: the server frames exactly that many bytes and the worker
+reads exactly that many. **The server does not parse the body.** It never looks at `Content-Type`,
+never splits a boundary and never writes a file — which is what keeps this a transport rather than a
+second PHP.
+
+A worker's SDK therefore receives a multipart body as opaque `BODY` frames, and parses them itself if
+it wants `$_POST` and `$_FILES`. The PHP SDK does, incrementally: it consumes each frame as it
+arrives and writes a file part straight to its temporary file, so peak memory is the largest text
+field rather than the body. That is a property of the SDK, not of the protocol, and another
+language's SDK is free to hand the same frames to a framework that parses them.
+
+Two consequences are worth stating because they are easy to get wrong when writing an SDK:
+
+- **`body_len` lets a worker decide *before* reading a byte.** There is no "the body has ended" signal
+  other than the length being reached, and a `BODY` flagged `LAST` before it means the framing and
+  the declared length disagree — which is worth failing on, because the rest of the stream cannot be
+  trusted after that.
+- **Nothing tells the worker how big the upload is *allowed* to be.** The server enforces
+  `server.max_body_bytes` by refusing the request with a 413 before a `REQUEST` frame is ever
+  written, so a worker never sees an oversized body. A worker's own `upload_max_filesize` and
+  `post_max_size` are a second, narrower limit it applies to what it did receive.
+
 ### gRPC calls, over the same exchange
 
 A gRPC call is delivered as an ordinary `REQUEST`, and this is a decision rather than a shortcut:

@@ -257,6 +257,94 @@ fn request(method: &str, uri: &str, body: &[u8]) -> Request {
     }
 }
 
+/// A request routed through the real CGI environment, with a body and a content type.
+fn request_with_type(method: &str, uri: &str, body: &[u8], content_type: &str) -> Request {
+    let routing = Routing {
+        document_root: Path::new(".").to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let info = RequestInfo {
+        method: method.to_string(),
+        uri: uri.to_string(),
+        body_len: body.len(),
+        headers: vec![("Content-Type".to_string(), content_type.to_string())],
+        ..RequestInfo::default()
+    };
+    Request {
+        params: build_params(&info, &routing).expect("params build"),
+        body: body.to_vec(),
+        keep_conn: true,
+    }
+}
+
+/// A multipart upload arrives in the worker as `$_POST` and `$_FILES`, and the bytes are the client's.
+///
+/// This is the end-to-end half of the upload work: `MultipartTest.php` proves the parser agrees with
+/// `php-cgi`, and this proves the frames reach it through a real pool, a real pipe and a real PHP
+/// process. It also asserts the one thing that cannot work — `is_uploaded_file()` — rather than
+/// leaving it to be discovered, so that the documented limitation is a fact the suite knows.
+#[test]
+fn a_multipart_upload_reaches_the_worker_as_post_and_files() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    let body = concat!(
+        "--X\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n\r\n",
+        "A title\r\n",
+        "--X\r\n",
+        "Content-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "FILEBYTES\r\n",
+        "--X--\r\n",
+    );
+
+    let response = pool
+        .request(&request_with_type(
+            "POST",
+            "/upload",
+            body.as_bytes(),
+            "multipart/form-data; boundary=X",
+        ))
+        .expect("the worker served the upload");
+
+    let rendered = body_of(&response);
+    let json: serde_json::Value =
+        serde_json::from_str(&rendered).unwrap_or_else(|err| panic!("{err}: {rendered}"));
+
+    assert_eq!(
+        json["post"]["title"], "A title",
+        "the text field reached $_POST: {rendered}"
+    );
+    assert_eq!(
+        json["files"]["doc"]["name"], "a.txt",
+        "the file reached $_FILES: {rendered}"
+    );
+    assert_eq!(
+        json["files"]["doc"]["size"], 9,
+        "the size is the bytes the client sent: {rendered}"
+    );
+    assert_eq!(
+        json["files"]["doc"]["contents"], "FILEBYTES",
+        "the temp file holds exactly the part body: {rendered}"
+    );
+    assert_eq!(
+        json["globals_agree"], true,
+        "the superglobals and the Request accessors hold the same arrays: {rendered}"
+    );
+
+    // The documented limitation, asserted rather than assumed. If this ever starts being true,
+    // the documentation is wrong and this test is where that is discovered.
+    assert_eq!(
+        json["files"]["doc"]["is_uploaded_file"], false,
+        "is_uploaded_file() is false in worker mode — a SAPI-internal hash cannot be filled \
+         from outside PHP: {rendered}"
+    );
+}
+
 /// The body of a rendered response, with the `Status:` block stripped.
 fn body_of(response: &volucer_fcgi::Response) -> String {
     let text = String::from_utf8_lossy(&response.stdout);
