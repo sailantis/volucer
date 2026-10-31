@@ -55,13 +55,18 @@ jobs:
       # so this is a build prerequisite rather than a linting detail. See the README's
       # "Build prerequisites".
       - run: sudo apt-get update && sudo apt-get install -y nasm
-      # **Two passes, and the second is the load-bearing one.** The default build is what a
-      # deployment gets, so it must lint clean; `--features http3` is the half that is otherwise
-      # never compiled by CI at all, and a feature nothing builds is a feature that rots. Both are
-      # required rather than `--all-features`, because `redis` needs a server the job does not have
-      # and the point is HTTP/3 specifically.
+      # **Three passes, and the second and third are the load-bearing ones.** The default build is
+      # what a deployment gets, so it must lint clean; `--features http3` and `--features amqp` are
+      # the halves that are otherwise never compiled by CI at all, and a feature nothing builds is
+      # a feature that rots. Named rather than `--all-features`, because `redis` needs a server the
+      # job does not have and the point here is the optional features specifically.
+      #
+      # `amqp` landed after this job was written, which is exactly the gap this list exists to
+      # close: no broker is needed to *lint* the driver — the client is compiled and never
+      # connected — so the cost is a third compile, not a service.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --features http3 -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features amqp -- -D warnings
 
   # `rust-version` is a promise about what a clean machine needs, and an unverified promise is how
   # this one came to be wrong: the manifest said 1.85 while a transitive dependency required 1.88.
@@ -175,6 +180,82 @@ jobs:
           VOLUCER_E2E: '1'
           VOLUCER_SDK_DIR: ${{ github.workspace }}/volucer-php-sdk
         run: cargo test --workspace --features http3
+
+      # `amqp` is deliberately **not** here. Its suite needs a broker, and a GitHub Actions
+      # `services:` block needs Docker, which the macOS and Windows runners do not have — a service
+      # on this matrix would fail the two jobs it cannot help. It has its own Linux job below.
+
+      # **The suites that are compiled away, not skipped, and therefore need a count.** A
+      # `#[cfg(unix)]` test does not exist on Windows and a `#[cfg(target_os = "linux")]` one does
+      # not exist on macOS. libtest has nothing to report for a test that was never compiled, so
+      # `0 passed` and `2 passed` are both green — the count is the only evidence.
+      #
+      # A floor rather than an exact number, so adding a test does not require editing this file.
+      # Only losing one does, which is the direction that matters.
+      - name: Assert the platform-gated tests are compiled in (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p volucer --test serve --no-run
+          listed=$(cargo test -p volucer --test serve -- --list --format terse)
+          unix=$(echo "$listed" | grep -c '^a_unix_' || true)
+          drain=$(echo "$listed" | grep -c '^a_stop_finishes' || true)
+          echo "unix-socket tests: $unix, drain tests: $drain"
+          if [ "$unix" -lt 2 ] || [ "$drain" -lt 1 ]; then
+            echo "::error::expected >=2 a_unix_ tests and >=1 drain test on Linux, found $unix and $drain — a cfg gate has removed one"
+            exit 1
+          fi
+
+      - name: Assert the unix-socket tests are compiled in (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p volucer --test serve --no-run
+          listed=$(cargo test -p volucer --test serve -- --list --format terse)
+          unix=$(echo "$listed" | grep -c '^a_unix_' || true)
+          echo "unix-socket tests: $unix"
+          if [ "$unix" -lt 2 ]; then
+            echo "::error::expected >=2 a_unix_ tests on macOS, found $unix"
+            exit 1
+          fi
+
+  # **The AMQP driver, against a real broker, and it was untested by CI at all.** The RabbitMQ
+  # driver landed two days after this workflow was last edited, by which time adding it meant
+  # editing CI rather than forgetting to — the `amqp` feature compiled in no job, so a build that
+  # could not compile `amqp.rs` would have shipped green.
+  #
+  # It is a job of its own rather than a matrix step because `services:` needs Docker and only the
+  # Linux runners have it. RabbitMQ with a management-free image and a fixed guest account, which is
+  # the one every AMQP tutorial uses; the suite creates and deletes its own uniquely named queues,
+  # so it is safe to share.
+  amqp:
+    name: AMQP (RabbitMQ)
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      # `VOLUCER_E2E=1` is what makes the suite's own skip a failure. Without it, a broker that
+      # never came up produces ten green "skipping: no AMQP broker" lines — the same shape of
+      # false pass this file already guards against for PHP.
+      - name: Test (amqp)
+        env:
+          VOLUCER_E2E: '1'
+          # `%2f` is the AMQP URI spelling of the default `/` virtual host, and it is the spelling
+          # the driver had to be fixed to accept. Written this way so the CI proves that spelling.
+          AMQP_URL: amqp://guest:guest@127.0.0.1:5672/%2f
+        run: cargo test --workspace --features amqp
 
   # The installers are the first thing an operator runs and the last thing anyone tests, and both
   # of them are shell scripts with a security property: verify before extracting. A `curl | sh`
