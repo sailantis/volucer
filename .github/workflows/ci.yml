@@ -246,12 +246,36 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nasm
+
+      # `--workspace` runs every suite in the repository, not only the AMQP one, so this job also
+      # runs the PHP-backed suites — and those need the same two things the `test` job sets up: an
+      # interpreter, and the SDK checkout the example worker lives in.
+      #
+      # Not having them is how this job first failed. With `VOLUCER_E2E=1` and no
+      # `VOLUCER_SDK_DIR`, three `serve.rs` tests panicked with "the SDK example worker is not at
+      # …/volucer-php-sdk/example/worker.php": the guard doing exactly its job, on a job that never
+      # gave it the checkout. Only that half showed, because the runner image already has `php`.
+      - name: Set up PHP
+        uses: shivammathur/setup-php@2.40.0
+        with:
+          php-version: '8.3'
+          tools: none
+          coverage: none
+
+      - name: Check out the PHP worker SDK
+        uses: actions/checkout@v7
+        with:
+          repository: sailantis/volucer-php-sdk
+          path: volucer-php-sdk
+
       # `VOLUCER_E2E=1` is what makes the suite's own skip a failure. Without it, a broker that
       # never came up produces ten green "skipping: no AMQP broker" lines — the same shape of
-      # false pass this file already guards against for PHP.
+      # false pass this file already guards against for PHP. It applies to every suite this job
+      # runs, which is why the SDK above has to be here and not only in the `test` job.
       - name: Test (amqp)
         env:
           VOLUCER_E2E: '1'
+          VOLUCER_SDK_DIR: ${{ github.workspace }}/volucer-php-sdk
           # `%2f` is the AMQP URI spelling of the default `/` virtual host, and it is the spelling
           # the driver had to be fixed to accept. Written this way so the CI proves that spelling.
           AMQP_URL: amqp://guest:guest@127.0.0.1:5672/%2f
