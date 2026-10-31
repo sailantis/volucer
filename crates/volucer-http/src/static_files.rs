@@ -1483,12 +1483,18 @@ mod tests {
     fn a_directory_url_redirects_to_its_trailing_slash() {
         let headers = no_headers();
         let subject = owned("/docs", &headers);
-        assert_eq!(directory_location(&subject, Some(8080)), "//example.test/docs/");
+        assert_eq!(
+            directory_location(&subject, Some(8080)),
+            "//example.test/docs/"
+        );
 
         // Without a `Host`, the listener's own port is the honest answer.
         let mut bare = owned("/docs", &headers);
         bare.host = None;
-        assert_eq!(directory_location(&bare, Some(8080)), "//localhost:8080/docs/");
+        assert_eq!(
+            directory_location(&bare, Some(8080)),
+            "//localhost:8080/docs/"
+        );
         assert_eq!(directory_location(&bare, Some(80)), "//localhost/docs/");
     }
 

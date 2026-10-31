@@ -625,7 +625,10 @@ max_connections = 0
 #[test]
 fn a_request_timeout_is_configurable_per_backend_and_zero_is_refused() {
     for (kind, table) in [
-        ("worker", "[backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\""),
+        (
+            "worker",
+            "[backends.app]\nkind = \"worker\"\ncommand = \"php worker.php\"",
+        ),
         (
             "spawn_cgi",
             "[backends.app]\nkind = \"spawn_cgi\"\nbinary = \"php-cgi\"",
@@ -683,9 +686,7 @@ http = "127.0.0.1:8080"
         ("\"302\" = \"pages/moved.html\"", "not an error status"),
         ("\"not-a-code\" = \"x.html\"", "not a status code"),
     ] {
-        let text = format!(
-            "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.error_pages]\n{key}\n"
-        );
+        let text = format!("[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.error_pages]\n{key}\n");
         let config = Config::from_toml(&text).expect("parses");
         let err = config.validate().expect_err("must be refused");
         let message = err.to_string();
@@ -703,14 +704,14 @@ fn an_absent_access_table_admits_everything_and_costs_nothing() {
     // policy object at all, which is what keeps an unconfigured request path free.
     let config = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
     assert!(config.server.access.is_none());
-    assert!(
-        config
-            .server
-            .access_policy()
-            .expect("no table is not an error")
-            .is_none()
-    );
-    config.validate().expect("an unconfigured deployment validates");
+    assert!(config
+        .server
+        .access_policy()
+        .expect("no table is not an error")
+        .is_none());
+    config
+        .validate()
+        .expect("an unconfigured deployment validates");
 }
 
 #[test]
@@ -732,7 +733,9 @@ rules = [
 "#,
     )
     .expect("parses");
-    config.validate().expect("the ranges parse and the default is allow");
+    config
+        .validate()
+        .expect("the ranges parse and the default is allow");
 
     let policy = config
         .server
@@ -772,7 +775,9 @@ rules = [
 "#,
     )
     .expect("the file parses; the range does not");
-    let err = config.validate().expect_err("a /64 on a v4 range is not a range");
+    let err = config
+        .validate()
+        .expect_err("a /64 on a v4 range is not a range");
     let text = err.to_string();
     assert!(text.contains("server.access"), "{text}");
     assert!(text.contains("rule 2"), "{text}");
@@ -822,7 +827,10 @@ rules = [{ action = "allow", range = "127.0.0.0/8" }]
             .expect_err("a closed default cannot be applied to a socket");
         let text = err.to_string();
         assert!(text.contains("server.access.default"), "{text}");
-        assert!(text.contains("unix:/tmp/volucer-access-test.sock"), "{text}");
+        assert!(
+            text.contains("unix:/tmp/volucer-access-test.sock"),
+            "{text}"
+        );
         assert!(text.contains("no client address"), "{text}");
 
         // The same table with `allow` is fine: that is a rule that can never match rather than a
@@ -877,7 +885,9 @@ fn an_absent_sendfile_table_turns_the_feature_off() {
     // disclosing the application's own sources.
     let config = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
     assert!(config.server.sendfile.is_none());
-    config.validate().expect("an unconfigured deployment validates");
+    config
+        .validate()
+        .expect("an unconfigured deployment validates");
 }
 
 #[test]
@@ -949,5 +959,3 @@ roots = ["nope"]
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-

@@ -121,7 +121,8 @@ fn to_cgi_cost(header_count: usize) -> (usize, usize) {
     let parts = parts(header_count);
     let routing = routing();
     allocations(|| {
-        let request = to_cgi(&parts, Vec::new(), &routing, Some(8080), Some("10.0.0.5")).expect("routes");
+        let request =
+            to_cgi(&parts, Vec::new(), &routing, Some(8080), Some("10.0.0.5")).expect("routes");
         std::hint::black_box(&request);
     })
 }
@@ -463,7 +464,9 @@ fn the_body_is_moved_not_copied() {
 /// blank line, body — all in one `Vec`.
 fn backend_response(body_len: usize) -> volucer_fcgi::Response {
     let mut stdout = Vec::with_capacity(body_len + 128);
-    stdout.extend_from_slice(b"Status: 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n");
+    stdout.extend_from_slice(
+        b"Status: 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n",
+    );
     stdout.extend(std::iter::repeat_n(b'x', body_len));
     volucer_fcgi::Response {
         stdout,

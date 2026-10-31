@@ -45,7 +45,8 @@ fn patience() -> Duration {
 
 /// The broker URL, or the default a local RabbitMQ listens on.
 fn url() -> String {
-    std::env::var("AMQP_URL").unwrap_or_else(|_| "amqp://guest:guest@127.0.0.1:5672/%2f".to_string())
+    std::env::var("AMQP_URL")
+        .unwrap_or_else(|_| "amqp://guest:guest@127.0.0.1:5672/%2f".to_string())
 }
 
 fn skip_is_a_failure() -> bool {
@@ -351,9 +352,7 @@ fn a_quorum_queue_reports_the_exact_attempt_count() {
     );
 
     let last = driver.reserve(&pipeline, 1, long()).expect("reserved");
-    driver
-        .ack(&pipeline, &last[0].reservation)
-        .expect("acked");
+    driver.ack(&pipeline, &last[0].reservation).expect("acked");
     wipe(&pipeline);
 }
 
@@ -377,10 +376,7 @@ fn a_settle_for_an_unknown_reservation_is_refused_and_leaves_the_channel_usable(
 
     // A reservation this process never issued. Sending it as an ack would close the channel.
     assert!(
-        matches!(
-            driver.ack(&pipeline, "0-deadbeef"),
-            Err(Error::Lost { .. })
-        ),
+        matches!(driver.ack(&pipeline, "0-deadbeef"), Err(Error::Lost { .. })),
         "an unknown reservation is Lost, which is what the trait reserves that variant for"
     );
 
@@ -393,9 +389,7 @@ fn a_settle_for_an_unknown_reservation_is_refused_and_leaves_the_channel_usable(
         .expect("a push after an unknown reservation still works");
     let after = driver.reserve(&pipeline, 1, long()).expect("reserved");
     assert_eq!(after[0].job.task, "after");
-    driver
-        .ack(&pipeline, &after[0].reservation)
-        .expect("acked");
+    driver.ack(&pipeline, &after[0].reservation).expect("acked");
     wipe(&pipeline);
 }
 
@@ -487,7 +481,10 @@ fn an_empty_queue_is_not_an_error() {
     assert_eq!(driver.size(&pipeline).expect("size"), 0);
     assert_eq!(driver.in_flight(&pipeline).expect("in flight"), 0);
     assert!(
-        driver.reserve(&pipeline, 5, long()).expect("reserved").is_empty(),
+        driver
+            .reserve(&pipeline, 5, long())
+            .expect("reserved")
+            .is_empty(),
         "fewer than asked for is normal and is not an error, the same rule every driver follows"
     );
     wipe(&pipeline);

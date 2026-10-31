@@ -70,7 +70,10 @@ impl Body for RelayBody {
     type Data = Bytes;
     type Error = std::io::Error;
 
-    fn poll_frame(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         if self.failed {
             return Poll::Ready(None);
         }

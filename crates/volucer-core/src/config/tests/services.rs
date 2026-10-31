@@ -423,7 +423,9 @@ url = "{url}"
 {extra}
 "#
         );
-        Config::from_toml(&text).expect("the file parses").validate()
+        Config::from_toml(&text)
+            .expect("the file parses")
+            .validate()
     };
 
     with("amqp://guest:guest@127.0.0.1:5672", "")
@@ -892,4 +894,3 @@ fn a_grant_is_parsed_into_one_of_four_shapes_or_refused() {
     assert!(workers.covers("workers.list"));
     assert!(workers.covers("workers.reset"));
 }
-

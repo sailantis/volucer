@@ -984,8 +984,12 @@ mod tests {
     /// loop *ran* — a sampler that never sampled would "observe no mixture" too.
     #[test]
     fn one_swap_never_yields_a_partial_generation() {
-        let state = Swappable::new(Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080),
-            Arc::new(GrpcGrantsMap::new()), std::collections::BTreeMap::new()));
+        let state = Swappable::new(Reloaded::from_sites(
+            Arc::new(named_sites("/srv/first")),
+            Some(8080),
+            Arc::new(GrpcGrantsMap::new()),
+            std::collections::BTreeMap::new(),
+        ));
 
         let stop = AtomicBool::new(false);
         let mut seen: Vec<PathBuf> = Vec::new();
@@ -1017,7 +1021,9 @@ mod tests {
                 let _ = state.replace(Reloaded::from_sites(
                     Arc::new(named_sites(root)),
                     Some(8080),
-                    Arc::new(GrpcGrantsMap::new()), std::collections::BTreeMap::new()));
+                    Arc::new(GrpcGrantsMap::new()),
+                    std::collections::BTreeMap::new(),
+                ));
             }
             stop.store(true, Ordering::Relaxed);
             seen = reader.join().expect("the reader thread panicked");
@@ -1055,10 +1061,18 @@ mod tests {
             ),
         );
 
-        let first =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(before), std::collections::BTreeMap::new());
-        let second =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(after), std::collections::BTreeMap::new());
+        let first = Reloaded::from_sites(
+            Arc::new(named_sites("/srv/first")),
+            Some(8080),
+            Arc::new(before),
+            std::collections::BTreeMap::new(),
+        );
+        let second = Reloaded::from_sites(
+            Arc::new(named_sites("/srv/first")),
+            Some(8080),
+            Arc::new(after),
+            std::collections::BTreeMap::new(),
+        );
 
         assert!(first
             .granted_grpc_call("app", "/greeter.Greeter/SayHello")
@@ -1092,8 +1106,12 @@ mod tests {
     fn a_generation_may_grant_every_service_but_not_every_path() {
         let mut grants = GrpcGrantsMap::new();
         grants.insert("app".to_string(), GrpcGrants::any());
-        let state =
-            Reloaded::from_sites(Arc::new(named_sites("/srv/first")), Some(8080), Arc::new(grants), std::collections::BTreeMap::new());
+        let state = Reloaded::from_sites(
+            Arc::new(named_sites("/srv/first")),
+            Some(8080),
+            Arc::new(grants),
+            std::collections::BTreeMap::new(),
+        );
 
         assert!(state
             .granted_grpc_call("app", "/never.Listed/Method")

@@ -154,9 +154,9 @@ pub(super) fn validate_route(
         // meant to retire.
         (_, Some(_)) if route.redirect.is_some() => {
             return Err(Error::Config(format!(
-                "{where_}[{index}] has both `redirect` and `backend`. A redirect answers the request \
+            "{where_}[{index}] has both `redirect` and `backend`. A redirect answers the request \
                  itself and never dispatches, so `backend` would do nothing; remove one of them"
-            )))
+        )))
         }
         (_, _) if route.redirect.is_some() => None,
         (RoutePolicy::Static, None) => None,

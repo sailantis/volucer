@@ -372,7 +372,11 @@ impl AccessLog {
             Sink::Stream => {
                 use std::io::Write;
                 let mut out = std::io::stdout();
-                if out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_err() {
+                if out
+                    .write_all(line.as_bytes())
+                    .and_then(|()| out.flush())
+                    .is_err()
+                {
                     self.report_once();
                 }
             }

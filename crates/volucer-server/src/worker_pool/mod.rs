@@ -1960,7 +1960,6 @@ impl WorkerPool {
     /// The acquisition every lease form shares.
     fn acquire_index(&self) -> Result<usize> {
         if self.slots.is_empty() {
-            
             return Err(ServerError::NoWorker {
                 backend: self.name.clone(),
             });
@@ -1978,7 +1977,6 @@ impl WorkerPool {
         // That is unavoidable — twelve workers cannot serve thirty-two clients — and the only
         // question is how long it is allowed to be charged for.
         let Some(limit) = self.max_wait else {
-            
             return Err(ServerError::AllBusy {
                 backend: self.name.clone(),
             });

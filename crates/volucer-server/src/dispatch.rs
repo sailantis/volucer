@@ -326,12 +326,14 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
                 let queue = volucer_jobs::AmqpQueue {
                     queue: amqp.queue.clone().unwrap_or_else(|| name.clone()),
                     exchange: amqp.exchange.clone().unwrap_or_default(),
-                    routing_key: amqp.routing_key.clone().unwrap_or_else(|| {
-                        amqp.queue.clone().unwrap_or_else(|| name.clone())
-                    }),
+                    routing_key: amqp
+                        .routing_key
+                        .clone()
+                        .unwrap_or_else(|| amqp.queue.clone().unwrap_or_else(|| name.clone())),
                     durable: amqp.durable,
                     arguments: field_table(&amqp.arguments)?,
-                };                let driver = volucer_jobs::AmqpDriver::connect(
+                };
+                let driver = volucer_jobs::AmqpDriver::connect(
                     &amqp.url,
                     Duration::from_millis(amqp.read_timeout_ms),
                     [(name.clone(), queue)],
@@ -379,14 +381,12 @@ fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
 /// argument the application did not write, and the failure would surface as a queue with the wrong TTL.
 #[cfg(feature = "amqp")]
 fn field_name(name: &str) -> Result<volucer_jobs::amqp_types::FieldName> {
-    volucer_jobs::amqp_types::FieldName::try_from(name).map_err(|_| {
-        ServerError::Misconfigured {
-            backend: "jobs".to_string(),
-            reason: format!(
-                "the queue argument {name:?} is longer than an AMQP field name allows, so the broker \
+    volucer_jobs::amqp_types::FieldName::try_from(name).map_err(|_| ServerError::Misconfigured {
+        backend: "jobs".to_string(),
+        reason: format!(
+            "the queue argument {name:?} is longer than an AMQP field name allows, so the broker \
                  could not be told it"
-            ),
-        }
+        ),
     })
 }
 
@@ -984,11 +984,7 @@ impl Dispatcher {
     /// **`&self`, and not a stop-then-start**: the whole point is that the dispatcher and the
     /// listeners keep running, so the front-ends never see the pools change shape.
     pub fn respawn_idle(&self) -> Vec<crate::respawn::RespawnReport> {
-        let reports: Vec<_> = self
-            .backends
-            .values()
-            .map(Backend::respawn_idle)
-            .collect();
+        let reports: Vec<_> = self.backends.values().map(Backend::respawn_idle).collect();
         for report in &reports {
             if report.is_noop() {
                 continue;

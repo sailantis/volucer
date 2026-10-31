@@ -260,11 +260,7 @@ impl ChannelCallback for Confirms {
         // something an operator can act on; dropping the sender is what tells a waiting publish that no
         // confirmation can arrive, so a `recv` answers `None` rather than hanging.
         if let Ok(mut reason) = self.closed.lock() {
-            *reason = Some(format!(
-                "{} {}",
-                close.reply_code(),
-                close.reply_text()
-            ));
+            *reason = Some(format!("{} {}", close.reply_code(), close.reply_text()));
         }
         Ok(())
     }
@@ -551,7 +547,10 @@ impl AmqpDriver {
                 .await
                 .map_err(|_| Error::Backend {
                     driver: "amqp",
-                    reason: format!("the broker did not answer within {} ms", deadline.as_millis()),
+                    reason: format!(
+                        "the broker did not answer within {} ms",
+                        deadline.as_millis()
+                    ),
                 })?
                 .map_err(|err| Error::Backend {
                     driver: "amqp",
@@ -665,9 +664,9 @@ impl AmqpDriver {
             .expect("a live link always has its channel")
             .clone();
 
-        let attempt =
-            self.runtime
-                .block_on(async { tokio::time::timeout(self.command_timeout, run(channel)).await });
+        let attempt = self
+            .runtime
+            .block_on(async { tokio::time::timeout(self.command_timeout, run(channel)).await });
 
         // Read **before** the channel is dropped, so a close the broker sent while this call was in
         // flight is included in the message rather than lost with the channel.
@@ -691,7 +690,9 @@ impl AmqpDriver {
                         // The broker's own words, because "channel closed" tells an operator nothing and
                         // the reason it gave — a refused queue argument, a permission, a name clash — is
                         // the whole explanation.
-                        Some(reason) => format!("{operation} failed: the broker closed the channel: {reason}"),
+                        Some(reason) => {
+                            format!("{operation} failed: the broker closed the channel: {reason}")
+                        }
                         None => format!("{operation} failed: {err}"),
                     },
                 })
@@ -933,9 +934,10 @@ impl AmqpDriver {
             held.remove(reservation).ok_or_else(|| Error::Lost {
                 job: reservation.to_string(),
                 reservation: reservation.to_string(),
-                reason: "this process is not holding it: it was already settled, the connection it was \
+                reason:
+                    "this process is not holding it: it was already settled, the connection it was \
                          taken on has been replaced, or it was taken before a restart"
-                    .to_string(),
+                        .to_string(),
             })?
         };
 
@@ -970,7 +972,8 @@ impl Driver for AmqpDriver {
             FieldValue::from(job.task.clone()),
         );
         headers.insert(
-            FieldName::try_from(ATTEMPTS_HEADER).expect("the attempts header is a valid short string"),
+            FieldName::try_from(ATTEMPTS_HEADER)
+                .expect("the attempts header is a valid short string"),
             FieldValue::I(0),
         );
         for (name, value) in &job.headers {
@@ -1143,13 +1146,14 @@ mod tests {
                 FieldName::try_from(ACQUIRED_COUNT_HEADER).expect("a valid field name"),
                 value,
             );
-            BasicProperties::default()
-                .with_headers(headers)
-                .finish()
+            BasicProperties::default().with_headers(headers).finish()
         };
 
         // A quorum queue's header counts *previous* acquisitions, so the current one is that plus one.
-        assert_eq!(AmqpDriver::attempts(&with_count(FieldValue::l(0)), false), 1);
+        assert_eq!(
+            AmqpDriver::attempts(&with_count(FieldValue::l(0)), false),
+            1
+        );
         assert_eq!(
             AmqpDriver::attempts(&with_count(FieldValue::l(2)), true),
             3,
@@ -1197,9 +1201,7 @@ mod tests {
             FieldName::try_from(TASK_HEADER).expect("a valid field name"),
             FieldValue::I(7),
         );
-        let numeric = BasicProperties::default()
-            .with_headers(headers)
-            .finish();
+        let numeric = BasicProperties::default().with_headers(headers).finish();
         assert_eq!(
             AmqpDriver::header(&numeric, TASK_HEADER),
             None,
@@ -1219,9 +1221,18 @@ mod tests {
     fn a_queue_defaults_match_its_pipeline_and_route_through_the_default_exchange() {
         let queue = AmqpQueue::new("emails");
         assert_eq!(queue.queue, "emails");
-        assert_eq!(queue.routing_key, "emails", "the default exchange routes by queue name");
-        assert!(queue.exchange.is_empty(), "the default exchange is the empty name");
-        assert!(queue.durable, "a transient queue would lose jobs on a broker restart");
+        assert_eq!(
+            queue.routing_key, "emails",
+            "the default exchange routes by queue name"
+        );
+        assert!(
+            queue.exchange.is_empty(),
+            "the default exchange is the empty name"
+        );
+        assert!(
+            queue.durable,
+            "a transient queue would lose jobs on a broker restart"
+        );
         assert!(
             queue.arguments.as_ref().is_empty(),
             "and no queue argument is imposed: the application's queue type and TTLs are its own"

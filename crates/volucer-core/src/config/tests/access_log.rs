@@ -77,7 +77,9 @@ format = "json"
     // there was none.
     let text = text.replace("path = \"-\"", "path = \"\"");
     let config = Config::from_toml(&text).expect("parses");
-    let err = config.validate().expect_err("an empty path must be refused");
+    let err = config
+        .validate()
+        .expect_err("an empty path must be refused");
     assert!(err.to_string().contains("empty `path`"), "{err}");
     assert!(
         err.to_string().contains("\"-\""),

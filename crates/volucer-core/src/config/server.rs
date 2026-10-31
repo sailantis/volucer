@@ -889,7 +889,9 @@ impl ServerConfig {
     /// The ranges are parsed here, once. A range that does not parse is an error rather than a rule
     /// that matches nobody: this is the one setting whose typo has a direction, and a dropped
     /// `deny` line is a range that is served.
-    pub fn access_policy(&self) -> std::result::Result<Option<crate::access::AccessPolicy>, String> {
+    pub fn access_policy(
+        &self,
+    ) -> std::result::Result<Option<crate::access::AccessPolicy>, String> {
         let Some(access) = &self.access else {
             return Ok(None);
         };

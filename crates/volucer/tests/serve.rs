@@ -447,7 +447,8 @@ impl Server {
         // `wait` below reports properly.
         let sent = unsafe { libc::kill(pid, libc::SIGTERM) };
         assert_eq!(
-            sent, 0,
+            sent,
+            0,
             "SIGTERM could not be delivered to the server: {}",
             std::io::Error::last_os_error()
         );
@@ -1065,12 +1066,7 @@ fn parse_http_response(raw: &[u8]) -> HttpResponse {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .unwrap_or_else(|| {
-            panic!(
-                "no header terminator in {:?}",
-                String::from_utf8_lossy(raw)
-            )
-        });
+        .unwrap_or_else(|| panic!("no header terminator in {:?}", String::from_utf8_lossy(raw)));
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
     let mut lines = head.lines();
     let status = lines
@@ -4974,7 +4970,6 @@ fn an_https_only_configuration_starts_a_listener() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-
 // ---------------------------------------------------------------------------
 // Unix-socket listeners.
 //
@@ -4996,7 +4991,8 @@ fn http_get_over_unix(path: &Path, target: &str) -> HttpResponse {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("a read timeout");
-    let request = format!("GET {target} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {target} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).expect("write");
     stream.flush().expect("flush");
 
@@ -5220,10 +5216,7 @@ fn a_stop_finishes_a_request_that_is_already_in_flight() {
     let Some(mut server) = Server::start(&binary, &config_path) else {
         panic!("the server must start against a reachable origin");
     };
-    let address = server
-        .http_address
-        .clone()
-        .expect("a bound http listener");
+    let address = server.http_address.clone().expect("a bound http listener");
 
     // The request in the background, so the stop can happen while it is unanswered.
     let in_flight = std::thread::spawn(move || {

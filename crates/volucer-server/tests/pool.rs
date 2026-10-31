@@ -971,11 +971,7 @@ fn a_sweep_leaves_a_busy_cgi_slot_alone() {
     let root = std::env::temp_dir().join(format!("volucer-pool-sweep-busy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
-    let _script = write_script(
-        &root,
-        "index.php",
-        "<?php usleep(1200000); echo 'SLOW-OK';",
-    );
+    let _script = write_script(&root, "index.php", "<?php usleep(1200000); echo 'SLOW-OK';");
 
     let pool = CgiPool::start("busy", &config_for(&binary, 1, base)).expect("pool starts");
     let before = pool.pids();

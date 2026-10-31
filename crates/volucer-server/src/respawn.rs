@@ -108,7 +108,11 @@ impl RespawnReport {
             );
         }
         let total = self.replaced.len() + self.skipped_busy.len() + self.failed.len();
-        let mut line = format!("{}: {} of {total} replaced", self.backend, self.replaced.len());
+        let mut line = format!(
+            "{}: {} of {total} replaced",
+            self.backend,
+            self.replaced.len()
+        );
         if !self.skipped_busy.is_empty() {
             line.push_str(&format!(", {} busy", self.skipped_busy.len()));
         }
@@ -126,7 +130,10 @@ mod tests {
     #[test]
     fn a_finished_sweep_is_complete_and_a_partial_one_is_not() {
         let mut report = RespawnReport::new("app");
-        assert!(report.is_complete(), "a pool with no slots is trivially done");
+        assert!(
+            report.is_complete(),
+            "a pool with no slots is trivially done"
+        );
         assert!(report.is_noop());
 
         report.replaced.push(0);

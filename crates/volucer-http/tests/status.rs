@@ -862,8 +862,8 @@ fn a_complete_sweep_is_200_and_a_partial_one_is_202() {
     ] {
         let mut control = FakeControl::with(2, Ok(()));
         control.sweep = Mutex::new(reports.clone());
-        let running = RunningStatus::start("127.0.0.1:0", worker_services(Arc::new(control)))
-            .expect("start");
+        let running =
+            RunningStatus::start("127.0.0.1:0", worker_services(Arc::new(control))).expect("start");
 
         let (head, body) = request(running.local_addr(), "POST", "/workers/restart");
         assert!(
@@ -911,10 +911,7 @@ fn the_sweep_route_is_granted_separately_from_the_reset() {
     let (head, _) = request(running.local_addr(), "POST", "/workers/restart");
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert!(
-        control
-            .sweeps
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0,
+        control.sweeps.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the sweep reached the pools"
     );
 
@@ -943,13 +940,11 @@ fn the_sweep_route_is_absent_until_it_is_granted() {
         "127.0.0.1:0",
         StatusServices {
             workers: Some(Arc::clone(&control) as Arc<dyn WorkerControl>),
-            reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(
-                WorkerGrant {
-                    list: true,
-                    reset: true,
-                    restart: false,
-                },
-            ))),
+            reset_gate: Some(Arc::new(volucer_http::WorkerResetGate::open(WorkerGrant {
+                list: true,
+                reset: true,
+                restart: false,
+            }))),
             ..StatusServices::default()
         },
     )
@@ -961,9 +956,7 @@ fn the_sweep_route_is_absent_until_it_is_granted() {
         "a sweep the file did not grant must not exist, not refuse: {head}"
     );
     assert_eq!(
-        control
-            .sweeps
-            .load(std::sync::atomic::Ordering::SeqCst),
+        control.sweeps.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "and it must not have reached the pools"
     );

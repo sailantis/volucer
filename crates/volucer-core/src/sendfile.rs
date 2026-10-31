@@ -157,10 +157,7 @@ impl SendfilePolicy {
     /// feature is off. An error means a root is empty, is not a directory, or does not resolve —
     /// all three refused by name rather than skipped, because a skipped root is a feature that
     /// silently does not work and the 403 would blame the application.
-    pub fn new(
-        config: Option<&SendfileConfig>,
-        config_dir: &Path,
-    ) -> Result<Option<Self>, String> {
+    pub fn new(config: Option<&SendfileConfig>, config_dir: &Path) -> Result<Option<Self>, String> {
         let Some(config) = config else {
             return Ok(None);
         };
@@ -302,7 +299,8 @@ mod tests {
         // The default has to be off, and it has to be *absent* rather than a policy with no roots:
         // a policy that admitted nothing would still be a policy, and the request path would pay for
         // one on every response.
-        let policy = SendfilePolicy::new(None, Path::new("/nowhere")).expect("absent is not an error");
+        let policy =
+            SendfilePolicy::new(None, Path::new("/nowhere")).expect("absent is not an error");
         assert!(policy.is_none());
     }
 
@@ -425,9 +423,10 @@ mod tests {
         std::fs::write(base.join("in.txt"), b"x").expect("write");
         let policy = policy(std::slice::from_ref(&base));
         let named = format!("{}/in.txt\0.png", base.display());
-        let err = policy.resolve(&named).expect_err("a NUL truncates in a syscall");
+        let err = policy
+            .resolve(&named)
+            .expect_err("a NUL truncates in a syscall");
         assert!(matches!(err, Refusal::Missing { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
-

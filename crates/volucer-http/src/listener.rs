@@ -600,7 +600,9 @@ impl FrontEnd {
     /// belongs to which status also decides which *generation* it comes from. `None` for a code with
     /// no page, which is every code on a deployment that wrote none.
     fn error_page(&self, status: u16) -> Option<std::path::PathBuf> {
-        self.state().error_page(status).map(std::path::PathBuf::from)
+        self.state()
+            .error_page(status)
+            .map(std::path::PathBuf::from)
     }
 
     /// The statistics handle, shared with the accept loops.
@@ -775,7 +777,10 @@ impl ReloadHandles {
     /// The error-page setter above goes through `apply`; this one does too, so a root added to the
     /// file reaches the generation a request is served under. `None` keeps the feature off.
     #[must_use]
-    pub fn with_resolved_sendfile(mut self, sendfile: Option<volucer_core::SendfilePolicy>) -> Self {
+    pub fn with_resolved_sendfile(
+        mut self,
+        sendfile: Option<volucer_core::SendfilePolicy>,
+    ) -> Self {
         self.sendfile = sendfile;
         self
     }
@@ -1056,7 +1061,9 @@ impl BoundListener {
     /// The port this listener answers on, when it has one.
     fn port(&self) -> Option<u16> {
         match self {
-            BoundListener::Tcp(listener) => listener.local_addr().ok().map(|address| address.port()),
+            BoundListener::Tcp(listener) => {
+                listener.local_addr().ok().map(|address| address.port())
+            }
             #[cfg(unix)]
             BoundListener::Unix(..) => None,
         }
@@ -1583,11 +1590,12 @@ impl HttpListener {
         } = self;
 
         while !front_end.shutdown.load(Ordering::Relaxed) {
-            match tokio::time::timeout(ACCEPT_POLL, listener.accept()).await {                            Ok(Ok(stream)) => {
+            match tokio::time::timeout(ACCEPT_POLL, listener.accept()).await {
+                Ok(Ok(stream)) => {
                     let active = front_end.stats.connections.fetch_add(1, Ordering::Relaxed) + 1;
                     if active > front_end.limits.max_connections {
                         front_end.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(active, "refusing an HTTP connection: at the limit");
+                        tracing::warn!(active, "refusing an HTTP connection: at the limit");
                         drop(stream);
                         continue;
                     }
@@ -1692,11 +1700,7 @@ impl HttpListener {
 /// `shutdown_timeout = 0` skips the wait entirely, which is a deliberate way to say "recycle
 /// instantly and accept the truncation".
 async fn drain_connections(front_end: &FrontEnd) {
-    drain_until(
-        &front_end.connections,
-        front_end.shutdown_timeout,
-    )
-    .await;
+    drain_until(&front_end.connections, front_end.shutdown_timeout).await;
 }
 
 /// The drain, over the two things it actually reads.
@@ -1975,10 +1979,11 @@ impl tokio::io::AsyncWrite for Accepted {
 /// meaningful unix-socket story here, and refusing in the configuration is what keeps `volucer check`
 /// honest.
 async fn bind_listener(address: &str) -> Result<BoundListener> {
-    let parsed = volucer_core::config::parse_listener(address).map_err(|reason| HttpError::Bind {
-        address: address.to_string(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
-    })?;
+    let parsed =
+        volucer_core::config::parse_listener(address).map_err(|reason| HttpError::Bind {
+            address: address.to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
+        })?;
     match parsed {
         volucer_core::config::Listener::Tcp(socket) => tokio::net::TcpListener::bind(socket)
             .await
@@ -3144,9 +3149,7 @@ fn relayed_response(
     let finished = relayed.finished_flag();
     builder
         .body(crate::relay_body::RelayBody::new(relayed.body, finished).boxed())
-        .map_err(|err| {
-            HttpError::BadGateway(format!("the backend sent an unusable header: {err}"))
-        })
+        .map_err(|err| HttpError::BadGateway(format!("the backend sent an unusable header: {err}")))
 }
 
 /// The `X-Sendfile`/`X-Accel-Redirect` a backend's response carries, if any.
@@ -4361,7 +4364,10 @@ mod tests {
         );
         assert_eq!(split_host(Some("[::1]"), Some(80)), ("::1".to_string(), 80));
         assert_eq!(split_host(None, Some(80)), ("localhost".to_string(), 80));
-        assert_eq!(split_host(Some(""), Some(80)), ("localhost".to_string(), 80));
+        assert_eq!(
+            split_host(Some(""), Some(80)),
+            ("localhost".to_string(), 80)
+        );
     }
 
     /// An authority-only request names its site, which is what an `h2` or `h3` request looks like.
@@ -4435,8 +4441,14 @@ mod tests {
             .into_parts()
             .0;
 
-        let built = to_cgi(&request, b"{}".to_vec(), &routing(), Some(80), Some("127.0.0.1"))
-            .expect("a request that routes");
+        let built = to_cgi(
+            &request,
+            b"{}".to_vec(),
+            &routing(),
+            Some(80),
+            Some("127.0.0.1"),
+        )
+        .expect("a request that routes");
 
         assert_eq!(param(&built, "HTTP_X_CUSTOM"), b"yes");
         // Content-Type keeps its CGI name; it is not a hop-by-hop header.
@@ -4845,9 +4857,7 @@ fn cancel_all_reaches_every_open_connection() {
     let registry = ConnectionRegistry::new();
     let stopping = AtomicBool::new(false);
 
-    let tokens: Vec<_> = (0..3)
-        .map(|_| registry.register(&stopping).1)
-        .collect();
+    let tokens: Vec<_> = (0..3).map(|_| registry.register(&stopping).1).collect();
     registry.cancel_all();
 
     for (index, token) in tokens.iter().enumerate() {

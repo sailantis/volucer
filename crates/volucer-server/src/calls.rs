@@ -3079,7 +3079,8 @@ impl Namespace for WorkersNamespace {
                     )),
                 }
             }
-            other => Return::refused(format!("the workers namespace does not serve {other}")),        }
+            other => Return::refused(format!("the workers namespace does not serve {other}")),
+        }
     }
 }
 
@@ -3233,7 +3234,10 @@ mod worker_reset_tests {
         );
         // The answer is the report, because "two of eight replaced" is what tells an operator to
         // sweep again — a bare `ok` would be the answer that hides a partial roll.
-        let result = answer.result.clone().expect("a sweep answers with its report");
+        let result = answer
+            .result
+            .clone()
+            .expect("a sweep answers with its report");
         assert_eq!(result["complete"], true, "{answer:?}");
         assert_eq!(result["backends"][0]["backend"], "app", "{answer:?}");
     }

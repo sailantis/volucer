@@ -859,7 +859,8 @@ fn workers_restart(
         // The summary is derived from the report's own fields rather than re-parsed as JSON: the
         // body is the `serde_json` of `RespawnReport`, and a `serde_json::Value` walk here would be a
         // second reader of a shape the server owns.
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
         match value.get("backends").and_then(|b| b.as_array()) {
             Some(backends) if !backends.is_empty() => {
                 for backend in backends {
@@ -3491,10 +3492,7 @@ impl volucer_http::WorkerControl for PoolControl {
             Some(pools) => volucer_server::PoolLookup::restart(&*pools, index),
             // A deployment with no pool has no index to act on, and answering "no such worker" with
             // the count it actually has is the accurate refusal rather than a silent success.
-            None => Err(volucer_server::ResetRefusal::NoSuchWorker {
-                index,
-                workers: 0,
-            }),
+            None => Err(volucer_server::ResetRefusal::NoSuchWorker { index, workers: 0 }),
         }
     }
 
@@ -3817,12 +3815,9 @@ impl Reloader {
                 self.sendfile.load().as_ref().as_ref().cloned()
             }
         };
-        let _previous = self.registry.apply_with_sendfile(
-            sites,
-            grpc_grants,
-            error_pages,
-            sendfile.clone(),
-        );
+        let _previous =
+            self.registry
+                .apply_with_sendfile(sites, grpc_grants, error_pages, sendfile.clone());
         let _replaced = self.sendfile.replace(sendfile);
         tracing::info!(
             generation,
@@ -3917,7 +3912,11 @@ impl Reloader {
                 "this reload changed the worker-control routes: {} list, {} reset, {} restart",
                 if granted.list { "granted" } else { "removed" },
                 if granted.reset { "granted" } else { "removed" },
-                if granted.restart { "granted" } else { "removed" }
+                if granted.restart {
+                    "granted"
+                } else {
+                    "removed"
+                }
             );
         }
 
@@ -4254,7 +4253,12 @@ fn check(
             } else {
                 println!("      rules:    first match decides, top to bottom");
                 for (index, rule) in policy.rules().iter().enumerate() {
-                    println!("        {:>2}. {}  {}", index + 1, rule.action(), rule.spec());
+                    println!(
+                        "        {:>2}. {}  {}",
+                        index + 1,
+                        rule.action(),
+                        rule.spec()
+                    );
                 }
             }
             if !access.rules.is_empty() && config.server.proxy.is_none() {
@@ -4267,9 +4271,9 @@ fn check(
                 );
             }
         }
-        None => println!(
-            "    access list: none (server.access is unset; every address is admitted)"
-        ),
+        None => {
+            println!("    access list: none (server.access is unset; every address is admitted)")
+        }
     }
 
     // The sendfile allow-list. Printed in the off case too, because "a backend cannot send a file"
@@ -6413,146 +6417,145 @@ document_root = "/from/file"
     }
 }
 
-    /// **A completed sweep renders as replaced slots, not as "nothing replaced".**
-    ///
-    /// `RespawnReport` serialises `unmanaged` as `null` when it is `None`, so a presence check on the
-    /// key matched every report and the CLI printed "nothing replaced — volucer does not manage this
-    /// backend's processes" for a sweep that had just replaced every worker. Found against a live
-    /// server; the route's own tests all passed, because they assert the body rather than this
-    /// rendering of it.
-    #[test]
-    fn a_completed_sweep_renders_as_replaced_rather_than_unmanaged() {
-        let completed = serde_json::json!({
-            "backend": "app",
-            "replaced": [0, 1, 2],
-            "skipped_busy": [],
-            "failed": [],
-            "unmanaged": serde_json::Value::Null,
-        });
-        assert_eq!(
-            "app: 3 slot(s) replaced",
-            describe_sweep(&completed),
-            "a successful sweep must not read as an unmanaged backend"
-        );
+/// **A completed sweep renders as replaced slots, not as "nothing replaced".**
+///
+/// `RespawnReport` serialises `unmanaged` as `null` when it is `None`, so a presence check on the
+/// key matched every report and the CLI printed "nothing replaced — volucer does not manage this
+/// backend's processes" for a sweep that had just replaced every worker. Found against a live
+/// server; the route's own tests all passed, because they assert the body rather than this
+/// rendering of it.
+#[test]
+fn a_completed_sweep_renders_as_replaced_rather_than_unmanaged() {
+    let completed = serde_json::json!({
+        "backend": "app",
+        "replaced": [0, 1, 2],
+        "skipped_busy": [],
+        "failed": [],
+        "unmanaged": serde_json::Value::Null,
+    });
+    assert_eq!(
+        "app: 3 slot(s) replaced",
+        describe_sweep(&completed),
+        "a successful sweep must not read as an unmanaged backend"
+    );
 
-        let partial = serde_json::json!({
-            "backend": "app",
-            "replaced": [0],
-            "skipped_busy": [1],
-            "failed": [],
-            "unmanaged": serde_json::Value::Null,
-        });
-        assert_eq!(
-            "app: 1 slot(s) replaced; 1 busy and left for the next sweep",
-            describe_sweep(&partial),
-            "a partial sweep has to say what is left, which is the instruction to sweep again"
-        );
+    let partial = serde_json::json!({
+        "backend": "app",
+        "replaced": [0],
+        "skipped_busy": [1],
+        "failed": [],
+        "unmanaged": serde_json::Value::Null,
+    });
+    assert_eq!(
+        "app: 1 slot(s) replaced; 1 busy and left for the next sweep",
+        describe_sweep(&partial),
+        "a partial sweep has to say what is left, which is the instruction to sweep again"
+    );
 
-        let failed = serde_json::json!({
-            "backend": "app",
-            "replaced": [],
-            "skipped_busy": [],
-            "failed": [0],
-            "unmanaged": serde_json::Value::Null,
-        });
-        assert_eq!(
-            "app: 0 slot(s) replaced; 1 FAILED to restart",
-            describe_sweep(&failed)
-        );
+    let failed = serde_json::json!({
+        "backend": "app",
+        "replaced": [],
+        "skipped_busy": [],
+        "failed": [0],
+        "unmanaged": serde_json::Value::Null,
+    });
+    assert_eq!(
+        "app: 0 slot(s) replaced; 1 FAILED to restart",
+        describe_sweep(&failed)
+    );
 
-        let unmanaged = serde_json::json!({
-            "backend": "fpm",
-            "replaced": [],
-            "skipped_busy": [],
-            "failed": [],
+    let unmanaged = serde_json::json!({
+        "backend": "fpm",
+        "replaced": [],
+        "skipped_busy": [],
+        "failed": [],
+        "unmanaged": { "slots": 4, "reason": "php-fpm owns this pool" },
+    });
+    assert_eq!(
+        "fpm: nothing replaced — php-fpm owns this pool",
+        describe_sweep(&unmanaged),
+        "an unmanaged backend says who owns it, because that is the instruction"
+    );
+}
+
+/// **An incomplete sweep reports its actual cause, not an assumed one.**
+///
+/// The message used to be a fixed sentence: "at least one slot was serving a request". That is
+/// only one of the three ways a sweep answers `202`, and for the most serious of them — a
+/// replacement that would not boot — it told the operator to sweep again, which cannot fix an
+/// application that does not start. Found by making a worker exit non-zero on boot and reading
+/// what the command actually said: `failed:[0]` was reported as a busy slot.
+///
+/// Every arm is asserted, because a fix that only special-cased failure would have left the
+/// unmanaged case claiming a request was in flight.
+#[test]
+fn an_incomplete_sweep_names_the_cause_the_report_gives() {
+    let busy = serde_json::json!({
+        "backends": [{
+            "backend": "app", "replaced": [], "skipped_busy": [0, 1],
+            "failed": [], "unmanaged": serde_json::Value::Null,
+        }],
+        "complete": false,
+    });
+    let reason = why_incomplete(&busy.to_string());
+    assert!(
+        reason.contains("serving a request"),
+        "a busy slot is the one cause a second sweep fixes: {reason}"
+    );
+
+    let failed = serde_json::json!({
+        "backends": [{
+            "backend": "app", "replaced": [], "skipped_busy": [],
+            "failed": [0], "unmanaged": serde_json::Value::Null,
+        }],
+        "complete": false,
+    });
+    let reason = why_incomplete(&failed.to_string());
+    assert!(
+        reason.contains("could not be replaced"),
+        "a failed replacement must not be described as busy: {reason}"
+    );
+    assert!(
+        !reason.contains("serving a request"),
+        "the wrong cause is worse than none, because it sends the operator to retry: {reason}"
+    );
+
+    // Both at once: failure wins, because it is the one a retry cannot clear.
+    let both = serde_json::json!({
+        "backends": [{
+            "backend": "app", "replaced": [], "skipped_busy": [2],
+            "failed": [0], "unmanaged": serde_json::Value::Null,
+        }],
+        "complete": false,
+    });
+    let reason = why_incomplete(&both.to_string());
+    assert!(
+        reason.contains("could not be replaced"),
+        "a mixed report leads with the cause a sweep cannot fix: {reason}"
+    );
+
+    let unmanaged = serde_json::json!({
+        "backends": [{
+            "backend": "fpm", "replaced": [], "skipped_busy": [], "failed": [],
             "unmanaged": { "slots": 4, "reason": "php-fpm owns this pool" },
-        });
-        assert_eq!(
-            "fpm: nothing replaced — php-fpm owns this pool",
-            describe_sweep(&unmanaged),
-            "an unmanaged backend says who owns it, because that is the instruction"
+        }],
+        "complete": false,
+    });
+    let reason = why_incomplete(&unmanaged.to_string());
+    assert!(
+        reason.contains("not volucer's to roll"),
+        "an unmanaged backend is not a busy one: {reason}"
+    );
+}
+
+/// A report this does not understand is said to be unknown rather than guessed at.
+#[test]
+fn an_unreadable_sweep_report_does_not_invent_a_cause() {
+    for body in ["", "not json", "{}", r#"{"backends":[]}"#] {
+        let reason = why_incomplete(body);
+        assert!(
+            reason.contains("named no busy, failed or unmanaged slot"),
+            "{body:?} produced {reason:?}"
         );
     }
-
-    /// **An incomplete sweep reports its actual cause, not an assumed one.**
-    ///
-    /// The message used to be a fixed sentence: "at least one slot was serving a request". That is
-    /// only one of the three ways a sweep answers `202`, and for the most serious of them — a
-    /// replacement that would not boot — it told the operator to sweep again, which cannot fix an
-    /// application that does not start. Found by making a worker exit non-zero on boot and reading
-    /// what the command actually said: `failed:[0]` was reported as a busy slot.
-    ///
-    /// Every arm is asserted, because a fix that only special-cased failure would have left the
-    /// unmanaged case claiming a request was in flight.
-    #[test]
-    fn an_incomplete_sweep_names_the_cause_the_report_gives() {
-        let busy = serde_json::json!({
-            "backends": [{
-                "backend": "app", "replaced": [], "skipped_busy": [0, 1],
-                "failed": [], "unmanaged": serde_json::Value::Null,
-            }],
-            "complete": false,
-        });
-        let reason = why_incomplete(&busy.to_string());
-        assert!(
-            reason.contains("serving a request"),
-            "a busy slot is the one cause a second sweep fixes: {reason}"
-        );
-
-        let failed = serde_json::json!({
-            "backends": [{
-                "backend": "app", "replaced": [], "skipped_busy": [],
-                "failed": [0], "unmanaged": serde_json::Value::Null,
-            }],
-            "complete": false,
-        });
-        let reason = why_incomplete(&failed.to_string());
-        assert!(
-            reason.contains("could not be replaced"),
-            "a failed replacement must not be described as busy: {reason}"
-        );
-        assert!(
-            !reason.contains("serving a request"),
-            "the wrong cause is worse than none, because it sends the operator to retry: {reason}"
-        );
-
-        // Both at once: failure wins, because it is the one a retry cannot clear.
-        let both = serde_json::json!({
-            "backends": [{
-                "backend": "app", "replaced": [], "skipped_busy": [2],
-                "failed": [0], "unmanaged": serde_json::Value::Null,
-            }],
-            "complete": false,
-        });
-        let reason = why_incomplete(&both.to_string());
-        assert!(
-            reason.contains("could not be replaced"),
-            "a mixed report leads with the cause a sweep cannot fix: {reason}"
-        );
-
-        let unmanaged = serde_json::json!({
-            "backends": [{
-                "backend": "fpm", "replaced": [], "skipped_busy": [], "failed": [],
-                "unmanaged": { "slots": 4, "reason": "php-fpm owns this pool" },
-            }],
-            "complete": false,
-        });
-        let reason = why_incomplete(&unmanaged.to_string());
-        assert!(
-            reason.contains("not volucer's to roll"),
-            "an unmanaged backend is not a busy one: {reason}"
-        );
-    }
-
-    /// A report this does not understand is said to be unknown rather than guessed at.
-    #[test]
-    fn an_unreadable_sweep_report_does_not_invent_a_cause() {
-        for body in ["", "not json", "{}", r#"{"backends":[]}"#] {
-            let reason = why_incomplete(body);
-            assert!(
-                reason.contains("named no busy, failed or unmanaged slot"),
-                "{body:?} produced {reason:?}"
-            );
-        }
-    }
-
+}

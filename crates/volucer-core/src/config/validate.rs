@@ -7,10 +7,10 @@ use super::rules::{
     is_header_name, is_header_name_byte, is_metric_name, is_metric_name_prefix, validate_route,
 };
 use super::services::default_kv_max_bytes;
-#[cfg(feature = "redis")]
-use super::services::validate_redis;
 #[cfg(feature = "amqp")]
 use super::services::validate_amqp;
+#[cfg(feature = "redis")]
+use super::services::validate_redis;
 use super::*;
 
 /// Refuse a `unix:` listener on a platform that has no unix sockets.

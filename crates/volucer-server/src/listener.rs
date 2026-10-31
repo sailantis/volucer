@@ -536,11 +536,9 @@ fn bind(address: &str) -> Result<Bound> {
     let listener = volucer_core::config::parse_listener(address)
         .map_err(|reason| bind_failure(address, reason))?;
     match listener {
-        volucer_core::config::Listener::Tcp(socket) => {
-            std::net::TcpListener::bind(socket)
-                .map(Bound::Tcp)
-                .map_err(|source| bind_failure(address, source.to_string()))
-        }
+        volucer_core::config::Listener::Tcp(socket) => std::net::TcpListener::bind(socket)
+            .map(Bound::Tcp)
+            .map_err(|source| bind_failure(address, source.to_string())),
         volucer_core::config::Listener::Unix(path) => bind_unix(address, &path),
     }
 }
@@ -1061,7 +1059,14 @@ fn serve_connection(
                 // The record is written before the answer, like the refusals above and unlike a
                 // backend's: there is no backend answer to wait for, so an order that waited for
                 // one would log nothing.
-                record_fastcgi(&observe, &context, &request, redirect.status, 0, started.elapsed());
+                record_fastcgi(
+                    &observe,
+                    &context,
+                    &request,
+                    redirect.status,
+                    0,
+                    started.elapsed(),
+                );
             }
             fastcgi::write_redirect(
                 stream.get_mut(),

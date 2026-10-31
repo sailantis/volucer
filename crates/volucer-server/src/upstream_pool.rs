@@ -401,7 +401,11 @@ impl Supervisor {
             });
         }
         {
-            let mut process = self.shared.process.lock().unwrap_or_else(|p| p.into_inner());
+            let mut process = self
+                .shared
+                .process
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             process.child = child;
             process.started_at = Instant::now();
         }

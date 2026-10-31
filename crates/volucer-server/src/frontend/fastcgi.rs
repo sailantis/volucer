@@ -284,13 +284,7 @@ pub fn write_relayed<W: Write>(
     // **The head goes out immediately.** That is the whole point of relaying: a client sees the
     // status line and the headers before the application has finished producing the body, which is
     // what makes progress visible for a long download.
-    record::write_records(
-        writer,
-        RecordType::Stdout,
-        request_id,
-        &relayed.head,
-        false,
-    )?;
+    record::write_records(writer, RecordType::Stdout, request_id, &relayed.head, false)?;
     writer.flush()?;
 
     let mut body_bytes = 0u64;
@@ -314,7 +308,9 @@ pub fn write_relayed<W: Write>(
         let end = volucer_fcgi::EndRequest::complete();
         write_assembled(writer, |out| {
             record::append_records(out, RecordType::Stdout, request_id, &[], true);
-            out.extend_from_slice(&record::Header::new(RecordType::EndRequest, request_id, 8).encode());
+            out.extend_from_slice(
+                &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
+            );
             out.extend_from_slice(&end.encode());
         })?;
     } else {
@@ -471,9 +467,7 @@ pub fn write_redirect<W: Write>(
     );
     write_assembled(writer, |out| {
         record::append_records(out, RecordType::Stdout, request_id, body.as_bytes(), true);
-        out.extend_from_slice(
-            &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
-        );
+        out.extend_from_slice(&record::Header::new(RecordType::EndRequest, request_id, 8).encode());
         out.extend_from_slice(
             &EndRequest {
                 app_status: 0,
@@ -502,9 +496,12 @@ fn write_error_with<W: Write>(
         (ServerErrorKind::RateLimited, Some(seconds)) => {
             format!("Cache-Control: no-store\r\nRetry-After: {seconds}\r\n")
         }
-        (ServerErrorKind::BodyTooLarge | ServerErrorKind::RateLimited | ServerErrorKind::AddressDenied, _) => {
-            "Cache-Control: no-store\r\n".to_string()
-        }
+        (
+            ServerErrorKind::BodyTooLarge
+            | ServerErrorKind::RateLimited
+            | ServerErrorKind::AddressDenied,
+            _,
+        ) => "Cache-Control: no-store\r\n".to_string(),
         _ => String::new(),
     };
     let body = format!(

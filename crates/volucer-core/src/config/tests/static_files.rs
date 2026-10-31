@@ -502,7 +502,10 @@ http = "127.0.0.1:8080"
         config.server.shutdown_timeout(),
         std::time::Duration::from_millis(DEFAULT_SHUTDOWN_TIMEOUT_MS)
     );
-    assert_eq!(DEFAULT_SHUTDOWN_TIMEOUT_MS, 30_000, "docker stop's own default");
+    assert_eq!(
+        DEFAULT_SHUTDOWN_TIMEOUT_MS, 30_000,
+        "docker stop's own default"
+    );
     config.validate().expect("an absent key is valid");
 
     let text = r#"

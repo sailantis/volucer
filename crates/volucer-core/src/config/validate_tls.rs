@@ -193,14 +193,12 @@ impl Config {
         // this same check, since `http` is where the cleartext request arrives.
         if self.server.redirect_to_https {
             if let Some(http) = &self.server.http {
-                let cleartext_here = matches!(
-                    parse_listener(http),
-                    Ok(Listener::Unix(_))
-                ) && self
-                    .server
-                    .tls
-                    .as_ref()
-                    .is_some_and(|tls| self.server.https.is_none() || tls.plain);
+                let cleartext_here = matches!(parse_listener(http), Ok(Listener::Unix(_)))
+                    && self
+                        .server
+                        .tls
+                        .as_ref()
+                        .is_some_and(|tls| self.server.https.is_none() || tls.plain);
                 if cleartext_here {
                     return Err(Error::Config(format!(
                         "server.redirect_to_https is set but server.http is {http}, a unix socket, \

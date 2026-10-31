@@ -548,13 +548,8 @@ async fn answer(
         .as_ref()
         .map_or(WorkerGrant::NONE, |gate| gate.routes());
     if grant.any() {
-        if let Some(response) = worker_route(
-            request.method(),
-            path,
-            services.workers.as_ref(),
-            grant,
-        )
-        .await
+        if let Some(response) =
+            worker_route(request.method(), path, services.workers.as_ref(), grant).await
         {
             return response;
         }
@@ -810,7 +805,9 @@ async fn sweep_response(
         None => Vec::new(),
     };
 
-    let complete = reports.iter().all(volucer_server::RespawnReport::is_complete);
+    let complete = reports
+        .iter()
+        .all(volucer_server::RespawnReport::is_complete);
     // **`200` for a complete sweep and `202` for one that is not**, which is the honest pair rather
     // than one code for both. A sweep that skipped a busy slot has not deployed everything yet;
     // answering `200` would tell a pipeline the rollout is done and it would stop sweeping, leaving

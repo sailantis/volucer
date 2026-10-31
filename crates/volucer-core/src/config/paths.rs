@@ -39,7 +39,8 @@ pub fn is_stdout_log(path: &Path) -> bool {
 /// one with a rename: the two settings are resolved at different times by different callers, and a
 /// generic `resolve_path` would be a name that says nothing about which setting it is resolving.
 #[must_use]
-pub fn resolve_kv_path(path: &Path, config_dir: &Path) -> PathBuf {    if path.is_absolute() {
+pub fn resolve_kv_path(path: &Path, config_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
         config_dir.join(path)

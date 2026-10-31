@@ -467,7 +467,8 @@ path_prefix = "/blog"
 redirect = { status = 301, to = "/news{path}" }
 "#,
     );
-    fine.validate().expect("a different prefix is the migration shape");
+    fine.validate()
+        .expect("a different prefix is the migration shape");
 }
 
 #[test]
@@ -515,8 +516,8 @@ redirect = { status = 301, to = "/new" }
     )
     .expect("the fixture parses");
     config.validate().expect("the fixture validates");
-    let selected = super::select_route(&config.server.routes, None, "/old/x")
-        .expect("one of the two matches");
+    let selected =
+        super::select_route(&config.server.routes, None, "/old/x").expect("one of the two matches");
     assert!(
         selected.redirect.is_some(),
         "the redirect must win the tie, not the route it is retiring"

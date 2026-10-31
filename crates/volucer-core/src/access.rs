@@ -296,9 +296,11 @@ mod tests {
         assert!(policy(&[(Action::Deny, "10.0.0.0/8")], Action::Allow).admits(None));
         let closed = policy(&[(Action::Allow, "10.0.0.0/8")], Action::Deny);
         assert!(!closed.admits(None));
-        assert!(closed.refusal(None).expect("refused").to_string().contains(
-            "no client address"
-        ));
+        assert!(closed
+            .refusal(None)
+            .expect("refused")
+            .to_string()
+            .contains("no client address"));
     }
 
     #[test]
@@ -315,7 +317,10 @@ mod tests {
     fn a_bad_range_is_refused_with_its_position_and_text() {
         // The reason must find the line: an operator with forty rules cannot search for "invalid".
         let err = AccessPolicy::new(
-            [(Action::Allow, "10.0.0.0/8"), (Action::Deny, "not-an-address")],
+            [
+                (Action::Allow, "10.0.0.0/8"),
+                (Action::Deny, "not-an-address"),
+            ],
             Action::Allow,
         )
         .expect_err("the second range does not parse");
