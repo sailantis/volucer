@@ -1,0 +1,76 @@
+#!/bin/sh
+# Refuse a commit whose staged Rust is not `cargo fmt` clean.
+#
+# `.editorconfig` sets indentation and line endings, but it cannot know that a line past the width
+# limit has to break, and it only applies when an editor writes a file — not to a `git checkout`,
+# not to a patch, not to an assistant. That gap is what left CI's `Format` job failing on 109
+# hunks: nothing in the loop ever asked rustfmt.
+#
+# **This checks the index, not the working tree.** Reading the files on disk would pass the one
+# commit that matters: the formatted copy was never `git add`ed, so CI goes red on content the
+# hook just declared clean. The whole index is therefore materialised into a scratch directory and
+# formatted there, which is the tree the commit is about to create.
+#
+# Materialising the whole tree rather than just the changed files is deliberate: rustfmt follows
+# `mod foo;` into child modules and refuses the parent outright when one is missing, so a `lib.rs`
+# cannot be checked on its own. Both `skip_children` and `ignore`, which would have avoided the
+# copy, are nightly-only — on stable this is the only way to format a file that has children.
+#
+# Install with `git config core.hooksPath .githooks`; `.git/hooks` is not committed, so a hook in
+# there does not exist for anyone else or on a fresh clone.
+#
+# Emergency bypass: `git commit --no-verify`.
+
+set -eu
+
+# Every Rust file this commit adds, copies or modifies. Deletions and renames have nothing to
+# format, and `--diff-filter` is cheaper than sorting that out in the loop.
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+  echo "pre-commit: rustfmt is not on PATH, so formatting cannot be checked." >&2
+  echo "Install it with 'rustup component add rustfmt', or commit with --no-verify." >&2
+  exit 1
+fi
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT INT TERM
+
+# The index as it stands right now, at a path where the paths resolve relative to each other.
+# `-a` is every file and `--prefix` puts them under the scratch directory; the committed
+# `Cargo.toml` files come along too, which is what lets rustfmt read each crate's edition.
+git checkout-index -a --prefix="$scratch/"
+
+# A config beside the scratch tree, so the check is the repository's rules and not this machine's:
+# a global `~/.rustfmt.toml` must not be able to make a commit pass that CI would reject.
+printf 'edition = "2021"\n' > "$scratch/rustfmt.toml"
+
+failed=
+
+for file in $staged; do
+  if [ ! -f "$scratch/$file" ]; then
+    # Added with `git add -N`: the path is in the index as intent-to-add, with no content yet, so
+    # there is nothing to format and nothing to refuse.
+    continue
+  fi
+
+  if ! rustfmt --config-path "$scratch" --check "$scratch/$file" >/dev/null 2>&1; then
+    failed="$failed $file"
+  fi
+done
+
+if [ -n "$failed" ]; then
+  echo "" >&2
+  echo "pre-commit: cargo fmt would change these staged files:" >&2
+  for file in $failed; do
+    echo "  $file" >&2
+  done
+  echo "" >&2
+  echo "Run 'cargo fmt --all', then 'git add' the result and commit again." >&2
+  echo "Run it twice — rustfmt is not always idempotent in a single pass." >&2
+  exit 1
+fi

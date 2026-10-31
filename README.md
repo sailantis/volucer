@@ -247,6 +247,17 @@ cargo build --release
 
 Integration tests that spawn PHP processes require `php` and `php-cgi` on `PATH`.
 
+`cargo fmt --all --check` is a CI job, so a commit that is not formatted is a red run. Turn the
+hook on once per clone and it is refused before it is made:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It checks the staged content, so it catches a formatted file that was never `git add`ed — the
+commit that would otherwise pass locally and fail in CI. Run `cargo fmt --all` (twice: rustfmt is
+not always idempotent in one pass) to fix what it reports, or `git commit --no-verify` to bypass it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -4,6 +4,12 @@
 # `core.autocrlf=true` by default.
 *.sh text eol=lf
 
+# The hooks have no extension, so `*.sh` does not reach them, and a CRLF `#!/bin/sh` fails on Unix
+# with `bad interpreter: /bin/sh^M: no such file or directory`. `text` is also what makes Git store
+# the file with LF regardless of `core.autocrlf`, so the script is executable in a checkout on
+# either platform.
+.githooks/* text eol=lf
+
 # Workflows are YAML parsed by GitHub, and a stray CR in a `run:` block reaches the shell.
 *.yml text eol=lf
 *.yaml text eol=lf
