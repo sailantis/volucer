@@ -37,6 +37,39 @@ independent of where the process was started. `volucer check` displays the resol
 Keep `http/1.1` in `alpn`. Volucer supports both HTTP/2 and HTTP/1.1, and some clients
 offer only HTTP/1.1.
 
+### A client certificate is never requested
+
+Volucer's TLS listener asks every client for **nothing** but its offer of protocols. There
+is no `[server.tls].client_ca` and no `require_client_cert`, and `volucer check` refuses
+both by name:
+
+```text
+unknown field `client_ca`, expected one of `certificate`, `key`, `min_version`, `alpn`, `plain`
+```
+
+The verification is therefore one-sided: the client authenticates the server, and the
+server authenticates nobody. A connection with **no certificate at all** is accepted and
+served normally, which is the only behaviour worth stating plainly, because an operator
+who expects a mutual handshake would otherwise read its absence as a misconfiguration on
+the client's side. HTTP/3 is the same: QUIC's mutual TLS is an extension rather than a
+handshake field, and nothing configures one there either.
+
+Use a different mechanism for service-to-service authentication. In order of cost:
+
+| Mechanism | Where it is checked | Configurable today |
+|---|---|---|
+| A shared secret in a header | the application, or `[[server.routes]]` | yes, by the application |
+| A source address | `[server.access]` | yes, as CIDR rules |
+| An `upstream` in front of a service that needs mTLS | that proxy terminates it and forwards a verified header | yes, via [`[server.proxy]`](01-CONFIGURATION.md#serverproxy) |
+| A client certificate | this listener | **no** |
+
+The last row is a deliberate omission rather than a missing key: it changes *who can
+connect*, so it arrives as a decision with a deployment asking for it, not as a flag added
+beside `plain`. Note also that `[server.proxy].trusted_headers` is only as good as
+`trusted_subnets` — a forwarded identity header from an untrusted peer is a claim, not a
+fact, so a header-based scheme behind an mTLS proxy must restrict the subnets that proxy
+occupies.
+
 ## Plain HTTP and TLS together
 
 Volucer supports each of these listener configurations. The `http` setting retains its

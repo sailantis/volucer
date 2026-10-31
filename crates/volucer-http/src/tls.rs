@@ -921,6 +921,9 @@ pub fn server_config(
     };
 
     let mut server = rustls::ServerConfig::builder_with_protocol_versions(versions)
+        // Deliberate, and documented rather than merely absent: no key asks for a client
+        // certificate, so adding `with_client_cert_verifier` here means adding a configuration
+        // surface that decides who can connect. See docs/05-TLS-AND-ACME.md.
         .with_no_client_auth()
         .with_cert_resolver(resolver);
 

@@ -247,6 +247,13 @@ fastcgi = "127.0.0.1:9080"
 # alpn = ["h2", "http/1.1"]           # h2 preferred; do NOT drop http/1.1
 # plain = false                       # accept cleartext on the TLS port too
 #
+# **There is no client-certificate key, and adding one is refused by name.** The
+# listener never sends a CertificateRequest, so a client presenting no certificate
+# connects normally -- mTLS is not available here. `client_ca` and `require_client_cert`
+# are unknown fields, not ignored ones. For service-to-service authentication use a
+# header behind a proxy ([server.proxy] with a narrow trusted_subnets), a CIDR rule in
+# [server.access], or terminate mTLS in an upstream. See docs/05-TLS-AND-ACME.md.
+#
 # HTTP/3 over QUIC, on its own UDP socket. Presence of the table is what turns
 # it on, following [server.tls] and [server.acme]. It needs [server.tls]: QUIC
 # is TLS 1.3 with no cleartext mode anywhere in the protocol, and the

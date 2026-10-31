@@ -100,6 +100,9 @@ pub fn server_config(
     let mut server = quinn::rustls::ServerConfig::builder_with_protocol_versions(&[
         &quinn::rustls::version::TLS13,
     ])
+    // The same deliberate omission as the TCP listener, and the same documentation: nothing
+    // configures a client certificate, so an mTLS mode added to one front end without the other
+    // would be a deployment that is authenticated over TCP and anonymous over QUIC.
     .with_no_client_auth()
     .with_cert_resolver(resolver);
 

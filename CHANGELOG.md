@@ -88,6 +88,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Releasing at return time would let the pool hand the same worker a second request while the first
   response's body was still on its pipe.
 
+- **TLS documents that it never asks a client for a certificate.** `.with_no_client_auth()` was
+  hard-coded and nothing said so: an operator could read `[server.tls]`'s key list, see no mTLS
+  entry, and conclude the feature was there to be found rather than absent. The omission is now
+  stated in three places with the verification behind it — a client presenting **no** certificate
+  connects and is served `200` — and `volucer check` refuses `client_ca` and
+  `require_client_cert` by name rather than accepting them silently:
+
+  ```text
+  unknown field `client_ca`, expected one of `certificate`, `key`, `min_version`, `alpn`, `plain`
+  ```
+
+  The guide now names the three mechanisms that *are* available for service-to-service
+  authentication, and the trap in the header-based one: `[server.proxy].trusted_headers` is only
+  as good as `trusted_subnets`, so a forwarded identity header from an untrusted peer is a claim
+  rather than a fact.
+
 ### Fixed
 
 - **A worker's stream that stops without `LAST` is a truncation, and now says so.** A worker that

@@ -572,6 +572,11 @@ revealing whether a hidden file exists.
 Relative certificate and key paths are resolved from the configuration file's directory,
 not the process's working directory. `volucer check` prints the resolved paths.
 
+**There is no key for a client certificate.** The listener never requests one, so mTLS is
+not available here; `client_ca` and `require_client_cert` are refused as unknown fields
+rather than ignored. See [TLS and ACME](05-TLS-AND-ACME.md#a-client-certificate-is-never-requested)
+for what to use instead.
+
 See [TLS and ACME](05-TLS-AND-ACME.md) for deployment examples and details about `plain`.
 
 ## `[server.http3]`
