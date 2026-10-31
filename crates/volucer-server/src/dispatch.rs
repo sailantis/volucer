@@ -1297,6 +1297,36 @@ impl Dispatcher {
         self.dispatch_to_relayed(name, request, buffer, relay)
     }
 
+    /// Send a request to a named backend. Streamed bodies, and the route-selected form.
+    ///
+    /// Added beside [`Self::dispatch_to`] for the reason [`Self::dispatch_to_relayed`] exists beside
+    /// it: a caller that has no stream (the FastCGI front-end, and the HTTP front-end for any
+    /// backend that did not advertise the capability) asks for the buffered one and gets
+    /// byte-identical behaviour.
+    pub fn dispatch_to_streaming(
+        &self,
+        name: &str,
+        request: &Request,
+        chunks: Box<
+            dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send,
+        >,
+    ) -> Result<Response> {
+        let backend = self.backend_named(name)?;
+        backend.request_streaming(request, chunks)
+    }
+
+    /// Whether the named backend can accept a request body it is told no length for.
+    ///
+    /// **The gate the front-end asks before it opens a stream at all**, and it is a method here
+    /// rather than a field read because the answer is a property of the backend's *kind* — a CGI
+    /// process can never take one, a worker pool can if every slot advertised it, and an `upstream`
+    /// streams without being asked.
+    pub fn streams_request_bodies(&self, name: &str) -> bool {
+        self.backends
+            .get(name)
+            .is_some_and(Backend::streams_request_bodies)
+    }
+
     /// The named backend, or the error that says which kind of miss this is.
     ///
     /// Two different failures share this lookup, and which one it is decides the status a client

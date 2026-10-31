@@ -99,6 +99,38 @@ behaves the same in both modes. See the PHP SDK's README for the full table.
 A `spawn_cgi`, `php-fpm` or `upstream` backend has no such difference: PHP parses the body
 inside the request, so `is_uploaded_file()` is true there.
 
+#### A large upload does not cost a large amount of memory
+
+The body is **streamed to the worker** rather than buffered, when the worker says it can read one
+whose length it was not told. The SDK advertises `stream_request_body` in its handshake, the server
+sends frames as the client produces them, and the only bound on the request is
+`server.max_body_bytes` — which is a limit on what this server will accept, not a buffer it
+allocates. A body that exceeds it is refused with `413` while it is still arriving.
+
+Measured against the built binary with a 256 MiB `Transfer-Encoding: chunked` upload:
+
+| Worker | Server peak growth |
+|---|---|
+| advertises `stream_request_body` (streamed) | **2.6 MiB** |
+| does not (buffered, as before) | **513 MiB** |
+
+The buffered column is not a defect to fix — it is what an SDK that predates the field gets, and it
+is byte-for-byte the behaviour every other backend has. What the streamed column buys is that a
+deployment no longer has to set `max_body_bytes` to the size of its machine to accept a large
+upload.
+
+Two consequences worth knowing:
+
+- **A streamed request is never retried.** A buffered body can be sent to a second worker because
+  the pool still holds it; a streamed one has been consumed from the client's socket frame by frame.
+  A worker that dies mid-upload is replaced and the client gets a `502`, which is the honest answer.
+- **A slow upload is not a slow worker.** `request_timeout_ms` starts when the body is complete, not
+  when it starts arriving, so a 256 MiB upload over a phone link is not a `504` at the
+  thirty-second mark. The client's own connection is what bounds the upload.
+
+A CGI backend cannot be streamed to: `php-cgi` reads `CONTENT_LENGTH` from its environment before
+it touches `STDIN`. Those backends keep the buffered path, unchanged.
+
 ### Recycling
 
 A worker is replaced when any of the following occurs:

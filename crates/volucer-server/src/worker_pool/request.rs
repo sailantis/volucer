@@ -48,17 +48,21 @@ pub struct BorrowedRequest<'a> {
 impl<'a> BorrowedRequest<'a> {
     /// The frame's JSON head, borrowing this translation and the environment under it.
     ///
-    /// `body_len` is left at zero because the channel stamps in the length of the body it is
-    /// about to frame, so the declared length and the bytes sent cannot disagree.
+    /// `body_len` is the body's declared length, or `None` when it cannot be known because the
+    /// body is being streamed. The channel stamps a known length in from the bytes it is about to
+    /// frame, so for a buffered request the declared length and the bytes sent cannot disagree.
     #[doc(hidden)]
-    pub fn draft(&self) -> RequestHeaderJson<'_, RequestHeaderParams<'_>, CgiHeader<'_>> {
+    pub fn draft(
+        &self,
+        body_len: Option<u64>,
+    ) -> RequestHeaderJson<'_, RequestHeaderParams<'_>, CgiHeader<'_>> {
         RequestHeaderJson {
             method: &self.method,
             uri: &self.uri,
             protocol: &self.protocol,
             headers: BorrowedHeaders::new(self.headers.clone()),
             remote_addr: &self.remote_addr,
-            body_len: 0,
+            body_len,
             script_filename: &self.script_filename,
             https: self.https,
         }
@@ -278,7 +282,7 @@ pub fn request_header(request: &Request) -> RequestHeader {
         remote_addr: text_param(params, "REMOTE_ADDR").unwrap_or_default(),
         // Overwritten by `WorkerChannel::request` from the body it frames, so the
         // declared length and the bytes sent cannot disagree.
-        body_len: 0,
+        body_len: None,
         script_filename: text_param(params, "SCRIPT_FILENAME").unwrap_or_default(),
         https: match params.iter().find(|(key, _)| key.as_slice() == b"HTTPS") {
             // Present means the request arrived over TLS; CGI uses "on" and
@@ -434,7 +438,7 @@ mod tests {
         assert_eq!(header.script_filename, "/srv/app/index.php");
         assert!(header.https);
         assert_eq!(
-            header.body_len, 0,
+            header.body_len, None,
             "the channel decides this, not the CGI env"
         );
         assert_eq!(header.header("host"), Some("example.test"));
@@ -505,9 +509,10 @@ mod tests {
                 keep_conn: true,
             };
 
-            // `body_len` is zero on both: the channel stamps it in from the body it frames.
-            let owned = Json::encode(&request_header(&request).draft(0)).expect("encode");
-            let borrowed = Json::encode(&borrowed_request(&request).draft()).expect("encode");
+            // `body_len` is absent on both: the channel stamps it in from the body it frames.
+            let owned = Json::encode(&request_header(&request).draft(Some(0))).expect("encode");
+            let borrowed =
+                Json::encode(&borrowed_request(&request).draft(Some(0))).expect("encode");
 
             assert_eq!(
                 String::from_utf8_lossy(&borrowed),

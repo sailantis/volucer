@@ -185,7 +185,7 @@ impl PhpWorker {
             protocol: "HTTP/1.1".to_string(),
             headers: vec![("Accept".to_string(), "text/html".to_string())],
             remote_addr: "127.0.0.1".to_string(),
-            body_len: 0,
+            body_len: Some(0),
             script_filename: "index.php".to_string(),
             https: false,
         };
@@ -206,7 +206,7 @@ impl PhpWorker {
                 ("Host".to_string(), "example.test".to_string()),
             ],
             remote_addr: "127.0.0.1".to_string(),
-            body_len: body.len() as u64,
+            body_len: Some(body.len() as u64),
             script_filename: "index.php".to_string(),
             https: false,
         };
@@ -540,6 +540,7 @@ fn a_frame_the_php_side_did_not_write_is_not_accepted() {
         pid: 1234,
         runtime: String::new(),
         no_checksum: false,
+        stream_request_body: false,
     };
     let encoded = Json::encode(&ack).expect("encode a HELLO_ACK");
     let mut wire = Vec::new();

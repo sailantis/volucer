@@ -101,7 +101,7 @@ fn request_with(header_count: usize) -> RequestHeader {
             .map(|index| (format!("X-Header-{index}"), format!("value-{index}")))
             .collect(),
         remote_addr: "127.0.0.1".to_string(),
-        body_len: 0,
+        body_len: Some(0),
         script_filename: "/srv/app/public/index.php".to_string(),
         https: false,
     }

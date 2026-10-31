@@ -345,6 +345,57 @@ fn a_multipart_upload_reaches_the_worker_as_post_and_files() {
     );
 }
 
+/// A request body streamed to a worker frame by frame, and the pool's answer.
+///
+/// The end-to-end half of request-body streaming: the head goes out with no `body_len` and the
+/// `STREAMED` flag, the frames follow as the closure yields them, and `LAST` closes the body. What
+/// this proves is that a worker which advertised the capability can be handed a body the server never
+/// held — the memory saving is measured against the built binary in the CHANGELOG, because a unit test
+/// cannot weigh a process.
+///
+/// It also pins the **refusal**: a worker that did *not* advertise must not be streamed to, because
+/// an SDK that predates the field reads an absent `body_len` as `0` and would take the first `BODY`
+/// frame for its own response.
+#[test]
+fn a_streamed_request_body_reaches_the_worker_in_order() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    assert!(
+        pool.streams_request_bodies(),
+        "the PHP SDK advertises `stream_request_body`; if this fails the handshake field was lost"
+    );
+
+    let pieces: Vec<Vec<u8>> = vec![b"first-".to_vec(), b"second-".to_vec(), b"third".to_vec()];
+    let expected: usize = pieces.iter().map(Vec::len).sum();
+    let mut iter = pieces.into_iter();
+    let chunks: Box<
+        dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send,
+    > = Box::new(move || Ok(iter.next()));
+
+    let request = request_with_type("POST", "/upload", &[], "application/octet-stream");
+    let response = pool
+        .request_streaming(&request, chunks)
+        .expect("the worker served the streamed body");
+
+    let rendered = body_of(&response);
+    let json: serde_json::Value =
+        serde_json::from_str(&rendered).unwrap_or_else(|err| panic!("{err}: {rendered}"));
+
+    assert_eq!(
+        json["received"].as_u64(),
+        Some(expected as u64),
+        "every frame of a streamed body has to arrive: {rendered}"
+    );
+    assert_eq!(
+        json["body"].as_str(),
+        Some("first-second-third"),
+        "and in the order the closure produced them: {rendered}"
+    );
+}
+
 /// The body of a rendered response, with the `Status:` block stripped.
 fn body_of(response: &volucer_fcgi::Response) -> String {
     let text = String::from_utf8_lossy(&response.stdout);

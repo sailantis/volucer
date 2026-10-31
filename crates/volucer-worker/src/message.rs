@@ -60,6 +60,18 @@ pub struct HelloAck {
     /// so the pool can see what a worker actually agreed to rather than assuming it followed.
     #[serde(default)]
     pub no_checksum: bool,
+    /// Whether this worker can accept a request body whose length it is not told up front.
+    ///
+    /// **The server must never stream a body to a worker that did not say this**, and the
+    /// direction of that rule is what makes the feature safe to add to a live protocol. An SDK
+    /// that predates this field decodes it as `false`, keeps receiving `body_len`, and behaves
+    /// exactly as it did — whereas a server that streamed anyway would send a head whose
+    /// `body_len` is absent, which an older SDK reads as `0`, concludes there is no body, and
+    /// then reads the first `BODY` frame as the *response* to its own request. One missing
+    /// field would desynchronise every request, so the capability is advertised by the party
+    /// that would have to cope with the new shape, exactly like [`Self::no_checksum`].
+    #[serde(default)]
+    pub stream_request_body: bool,
 }
 
 /// What the server tells a worker when asking it to serve a request.
@@ -76,10 +88,18 @@ pub struct RequestHeader {
     /// Client address, for `REMOTE_ADDR`.
     #[serde(default)]
     pub remote_addr: String,
-    /// How many body bytes follow in `Body` frames, so the worker can decide
-    /// whether to buffer or stream before reading a single one.
-    #[serde(default)]
-    pub body_len: u64,
+    /// How many body bytes follow in `Body` frames.
+    ///
+    /// **Absent when the length is not known**, which is what request-body streaming means: the
+    /// server forwards frames as the client produces them, so it cannot state a total before the
+    /// first one. An *absent* field rather than `0`, and for the reason
+    /// [`ResponseHead::body_len`] spells out: `0` already means "correctly empty", and a reader
+    /// that treated every zero as "read until `LAST`" would wait for frames that a `GET` will
+    /// never send.
+    ///
+    /// Only a worker that set [`HelloAck::stream_request_body`] is ever sent a head without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_len: Option<u64>,
     /// The absolute script the server routed to.
     #[serde(default)]
     pub script_filename: String,
@@ -108,9 +128,13 @@ impl RequestHeader {
     /// `RequestHeader` can be framed without cloning it, and so the frame's shape has one
     /// definition: the `body_len` that matters is the length of the body about to be framed,
     /// which the caller holds and this type cannot see.
+    ///
+    /// `Some(len)` frames exactly that many bytes; `None` says the length is unknown and the
+    /// body ends at the `LAST` frame, which is only legal for a worker that advertised
+    /// [`HelloAck::stream_request_body`].
     pub fn draft(
         &self,
-        body_len: u64,
+        body_len: Option<u64>,
     ) -> crate::codec::RequestHeaderJson<'_, crate::codec::HeaderPairs<'_>> {
         crate::codec::RequestHeaderJson {
             method: &self.method,
@@ -598,7 +622,7 @@ mod tests {
             protocol: "HTTP/1.1".to_string(),
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             remote_addr: "127.0.0.1".to_string(),
-            body_len: 17,
+            body_len: Some(17),
             script_filename: "/srv/app/public/index.php".to_string(),
             https: true,
         };

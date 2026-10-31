@@ -166,7 +166,7 @@ fn borrowed_cost(header_count: usize) -> (usize, usize) {
     allocations(|| {
         // Exactly what the pool does: read the head out of the environment, encode it, and send
         // the bytes. The encode is the single buffer the head now costs.
-        let head = Json::encode(&borrowed_request(&request).draft()).expect("encode");
+        let head = Json::encode(&borrowed_request(&request).draft(Some(0))).expect("encode");
         let response = channel
             .request_encoded(head, &request.body, |_| {})
             .expect("a canned reply");
@@ -237,7 +237,7 @@ fn translation_only_borrowed(header_count: usize) -> usize {
         keep_conn: true,
     };
     allocations(|| {
-        std::hint::black_box(borrowed_request(&request).draft());
+        std::hint::black_box(borrowed_request(&request).draft(Some(0)));
     })
     .0
 }

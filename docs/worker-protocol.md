@@ -120,8 +120,8 @@ The numbering is part of the protocol. These values must never be reordered or r
 | # | Name | Direction | Correlated | Carries |
 | --- | --- | --- | --- | --- |
 | 1 | `HELLO` | server → worker | no | Protocol version, for the handshake |
-| 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime` (see below) |
-| 3 | `REQUEST` | server → worker | yes | Request metadata (JSON). The body follows in `BODY` frames |
+| 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime`, `no_checksum`, `stream_request_body` (see below) |
+| 3 | `REQUEST` | server → worker | yes | Request metadata (JSON). The body follows in `BODY` frames. `body_len` is absent when the frame carries `STREAMED`, which is only sent to a worker that set `stream_request_body` in its `HELLO_ACK` |
 | 4 | `RESPONSE` | worker → server | yes | Response head: `status`, `headers`, `body_len`. `body_len` is authoritative unless the frame carries `STREAMED`, which declares no length |
 | 5 | `BODY` | either direction | yes | Raw bytes of the request or response body |
 | 6 | `EVENT` | worker → server | no | Application-level telemetry. Currently traced and dropped |
@@ -259,6 +259,48 @@ Two invariants apply, and a reader must enforce both:
 
 A body of zero length sends **no** `BODY` frames at all.
 
+Both rules have a **streamed** exception, and it is opt-in in each direction. A response may omit
+its length (below), and a request may arrive with none either — see
+[A request whose length is not known](#a-request-whose-length-is-not-known). The exception is never
+implied by a missing value; it is always a flag, because a zero `body_len` is a real and common
+answer.
+
+### A request whose length is not known
+
+The mirror of a streamed response, and the reason `max_body_bytes` no longer has to be the size of
+the machine.
+
+A client that sends `Transfer-Encoding: chunked` — or simply has not finished sending when the
+server starts reading — has no total to state, so the server cannot put one in the `REQUEST` head.
+It therefore:
+
+- **omits `body_len` from the head entirely** rather than sending `0`, because `0` already means
+  "correctly empty" and a reader that confused the two would wait for frames that never come;
+- sets `STREAMED` on the `REQUEST` frame, which is the only signal that the length is unknown;
+- forwards each `BODY` frame as the client produces it, with **`LAST` as the only end signal**.
+
+```
+──REQUEST (id, method, uri, headers)───────────►   flags: STREAMED, no body_len
+──BODY (id, <first bytes>)──────────────────────►
+──BODY (id, <more bytes>)───────────────────────►
+──BODY (id, "")─────────────────────────────────►   flags: LAST   ← the terminator
+```
+
+An empty streamed body still ends with an empty `LAST` frame. A reader that waited for a non-empty
+one would hang until the pool killed the worker.
+
+**Only a worker that asked for it is ever sent one.** The `HELLO_ACK` field `stream_request_body`
+is the worker's answer, and a server that streamed to a worker which did not set it would break
+every SDK that predates the field: such an SDK reads an absent `body_len` as `0`, concludes there is
+nothing to read, and then takes the first `BODY` frame for the *response* to its own request. One
+missing key would desynchronise every request, which is why the party that has to cope is the one
+that advertises. A server that does not offer it — because it has not been upgraded, or because the
+body was small enough to buffer — sends `body_len` as it always did.
+
+**A CGI backend is never streamed to.** `php-cgi` and `php-fpm` read `CONTENT_LENGTH` from the
+environment before touching `STDIN`, so a body of unknown length is not something they can be given.
+Those backends keep the buffered path, unchanged.
+
 ### A response whose length is not known
 
 A worker that generates its body as it goes — a CSV export, an SSE feed — cannot declare a
@@ -325,7 +367,7 @@ work per byte on the hot path, so bytes travel as bytes.
 | `0x0004` | `LAST` | This is the last chunk of a logical message |
 | `0x0008` | `ERROR` | The sender is reporting a failure |
 | `0x0010` | `NO_CHECKSUM` | The `crc32c` field is **not** a checksum and must not be verified. Only legal once the handshake has agreed to it |
-| `0x0020` | `STREAMED` | Set on `RESPONSE`: the body's length is not declared, and `LAST` is its only end signal. See [Body framing](#a-response-whose-length-is-not-known) |
+| `0x0020` | `STREAMED` | The body's length is not declared, and `LAST` is its only end signal. On `RESPONSE` (a generated body) or `REQUEST` (a body still arriving from the client). See [Body framing](#body-framing) |
 
 `NO_CHECKSUM` is a **flag rather than a zero checksum**, and the reason is that zero is already
 a real checksum: `crc32c("") == 0`, which every empty-payload frame carries. Using the value
@@ -412,6 +454,24 @@ The field is deliberately reused rather than added. A new field would be a chang
 format and would require a protocol version bump — a breaking change to discover a string that
 the message already had room for.
 
+### `stream_request_body`, and why the worker decides
+
+`request_timeout_ms` bounds a *worker*, and a body still arriving from the client is not the
+worker's time. So the server offers to forward the body as it arrives instead of buffering it, and
+the worker answers with `stream_request_body: true` in its `HELLO_ACK` when it can read a body of
+unknown length.
+
+**The capability is advertised by the worker, not offered by the server**, and the direction
+matters. An SDK that predates the field decodes it as `false`, keeps receiving `body_len` in every
+`REQUEST`, and behaves exactly as it did. A server that streamed anyway would send a head with no
+`body_len`, which that SDK reads as `0` — it would conclude there is nothing to read and then take
+the first `BODY` frame for the *response* to its own request, desynchronising every subsequent
+request. The party that has to cope is the party that advertises.
+
+A pool answers "yes" only when **every** slot agreed, because a body can only be drained once: a
+caller that fell back to buffering after half the body had gone to a worker that turned out not to
+understand it would have nothing left to send.
+
 ### Serving a request
 
 ```
@@ -420,6 +480,16 @@ server  ──REQUEST (id, metadata, body_len)─►  worker
         ◄─RESPONSE (id, status, headers, body_len)─
         ◄─BODY (id, chunk)*, last flagged LAST─────
         ◄─END (id, app_status, rss, duration)──────
+```
+
+When the body is streamed, the `REQUEST` carries no `body_len` and sets `STREAMED`, and the frames
+follow as the client produces them:
+
+```
+server  ──REQUEST (id, metadata)─►  worker      flags: STREAMED
+        ──BODY (id, chunk)*──────►
+        ──BODY (id, "")──────────►              flags: LAST
+        ◄─RESPONSE …───────────────────────────
 ```
 
 `app_status` in `END` is the **application's** exit status and is **not** the HTTP status. A

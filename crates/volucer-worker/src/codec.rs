@@ -163,6 +163,20 @@ impl BoundedChannel {
         self.channel.request_encoded(head, body, on_stage)
     }
 
+    /// A request whose body is still arriving, forwarded frame by frame as it comes.
+    ///
+    /// The counterpart of [`BoundedChannel::request_encoded`] for a body whose length is not known.
+    /// See [`WorkerChannel::request_encoded_streaming`], which owns the reasoning.
+    pub fn request_encoded_streaming(
+        &mut self,
+        head: Vec<u8>,
+        chunks: impl FnMut() -> Result<Option<Vec<u8>>>,
+        on_stage: impl FnMut(RequestStage),
+    ) -> Result<WorkerResponse> {
+        self.channel
+            .request_encoded_streaming(head, chunks, on_stage)
+    }
+
     /// Send a request and return as soon as its head has arrived, leaving the body to drain.
     ///
     /// Forwarded from [`WorkerChannel::request_streamed`], which owns the reasoning.
@@ -269,7 +283,13 @@ where
     pub protocol: &'a str,
     pub headers: BorrowedHeaders<'a, I>,
     pub remote_addr: &'a str,
-    pub body_len: u64,
+    /// The body's declared length, or `None` when it is unknown because it is being streamed.
+    ///
+    /// Serialized with `skip_serializing_if`, so an unknown length is an **absent** key rather
+    /// than a `0`. The two must stay distinguishable: `0` is a correctly empty body, and a reader
+    /// that could not tell them apart would wait for `BODY` frames a `GET` never sends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_len: Option<u64>,
     pub script_filename: &'a str,
     pub https: bool,
 }
@@ -567,6 +587,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             sapi = %ack.sapi,
             pid = ack.pid,
             no_checksum = ack.no_checksum,
+            stream_request_body = ack.stream_request_body,
             "worker handshake complete"
         );
         Ok(ack)
@@ -658,7 +679,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         let mut payload = std::mem::take(&mut self.payload);
         payload.clear();
         let head = RequestHeaderJson {
-            body_len: body.len() as u64,
+            body_len: Some(body.len() as u64),
             ..head
         };
 
@@ -674,6 +695,69 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         // its capacity.
         self.payload = payload;
         outcome.map(|()| request_id)
+    }
+
+    /// Send a request whose body arrives in pieces, ending at a `LAST` frame.
+    ///
+    /// # Why this is a separate function rather than a mode of [`Self::send_request`]
+    ///
+    /// `send_request` declares the body's length because it holds the whole body, and that
+    /// declaration is what lets a worker size its buffer once and check it arrived complete. Here
+    /// the length *cannot* be known — the bytes are still on the client's socket — so the head goes
+    /// out with `body_len` absent and the `STREAMED` bit set, and `LAST` becomes the only end
+    /// signal. The two spellings stay apart for the reason
+    /// [`flags::STREAMED`](crate::header::flags::STREAMED) gives: a `body_len` of `0` already means
+    /// a correctly empty body.
+    ///
+    /// `chunks` is called until it reports end-of-input, and each piece is written out before the
+    /// next is asked for. That ordering is the whole point: a caller reading those pieces from a
+    /// client socket applies backpressure to the client, so a 1 GB upload costs one frame's buffer
+    /// rather than 1 GB. A caller that collected the pieces into a `Vec` first would get identical
+    /// bytes on the wire and all of the memory back.
+    ///
+    /// A worker must have advertised [`HelloAck::stream_request_body`] before this is called;
+    /// nothing here can check that, because the capability lives on the pool's side of the thread
+    /// boundary. `Exchange::StreamedRequest` is the only caller and the pool gates it there.
+    pub fn request_encoded_streaming(
+        &mut self,
+        head: Vec<u8>,
+        mut chunks: impl FnMut() -> Result<Option<Vec<u8>>>,
+        mut on_stage: impl FnMut(RequestStage),
+    ) -> Result<WorkerResponse> {
+        let request_id = self.take_request_id();
+
+        on_stage(RequestStage::Sending);
+        self.send_frame(MessageType::Request, request_id, &head, flags::STREAMED)?;
+
+        // The frames are written as they are produced. `LAST` goes on whichever frame ends the
+        // body, which for an empty one is a zero-length frame — a streamed request that happens to
+        // have no body still has to say so, or the worker waits for one that will never come.
+        loop {
+            let chunk = match chunks() {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    // **The head is already on the wire with `STREAMED` set**, so this worker is
+                    // mid-request and cannot be reused: it is waiting for `LAST` and would read the
+                    // next request's frames as this body. The caller kills the slot on a fatal
+                    // error, and an incomplete stream is fatal for exactly this reason.
+                    return Err(err);
+                }
+            };
+            match chunk {
+                // An empty piece carries no information, and a stream of them would spin here.
+                Some(bytes) if bytes.is_empty() => continue,
+                Some(bytes) => self.send_frame(MessageType::Body, request_id, &bytes, 0)?,
+                None => {
+                    // Terminal frame, empty when nothing was sent. `LAST` is the only end signal
+                    // for a streamed body, so it is written even for an empty one.
+                    self.send_frame(MessageType::Body, request_id, &[], flags::LAST)?;
+                    break;
+                }
+            }
+        }
+
+        on_stage(RequestStage::Reading);
+        self.collect_response(request_id)
     }
 
     /// Send a request whose head was encoded on the caller's side of the thread boundary.
@@ -735,7 +819,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         // reported before returning, so a failure that happens *during* the write is still
         // attributed to `Sending`.
         on_stage(RequestStage::Sending);
-        let request_id = self.send_request(request.draft(body.len() as u64), body)?;
+        let request_id = self.send_request(request.draft(Some(body.len() as u64)), body)?;
 
         on_stage(RequestStage::Reading);
         self.collect_response(request_id)
@@ -1982,7 +2066,93 @@ mod tests {
         assert_eq!(frames[0].0.message_type, MessageType::Request);
         assert_eq!(frames[0].0.request_id, 1);
         let sent: RequestHeader = Json::decode(&frames[0].1).unwrap();
-        assert_eq!(sent.body_len, 10);
+        assert_eq!(sent.body_len, Some(10));
+    }
+
+    #[test]
+    fn a_streamed_request_head_omits_body_len_and_sets_the_flag() {
+        // **The wire contract the whole feature rests on.** A worker that advertised
+        // `stream_request_body` is told nothing about the length, and `LAST` is the only end signal.
+        // The key must be *absent* rather than zero: `0` is a correctly empty body, and an SDK that
+        // could not tell the two apart would wait for frames a `GET` never sends.
+        let mut script = WorkerScript::default();
+        script
+            .head(1, 200, 0)
+            .json(MessageType::End, 1, &RequestEnd::default());
+        let mut channel = script.channel();
+
+        let pieces = vec![b"abc".to_vec(), b"defg".to_vec()];
+        let mut iter = pieces.into_iter();
+        channel
+            .request_encoded_streaming(
+                b"{\"method\":\"POST\",\"uri\":\"/\"}".to_vec(),
+                || Ok(iter.next()),
+                |_| {},
+            )
+            .unwrap();
+
+        let frames = sent_frames(&channel.writer);
+        assert_eq!(frames[0].0.message_type, MessageType::Request);
+        assert!(
+            frames[0].0.flags & flags::STREAMED != 0,
+            "an unknown length must be flagged, not merely omitted"
+        );
+        let sent: RequestHeader = Json::decode(&frames[0].1).unwrap();
+        assert_eq!(
+            sent.body_len, None,
+            "an absent body_len is the wire spelling of \"the length is unknown\""
+        );
+
+        // The raw JSON is what the SDK actually reads, so the absence is checked there too.
+        let text = String::from_utf8_lossy(&frames[0].1);
+        assert!(
+            !text.contains("body_len"),
+            "the key must be omitted, not serialized as null: {text}"
+        );
+
+        // One frame per piece, and `LAST` on exactly the final one — including when the body ends
+        // without any piece having carried it.
+        assert_eq!(frames[1].1, b"abc");
+        assert_eq!(frames[1].0.flags & flags::LAST, 0);
+        assert_eq!(frames[2].1, b"defg");
+        assert_eq!(frames[2].0.flags & flags::LAST, 0);
+        assert_eq!(frames[3].1, b"");
+        assert!(
+            frames[3].0.flags & flags::LAST != 0,
+            "an empty terminator is still a terminator"
+        );
+    }
+
+    #[test]
+    fn a_streamed_request_with_no_body_still_terminates() {
+        // A `POST` with `Transfer-Encoding: chunked` and no bytes is a real request, and a worker
+        // waiting for `LAST` would hang until the pool killed it.
+        let mut script = WorkerScript::default();
+        script
+            .head(1, 204, 0)
+            .json(MessageType::End, 1, &RequestEnd::default());
+        let mut channel = script.channel();
+
+        let mut calls = 0;
+        channel
+            .request_encoded_streaming(
+                b"{}".to_vec(),
+                || {
+                    calls += 1;
+                    Ok(None)
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(calls, 1, "an empty body is one `None` and no frames");
+        let frames = sent_frames(&channel.writer);
+        // Only what the *channel writes* is here: the `REQUEST` and one empty terminator. The
+        // response is read from the script, not written.
+        assert_eq!(frames.len(), 2, "REQUEST and one empty BODY");
+        assert_eq!(frames[1].0.message_type, MessageType::Body);
+        assert_eq!(frames[1].1, b"");
+        assert!(frames[1].0.flags & flags::LAST != 0);
     }
 
     #[test]
@@ -2005,13 +2175,13 @@ mod tests {
                 ("X-Trace".to_string(), "abc".to_string()),
             ],
             remote_addr: "10.0.0.7".to_string(),
-            body_len: 0,
+            body_len: Some(0),
             script_filename: "/srv/app/public/index.php".to_string(),
             https: true,
         };
         let body = b"{\"a\":1}";
         let expected = Json::encode(&RequestHeader {
-            body_len: body.len() as u64,
+            body_len: Some(body.len() as u64),
             ..request.clone()
         })
         .unwrap();
@@ -2582,6 +2752,7 @@ mod tests {
                 pid: 4242,
                 runtime: "php-cli".to_string(),
                 no_checksum: false,
+                stream_request_body: false,
             },
         );
         let mut channel = script.channel();

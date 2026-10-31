@@ -9,6 +9,14 @@ use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
 use volucer_worker::{Ack, BoundedChannel, JobHeader, MessageType, WorkerError};
 
+/// How often [`ChannelExchange::round_trip_streaming`] re-checks whether a body has finished.
+///
+/// Short enough that the switch to the worker's own deadline is imperceptible, long enough that a
+/// long upload does not spin. It is a *poll* rather than a notification because the one thing being
+/// watched for is written by the exchange thread and read by this one, and a second channel for a
+/// single boolean would be more machinery than the fact deserves.
+const BODY_TICK: Duration = Duration::from_millis(50);
+
 /// Both directions of one worker's pipes, buffered.
 ///
 /// Buffered because every frame is written as a header and then a payload and read the same
@@ -31,6 +39,34 @@ pub(super) enum Exchange {
     /// on a timeout the thread outlives the call that made it. So the pool serializes the head and
     /// sends the bytes, and the worker cannot tell which side of the boundary encoded them.
     Request { head: Vec<u8>, body: Vec<u8> },
+    /// Send one request whose body is still arriving, forwarding frames as they come.
+    ///
+    /// The counterpart of [`Exchange::Request`] for a request whose length is not yet known. The
+    /// head goes out with `body_len` **absent** and `STREAMED` set, and `chunks` is asked for each
+    /// piece until it returns `None`, at which point a `LAST` frame closes the body.
+    ///
+    /// # Why the body is a pull closure and not a `Vec`
+    ///
+    /// The whole point is that the bytes are not held. A `Vec` here would make this
+    /// `Exchange::Request` with a different head, and the memory cost — the 1 GB upload — would be
+    /// unchanged. A closure is what lets the front-end decide *how* the pieces are obtained: the
+    /// HTTP listener blocks on a bounded channel that the connection's frame loop fills, so a
+    /// client faster than the worker applies backpressure to the client instead of growing a
+    /// buffer. Collecting the pieces here first would reproduce the bug.
+    RequestStreaming {
+        head: Vec<u8>,
+        chunks: Box<dyn FnMut() -> std::result::Result<Option<Vec<u8>>, WorkerError> + Send>,
+        /// Set once the last body frame has been written.
+        ///
+        /// **The request deadline starts here, not when the exchange is posted.** `request_timeout_ms`
+        /// is a bound on how long a *worker* may take, and while the client is still uploading the
+        /// worker has not been asked anything yet — a deadline that covered the upload would make a
+        /// slow but legitimate upload look like a hung application, and would turn a 256 MiB POST over
+        /// a slow link into a `504` at the thirty-second mark. The flag is shared with the caller so
+        /// the wait it does can be split in two: unbounded while the body arrives (bounded instead by
+        /// the client's own connection), then the ordinary deadline once the worker owes an answer.
+        body_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     /// Send one job and collect the consumer's terminal answer.
     ///
     /// The head arrives **already built** rather than already encoded, and the asymmetry with
@@ -155,6 +191,34 @@ impl Exchange {
                 // The stage is reported by the channel as it moves from writing to reading, which
                 // is the only place that can know where a failure happened.
                 let result = channel.request_encoded(head, &body, &mut *on_stage);
+                result.map(|response| Some(Completed::Response(response)))
+            }
+            Exchange::RequestStreaming {
+                head,
+                mut chunks,
+                body_done,
+            } => {
+                // The closure blocks while the next piece is not ready, and that is the
+                // backpressure: this thread is the only writer to the worker's pipe, so while it
+                // waits it is not sending, and the client's frames stop being polled. An error
+                // means the body ended early — a client disconnect, or a frame that failed to
+                // read — and reporting that as a clean end would make a truncated upload look
+                // complete. The pool kills the slot on it, because an unterminated stream leaves
+                // the worker's pipes mid-body.
+                //
+                // The terminating `None` is intercepted to raise `body_done`, which is what starts
+                // the caller's deadline: until then it is waiting on the client, not on the worker.
+                let mut timed = || {
+                    let next = chunks();
+                    if matches!(next, Ok(None) | Err(_)) {
+                        body_done.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    next
+                };
+                let result = channel.request_encoded_streaming(head, &mut timed, &mut *on_stage);
+                // Raised on every exit, including a failed send: the caller must not go on waiting
+                // forever for a body that will never be completed.
+                body_done.store(true, std::sync::atomic::Ordering::Release);
                 result.map(|response| Some(Completed::Response(response)))
             }
             Exchange::Job { head, body } => {
@@ -515,6 +579,50 @@ impl ChannelExchange {
         }
     }
 
+    /// Hand one request to a worker whose body is still arriving.
+    ///
+    /// The same shape as [`Self::request`] — post an exchange, wait on a channel, let the timeout be
+    /// the caller's — because the exchange thread is the only thing that touches the worker's pipe
+    /// and it must run whichever exchange it is told to. The difference is entirely in
+    /// [`Exchange::RequestStreaming`]: the body arrives on a channel instead of in a `Vec`, so the
+    /// 1 GB upload costs one frame's buffer rather than 1 GB.
+    ///
+    /// # The wait is in two parts, and that is the point
+    ///
+    /// `timeout` is the deadline on the *worker*, not on the client. While the body is still
+    /// arriving the worker has not been asked anything, so waiting on `timeout` would fail an
+    /// upload that is merely slow — a 256 MiB POST over a phone link takes longer than the thirty
+    /// seconds this pool allows a worker to think. So the first part of the wait has no deadline of
+    /// its own and ends when the exchange thread reports the body complete, and only then does
+    /// `timeout` begin. The client's connection is what bounds the first part, which is the only
+    /// party that can do anything about it.
+    ///
+    /// The caller must have checked that the worker advertised `stream_request_body`; the head it
+    /// passes has no `body_len` and carries `flags::STREAMED`, which only such a worker is willing
+    /// to decode.
+    pub fn request_streaming(
+        &mut self,
+        head: Vec<u8>,
+        chunks: Box<dyn FnMut() -> std::result::Result<Option<Vec<u8>>, WorkerError> + Send>,
+        timeout: Duration,
+    ) -> std::result::Result<WorkerResponse, (RequestStage, WorkerError)> {
+        let body_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exchange = Exchange::RequestStreaming {
+            head,
+            chunks,
+            body_done: std::sync::Arc::clone(&body_done),
+        };
+
+        match self.round_trip_streaming(exchange, timeout, body_done) {
+            Ok(Some(Completed::Response(response))) => Ok(response),
+            Ok(_) => Err((
+                RequestStage::Reading,
+                WorkerError::Closed("the exchange thread answered without a response".to_string()),
+            )),
+            Err(failure) => Err(failure),
+        }
+    }
+
     /// Hand one job to a consumer and wait for its terminal answer.
     ///
     /// The same shape as `request` — post an exchange, wait on a channel, let the timeout be the
@@ -684,6 +792,79 @@ impl ChannelExchange {
     /// answer on `answers` is necessarily this one's and no request id needs to
     /// travel with it to say so. That is a property of the slot's lock, and it is
     /// why this is not a general-purpose multiplexer.
+    /// [`Self::round_trip`], with the deadline starting only once the body has been sent.
+    ///
+    /// Two phases, and the split is the feature:
+    ///
+    /// - **Until `body_done`**, there is no deadline. The exchange thread is pulling the body from
+    ///   the client through the caller's closure, and how long that takes is the client's business.
+    ///   This loop polls the flag on a short tick rather than blocking on the answer channel, because
+    ///   the answer cannot arrive before the body does and the flag is the only signal that it has.
+    /// - **After `body_done`**, the ordinary `timeout` applies, measured from that moment. That is the
+    ///   deadline the pool's configuration has always meant: how long a *worker* may take.
+    ///
+    /// A worker that dies mid-upload surfaces as `Disconnected` in the first phase, which is reported
+    /// as the failure it is rather than waited out.
+    fn round_trip_streaming(
+        &mut self,
+        exchange: Exchange,
+        timeout: Duration,
+        body_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::result::Result<Option<Completed>, (RequestStage, WorkerError)> {
+        if self.ended {
+            return Err((
+                RequestStage::Reading,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            ));
+        }
+
+        let Some(work) = self.work.as_ref() else {
+            return Err((
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has already ended".to_string()),
+            ));
+        };
+
+        work.send(exchange).map_err(|_| {
+            self.ended = true;
+            (
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            )
+        })?;
+
+        // Phase one: the client is still uploading. Polled rather than blocked on the answer, because
+        // there is no answer to wait for yet and the only thing that can change is the flag.
+        while !body_done.load(std::sync::atomic::Ordering::Acquire) {
+            match self.answers.recv_timeout(BODY_TICK) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.ended = true;
+                    return Err((
+                        RequestStage::Reading,
+                        WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+                    ));
+                }
+            }
+        }
+
+        // Phase two: the body is in, so the worker owes an answer within its own deadline.
+        match self.answers.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                Err((RequestStage::Reading, WorkerError::Timeout(timeout)))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.ended = true;
+                Err((
+                    RequestStage::Reading,
+                    WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+                ))
+            }
+        }
+    }
+
     fn round_trip(
         &mut self,
         exchange: Exchange,

@@ -56,6 +56,14 @@ pub enum WorkerError {
     #[error("the worker closed its output: {0}")]
     Closed(String),
 
+    /// The request body was larger than this deployment accepts.
+    ///
+    /// A variant of its own rather than a [`Self::Closed`] with a message, because the two map to
+    /// different HTTP statuses: a worker that vanished is a `502`, while a client that sent more
+    /// than `max_body_bytes` is a `413` and the client is the party that can act on it.
+    #[error("the request body exceeded {limit} bytes")]
+    BodyTooLarge { limit: usize },
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -85,6 +93,12 @@ impl WorkerError {
     /// consequence — the pool must replace the worker — and because a caller that
     /// needed to tell them apart would have to ask why, which the error already
     /// says.
+    ///
+    /// [`WorkerError::BodyTooLarge`] is **fatal here and only here**: it did not come from the wire
+    /// at all, it came from the front-end's own limit check while feeding a streamed body. The
+    /// worker is therefore mid-body, waiting for a `LAST` that will never be written, and it must be
+    /// replaced. The HTTP status the client sees is `413`, not the `502` a protocol failure produces
+    /// — that mapping is the front-end's, not this predicate's.
     pub fn is_fatal(&self) -> bool {
         match self {
             WorkerError::UnsupportedVersion { .. }
@@ -96,6 +110,7 @@ impl WorkerError {
             | WorkerError::NotUtf8(_)
             | WorkerError::Json(_)
             | WorkerError::PayloadTooLarge { .. }
+            | WorkerError::BodyTooLarge { .. }
             | WorkerError::Io(_)
             | WorkerError::Closed(_)
             | WorkerError::Timeout(_) => true,

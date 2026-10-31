@@ -507,6 +507,45 @@ impl Backend {
         }
     }
 
+    /// Ask this backend for a response to a request whose body is still arriving.
+    ///
+    /// Only a worker pool can take one. A CGI process cannot: its environment declares the body's
+    /// length in `CONTENT_LENGTH` before `STDIN` is written, and the process will not read a byte
+    /// until it has it. An `upstream` never reaches here because the front-end streams to an origin
+    /// on its own path, before any of this is asked.
+    pub fn request_streaming(
+        &self,
+        request: &Request,
+        chunks: Box<
+            dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send,
+        >,
+    ) -> Result<Response> {
+        match self {
+            Backend::Worker { pool, .. } => pool.request_streaming(request, chunks),
+            Backend::External { name, .. } | Backend::SpawnCgi { name, .. } => {
+                Err(ServerError::WrongProtocol {
+                    backend: name.clone(),
+                })
+            }
+            Backend::Upstream { name, .. } => Err(ServerError::WrongProtocol {
+                backend: name.clone(),
+            }),
+        }
+    }
+
+    /// Whether this backend accepts a request body whose length it is not told.
+    pub fn streams_request_bodies(&self) -> bool {
+        match self {
+            Backend::Worker { pool, .. } => pool.streams_request_bodies(),
+            // A CGI process needs `CONTENT_LENGTH` before it reads `STDIN`, so there is no way to
+            // hand it a body of unknown length. `false` is not a limitation being reported, it is
+            // the protocol.
+            Backend::External { .. } | Backend::SpawnCgi { .. } => false,
+            // An origin is streamed to on its own path, never through this question.
+            Backend::Upstream { .. } => false,
+        }
+    }
+
     /// Ask this backend for a response, relaying the body when it does not fit in `buffer`.
     ///
     /// **All three CGI-shaped kinds relay; an upstream says so by returning a whole response.** A

@@ -95,9 +95,7 @@ use volucer_fcgi::{Request, Response};
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
 use volucer_worker::message::MetricRecord;
-use volucer_worker::{
-    Ack, Control, HelloAck, JobHeader, MessageType, RequestHeaderJson, WorkerError, UNSOLICITED,
-};
+use volucer_worker::{Ack, Control, HelloAck, JobHeader, MessageType, WorkerError, UNSOLICITED};
 
 mod exchange;
 mod handshake;
@@ -795,6 +793,173 @@ impl WorkerPool {
             .iter()
             .map(|slot| slot.hello.no_checksum)
             .collect()
+    }
+
+    /// Serve one request whose body is still arriving, forwarding it as it comes.
+    ///
+    /// Returns only when the **response** is complete, exactly like [`Self::request`]: the request
+    /// body is what is streamed, not the response — that is [`Self::request_relayed`]'s job, and
+    /// conflating the two would make `max_body_bytes` and `stream_threshold_bytes` describe the same
+    /// request in opposite directions.
+    ///
+    /// # Why this takes a closure rather than a buffer
+    ///
+    /// The body crosses a thread boundary here: this function runs on the exchange thread's
+    /// caller, and the bytes arrive on a runtime thread reading the client's socket. A closure that
+    /// **pulls** is what avoids a second thread: the exchange thread calls it and blocks until the
+    /// next piece is ready, so the HTTP front-end's bounded channel is the backpressure and the
+    /// client feels it. A `Vec` would put the whole upload in memory, which is the bug this exists
+    /// to remove.
+    ///
+    /// # Preconditions
+    ///
+    /// The caller must have checked [`Self::streams_request_bodies`] and must pass a head with no
+    /// `body_len` and with `flags::STREAMED` set. Both are the front-end's responsibility because it
+    /// is the only place that knows the request will not have to be retried: a streamed body cannot
+    /// be replayed, since its bytes were consumed from a socket that is now empty.
+    pub fn request_streaming(
+        &self,
+        request: &Request,
+        chunks: Box<
+            dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send,
+        >,
+    ) -> Result<Response> {
+        self.attempt_streaming(request, chunks)
+            .map_err(|failure| failure.source)
+    }
+
+    /// One try at a streamed request.
+    ///
+    /// **Deliberately no retry**, unlike [`Self::attempt`]'s caller. A buffered body can be sent a
+    /// second time because the pool still holds it; a streamed one was consumed from the client's
+    /// socket frame by frame and there is nothing left to send. A retry here would deliver a
+    /// truncated body and claim success.
+    fn attempt_streaming(
+        &self,
+        request: &Request,
+        chunks: Box<
+            dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send,
+        >,
+    ) -> std::result::Result<Response, FailedAttempt> {
+        let queued_at = Instant::now();
+        let lease = self.acquire().map_err(|source| FailedAttempt {
+            source,
+            retryable: false,
+        })?;
+        let index = lease.index();
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Checked *before* the head goes out, and this is the one place it matters most: a worker
+        // that cannot read a streamed body would either refuse the frame (and the sender would then
+        // block forever on a body nobody drains) or, if it silently read `body_len` as absent, treat
+        // the first `BODY` frame as the answer to its request. So a slot that is not capable is
+        // reported rather than used, and the front-end only calls this when the whole pool is.
+        if !slot.hello.stream_request_body {
+            return Err(FailedAttempt {
+                source: ServerError::NoWorker {
+                    backend: self.name.clone(),
+                },
+                retryable: false,
+            });
+        }
+
+        if !slot.is_available() {
+            tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
+            let outcome = respawn(
+                &self.name,
+                &self.spec,
+                index as u32,
+                &self.guard,
+                self.call_handler.as_ref(),
+                &mut slot,
+            );
+            drop(slot);
+            return Err(FailedAttempt {
+                source: match outcome {
+                    Ok(()) => ServerError::NoWorker {
+                        backend: self.name.clone(),
+                    },
+                    Err(source) => source,
+                },
+                retryable: false,
+            });
+        }
+
+        let head = {
+            let translated = borrowed_request(request);
+            let draft = translated.draft(None);
+            encode_head(&draft)
+        };
+
+        let outcome = match slot.exchange.as_mut() {
+            Some(exchange) => exchange.request_streaming(head, chunks, self.spec.request_timeout),
+            None => Err((
+                RequestStage::Sending,
+                WorkerError::Closed("the worker has no exchange".to_string()),
+            )),
+        };
+
+        match outcome {
+            Ok(response) => {
+                // The worker has read this body to `LAST` and written its whole answer, so its pipes
+                // are at a frame boundary and the slot goes back into rotation exactly as a buffered
+                // request leaves it. `after_response` is the same recycling decision — a worker past
+                // `max_requests` or over its memory ceiling is replaced here, not later.
+                if !response.metrics.is_empty() {
+                    self.stash_metrics(response.metrics.to_vec());
+                }
+                self.after_response(&mut slot, &response);
+                let duration = started.elapsed();
+                drop(slot);
+                drop(lease);
+                Ok(render(response, duration))
+            }
+            Err((stage, source)) => {
+                if source.is_fatal() {
+                    slot.terminate();
+                }
+                // `may_retry` is not consulted, and `stage` is kept only so a log line can say where
+                // it broke: a streamed request body has been consumed from the client's socket, so
+                // there is nothing left to replay. `retryable: false` is the honest answer whatever
+                // the verb is.
+                let _ = stage;
+                drop(slot);
+                Err(FailedAttempt {
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                    retryable: false,
+                })
+            }
+        }
+    }
+
+    /// Whether this pool can stream a request body instead of buffering it.
+    ///
+    /// `true` only when **every** slot advertised `stream_request_body`, because a caller that got
+    /// `true` here and then landed on a slot that did not would have to fall back after the body was
+    /// already half-read — and a body can only be drained once. The conservative answer costs one
+    /// `Vec` per upload on a mixed pool, which is exactly what happened before this existed;
+    /// the optimistic one would corrupt a request.
+    ///
+    /// A pool whose workers are all older than the capability answers `false` for the same reason,
+    /// which is what makes this safe to ship before every SDK has caught up.
+    pub fn streams_request_bodies(&self) -> bool {
+        let slots = self.locked_slots();
+        !slots.is_empty() && slots.iter().all(|slot| slot.hello.stream_request_body)
     }
 
     /// This pool's workers, one entry each, for `workers.list`.
@@ -2112,11 +2277,8 @@ impl PoolEnding {
 /// compile. Two copies of three lines is the price of not threading a lifetime through a callback.
 fn encode_relayed_head(request: &Request) -> Vec<u8> {
     let translated = borrowed_request(request);
-    let draft = translated.draft();
-    encode_head(&RequestHeaderJson {
-        body_len: request.body.len() as u64,
-        ..draft
-    })
+    let draft = translated.draft(Some(request.body.len() as u64));
+    encode_head(&draft)
 }
 
 /// A failed attempt at one request, and whether it may be made again.
@@ -2165,11 +2327,8 @@ fn invoke(
             // The head is encoded first, while the CGI environment it borrows is still alive.
             let head = {
                 let translated = borrowed_request(request);
-                let draft = translated.draft();
-                encode_head(&RequestHeaderJson {
-                    body_len: request.body.len() as u64,
-                    ..draft
-                })
+                let draft = translated.draft(Some(request.body.len() as u64));
+                encode_head(&draft)
             };
             exchange.request(head, &request.body, timeout)
         }

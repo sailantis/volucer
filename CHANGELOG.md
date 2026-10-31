@@ -9,6 +9,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A worker-mode request body is streamed to the worker, so a large upload no longer costs a large
+  amount of server memory.** When a worker advertises `stream_request_body` in its `HELLO_ACK`, the
+  server forwards the body frame by frame as the client produces it instead of buffering it first.
+  The `REQUEST` head then carries no `body_len` and sets `STREAMED`, and `LAST` on the final `BODY`
+  frame is the only end signal — the mirror of a streamed response.
+
+  Measured against the built binary, with a **256 MiB** `Transfer-Encoding: chunked` upload:
+
+  | Worker | Server peak growth |
+  | --- | --- |
+  | advertises `stream_request_body` | **2.6 MiB** |
+  | does not (the buffered path) | **513 MiB** |
+
+  An SDK that predates the field decodes it as `false`, keeps receiving `body_len` in every
+  `REQUEST`, and behaves exactly as before — the buffered column *is* that path, unchanged. The
+  capability is advertised by the worker rather than offered by the server because the opposite
+  direction would desynchronise every request: a head with no `body_len` reads as `0` to an old SDK,
+  which would then take the first `BODY` frame for its own response. A pool answers "yes" only when
+  every slot agreed, since a body can only be drained once.
+
+  Two behaviours follow from it, and both are documented:
+
+  - **A streamed request is never retried**, because its bytes were consumed from the client's
+    socket. A worker that dies mid-upload is replaced and the client gets a `502`.
+  - **`request_timeout_ms` starts when the body is complete**, not when it starts arriving, so a
+    slow upload is not a `504`. The client's own connection bounds the upload instead.
+
+  A CGI backend is never streamed to — `php-cgi` reads `CONTENT_LENGTH` before touching `STDIN` —
+  and `upstream` already streamed both ways. A body over `server.max_body_bytes` is still refused
+  with `413`, now while it is arriving rather than after it has been held, and the streaming pump's
+  bound is four frames (256 KiB) rather than the body's size.
+
+  The PHP, Python and Ruby SDKs all advertise the capability and read the streamed form; the
+  framework bridges reach it through `$request->body` unchanged.
+
 - **A worker-mode request can carry a multipart upload, and the file is spooled to disk as it
   streams in.** The PHP SDK now parses `application/x-www-form-urlencoded` and
   `multipart/form-data` itself, so `$_POST` and `$_FILES` are populated exactly as a `php-cgi`

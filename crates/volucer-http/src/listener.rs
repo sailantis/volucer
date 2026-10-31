@@ -17,12 +17,15 @@
 //! # Request body handling
 //!
 //! The body is read into memory before dispatch, up to
-//! [`HttpLimits::max_body_bytes`]. That is a deliberate limit rather than a
-//! shortcut: the CGI protocol carries a body as one `STDIN` stream preceded by
-//! its length, and `php-cgi` needs `CONTENT_LENGTH` before it will read any of
-//! it, so a streaming pass-through is not available. Multipart parsing is not
-//! done here either — the bytes go to PHP, which owns `$_FILES` and
-//! `is_uploaded_file()`.
+//! [`HttpLimits::max_body_bytes`], **unless the backend can take it as it arrives**. A CGI
+//! process cannot: the CGI protocol carries a body as one `STDIN` stream preceded by its length,
+//! and `php-cgi` needs `CONTENT_LENGTH` before it will read any of it, so a streaming pass-through
+//! is not available *for CGI*. A worker can, and advertises `stream_request_body` at handshake —
+//! then the frames are forwarded from the client's socket to the worker's pipe through a bounded
+//! channel, and a 256 MiB upload costs a few hundred kilobytes rather than 256.
+//!
+//! Multipart parsing is not done here either way — the bytes go to the SDK, or to PHP, which owns
+//! `$_FILES` and `is_uploaded_file()`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -2829,7 +2832,23 @@ async fn prepare(
         ));
     }
 
-    let body = read_body(body, front_end.limits.max_body_bytes).await?;
+    // **A worker that can take a body of unknown length is handed it as it arrives**, and this is
+    // the whole of request-body streaming.
+    //
+    // Streaming is not a property of the body but of *both* ends: the bytes can be forwarded
+    // incrementally only if the party receiving them does not need the length first. A CGI process
+    // does — its environment carries `CONTENT_LENGTH` and it will not read `STDIN` without it — so
+    // `streams_request_bodies` answers `false` for every CGI backend, and those keep the buffered
+    // path below byte for byte. An `upstream` took its own branch above and never reaches here.
+    //
+    // The memory is the point: without this a 1 GB upload is 1 GB of server heap before the
+    // application sees a byte.
+    let limit = front_end.limits.max_body_bytes;
+    let streaming = front_end.dispatcher.streams_request_bodies(&backend);
+    let (body, pump) = match (body, streaming) {
+        (Payload::Streamed(body), true) => (None, Some(BodyPump::start(body, limit))),
+        (body, _) => (Some(read_body(body, limit).await?), None),
+    };
 
     // A route that proves its pattern names a script may skip the router's own `stat`:
     let skips_stat = route.is_some_and(|route| {
@@ -2866,12 +2885,35 @@ async fn prepare(
     // inside the blocking task: it is a property of the configuration generation the request is
     // being served under, and a streamed response has to be started under the same one.
     let stream_threshold = front_end.limits.max_stream_bytes;
+    let streaming_dispatch = pump.is_some();
     let blocking =
         tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
-            let mut cgi_request = if skips_stat {
+            let mut cgi_request = if streaming_dispatch {
+                // The body is on the channel, so the frame carries only the client's own declared
+                //length. `None` for a chunked upload, which then has no `CONTENT_LENGTH` — the
+                //honest answer rather than a fabricated one.
+                let declared_len = declared_body_len(&parts);
+                if skips_stat {
+                    to_cgi_routed_streaming(
+                        &parts,
+                        &routing,
+                        front_end.server_port,
+                        remote_addr.as_deref(),
+                        declared_len,
+                    )?
+                } else {
+                    to_cgi_streaming(
+                        &parts,
+                        &routing,
+                        front_end.server_port,
+                        remote_addr.as_deref(),
+                        declared_len,
+                    )?
+                }
+            } else if skips_stat {
                 to_cgi_routed(
                     &parts,
-                    body,
+                    body.unwrap_or_default(),
                     &routing,
                     front_end.server_port,
                     remote_addr.as_deref(),
@@ -2879,7 +2921,7 @@ async fn prepare(
             } else {
                 to_cgi(
                     &parts,
-                    body,
+                    body.unwrap_or_default(),
                     &routing,
                     front_end.server_port,
                     remote_addr.as_deref(),
@@ -2910,15 +2952,25 @@ async fn prepare(
             // **A large response is relayed rather than returned**, and the threshold is the
             // deployment's own. That is the only branch between the two: a caller that gets
             // `Relayed` has a header block and a body still being produced.
-            front_end
-                .dispatcher
-                .dispatch_to_relayed(
-                    &selected,
-                    &cgi_request,
-                    stream_threshold,
-                    volucer_fcgi::Relay::for_threshold(stream_threshold),
-                )
-                .map_err(BackendFailure::Backend)
+            match pump {
+                // The request body is on the channel, so the exchange thread pulls it a frame at a
+                // time. `request_streaming` returns a complete *response*, so it is wrapped as
+                // `Buffered` and the relay threshold above still applies to what came back.
+                Some(pump) => front_end
+                    .dispatcher
+                    .dispatch_to_streaming(&selected, &cgi_request, pump.into_closure())
+                    .map(volucer_server::Delivery::Buffered)
+                    .map_err(BackendFailure::Backend),
+                None => front_end
+                    .dispatcher
+                    .dispatch_to_relayed(
+                        &selected,
+                        &cgi_request,
+                        stream_threshold,
+                        volucer_fcgi::Relay::for_threshold(stream_threshold),
+                    )
+                    .map_err(BackendFailure::Backend),
+            }
         });
 
     let response = match blocking.await {
@@ -2930,6 +2982,14 @@ async fn prepare(
         // the failure is "the call did not happen", which is a *protocol* fact rather than a
         // component one, so the mapping is chosen by protocol before it is chosen by component.
         Ok(Err(BackendFailure::Backend(err))) if is_grpc => return Err(grpc_failure(err)),
+        // **A client that sent too much is told so, and gets `413`.** Every other worker failure is a
+        // `502`, but this one is not the backend's fault: the client exceeded `max_body_bytes` and is
+        // the only party that can act on it. Reporting a gateway error would blame the application
+        // for a decision this server made.
+        Ok(Err(BackendFailure::Backend(volucer_server::ServerError::WorkerProtocol {
+            source: volucer_worker::WorkerError::BodyTooLarge { limit },
+            ..
+        }))) => return Err(HttpError::BodyTooLarge { limit }),
         Ok(Err(BackendFailure::Backend(err))) => return Err(map_server_error(err)),
         Err(err) => {
             return Err(HttpError::BadGateway(format!(
@@ -3297,6 +3357,102 @@ async fn read_body(body: Payload, limit: usize) -> Result<Vec<u8>> {
     }
 }
 
+/// The length the *client* declared, for a request whose body is not in hand.
+///
+/// `None` when it declared none, which is what a `Transfer-Encoding: chunked` upload does. Returning
+/// `None` rather than `0` is load-bearing: `build_params_for` omits `CONTENT_LENGTH` entirely for a
+/// zero length, so a chunked upload gets no variable instead of a wrong one, and PHP's SDK — which
+/// builds the same value from the bytes it actually receives — is not contradicted.
+fn declared_body_len(parts: &hyper::http::request::Parts) -> Option<u64> {
+    parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.trim().parse().ok())
+}
+
+/// How many request-body frames may be queued between the socket and a worker.///
+/// Four of [`MAX_BODY_CHUNK`], so the queue holds at most 256 KiB — enough that a worker which is a
+/// frame behind does not stall the read, small enough that the backpressure reaches the client while
+/// it still matters. An unbounded queue would accept a whole upload into memory, which is the bug
+/// this feature exists to remove.
+const STREAM_BODY_FRAMES: usize = 4;
+
+/// A request body being forwarded to a worker as the client produces it.
+///
+/// The join between the two halves of request-body streaming: an async pump on the runtime reads the
+/// client's `Incoming` and pushes frames into a **bounded** `tokio::sync::mpsc` channel, and the
+/// pool's exchange thread drains it with `blocking_recv`. Bounded is the whole feature — when the
+/// worker falls behind, `send().await` parks the pump, the client's socket stops being polled, and
+/// its own buffer fills. An unbounded channel would accept the whole upload into memory and
+/// reproduce the bug this exists to remove.
+struct BodyPump {
+    frames: tokio::sync::mpsc::Receiver<std::result::Result<Vec<u8>, volucer_worker::WorkerError>>,
+}
+
+impl BodyPump {
+    /// Start reading `body`, refusing anything over `limit` in total.
+    fn start(body: Incoming, limit: usize) -> Self {
+        let (sender, frames) = tokio::sync::mpsc::channel(STREAM_BODY_FRAMES);
+        tokio::spawn(async move {
+            let mut body = body;
+            let mut total = 0usize;
+            while let Some(frame) = body.frame().await {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        // The failure travels **in band** rather than being swallowed by a dropped
+                        // sender: a dropped sender and a finished body are both `None`, and a worker
+                        // told the body ended when it was truncated would answer it as complete.
+                        let _ = sender
+                            .send(Err(volucer_worker::WorkerError::Closed(format!(
+                                "reading the request body: {err}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
+                total = total.saturating_add(data.len());
+                if total > limit {
+                    // Its own variant, so the front-end can answer `413` rather than the `502` a
+                    // protocol failure produces. The client is the one who can act on this.
+                    let _ = sender
+                        .send(Err(volucer_worker::WorkerError::BodyTooLarge { limit }))
+                        .await;
+                    return;
+                }
+                // Parks while the worker is behind. That is the backpressure.
+                if sender.send(Ok(data.to_vec())).await.is_err() {
+                    // The pool gave up on this request. Nothing more can be delivered, and the slot
+                    // is being killed, so stop reading rather than drain a body nobody wants.
+                    return;
+                }
+            }
+            // Dropping the sender is the "body ended" signal, and every exit above does it too.
+        });
+        BodyPump { frames }
+    }
+
+    /// The pull closure the exchange thread drives.
+    ///
+    /// `blocking_recv` is called on a blocking thread, which is the one place it may be used: it is
+    /// `tokio`'s bridge from a synchronous consumer to an async producer, and the blocking is exactly
+    /// the backpressure described on [`BodyPump`].
+    fn into_closure(
+        mut self,
+    ) -> Box<dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send>
+    {
+        Box::new(move || match self.frames.blocking_recv() {
+            Some(Ok(bytes)) => Ok(Some(bytes)),
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
+        })
+    }
+}
+
 /// The counting half of [`read_body`], over any `hyper` body.
 ///
 /// Separate from `read_body` so the frame loop can be driven from a test with a `Full<Bytes>`
@@ -3361,9 +3517,97 @@ pub fn to_cgi_routed(
     to_cgi_with(parts, body, routing, server_port, remote_addr, true)
 }
 
+/// Build the CGI request for a **streamed** body, whose length is the client's own declaration.
+///
+/// Identical to [`to_cgi`] except for two things that follow from the body not being in hand:
+///
+/// - `RequestInfo::body_len` is the client's `Content-Length`, or `0` when it sent none (a chunked
+///   upload). `build_params_for` therefore emits a `CONTENT_LENGTH` exactly when the client declared
+///   one, which is the honest answer — PHP's SDK builds the same value from the bytes it receives,
+///   and inventing a number here would make the two disagree.
+/// - `volucer_fcgi::Request::body` is empty, because the bytes are still on the socket. The worker
+///   path never reads it; a CGI backend is never offered a streamed request at all (see
+///   `Backend::streams_request_bodies`).
+#[doc(hidden)]
+pub fn to_cgi_routed_streaming(
+    parts: &hyper::http::request::Parts,
+    routing: &Routing,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
+    declared_len: Option<u64>,
+) -> Result<volucer_fcgi::Request> {
+    to_cgi_streaming_with(parts, routing, server_port, remote_addr, declared_len, true)
+}
+
+#[doc(hidden)]
+pub fn to_cgi_streaming(
+    parts: &hyper::http::request::Parts,
+    routing: &Routing,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
+    declared_len: Option<u64>,
+) -> Result<volucer_fcgi::Request> {
+    to_cgi_streaming_with(
+        parts,
+        routing,
+        server_port,
+        remote_addr,
+        declared_len,
+        false,
+    )
+}
+
+fn to_cgi_streaming_with(
+    parts: &hyper::http::request::Parts,
+    routing: &Routing,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
+    declared_len: Option<u64>,
+    allow_no_script: bool,
+) -> Result<volucer_fcgi::Request> {
+    let len = declared_len
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(0);
+    build_cgi(
+        parts,
+        Vec::new(),
+        len,
+        routing,
+        server_port,
+        remote_addr,
+        allow_no_script,
+    )
+}
+
 fn to_cgi_with(
     parts: &hyper::http::request::Parts,
     body: Vec<u8>,
+    routing: &Routing,
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
+    allow_no_script: bool,
+) -> Result<volucer_fcgi::Request> {
+    let body_len = body.len();
+    build_cgi(
+        parts,
+        body,
+        body_len,
+        routing,
+        server_port,
+        remote_addr,
+        allow_no_script,
+    )
+}
+
+/// The shared half of every `to_cgi*`: the environment, the route, and the frame.
+///
+/// `body_len` is passed rather than read from `body` because the streamed case has an empty body and
+/// a length the client declared — the two are genuinely separate facts, and conflating them is how a
+/// streamed request would end up telling PHP it had no body.
+fn build_cgi(
+    parts: &hyper::http::request::Parts,
+    body: Vec<u8>,
+    body_len: usize,
     routing: &Routing,
     server_port: Option<u16>,
     remote_addr: Option<&str>,
@@ -3398,7 +3642,7 @@ fn to_cgi_with(
     let host = request_host(&parts.headers, &parts.uri);
     let (server_name, server_port) = split_host(host, server_port);
 
-    let body_len = body.len();
+    let body_len_used = body_len;
     let mut headers: Vec<(String, String)> = parts
         .headers
         .iter()
@@ -3438,7 +3682,7 @@ fn to_cgi_with(
         remote_addr: remote_addr.map(str::to_string),
         server_name,
         server_port,
-        body_len,
+        body_len: body_len_used,
         // Nothing can arrive here over HTTPS yet.
         https: false,
     };
