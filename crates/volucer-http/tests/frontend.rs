@@ -1545,8 +1545,14 @@ document_root = {app:?}
     let stop = std::sync::atomic::AtomicBool::new(false);
     let bodies = std::sync::Mutex::new(Vec::new());
     let samples = std::sync::atomic::AtomicUsize::new(0);
+    let answers = std::sync::atomic::AtomicUsize::new(0);
+    // **The property the post-reload wait is stated in terms of: a request served from the new
+    // generation.** A counter would be satisfied by a round trip that started before the swap and
+    // finished after it, which is the one interleaving indistinguishable from a reload that never
+    // happened.
+    let second_seen = std::sync::atomic::AtomicBool::new(false);
 
-    std::thread::scope(|scope| {
+    let samples_before = std::thread::scope(|scope| {
         // The invariant sampler. Every trip reads a site, its routing and its static layer *from
         // one snapshot* and checks they describe the same place. A mixture is the only way those
         // three can disagree, and they can only disagree if the one pointer becomes three.
@@ -1583,36 +1589,93 @@ document_root = {app:?}
             let address = address.clone();
             let stop = &stop;
             let bodies = &bodies;
+            let answers = &answers;
+            let second_seen = &second_seen;
             scope.spawn(move || {
                 let mut local = Vec::new();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let answer = get_as(&address, "app.test", "/whoami.txt");
-                    local.push((answer.status, answer.text()));
+                    let body = answer.text();
+                    if body == "second" {
+                        second_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    local.push((answer.status, body));
+                    answers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 bodies.lock().expect("not poisoned").extend(local);
             });
         }
 
         // Let every reader get into its loop, then apply the reload between them.
-        std::thread::sleep(Duration::from_millis(100));
+        //
+        // **The sleeps and the two thresholds this used to assert (`samples > 100`,
+        // `bodies.len() > 20`) were all statements about how fast the machine is, and they were the
+        // flake.** Eight concurrent copies of this suite failed two or three times per round on
+        // runs that were entirely correct: the reload landed, every answer was `200` and every body
+        // was `first` or `second`, and the test called the run broken because a loaded box
+        // completed fewer than twenty round trips in 200 ms. What the test actually needs is that
+        // work happened on *both sides* of the reload, and that is a fact that can be waited for
+        // rather than guessed at.
+        //
+        // So: a completed request **and** a completed sample, each proving a different half. The
+        // request proves the old generation was actually being served; the sample proves the
+        // invariant loop was already racing. Waiting on only one of them is how this test reported
+        // `first=false second=true` — the reload landed before a single request had returned.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while (samples.load(std::sync::atomic::Ordering::Relaxed) == 0
+            || answers.load(std::sync::atomic::Ordering::Relaxed) == 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let samples_before = samples.load(std::sync::atomic::Ordering::Relaxed);
+        let answers_before = answers.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            samples_before > 0 && answers_before > 0,
+            "30s produced no work to race against: {samples_before} sample(s), {answers_before} answer(s)"
+        );
         let _replaced = reload.apply(
             Sites::from_config(&config_for(&second), &second),
-            std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()), std::collections::BTreeMap::new());
-        std::thread::sleep(Duration::from_millis(100));
+            std::sync::Arc::new(volucer_http::GrpcGrantsMap::new()),
+            std::collections::BTreeMap::new(),
+        );
+        // **Then wait for the reload to be observable, which is a request that ran under it.**
+        // Waiting on a counter alone would be satisfied by a round trip that started before the swap
+        // and finished after it — the one interleaving indistinguishable from a reload that never
+        // happened. The bound is generous because this wait is expected to end in microseconds and
+        // an oversubscribed machine may take a moment to schedule the request thread at all; what
+        // it must not do is end before the *property* is true, which is why the condition is the
+        // property and not a duration.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !second_seen.load(std::sync::atomic::Ordering::Relaxed)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        samples_before
     });
 
     let samples = samples.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
-        samples > 100,
-        "the sampler must actually have raced the reload, or this asserts nothing: {samples} \
-         sample(s)"
+        samples > samples_before,
+        "the sampler must have been running on both sides of the reload, or the invariant above \
+         proves nothing: {samples_before} before, {samples} in total"
     );
 
     let bodies = bodies.into_inner().expect("not poisoned");
+
+    // **A request is served from one generation or the other, and both are seen.** The previous
+    // assertion accepted either body, which means a reload that never reached a single request
+    // would pass it — `first` alone satisfies it. The two names exist precisely so that "the reload
+    // took effect" is observable here, and the sequential test above is not the only place it can
+    // be checked.
+    let saw_first = bodies.iter().any(|(_, body)| body == "first");
+    let saw_second = bodies.iter().any(|(_, body)| body == "second");
     assert!(
-        bodies.len() > 20,
-        "the fixture must actually have run requests across the reload: {} answer(s)",
+        saw_first && saw_second,
+        "the requests must span the reload — one saw `first` and another `second` — or this \
+         asserts nothing. {} answer(s), first={saw_first} second={saw_second}",
         bodies.len()
     );
     for (status, body) in &bodies {
