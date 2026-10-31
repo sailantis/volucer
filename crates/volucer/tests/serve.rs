@@ -659,14 +659,7 @@ fn second_loopback_skip_reason() -> Option<String> {
 macro_rules! require_sdk {
     () => {
         if let Some(reason) = sdk_skip_reason() {
-            if std::env::var("VOLUCER_E2E")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(false)
-            {
-                panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
-            }
-            eprintln!("skipping: {reason}");
-            return;
+            skip_or_fail!(reason);
         }
     };
 }
@@ -675,15 +668,70 @@ macro_rules! require_sdk {
 macro_rules! require_second_loopback {
     () => {
         if let Some(reason) = second_loopback_skip_reason() {
-            if std::env::var("VOLUCER_E2E")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(false)
-            {
-                panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
-            }
-            eprintln!("skipping: {reason}");
-            return;
+            skip_or_fail!(reason);
         }
+    };
+}
+
+/// Leave a test unrun, unless something says a skip is a failure.
+///
+/// **`VOLUCER_E2E` is what makes the difference**, and the reason is libtest: it hides the stderr of
+/// a passing test, so a skipped test and a test that ran are the same green line. Five suites in this
+/// repository can skip — a missing binary, a missing `php`, a host with no second loopback address, a
+/// `unix` host the job is not on — and a CI run that skipped all of them would report the same
+/// success as one that exercised them.
+macro_rules! skip_or_fail {
+    ($reason:expr) => {{
+        let reason = $reason;
+        if std::env::var("VOLUCER_E2E")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
+            panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
+        }
+        eprintln!("skipping: {reason}");
+        return;
+    }};
+}
+
+/// Bind the built `volucer` binary, or leave the test unrun.
+///
+/// The identifier is a **parameter**, not something the macro invents: a `let` inside a
+/// `macro_rules!` body is hygienic, so a name introduced there would not be visible to the code
+/// following the call. Passing it in keeps the caller's spelling, which is the only version that
+/// works.
+///
+/// A macro that *binds* rather than one that only checks, because every use needs the path
+/// afterwards and fifty call sites writing their own `let … else` is fifty places for the message to
+/// drift — three spellings of it had already appeared before this existed, and each one was a skip
+/// nobody could grep for.
+macro_rules! require_binary {
+    ($name:ident) => {
+        let Some($name) = volucer_binary() else {
+            skip_or_fail!("the volucer binary is not built (run `cargo build`)");
+        };
+    };
+}
+
+/// Bind the `php` interpreter tests drive, or leave the test unrun.
+///
+/// Named `_php` at every call site because the checks that need it only need to know it is *there* —
+/// the command string they build says `php`. A macro that checks presence and binds nothing would
+/// lose the path a future test needs, so it binds and the caller ignores it.
+macro_rules! require_php {
+    ($name:ident) => {
+        let Some($name) = find_php() else {
+            skip_or_fail!("no php on PATH");
+        };
+    };
+}
+
+/// Bind the `php-cgi` binary tests drive, or leave the test unrun.
+macro_rules! require_php_cgi {
+    ($name:ident) => {
+        let Some($name) = find_php_cgi() else {
+            skip_or_fail!("no php-cgi on PATH");
+        };
     };
 }
 
@@ -748,14 +796,8 @@ fn start_dual_listener_server(binary: &Path, root: &Path) -> Option<Server> {
 
 #[test]
 fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_binary!(binary);
+    require_php!(_php);
 
     let root = std::env::temp_dir().join(format!("volucer-http-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -811,10 +853,7 @@ fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
 #[test]
 fn a_site_bound_to_an_address_is_not_reachable_by_name_elsewhere() {
     require_second_loopback!();
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-site-binding-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -887,10 +926,7 @@ document_root = "{root}/internal"
 #[test]
 fn an_address_only_site_answers_on_its_address_alone() {
     require_second_loopback!();
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-address-only-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1064,14 +1100,8 @@ fn parse_http_response(raw: &[u8]) -> HttpResponse {
 /// whether or not the route told it to. Two paths agreeing is not a test of which one ran.
 #[test]
 fn a_route_policy_decides_which_layer_answers() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     // Two *separate* runs of ports, not one shared value: the HTTP listener binds one and
     // `spawn_cgi` binds the next, so reusing the same number for both would have the backend
     // try to listen on the port the front-end already holds.
@@ -1166,14 +1196,8 @@ backend = "cgi"
 /// passed through even when asked for.
 #[test]
 fn a_backend_response_is_compressed_only_when_it_is_asked_for() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
 
     let root = std::env::temp_dir().join(format!("volucer-compress-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1309,14 +1333,8 @@ base_port = {base_port}
 
 #[test]
 fn serve_answers_a_fastcgi_request_from_a_real_php_process() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     let root = std::env::temp_dir().join(format!("volucer-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
@@ -1362,14 +1380,8 @@ echo "BODY=", file_get_contents('php://input');
 
 #[test]
 fn serve_keeps_serving_across_several_requests() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     let root = std::env::temp_dir().join(format!("volucer-smoke-many-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
@@ -1399,14 +1411,8 @@ fn serve_keeps_serving_across_several_requests() {
 
 #[test]
 fn the_nginx_get_values_probe_is_answered_without_ending_the_connection() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     let root = std::env::temp_dir().join(format!("volucer-smoke-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
@@ -1482,14 +1488,8 @@ fn the_nginx_get_values_probe_is_answered_without_ending_the_connection() {
 
 #[test]
 fn a_missing_script_is_an_error_response_not_a_hang() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     let root = std::env::temp_dir().join(format!("volucer-smoke-missing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
@@ -1521,14 +1521,8 @@ fn a_missing_script_is_an_error_response_not_a_hang() {
 /// all exercised together.
 #[test]
 fn serve_reaches_a_persistent_php_worker_over_the_volucer_protocol() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_binary!(binary);
+    require_php!(_php);
     let worker = example_worker();
     if !worker.is_file() {
         eprintln!(
@@ -1606,14 +1600,8 @@ fn start_static_server(binary: &Path, root: &Path) -> Option<Server> {
 /// replacement for the application.
 #[test]
 fn serve_serves_a_static_file_and_still_reaches_php_for_a_route() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_binary!(binary);
+    require_php!(_php);
 
     let root = std::env::temp_dir().join(format!("volucer-static-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1669,15 +1657,9 @@ fn serve_serves_a_static_file_and_still_reaches_php_for_a_route() {
 /// root and the same binary, with `enabled = true` written down and then left out.
 #[test]
 fn a_root_with_no_assets_serves_no_files_even_though_the_default_is_on() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     require_sdk!();
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_php!(_php);
 
     let root = std::env::temp_dir().join(format!("volucer-auto-off-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1736,14 +1718,8 @@ fn a_root_with_no_assets_serves_no_files_even_though_the_default_is_on() {
 ///
 #[test]
 fn the_command_line_document_root_overrides_the_one_in_the_file() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     let Some(base_port) = free_port_run(1) else {
         eprintln!("skipping: no free port");
         return;
@@ -1801,14 +1777,8 @@ fn the_command_line_document_root_overrides_the_one_in_the_file() {
 /// a PHP request has already run. A single-request test passes either way.
 #[test]
 fn a_relative_document_root_keeps_working_after_the_first_request() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
     let Some(base_port) = free_port_run(1) else {
         eprintln!("skipping: no free port");
         return;
@@ -1864,10 +1834,7 @@ fn a_relative_document_root_keeps_working_after_the_first_request() {
 /// floor from a shell without opening the documentation.
 #[test]
 fn version_prints_the_protocol_and_the_php_floor() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let output = Command::new(&binary)
         .arg("version")
@@ -1901,10 +1868,7 @@ fn version_prints_the_protocol_and_the_php_floor() {
 /// out of `docker inspect` afterwards.
 #[test]
 fn health_reads_its_target_from_the_configuration_and_exits_on_the_answer() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-health-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -2034,10 +1998,7 @@ fn health_reads_its_target_from_the_configuration_and_exits_on_the_answer() {
 /// image) is otherwise only observable by building one.
 #[test]
 fn health_probes_loopback_for_a_wildcard_listener() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-health-wild-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the temp root");
@@ -2081,10 +2042,7 @@ fn health_probes_loopback_for_a_wildcard_listener() {
 /// written, so the only way an operator can see the saving is if `check` prints it.
 #[test]
 fn check_describes_the_sites_and_the_routes_that_skip_the_stat() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-check-sites-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("a")).expect("create a site root");
@@ -2200,10 +2158,7 @@ default_backend = "cgi"
 /// not would report a deployment it would not start.
 #[test]
 fn check_names_the_files_it_merged() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-check-includes-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("conf.d")).expect("create the drop-in directory");
@@ -2276,10 +2231,7 @@ fn check_names_the_files_it_merged() {
 /// after every edit, and a new block of output on every deployment would be noise.
 #[test]
 fn check_prints_no_file_list_for_one_file() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-check-one-file-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the temp root");
@@ -2315,10 +2267,7 @@ fn check_prints_no_file_list_for_one_file() {
 /// message names the chain rather than one file.
 #[test]
 fn check_refuses_an_include_cycle() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-check-cycle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the temp root");
@@ -2357,10 +2306,7 @@ fn check_refuses_an_include_cycle() {
 fn serve_and_reload_follow_includes() {
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-serve-includes-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("conf.d")).expect("create the drop-in directory");
@@ -2445,10 +2391,7 @@ fn serve_and_reload_follow_includes() {
 /// "what does an operator see", and because `check` is where the two readers of these rules meet.
 #[test]
 fn check_describes_an_upstream_and_skips_the_stat_for_its_routes() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-check-upstream-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the root");
@@ -2681,10 +2624,7 @@ fn read_one_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
 /// translation, the header rules and the status, end to end.
 #[test]
 fn serve_reaches_an_http_origin_and_relays_its_answer() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let origin = TestOrigin::start(
         "HTTP/1.1 203 Non-Authoritative Information\r\n\
          X-Origin: node-app\r\n\
@@ -2788,10 +2728,7 @@ origin = {origin}
 /// controller answered".
 #[test]
 fn widening_the_script_list_stops_the_static_layer_serving_the_source() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-py-static-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -2896,20 +2833,11 @@ origin = {origin}
 /// still be broken behind a proxy.
 #[test]
 fn a_proxy_trust_list_decides_whether_a_forwarded_address_is_believed() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     // A backend that echoes the environment, so the assertion is on what PHP would actually read
     // rather than on what the server believes it sent.
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
+    require_php!(_php);
+    require_php_cgi!(php_cgi);
     let origin = TestOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let root = std::env::temp_dir().join(format!("volucer-proxy-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3048,10 +2976,7 @@ origin = {origin}
 /// client's claim, and a stale length is how a proxy desynchronises a connection.
 #[test]
 fn a_request_body_reaches_an_origin_with_the_right_length() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let origin = TestOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let root = std::env::temp_dir().join(format!("volucer-upstream-post-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3121,10 +3046,7 @@ origin = {origin}
 /// silent is a deadline — and an operator fixes those two differently.
 #[test]
 fn an_unreachable_origin_is_a_502_and_a_silent_one_is_a_504() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-upstream-fail-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the root");
@@ -3205,10 +3127,7 @@ extern "C" {
 fn a_fileless_deployment_survives_a_reload_unchanged() {
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-fileless-reload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3273,10 +3192,7 @@ fn a_fileless_deployment_survives_a_reload_unchanged() {
 fn sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing() {
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-reload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3403,10 +3319,7 @@ fn sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing() {
 fn one_sighup_reloads_a_certificate_and_a_site_together() {
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-cert-site-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3548,10 +3461,7 @@ fn a_reload_keeps_the_certificate_that_was_issued() {
 
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-acme-reload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3694,10 +3604,7 @@ fn a_reload_picks_up_a_renewed_named_certificate_while_issuance_stays() {
 
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-acme-merge-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3830,10 +3737,7 @@ fn a_reload_picks_up_a_renewed_named_certificate_while_issuance_stays() {
 fn a_site_with_its_own_acme_serves_a_placeholder_for_its_own_names() {
     use rustls_acme::CertCache;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-acme-site-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3955,10 +3859,7 @@ fn a_site_with_its_own_acme_serves_a_placeholder_for_its_own_names() {
 #[cfg(unix)]
 #[test]
 fn two_contacts_produce_two_accounts() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-acme-contact-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -4182,10 +4083,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
 fn an_acme_configured_server_serves_its_cached_certificate() {
     use rustls_acme::CertCache;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-acme-serve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -4297,10 +4195,7 @@ fn an_acme_configured_server_serves_its_cached_certificate() {
 /// right while the file says something else — and the file is what an operator greps.
 #[test]
 fn the_access_log_records_the_id_the_client_sees() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-access-log-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the root");
@@ -4424,10 +4319,7 @@ format = "combined"
 fn sighup_reopens_the_access_log_after_a_rotation() {
     const SIGHUP: i32 = 1;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-logrotate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the root");
@@ -4520,10 +4412,7 @@ format = "combined"
 /// on one.
 #[test]
 fn no_access_log_config_means_no_log_file_and_no_id_header() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
     let root = std::env::temp_dir().join(format!("volucer-no-log-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the root");
@@ -4575,14 +4464,8 @@ static_files = false
 /// notices.
 #[test]
 fn the_worker_list_and_the_reset_agree_about_a_worker_in_a_second_pool() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_binary!(binary);
+    require_php!(_php);
     require_sdk!();
 
     let root = std::env::temp_dir().join(format!("volucer-workers-{}", std::process::id()));
@@ -4700,10 +4583,7 @@ fn run_to_exit(binary: &Path, args: &[&str]) -> std::process::Output {
 /// proves the two mechanisms cooperate rather than one shadowing the other.
 #[test]
 fn a_configuration_can_be_the_command_line_alone() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-no-file-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -4778,10 +4658,7 @@ fn a_configuration_can_be_the_command_line_alone() {
 /// it were the one used.
 #[test]
 fn an_override_wins_over_the_file_and_over_the_listen_sugar() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-override-wins-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -4851,10 +4728,7 @@ fn an_override_wins_over_the_file_and_over_the_listen_sugar() {
 /// element but answers on a new prefix, and element 2 exists at all because the index appended it.
 #[test]
 fn an_override_index_amends_and_appends_routes_in_the_file() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-route-index-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -4941,10 +4815,7 @@ fn an_override_index_amends_and_appends_routes_in_the_file() {
 /// *table* and deserialized by the same strict parser the file goes through.
 #[test]
 fn an_override_naming_an_unknown_key_is_refused() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-bad-key-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -4987,10 +4858,7 @@ fn an_override_naming_an_unknown_key_is_refused() {
 /// typo most deserves to be caught as.
 #[test]
 fn an_explicit_config_that_does_not_exist_is_an_error() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-missing-c-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -5033,14 +4901,8 @@ fn an_https_only_configuration_starts_a_listener() {
     // The assertion is on the banner rather than on a request: the certificate here is
     // self-signed, and proving the handshake works is a different test. What this one
     // pins is that the listener exists, which is the fact that was wrong.
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary has not been built");
-        return;
-    };
-    let Some(php_cgi) = find_php_cgi() else {
-        eprintln!("skipping: php-cgi was not found");
-        return;
-    };
+    require_binary!(binary);
+    require_php_cgi!(php_cgi);
 
     let root = std::env::temp_dir().join(format!("volucer-https-only-{}", std::process::id()));
     std::fs::create_dir_all(root.join("public")).expect("create the document root");
@@ -5152,10 +5014,7 @@ fn http_get_over_unix(path: &Path, target: &str) -> HttpResponse {
 #[cfg(unix)]
 #[test]
 fn a_unix_http_listener_serves_a_request_and_cleans_up_its_socket() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-unix-http-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -5228,10 +5087,7 @@ fn a_unix_http_listener_serves_a_request_and_cleans_up_its_socket() {
 #[cfg(unix)]
 #[test]
 fn a_stale_socket_path_is_replaced_rather_than_fatal() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-unix-stale-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -5274,10 +5130,7 @@ fn a_stale_socket_path_is_replaced_rather_than_fatal() {
 fn a_unix_fastcgi_listener_answers_a_get_values_probe() {
     use std::os::unix::net::UnixStream;
 
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let root = std::env::temp_dir().join(format!("volucer-unix-fcgi-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -5344,10 +5197,7 @@ fn a_unix_fastcgi_listener_answers_a_get_values_probe() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_stop_finishes_a_request_that_is_already_in_flight() {
-    let Some(binary) = volucer_binary() else {
-        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
-        return;
-    };
+    require_binary!(binary);
 
     let body = "the response that was in flight";
     let origin = TestOrigin::start_after(
