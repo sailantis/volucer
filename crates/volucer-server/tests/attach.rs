@@ -480,6 +480,14 @@ fn each_connection_reaches_a_different_forked_child() {
 /// looks, and a deployment that recycles on `max_requests` looks after a few minutes.
 /// `/proc/<pid>/task/<pid>/children` lists the supervisor's own children, so the assertion
 /// is about the process table rather than about what the fixture claims to do.
+///
+/// **Linux only, as a `#[cfg]` rather than a `skip`.** `/proc` is Linux's alone, so there is nothing
+/// here for macOS to assert — an operating system the test was never written against is not a
+/// missing capability, and a `skip` that *is* one becomes a failure under `VOLUCER_E2E=1`. It was a
+/// `skip` until this line, which is how macOS first reported it. The in-body `skip` stays for the
+/// other case: a Linux kernel built without `CONFIG_PROC_CHILDREN`, which really is a capability
+/// this machine could have.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_prefork_supervisor_reaps_its_children() {
     let _serial = serial();
