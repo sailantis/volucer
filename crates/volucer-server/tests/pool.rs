@@ -339,16 +339,28 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
 /// establish.** With `children = 0` the slot's permit count is 1 and a second request blocks
 /// until the first finishes — which is correct and is what every earlier test already
 /// covers. With `children = 4` four requests must be *in flight together* against one
-/// address, and the only way to observe that is for the script to sleep: a serialised slot
-/// takes four sleeps, a concurrent one takes about one.
+/// address.
 ///
-/// The negative control is the `children = 0` half: if the pool were secretly concurrent
-/// already, that half would be fast and would fail — which is what makes the timings mean
-/// something rather than both being "fast enough".
+/// **Measured as overlap, not as a ratio.** The previous version compared the preforked
+/// half's wall time against the control's, and both numbers move with whatever else the
+/// machine is doing: it failed 18 times out of 18 when six copies of this suite were run at
+/// once, on runs where the pool was behaving perfectly. Timing is evidence here only in
+/// aggregate, and one round is not an aggregate.
+///
+/// So the fixture records **when each request was being executed inside PHP**, and the
+/// assertion is the property itself: of `AT_ONCE` requests, the largest number being executed
+/// at the same instant. A serialised slot can only ever reach 1, however slow the machine is;
+/// a preforked slot reaches `AT_ONCE` once its children have booted, however slow the machine
+/// is. Nothing in that sentence mentions a duration, so nothing in it can flake on one.
+///
+/// The `children = 0` half is kept as the negative control: it proves the measurement is not
+/// simply reporting `AT_ONCE` for anything that runs, which is the way a test of this shape
+/// usually fails — measuring something that is always true.
+///
+/// **The clock the spans are measured against is PHP's**, not this process's, so the two
+/// halves' numbers are never compared with each other and machine speed cannot enter.
 #[test]
 fn children_lets_one_slot_serve_several_requests_at_once() {
-    use std::time::Instant;
-
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
@@ -361,73 +373,155 @@ fn children_lets_one_slot_serve_several_requests_at_once() {
 
     const SLEEP_MS: u64 = 400;
     const AT_ONCE: usize = 4;
+    // The preforked half's allowance for children that have not booted yet. A fixed handful
+    // rather than a loop until the test passes.
+    const BOOT_ROUNDS: usize = 4;
 
     let root = std::env::temp_dir().join(format!("volucer-pool-children-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
-    // Long enough that serialisation is unmistakable, short enough to keep the test quick.
+    // The fixture records when PHP *started* and *finished* each request, onto one shared file
+    // under a lock, so the trace survives four children appending to it at once. `usleep` is what
+    // makes two requests' spans comparable: without it every span would be a few hundred
+    // microseconds and the overlap below would be measuring the interpreter's start-up.
     //
     // No trailing `$` and no heredoc: the first version of this fixture ended with a stray `$`,
     // which made the script a parse error — php-cgi then answered in microseconds and the
     // *control* assertion below is the only thing that noticed. A test whose fixture does not
     // execute measures the interpreter's error path, which is exactly the shape this defect
     // takes.
+    //
+    // Forward slashes, because PHP on Windows accepts them and a doubled backslash inside a PHP
+    // string literal is one more escape to get wrong.
+    let trace = root.join("overlap.txt");
+    let trace_php = trace.display().to_string().replace('\\', "/");
     let script = write_script(
         &root,
         "index.php",
-        &format!("<?php usleep({}); echo 'SLEPT';", SLEEP_MS * 1000),
+        &format!(
+            r#"<?php
+               $start = microtime(true);
+               usleep({sleep});
+               $end = microtime(true);
+               $f = fopen("{trace}", "a");
+               flock($f, LOCK_EX);
+               fwrite($f, $start . " " . $end . " " . getmypid() . "\n");
+               fflush($f);
+               flock($f, LOCK_UN);
+               fclose($f);
+               echo 'SLEPT';
+            "#,
+            sleep = SLEEP_MS * 1000,
+            trace = trace_php,
+        ),
     );
     assert!(script.is_file(), "the fixture script exists");
 
-    let time = |children: u32, port: u16| -> (Duration, String) {
+    // The largest number of the recorded spans that were running at the same instant.
+    //
+    // A sweep over start/end events, with **ends ordered before starts at equal timestamps** so
+    // two spans that merely touch are not counted as overlapping: a serialised slot ends one
+    // request before the next begins, and calling that a two-way overlap would let the broken
+    // implementation satisfy the preforked half.
+    fn peak_overlap(trace: &Path) -> (usize, usize) {
+        let text = std::fs::read_to_string(trace).unwrap_or_default();
+        let spans: Vec<(f64, f64, String)> = text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let start: f64 = parts.next()?.parse().ok()?;
+                let end: f64 = parts.next()?.parse().ok()?;
+                let pid = parts.next().unwrap_or("?").to_string();
+                Some((start, end, pid))
+            })
+            .collect();
+        let pids: std::collections::BTreeSet<&str> =
+            spans.iter().map(|(_, _, pid)| pid.as_str()).collect();
+        let mut events: Vec<(f64, i32)> = Vec::with_capacity(spans.len() * 2);
+        for (start, end, _) in &spans {
+            events.push((*start, 1));
+            events.push((*end, -1));
+        }
+        // `-1` sorts before `+1` at the same instant, which is the ordering described above.
+        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+        let mut live = 0i32;
+        let mut peak = 0i32;
+        for (_, delta) in events {
+            live += delta;
+            peak = peak.max(live);
+        }
+        (peak as usize, pids.len())
+    }
+
+    // Serve `rounds` rounds of `AT_ONCE` concurrent requests and report the best overlap seen.
+    //
+    // **Several rounds for the preforked half and one for the control**, which is the only
+    // asymmetry here. A preforked slot is listening the instant `CgiPool::start` returns — the
+    // master binds, *then* forks — so early rounds can be served by whichever children have
+    // booted, and until two of them have, the overlap is 1 for the honest reason that only one
+    // worker exists. The control has nothing to fork: its single process had bound and booted
+    // before `start` returned, so every round would measure the same thing.
+    //
+    // The number of rounds is fixed rather than "until the assertion passes", so a pool that
+    // truly cannot overlap fails the test rather than being retried into silence.
+    let run = |children: u32, port: u16, rounds: usize| -> (usize, usize) {
         let mut config = config_for(&binary, 1, port);
         config.children = children;
         let mut pool = CgiPool::start("children", &config).expect("pool starts");
         let request = request_for(&root, "index.php", "");
 
-        let started = Instant::now();
-        std::thread::scope(|scope| {
-            for _ in 0..AT_ONCE {
-                let pool = &pool;
-                let request = &request;
-                scope.spawn(move || {
-                    let response = pool.request(request).expect("a request was served");
-                    response.check_protocol().expect("completed");
-                    String::from_utf8_lossy(&response.stdout).into_owned()
-                });
-            }
-        });
-        let elapsed = started.elapsed();
-        // One more request to read the body, because a `scope` cannot return the values from
-        // its threads without collecting them and this is simpler.
-        let response = pool.request(&request).expect("a request was served");
-        let body = String::from_utf8_lossy(&response.stdout).into_owned();
+        let mut best = 0;
+        let mut most_pids = 0;
+        for _ in 0..rounds {
+            let _ = std::fs::remove_file(&trace);
+            std::thread::scope(|scope| {
+                for _ in 0..AT_ONCE {
+                    let pool = &pool;
+                    let request = &request;
+                    scope.spawn(move || {
+                        let response = pool.request(request).expect("a request was served");
+                        response.check_protocol().expect("completed");
+                        String::from_utf8_lossy(&response.stdout).into_owned()
+                    });
+                }
+            });
+            // The trace is written by PHP before it answers, so by the time every caller has
+            // returned it is complete. A moment's grace costs nothing and removes any doubt.
+            std::thread::sleep(Duration::from_millis(50));
+            let (peak, pids) = peak_overlap(&trace);
+            best = best.max(peak);
+            most_pids = most_pids.max(pids);
+        }
         pool.shutdown();
-        (elapsed, body)
+        (best, most_pids)
     };
 
     // The control first, on its own port so a lingering socket cannot confuse the second.
-    let (serial, body) = time(0, base);
-    // The fixture must actually run. A parse error answers instantly, which makes the control
-    // assertion below fail *and* would make the preforked half look fast for the wrong reason.
-    assert!(
-        body.contains("SLEPT"),
-        "the fixture did not execute — a parse error would make both halves meaningless: {body:?}"
+    let (serial_peak, serial_pids) = run(0, base, 1);
+    // The fixture must actually run, and must have run `AT_ONCE` times. A parse error answers
+    // instantly and writes no span, which would make the control assertion below pass for the
+    // worst possible reason: an empty trace has a peak overlap of zero.
+    assert_eq!(
+        serial_pids, 1,
+        "children=0 must serve every request from one process, and the trace named {serial_pids} — \
+         the fixture did not run as written"
     );
-    assert!(
-        serial >= Duration::from_millis(SLEEP_MS * AT_ONCE as u64 * 3 / 4),
-        "children=0 served {AT_ONCE} requests in {serial:?}, which is faster than {AT_ONCE} \
-         serialised {SLEEP_MS} ms requests — the control is not controlling anything"
+    assert_eq!(
+        serial_peak, 1,
+        "children=0 served {AT_ONCE} requests with an overlap of {serial_peak}, but one process \
+         cannot serve two requests at once — the fixture or the measurement is wrong, not the pool"
     );
 
-    let (preforked, _) = time(AT_ONCE as u32, base + 1);
-    // Half the serial time is a generous bound: four requests against four children should be
-    // about one sleep plus overhead, but CI machines are slow and the assertion should not
-    // flake on a bound the property does not need.
+    let (preforked_peak, preforked_pids) = run(AT_ONCE as u32, base + 1, BOOT_ROUNDS);
+    // **Two, not `AT_ONCE`.** The property is "several at once", and it is worth asserting at the
+    // weakest form that a serialised pool can never reach: a loaded machine can leave two children
+    // descheduled mid-request, and a test demanding all four would then be measuring the machine
+    // again. Anything above one is a fact a one-at-a-time slot cannot produce.
     assert!(
-        preforked * 2 < serial,
-        "children={AT_ONCE} served {AT_ONCE} requests in {preforked:?} against {serial:?} \
-         serialised — the slot is still one request at a time, so `children` is not taking effect"
+        preforked_peak >= 2,
+        "children={AT_ONCE} served {AT_ONCE} requests across {preforked_pids} process(es) with a \
+         peak overlap of {preforked_peak} — the slot is still one request at a time, so `children` \
+         is not taking effect"
     );
 
     let _ = std::fs::remove_dir_all(&root);

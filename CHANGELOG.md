@@ -17,20 +17,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Measured against the built binary, with a **256 MiB** `Transfer-Encoding: chunked` upload:
 
-  | Worker | Server peak growth |
-  | --- | --- |
-  | advertises `stream_request_body` | **2.6 MiB** |
-  | does not (the buffered path) | **513 MiB** |
+  | Worker                           | Server peak growth |
+  | -------------------------------- | ------------------ |
+  | advertises `stream_request_body` | **2.6 MiB**        |
+  | does not (the buffered path)     | **513 MiB**        |
 
   An SDK that predates the field decodes it as `false`, keeps receiving `body_len` in every
-  `REQUEST`, and behaves exactly as before — the buffered column *is* that path, unchanged. The
+  `REQUEST`, and behaves exactly as before — the buffered column _is_ that path, unchanged. The
   capability is advertised by the worker rather than offered by the server because the opposite
   direction would desynchronise every request: a head with no `body_len` reads as `0` to an old SDK,
   which would then take the first `BODY` frame for its own response. A pool answers "yes" only when
   every slot agreed, since a body can only be drained once.
 
   Two behaviours follow from it, and both are documented:
-
   - **A streamed request is never retried**, because its bytes were consumed from the client's
     socket. A worker that dies mid-upload is replaced and the client gets a `502`.
   - **`request_timeout_ms` starts when the body is complete**, not when it starts arriving, so a
@@ -64,7 +63,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is a SAPI; RoadRunner has the same limitation. Everything that operates on the temp file's path
   works, and the documentation says plainly which two calls do not.
 
-  **A worker keeps the raw body as well**, so `$request->body` is still the multipart bytes *and*
+  **A worker keeps the raw body as well**, so `$request->body` is still the multipart bytes _and_
   `$_FILES` is populated. That is a deliberate superset of PHP, where `php://input` is empty for a
   multipart request — an application that parses multipart itself, or reads `php://input`, keeps
   working.
@@ -81,7 +80,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   A relayed response is **never compressed** and carries **no `Content-Length`** — both need the
   whole body, which is the thing that does not exist yet. That is the same trade every server makes
-  for a stream, and it is why a download that is a *file* is still better served with `X-Sendfile`.
+  for a stream, and it is why a download that is a _file_ is still better served with `X-Sendfile`.
 
   The slot is held until the last byte: the ending that releases it, counts it against
   `max_requests` and decides whether the worker may be reused runs on that worker's exchange thread.
@@ -99,12 +98,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unknown field `client_ca`, expected one of `certificate`, `key`, `min_version`, `alpn`, `plain`
   ```
 
-  The guide now names the three mechanisms that *are* available for service-to-service
+  The guide now names the three mechanisms that _are_ available for service-to-service
   authentication, and the trap in the header-based one: `[server.proxy].trusted_headers` is only
   as good as `trusted_subnets`, so a forwarded identity header from an untrusted peer is a claim
   rather than a fact.
 
 ### Fixed
+
+- **The `children` test measured the machine, not `children`.** `children_lets_one_slot_serve_several_requests_at_once`
+  compared the preforked half's wall time against the control's and required the ratio to beat `2:1`.
+  Both numbers move with whatever else the box is doing, so six copies of the suite run at once
+  failed it **18 times out of 18** while the pool was behaving perfectly — the reported timings
+  were `1.24 s`, `1.99 s` and `2.37 s` against a `1.63 s` control, all from runs in which four
+  distinct `php-cgi` pids served the four requests.
+
+  It now asserts the property instead of a duration. The fixture records, under a lock, the instant
+  each request entered and left PHP, and the assertion is the largest number of those spans running
+  at once: **a serialised slot can only ever reach 1, and a preforked one reaches `AT_ONCE`,
+  however slow the machine is.** Nothing in that sentence mentions a clock, so nothing in it can
+  flake on one. The `children = 0` half is kept as the negative control, and was tightened: it now
+  requires one pid _and_ an overlap of exactly 1, so a fixture that never ran (an empty trace has an
+  overlap of zero) can no longer satisfy it.
+
+  Falsified by making `slot_concurrency` return `1` unconditionally: the test fails with
+  `children=4 served 4 requests across 1 process(es) with a peak overlap of 1`. Restored, it passed
+  24 consecutive runs at six copies of the test at once, where the previous version failed every
+  time.
 
 - **A worker's stream that stops without `LAST` is a truncation, and now says so.** A worker that
   throws inside its generator has already sent a `200`, so there is no status left to report with.
@@ -114,7 +133,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file that happens not to be.
 
 - **A push into a deleted AMQP queue is an error rather than a silent success.** RabbitMQ returns an
-  unroutable `mandatory` publish with `312 NO_ROUTE` and *then* confirms it, so a driver that watched
+  unroutable `mandatory` publish with `312 NO_ROUTE` and _then_ confirms it, so a driver that watched
   only for the publisher confirmation would report a lost job as accepted. The AMQP driver treats a
   return inside its confirm window as a failure.
 
@@ -142,12 +161,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Three properties of the protocol are documented rather than papered over, because each is something a
   deployment migrating from `redis` would otherwise discover the hard way:
-
   - **`attempts` is exact only on a quorum queue.** A classic queue gives a consumer one bit,
     `redelivered`, so the count is `1` then `2`, `2`, `2`. A quorum queue makes RabbitMQ report
     `x-acquired-count`, and then the count is real.
   - **`job_lease_seconds` does not bound an AMQP reservation.** A killed consumer's connection drops and
-    its job comes back immediately — stronger than a lease. A *hung* consumer stays connected and holds
+    its job comes back immediately — stronger than a lease. A _hung_ consumer stays connected and holds
     its job indefinitely — weaker.
   - **`in_flight` is per process**, because AMQP 0-9-1 has no method that reports a queue's
     unacknowledged count.
@@ -163,8 +181,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The worker protocol can describe a response whose length is not known.** A worker that generates
   its body as it goes — a CSV export, an SSE feed — could not previously say so: `ResponseHead.body_len`
   was authoritative, so the body had to be assembled before the first byte could be sent. The head now
-  carries a `STREAMED` flag (`0x0020`) meaning *this body declares no length, and its only end signal
-  is the `LAST`-flagged `BODY` frame*.
+  carries a `STREAMED` flag (`0x0020`) meaning _this body declares no length, and its only end signal
+  is the `LAST`-flagged `BODY` frame_.
 
   This is the protocol half of streaming a worker response; the pool and listener halves follow. It is
   deliberately landed and tested on its own, because the wire change is the part that must not be got
@@ -185,7 +203,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   takes belongs to the worker.
 
 - **`volucer workers restart` reports why a sweep was incomplete instead of assuming it was busy.**
-  The command explained exit `1` with a fixed sentence — *"at least one slot was serving a request"* —
+  The command explained exit `1` with a fixed sentence — _"at least one slot was serving a request"_ —
   which is only one of the three ways the route answers `202`. For the most serious of the other two
   it was actively misleading: a replacement that **could not boot** was reported as a busy slot, so
   the operator was told to sweep again for an application that does not start. Found by making a
@@ -224,7 +242,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`docs/14-DEPLOYING.md` documents the rolling deploy end to end.** The operations guide
   describes the three verbs and what each backend kind does during a sweep, but the deployment
-  question — *what does my deploy script do, and in what order?* — was never answered in one place.
+  question — _what does my deploy script do, and in what order?_ — was never answered in one place.
   The new guide covers the sweep's incomplete-by-design behaviour and the loop a pipeline needs (exit
   `1` means "accepted, still serving old code, sweep again"), the difference between a roll and a
   restart, and the ordering when a release changes both code and configuration.
@@ -256,7 +274,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that measurement away; disabling the rule makes the test that pins it fail with a relayed
   `Content-Length` response. A non-2xx response is answered whole, because `error_pages` reads its
   body and a status already on the wire cannot be rewritten. An `X-Sendfile` answer is an
-  *instruction* rather than a body, so the static layer answers it with the validators a relayed
+  _instruction_ rather than a body, so the static layer answers it with the validators a relayed
   stream could not carry.
 
   Two costs are deliberate and documented: a relayed response **is not compressed** and **declares no
@@ -354,7 +372,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   **The first matching rule decides**, and the order is the security property. Most-specific-wins —
   the rule the host table uses — cannot express "block this range except that host", which is the
-  case a list is usually written for. An exception therefore goes *above* the rule it excepts from,
+  case a list is usually written for. An exception therefore goes _above_ the rule it excepts from,
   and `volucer check` prints the rules in evaluation order so the answer is readable rather than
   discovered. `default = "allow"` is the default for the same reason nginx appends an implicit
   `allow all`: a half-written list must not take a deployment offline.
@@ -411,7 +429,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of slots. `volucer check` prints the effective deadline for each backend.
 
   **Two defects surfaced while verifying it, and neither was findable by reading.** A deadline was
-  classified as a transport error, so the one retry spent a *second* full budget on a worker that had
+  classified as a transport error, so the one retry spent a _second_ full budget on a worker that had
   already proved it was not answering — a three-second fixture with `request_timeout_ms = 1000`
   answered after 2.1 s. The two are separated by `is_deadline_expired`, which the pools ask before the
   retry predicate. And the error a client saw was the OS's socket timeout (`os error 10060`, "a
@@ -453,7 +471,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   would rather recycle instantly.
 
   This replaces a behaviour that was wrong and documented as right. Leaving the accept loop used to
-  *return*, which dropped the runtime that owned the connection tasks and cancelled every one of
+  _return_, which dropped the runtime that owned the connection tasks and cancelled every one of
   them: a stop in the middle of a response truncated it. Measured against the previous binary, a
   four-second response in flight produced `volucer exited 0 after 0.28s` and a client that received
   `RemoteDisconnected` with no body; the same request now completes and the process exits 3.03s
@@ -466,9 +484,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`server.http` and `server.fastcgi` accept a unix socket path.** `unix:/run/volucer/http.sock`
   is now a listener rather than a spelling that passed `volucer check` and then failed at bind with
   `invalid port value`, which is what it did before: `parse_listener` accepted the form, both bind
-  paths called `TcpListener::bind`, and only the *outbound* FastCGI client actually supported a
+  paths called `TcpListener::bind`, and only the _outbound_ FastCGI client actually supported a
   socket. This is the shape an nginx deployment wants — `proxy_pass
-  http://unix:/run/volucer/http.sock:/;` and `fastcgi_pass unix:/run/volucer/fcgi.sock;` — and it
+http://unix:/run/volucer/http.sock:/;` and `fastcgi_pass unix:/run/volucer/fcgi.sock;` — and it
   was the last of the three ways nginx reaches an application server that volucer could not serve.
 
   The transport is `BoundListener`/`Accepted` on the HTTP side and `Bound`/`Connected` on the FastCGI
@@ -517,7 +535,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The key is removed from the parsed table before it is merged, so position says nothing about
   meaning. That recovers the property MariaDB's format has for free (their `!include` is a line, and
   their documentation writes it inside `[mariadb]`) and that TOML otherwise cannot express, because
-  a `[table]` header *is* a scope. It is safe because no table in the model has an `include` field.
+  a `[table]` header _is_ a scope. It is safe because no table in the model has an `include` field.
   A bare directive used to be read as a key of whatever table preceded it and reach the reader as
   `unknown field 'include'`; it is now the directive it reads as.
 
@@ -529,12 +547,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   all of them: `include` → the file → overrides.
 
   Two rules differ from MariaDB's, because TOML asks a question its format never does:
-
-  * **The merge is of parsed tables, not of lines.** A second `[server]` header in one TOML
+  - **The merge is of parsed tables, not of lines.** A second `[server]` header in one TOML
     document is a parse error, so splicing text would refuse the ordinary layout — a base file
     with `[server]`, a drop-in adding `[server.tls]`. Tables are merged key by key instead, and a
     drop-in adds to `[server]` without restating it.
-  * **An array is replaced, never concatenated.** Two files that both list `[[server.routes]]`
+  - **An array is replaced, never concatenated.** Two files that both list `[[server.routes]]`
     have no key to match elements on, and concatenating would make the result depend on which
     file was read first.
 
@@ -560,19 +577,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extra. It is never sent over cleartext, where no browser acts on it.
 
   Three things about the feature are worth stating rather than discovering:
-
-  * **The request body is buffered**, up to `max_body_bytes`. A QUIC request stream is read by the
+  - **The request body is buffered**, up to `max_body_bytes`. A QUIC request stream is read by the
     application, so it cannot be handed across the blocking boundary the CGI path needs. Responses
     still stream, so SSE and large downloads are unaffected. This is the one behavioural difference
     from the TCP path and it is documented in `docs/05-TLS-AND-ACME.md`.
-  * **The QUIC TLS configuration is built TLS-1.3-only, in its own function.** Reusing
+  - **The QUIC TLS configuration is built TLS-1.3-only, in its own function.** Reusing
     `tls::server_config` would be the obvious implementation and is a crash:
     `QuicServerConfig::try_from` accepts a config that permits TLS 1.2 (it only checks for an
     AES-128-GCM suite), and `quinn-proto` then `unwrap`s the version check inside `start_session`.
     Since `min_version` defaults to `"1.2"`, that mistake binds the socket and then panics a
-    runtime worker on *every* handshake. `Http3Listener::bind` asserts the invariant eagerly, so a
+    runtime worker on _every_ handshake. `Http3Listener::bind` asserts the invariant eagerly, so a
     regression is a startup refusal rather than a per-connection panic.
-  * **`max_field_section_size` defaults to 16 KiB, deliberately, and the ceiling above it is
+  - **`max_field_section_size` defaults to 16 KiB, deliberately, and the ceiling above it is
     derived from a panic rather than chosen for roundness.** `h3` 0.0.8 defaults the setting to
     `VarInt::MAX`, which is hyperium/h3#379 — a remotely triggerable amplification, and the reason
     `deny.toml` and its job exist. The cap is a security setting rather than a tuning knob; see the
@@ -605,11 +621,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Three triggers now reach one implementation, so they cannot disagree about what an idle slot is:
 
-  | Trigger | How |
-  | --- | --- |
-  | `SIGUSR2` | the default; `systemctl kill -s SIGUSR2 volucer` |
+  | Trigger                   | How                                                                                                     |
+  | ------------------------- | ------------------------------------------------------------------------------------------------------- |
+  | `SIGUSR2`                 | the default; `systemctl kill -s SIGUSR2 volucer`                                                        |
   | `volucer workers restart` | a client of the `[status]` route, so it works where signals do not (Windows, a container with no shell) |
-  | `POST /workers/restart` | a new `workers.restart` grant, alongside `workers.list` and `workers.reset` |
+  | `POST /workers/restart`   | a new `workers.restart` grant, alongside `workers.list` and `workers.reset`                             |
 
   `workers.restart` is **not** an alias for `workers.reset`. A reset names one worker and either
   replaces it or is refused with `409`; a restart sweeps every slot and replaces the ones that are
@@ -618,24 +634,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replacing a slot mid-request truncates a live response. `volucer workers restart` exits non-zero
   on `202` for the same reason, so a pipeline loops instead of stopping one sweep short of deploying.
 
-  Two backend kinds are reported as *unmanaged* rather than counted as success, with the reason
+  Two backend kinds are reported as _unmanaged_ rather than counted as success, with the reason
   naming who owns them: an `attach` pool's processes belong to somebody else's supervisor, and an
   `external` (`php-fpm`) pool's belong to php-fpm. An `upstream` origin is restarted if volucer
   supervises it, and that is the one arm that cannot avoid losing in-flight requests: an HTTP origin
   serves many at once and has no idle state.
 
-  The idleness test is conservative by construction. A worker slot is *known* idle when it is on the
+  The idleness test is conservative by construction. A worker slot is _known_ idle when it is on the
   pool's free list — the same condition the request path uses — and it is **reserved** from that list
   before being replaced, so a request cannot arrive between the check and the kill and be served by a
   worker that is being torn down. A `spawn_cgi` slot is idle when its permit count is zero and its
   lock is uncontended, because with `children > 0` one address serves several requests at once and
-  the lock alone would not say so. Correctness over completeness: a slot that merely *might* be busy
+  the lock alone would not say so. Correctness over completeness: a slot that merely _might_ be busy
   is skipped and reported as `skipped_busy`.
 
   **`SIGUSR1` is now registered in order to be ignored, and not registering it was a crash.** It
   means "reopen the log" in nginx, so a `logrotate` script written for nginx sends it — and an
   unregistered signal keeps its default disposition, which for `SIGUSR1` is to terminate the
-  process. Measured against the build that only *logged* a warning arm for it: `kill -USR1` on a
+  process. Measured against the build that only _logged_ a warning arm for it: `kill -USR1` on a
   running server exited with code 10 and wrote nothing to the log. Registering the signal turns that
   into a warning that names the signal the operator probably meant.
 
@@ -684,6 +700,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   namespace, verb, whether it mutates — and a test in `volucer-server` asserts it agrees with the
   namespaces' own `match` arms in both directions, so a method added to a namespace without being
   catalogued fails the build rather than shipping a method no grant can name.
+
 - **`workers.reset` is refused on a backend that owns no pool.** A reset acts on a pool slot by
   index, and only a `worker` or an `attach` backend has a pool; an `external`, `spawn_cgi` or
   `upstream` application has none. The grant was accepted and documented as "an answer nobody
@@ -703,7 +720,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only be answered by reading the source.
 - **`[metrics]` and `[status]` are now one table, `[status]`, on one listener.** The old shape had
   two top-level tables that each named an address for the same socket, which is two settings for one
-  fact — and the server could only reconcile them by *refusing* a file where they disagreed. It did,
+  fact — and the server could only reconcile them by _refusing_ a file where they disagreed. It did,
   and the documented example was such a file: `[metrics] address = "127.0.0.1:2112"` beside
   `[status] address = "127.0.0.1:2114"` failed to start with "they share one listener". The listener
   is now named once, and each endpoint exists because its sub-table does:
@@ -728,12 +745,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a `[status]` table that carried no probe would be an address answering nothing. A file written the
   old way is refused by name rather than by `toml`'s `unknown field 'metrics'`: the setting did not
   disappear, it moved one table down, and each refusal says which key replaced it.
+
 - **The worker-control routes are granted per method, and the list can be granted alone.**
   `[status] allow_worker_reset = true` became `[status.workers] allow = ["workers.list"]`, and the
   two routes are no longer one switch. `workers.list` publishes `GET /workers` and answers 404 to a
-  reset — a deployment that wants to *see* a pool no longer has to arm a `POST` to do it. Naming
+  reset — a deployment that wants to _see_ a pool no longer has to arm a `POST` to do it. Naming
   `workers.reset` adds the recycle. The names are the call plane's own, so one vocabulary describes
-  both surfaces. The wildcard-address refusal now follows the *method* rather than the table: it
+  both surfaces. The wildcard-address refusal now follows the _method_ rather than the table: it
   fires for `workers.reset`, and a `listen = "0.0.0.0:2114"` that grants only the list is legal,
   because a list of workers is a fact about the process rather than a lever on it. An empty `allow`,
   and a name that is not one of the two routes, are both refused at startup.
@@ -747,16 +765,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the form. It is now refused when the file is read, with the reason: the listener serves an HTTP
   readiness probe, a scrape and the worker-control routes, and an orchestrator reaches it by address.
 - **The metrics exposition's path may not shadow one of the listener's own routes.** `path =
-  "/health"`, `"/ready"` or `"/workers"` is refused at startup rather than resolved by whichever arm
+"/health"`, `"/ready"` or `"/workers"` is refused at startup rather than resolved by whichever arm
   of the router happens to run first.
 - **The configuration parser is now TOML 1.1** (`toml = "1"`, from `0.8` / TOML 1.0). The feature
   this buys is the one that was most awkward to write by hand: an inline table may now span several
   lines and end with a trailing comma, so a deployment's own metrics read as one block —
   `collect = { app_orders_total = { type = "counter", help = "…" }, … }` — instead of one
-  `[status.metrics.collect.<name>]` header per metric, four levels deep. Nothing in the *code*
+  `[status.metrics.collect.<name>]` header per metric, four levels deep. Nothing in the _code_
   changed: `toml::Table`, `Value::Table(..).try_into()` and `de::Error` are the same API, and the
   whole workspace passed without an edit. Three tests pin the new syntax so a silent pin back to
-  `0.8` cannot pass: one asserts the block parses *and* that its entries reach the registry, one
+  `0.8` cannot pass: one asserts the block parses _and_ that its entries reach the registry, one
   asserts the price of the form — an inline table cannot be extended later **in the same text**, by a
   header or a dotted key — and one asserts the limit of that rule, that an `-o` pair still adds an
   entry because it is applied after parsing. `volucer.example.toml` and two documentation pages now
@@ -774,13 +792,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`h3` 0.0.8 carries an unpatched amplification (hyperium/h3#379), mitigated by configuration.**
   Its `max_field_section_size` defaults to `VarInt::MAX`, so a `HEADERS` frame of one-byte
   static-table references decodes into a `HeaderMap` with thousands of entries. `[server.http3]
-  max_field_section_size` (16 KiB) is what bounds it: RFC 9114 §4.2.2 charges each decoded field at
-  least 32 bytes, and `qpack::decode_stateless` rejects the section *before* the fields are
+max_field_section_size` (16 KiB) is what bounds it: RFC 9114 §4.2.2 charges each decoded field at
+  least 32 bytes, and `qpack::decode_stateless` rejects the section _before_ the fields are
   materialised. **No release carries the upstream fix** — h3 0.0.8 is still the newest, and
   hyperium/h3#378 (which replaces the panicking pre-allocation) is open and unmerged — so the
   mitigation is configuration and is pinned by
   `an_oversized_header_section_is_answered_431_and_the_listener_survives` — which asserts the
-  server answers 431 *and* serves the next request, and which fails if the cap is returned to the
+  server answers 431 _and_ serves the next request, and which fails if the cap is returned to the
   crate's default. `deny.toml` records the advisory rather than hiding it.
 
   The **ceiling** above the default is part of the mitigation rather than a guard rail on it: `h3`
@@ -790,6 +808,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the very crash it existed to prevent — so it is 512 KiB, and
   `the_ceiling_cannot_admit_a_panicking_field_count` pins the arithmetic between two constants
   that live in different crates.
+
 - **`rustls-pemfile` is unmaintained (RUSTSEC-2025-0134), recorded rather than migrated here.** It
   is a thin wrapper over `rustls-pki-types` and is not vulnerable; the migration is to use
   `rustls-pki-types`' own PEM parsing and drop the dependency. `deny.toml` ignores the advisory with
@@ -799,7 +818,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A cache TTL below one second silently deleted the key instead of storing it.** The file KV
   driver's header holds a deadline as an integer, and it was written in **seconds** with
-  `ttl.as_secs()`. Truncating 900 ms gives 0, so the deadline written was *now* — `set` returned
+  `ttl.as_secs()`. Truncating 900 ms gives 0, so the deadline written was _now_ — `set` returned
   `Ok`, and the very next `get` was a miss. An application asking for a short-lived cache entry got
   no entry at all, with nothing logged, and the window where it worked was a lucky sub-second
   boundary. The header now stores **milliseconds**, the same resolution the Redis driver uses
@@ -816,6 +835,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   produce, and `ttl_distinguishes_…` slept for an expiry it could write by hand. Both now assert
   the property — a range, or a deadline planted in the file — so a loaded machine is not a red
   build, and neither test needs a sleep.
+
 - **Every HTTP/3 request to an `upstream` backend failed as an unreachable origin.** The forward
   path passed the request's inbound HTTP version to the origin client, so a request that arrived
   over QUIC carried `HTTP_3` into `hyper-util`'s pooled client — which accepts HTTP/1.0, 1.1 and 2
@@ -823,7 +843,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The failure surfaced as `502 … the origin is unreachable`, naming an origin that had never been
   contacted, so the message pointed at the wrong component; the transport was the cause and the
   origin was fine. The version is now decided by one helper, `upstream_version`: HTTP/1.0 and
-  HTTP/1.1 pass through, and HTTP/2 or HTTP/3 become HTTP/1.1. It is deliberately *not* a
+  HTTP/1.1 pass through, and HTTP/2 or HTTP/3 become HTTP/1.1. It is deliberately _not_ a
   preference — how an origin is spoken to is `protocol = "h2c"` or the ALPN result, both applied
   by the connector, which sends an HTTP/2 request over an h2c connection whatever this value says.
   Asserted by `an_h2c_origins_trailers_reach_an_http_3_client`, which drives real QUIC at a real
@@ -848,7 +868,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   against the old code.
 - **`kv.getMultiple` and `kv.setMultiple` disagreed with every single-key method about what a key
   is.** The batch methods read their keys with `string_list` and used each string's literal UTF-8
-  bytes, while `setMultiple` decoded *both* halves of its object and every scalar method decoded its
+  bytes, while `setMultiple` decoded _both_ halves of its object and every scalar method decoded its
   `key`. The two spellings could therefore never address the same entry: a batch read reported every
   key as missing, and a batch write stored under a name no `get` could produce. Worse than a failure,
   it was silent — a cache that never hits, and for `setMultiple` writes that exist only to be
@@ -862,7 +882,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `200` with an empty body.** `Registry::render` skipped every family with no series, and the comment
   defended it on the grounds that a described-but-absent metric would puzzle a reader — which is
   true of the server's own `rr_http_*` set, whose families are pool-scoped and genuinely do not
-  apply to a process with no pool, and false of a name the *deployment* wrote in
+  apply to a process with no pool, and false of a name the _deployment_ wrote in
   `[status.metrics.collect]`. A deployment that declared two metrics and started a server with no
   worker pool got a zero-byte page that could not be told apart from an endpoint that was not wired
   up. Names now carry their provenance: `Registry::declare` (used by `describe_collected` for
@@ -870,21 +890,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Registry::describe` keeps the old omit-when-empty behaviour. `prefix` and histograms are covered.
 - **`workers.reset` was unreachable from a call, and had been since it was written.** The `workers`
   namespace is registered under that name, and `MethodRegistry::serve` routes on the text before the
-  *first* dot — so the method, spelled `worker.reset` (singular), resolved to a `worker` namespace no
+  _first_ dot — so the method, spelled `worker.reset` (singular), resolved to a `worker` namespace no
   registry contains. The lookup refused it before the arm that serves it could run, on the worker
   channel and over `[rpc]` alike; `POST /workers/{index}/reset` worked only because it calls
   `WorkerControl::restart` directly and never passes through a registry. The method is now
   `workers.reset`, matching its namespace and the HTTP route. Three tests assert that a reset reaches
-  the pool *through a registry* rather than on the namespace alone, which is the layer that would
+  the pool _through a registry_ rather than on the namespace alone, which is the layer that would
   have caught this: a test calling `WorkersNamespace::serve("worker.reset")` passes against the broken
   registration too.
 - **A route tie went to the later entry, not the earlier one.** `select_route` used
-  `Iterator::max_by_key`, which returns the *last* maximum, while the table's own documentation —
+  `Iterator::max_by_key`, which returns the _last_ maximum, while the table's own documentation —
   and `Config::route_backend`'s — says ties are settled by declaration order so the earlier entry
   wins. The two disagreed harmlessly for as long as a tie meant two routes that behaved identically
   for routing. They no longer do: `[rpc]` derives a backend's token from the name a route selects,
   so reversing the tie handed one backend's call plane to another. Two regression tests now pin both
-  halves of the rule — that a tie goes to the earlier entry, and that a later route stating *more*
+  halves of the rule — that a tie goes to the earlier entry, and that a later route stating _more_
   constraints still wins.
 
 ### Added
@@ -895,7 +915,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `connect()` dials nothing until the first call, so a request that never touches a store pays for
   neither a socket nor a failed connect, and `last_call_was_unknown` separates a refusal from a
   call that may have been served. The one thing a WSGI application must do differently is pass its
-  `environ`: volucer puts the address in the CGI *request*, and the process only receives
+  `environ`: volucer puts the address in the CGI _request_, and the process only receives
   `VOLUCER_FCGI_ADDRESS`, so a client reading `os.environ` works for a script started by hand and
   fails for every real request. Verified end to end against a real server through `spawn_cgi`.
 - **The Ruby SDK has one too, so all three SDKs reach `[rpc]`.** `Volucer::Rpc` reads the call
@@ -945,9 +965,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`[server] trace_context` decides what a backend is handed as its `traceparent`.** The four
   values are nginx's `otel_trace_context` — `ignore`, `extract`, `inject`, `propagate` — with the
   same meaning, and `extract` is the default because it is what the server has always done: the
-  client's header reaches the backend unchanged, so a backend's spans are *siblings* of this
+  client's header reaches the backend unchanged, so a backend's spans are _siblings_ of this
   server's span. Under `propagate` the backend is handed this server's own context instead, so its
-  spans are *children* and a trace view shows one request rather than two branches hanging from it.
+  spans are _children_ and a trace view shows one request rather than two branches hanging from it.
   The replacement applies to all three backend kinds — a worker's `HTTP_TRACEPARENT`, an
   `upstream` origin's forwarded header, and the FastCGI listener's `PARAMS` block, where the entry
   is replaced rather than appended to because two entries would leave the parent decided by
@@ -965,14 +985,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **An unsampled trace was exported as sampled.** The OTLP encoder wrote `"flags":1` unconditionally
   and ignored the `sampled` bit, so a caller that sent `traceparent …-00` had its trace propagated
-  onward as *unsampled* while this server exported its span as *sampled* — the backend and the
+  onward as _unsampled_ while this server exported its span as _sampled_ — the backend and the
   collector were told opposite things about one trace, and nothing on the wire failed. The flag is
   now carried from the request's context into the span, so the bit on the outbound `traceparent` and
   the bit in the exported payload are one decision. This is what nginx's `otel_trace
-  $otel_parent_sampled` covers, and it is why a trace the caller dropped now produces no export at
+$otel_parent_sampled` covers, and it is why a trace the caller dropped now produces no export at
   all rather than an orphaned parent span.
 - **A request with no `traceparent` was treated as unsampled.** It has no parent to defer to — it is
-  a *root* — and reporting it `00` meant a standalone deployment, with no proxy in front, exported
+  a _root_ — and reporting it `00` meant a standalone deployment, with no proxy in front, exported
   nothing at all while `[telemetry]` looked configured. Roots are now recorded, which is OTel's
   `ParentBased(root=AlwaysOn)`; an explicit `-00` from a caller is still obeyed.
 - **The docs claimed arrays of tables and maps could only be set in a file.** Maps always took
@@ -995,7 +1015,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   All three are still slices of what the client sent, never decoded or re-encoded, and substitution
   is one left-to-right pass so a token inside a client-supplied value is not re-expanded.
-  **Deliberately not added: a token that reads *into* the request** (`{query.id}`, captures). Every
+  **Deliberately not added: a token that reads _into_ the request** (`{query.id}`, captures). Every
   such token needs a policy for the ordinary cases — a missing parameter, a repeated one, a value
   that is `%2F%2Fevil.com` once decoded — and a policy per request is a rewrite engine however small
   it looks.
@@ -1057,8 +1077,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`--root`, `--worker`, `--fcgi` and `--concurrency` in the same quick-start shape.** `--root`
   aliases `--document-root`, and `--php-cgi`, `--worker` and `--fcgi` each declare a default
   backend in one flag: `--php-cgi [PATH]` a `spawn_cgi` pool driven by `php-cgi`, `--worker
-  COMMAND` a resident worker, and `--fcgi COMMAND` any FastCGI server with `{address}`. `--workers
-  <N>` sizes whichever was chosen and requires one of them; `--concurrency <N>` is how many
+COMMAND` a resident worker, and `--fcgi COMMAND` any FastCGI server with `{address}`. `--workers
+<N>` sizes whichever was chosen and requires one of them; `--concurrency <N>` is how many
   requests one `--fcgi` slot serves at once, and is refused for the other two. Two backend flags
   at once is a usage error. `--fcgi` also implies "only real files", because a WSGI or Rack
   program is not `index.php`. `volucer check` accepts the same flags, and its preflight now takes
@@ -1087,7 +1107,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `volucer check` reports these settings. See
   [Routing and Sites](docs/03-ROUTING-AND-SITES.md#binding-a-site-to-addresses-and-protocols).
 - **`serve` and `check` can configure the server from CLI overrides.** Repeat `-o`/`--override
-  KEY=VALUE`, or use `--listen` and `--fastcgi`; `-c`/`--config` is optional when the default file
+KEY=VALUE`, or use `--listen` and `--fastcgi`; `-c`/`--config` is optional when the default file
   is absent. Without a file, settings come from the overrides. They are applied to the TOML table
   and parsed once, preserving TOML types, environment expansion and unknown-key validation.
   Shorthand options apply before overrides, so overrides take precedence. An explicitly named
@@ -1136,7 +1156,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **`volucer check` prints a `spawn_cgi` backend's process total.** `processes: 16 (workers 4 ×
-  concurrency 4)` for a `command` driver, `processes: 20 (workers 4 × (children 4+1))` for
+concurrency 4)` for a `command` driver, `processes: 20 (workers 4 × (children 4+1))` for
   `php-cgi`, with `workers = 0` resolved to the core count first. The multiplication used to live
   only in prose, which made a `concurrency` misread as a backend-wide total invisible until the
   host ran out of memory. The line replaces the `php-cgi`-only `prefork:` line, which stated the
@@ -1147,7 +1167,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alias. An existing file that still sets `capacity` fails at startup naming the key rather than
   being silently ignored.
 - **The redirect is decided by the site, not by the listener.** `ListenerSettings::redirect_to_https`
-  is gone: a listener now supplies only the port a redirect should name, and *whether* a request is
+  is gone: a listener now supplies only the port a redirect should name, and _whether_ a request is
   redirected comes from the resolved site. A cleartext listener that no site redirects on no longer
   logs that it will.
 - **`default_backend` and `routes` now belong in `[server]`.** A file that still has the top-level
