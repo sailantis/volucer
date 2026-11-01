@@ -106,7 +106,9 @@ cargo install --path crates/volucer
 You can also download a prebuilt archive from the
 [releases page](https://github.com/sailantis/volucer/releases).
 
-Create a `volucer.toml` to configure the listener, document root, and worker:
+Create a `volucer.toml` to configure the listener, document root, and worker — or
+`.volucer.toml`, which the static layer answers `404` for, so it can live inside the document
+root. `VOLUCER_CONFIG` names the file when you would rather not pass `--config`:
 
 ```toml
 [server]

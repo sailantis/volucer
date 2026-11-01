@@ -2227,6 +2227,132 @@ fn check_prints_no_file_list_for_one_file() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The dotted default is what makes a configuration inside the document root safe to serve.
+///
+/// A `volucer.toml` written beside `document_root = "."` is a file the static layer would answer
+/// for — which is why `dotfiles = "deny"` exists, and why every fixture in this file keeps its
+/// configuration *outside* the root. With `.volucer.toml` the same deployment is safe by default,
+/// because the default answer for a dotfile is already `404`.
+///
+/// Run through `check` rather than `serve`: the resolution rule is what is under test, and a test
+/// that bound a port would fail for a port reason and say nothing about which file was read.
+#[test]
+fn a_dotfile_is_found_when_no_name_is_given() {
+    require_binary!(binary);
+
+    let root = std::env::temp_dir().join(format!("volucer-dotfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+    std::fs::write(root.join("index.html"), "hello").expect("write a document");
+
+    let dotfile = root.join(".volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:8080\"\ndocument_root = {}\n",
+        toml_string(&root.display().to_string())
+    );
+    std::fs::write(&dotfile, &config).expect("write the dotfile");
+
+    // No `--config`: the discovery order is what is under test, and it reads the working directory
+    // — which is why this is the one place a test starts the child in a directory of its own.
+    let found = Command::new(&binary)
+        .arg("check")
+        .current_dir(&root)
+        .output()
+        .expect("the check command runs");
+    assert!(found.status.success(), "{found:?}");
+    let text = String::from_utf8_lossy(&found.stdout);
+    assert!(
+        text.contains("configuration: .volucer.toml"),
+        "the dotfile must be the file that was read: {text}"
+    );
+
+    // With both names present the documented one wins, so an existing deployment keeps reading the
+    // file it already has rather than being switched to a different one by this change.
+    let documented = root.join("volucer.toml");
+    std::fs::write(
+        &documented,
+        config.replace("127.0.0.1:8080", "127.0.0.1:8081"),
+    )
+    .expect("write the documented name");
+
+    let preferred = Command::new(&binary)
+        .arg("check")
+        .current_dir(&root)
+        .output()
+        .expect("the check command runs");
+    assert!(preferred.status.success(), "{preferred:?}");
+    let text = String::from_utf8_lossy(&preferred.stdout);
+    assert!(
+        text.contains("configuration: volucer.toml") && text.contains("127.0.0.1:8081"),
+        "the documented name must win, and the listener it sets must be the one reported: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `VOLUCER_CONFIG` names the file when no `-c` does — including for the probes, which have no
+/// other way to be pointed at a file a fixed `CMD` was not given.
+///
+/// `-c` still wins, which is the half that keeps a hand-run command honest when the variable was
+/// exported in a shell days ago.
+#[test]
+fn the_environment_names_the_configuration_file() {
+    require_binary!(binary);
+
+    let root = std::env::temp_dir().join(format!("volucer-env-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+
+    let named = root.join("custom.toml");
+    std::fs::write(&named, "[server]\nhttp = \"127.0.0.1:8082\"\n").expect("write the config");
+    let other = root.join("other.toml");
+    std::fs::write(&other, "[server]\nhttp = \"127.0.0.1:8083\"\n")
+        .expect("write the other config");
+
+    let from_env = Command::new(&binary)
+        .arg("check")
+        .env("VOLUCER_CONFIG", &named)
+        .current_dir(&root)
+        .output()
+        .expect("the check command runs");
+    assert!(from_env.status.success(), "{from_env:?}");
+    let text = String::from_utf8_lossy(&from_env.stdout);
+    assert!(
+        text.contains("127.0.0.1:8082"),
+        "VOLUCER_CONFIG must be the file that was read: {text}"
+    );
+
+    let by_flag = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&other)
+        .env("VOLUCER_CONFIG", &named)
+        .current_dir(&root)
+        .output()
+        .expect("the check command runs");
+    assert!(by_flag.status.success(), "{by_flag:?}");
+    let text = String::from_utf8_lossy(&by_flag.stdout);
+    assert!(
+        text.contains("127.0.0.1:8083"),
+        "-c must win over the variable: {text}"
+    );
+
+    // A variable naming a file that is not there is an error rather than a silent fallback to the
+    // defaults: an operator who exported a typo has said "read this file", exactly as `-c` does.
+    let missing = Command::new(&binary)
+        .arg("check")
+        .env("VOLUCER_CONFIG", root.join("not-there.toml"))
+        .current_dir(&root)
+        .output()
+        .expect("the check command runs");
+    assert!(
+        !missing.status.success(),
+        "a named file that is missing must fail: {missing:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A cycle is refused by `check` and by `serve` alike, because they share the loader — and the
 /// message names the chain rather than one file.
 #[test]
@@ -4586,6 +4712,12 @@ fn a_configuration_can_be_the_command_line_alone() {
     assert!(
         !root.join("volucer.toml").exists(),
         "the test directory must have no configuration file, or it would prove nothing"
+    );
+    // Both default names, because the discovery order now has two: leaving the dotfile behind
+    // would make this test pass for the wrong reason on a machine that happened to have one.
+    assert!(
+        !root.join(".volucer.toml").exists(),
+        "the test directory must have no configuration file at either default name"
     );
 
     // `check` is the rehearsal of exactly that command line, so it has to accept it too — and to

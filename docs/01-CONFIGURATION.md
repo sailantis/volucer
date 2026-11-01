@@ -10,11 +10,52 @@ documentation pages explain how the features work.
 Volucer reads TOML configuration from `volucer.toml` by default. Use
 `volucer serve --config <path>` to select another file.
 
-**A configuration file is optional.** If you do not pass `--config` and there is no
-`volucer.toml` in the working directory, configure the server with command-line overrides
-(`-o key=value`, `--listen`, and `--fastcgi`). These options produce the same configuration
+**The name and extension are not inspected.** Every file is parsed as TOML, so a file called
+`config.yaml` or `volucer.conf` works when it is named with `--config` — the extension is a
+convention, not a format switch. What is written inside has to be TOML either way; there is no
+YAML or JSON reader.
+
+**Nothing is read when nothing is named.** A default name is used only when that file exists.
+
+### Which file is read
+
+Four sources, in this order — the first one that answers wins:
+
+1. **`-c` / `--config <path>`.** Always means what it says.
+2. **`VOLUCER_HEALTH_CONFIG` or `VOLUCER_STATUS_CONFIG`**, for `volucer health` and
+   `volucer workers restart` respectively. A probe can be pointed at a different file from the
+   one `serve` reads.
+3. **`VOLUCER_CONFIG`**, for every subcommand. This is the one an image with a fixed `CMD` can
+   override without rewriting its command line.
+4. **`volucer.toml`**, then **`.volucer.toml`**, in the working directory — the first that exists.
+
+```sh
+volucer serve                            # reads ./volucer.toml, else ./.volucer.toml
+VOLUCER_CONFIG=/etc/volucer/app.toml volucer serve
+volucer serve --config /etc/volucer/app.toml   # the flag wins over the variable
+```
+
+An **empty** variable is the same as an unset one, so `VOLUCER_CONFIG=""` does not become the path
+`""`.
+
+**`.volucer.toml` exists so a configuration can live inside the document root.** With
+`document_root = "."`, a `volucer.toml` beside the application is a file the static layer would
+answer for; `.volucer.toml` is a dotfile, and `dotfiles = "deny"` — the default — answers `404` for
+it. The dotted name is the fallback, not the first choice: a directory holding both reads
+`volucer.toml`, so an existing deployment is not switched to a different file.
+
+**A configuration file is optional.** If you do not pass `--config`, neither variable is set, and
+neither default name exists in the working directory, configure the server with command-line
+overrides (`-o key=value`, `--listen`, and `--fastcgi`). These options produce the same configuration
 table as a file. See [Getting Started](00-GETTING-STARTED.md#run-without-a-configuration-file)
 for syntax and limitations.
+
+The two are different statements, and the difference is deliberate:
+
+- **No file anywhere** — the command line is the whole configuration.
+- **A file named by `--config` or by a variable that cannot be read** — an error. An operator who
+  named a file has said "read this one", so falling back to the defaults would hide a typo behind a
+  server that started anyway.
 
 **Unknown keys are errors.** Volucer validates configuration strictly, so a typo stops
 startup instead of being silently ignored.
@@ -162,6 +203,12 @@ An included file is ordinary TOML — the same keys, the same strict validation,
 `!include` and `!includedir` — because a line in an option file has nowhere to say "this one is a
 directory"; a list does, so one key says everything and there is no precedence rule between two
 kinds for a reader to learn.
+
+**A directory contributes its `*.toml` files only**, so a `conf.d` shared with another program can
+hold a README or a drop-in for something else. An entry named as a *file* is read whatever it is
+called — `["extra.yaml"]` is read, because the name is not what decides the format. The two rules
+differ because a file name is a deliberate statement about one file, while a directory is a folder
+somebody else may add to.
 
 An entry that is neither a file nor a directory is refused, and so is `include_dir`, named in the
 message with the list that replaces it — an operator arriving from `my.cnf` should be told where the

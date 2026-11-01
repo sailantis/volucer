@@ -209,8 +209,10 @@ volucer check --php-dir /usr/local/php/bin
 
 ## Write a configuration file
 
-By default, Volucer reads `volucer.toml` from the working directory. This minimal
-configuration listens for HTTP requests and forwards them to an existing PHP-FPM socket:
+By default, Volucer reads `volucer.toml` from the working directory — or `.volucer.toml`, which
+keeps the file out of reach of the static layer when the document root is the project directory.
+This minimal configuration listens for HTTP requests and forwards them to an existing PHP-FPM
+socket:
 
 ```toml
 [server]
@@ -272,7 +274,7 @@ With the example configuration above, the application is available at
 
 | Option                                    | Effect                                                                                                                |
 | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `-c`, `--config <PATH>`                   | The configuration file. Defaults to `volucer.toml` in the working directory, and is optional — see below.             |
+| `-c`, `--config <PATH>`                   | The configuration file. Defaults to `VOLUCER_CONFIG`, then `volucer.toml`, then `.volucer.toml`, and is optional — see below. |
 | `-o`, `--override <KEY=VALUE>`            | Set one key, in `dot.notation`. Repeatable.                                                                           |
 | `--listen <ADDR>`                         | Shorthand for `-o server.http=<ADDR>`.                                                                                |
 | `--fastcgi <ADDR>`                        | Shorthand for `-o server.fastcgi=<ADDR>`.                                                                             |
@@ -371,9 +373,9 @@ The three backend options (`--php-cgi`, `--worker`, and `--fcgi`) are mutually e
 ### Run without a configuration file
 
 A configuration file and the command line are two ways to provide settings. If you do
-not pass `-c` and there is no `volucer.toml` in the working directory, configure the
-server with `-o`, `--listen`, and `--fastcgi`. This can be useful for a container command
-or systemd unit:
+not pass `-c`, `VOLUCER_CONFIG` is unset, and neither `volucer.toml` nor `.volucer.toml`
+exists in the working directory, configure the server with `-o`, `--listen`, and
+`--fastcgi`. This can be useful for a container command or systemd unit:
 
 ```sh
 volucer serve \
@@ -464,6 +466,7 @@ volucer 0.1.0
 ```sh
 volucer health --config volucer.toml          # /health: is the process alive?
 volucer health --config volucer.toml --ready  # /ready: should traffic be sent here?
+volucer health                                # the default names, then VOLUCER_CONFIG
 volucer health --url http://127.0.0.1:2114/health
 ```
 

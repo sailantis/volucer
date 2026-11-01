@@ -663,9 +663,11 @@ The command chooses its probe target using these settings, in order of increasin
 
 | Setting                 | Effect                                                                                                                        |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `VOLUCER_HEALTH_CONFIG` | The configuration file to read. The image defaults to `/etc/volucer/volucer.toml`; set this if the file is mounted elsewhere. |
+| the default file        | `volucer.toml`, then `.volucer.toml`, in the working directory.                                                               |
+| `VOLUCER_CONFIG`        | The configuration file to read, shared with `serve`.                                                                          |
+| `VOLUCER_HEALTH_CONFIG` | The configuration file to read, for this probe only. The image defaults to `/etc/volucer/volucer.toml`; set this if the file is mounted elsewhere. |
 | `VOLUCER_HEALTH_URL`    | A URL to probe instead of reading the configuration.                                                                          |
-| `--url` / `--config`    | The flags, which win over both — so a variable someone forgot does not fight a probe typed by hand.                           |
+| `--url` / `--config`    | The flags, which win over all of them — so a variable someone forgot does not fight a probe typed by hand.                     |
 
 The image's built-in health check uses `/health`, not `/ready`. A failed Docker health check
 may lead to a container restart, so a server should not fail it merely because its worker

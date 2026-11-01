@@ -10,6 +10,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Access controls and custom error pages.** Configure client-address allow/deny rules and status-specific pages for server-generated errors.
+- **`.volucer.toml` and `VOLUCER_CONFIG`.** The configuration file may now be named `.volucer.toml`, which the static layer answers `404` for and can therefore sit inside the document root, and `VOLUCER_CONFIG` names a file without a `--config` flag — the way an image overrides a `CMD` fixed at build time. `volucer.toml` still wins when both names exist, so an existing deployment reads the file it already has. Every subcommand resolves the file by one rule: `-c`, then the subcommand's own variable (`VOLUCER_HEALTH_CONFIG`, `VOLUCER_STATUS_CONFIG`), then `VOLUCER_CONFIG`, then the default names.
 - **AMQP job queues.** An optional `amqp` feature adds RabbitMQ as a job driver and passes queue arguments through to the broker.
 - **Backend response streaming and file offload.** Large responses can be relayed past `stream_threshold_bytes`; backends can also use `X-Sendfile` or `X-Accel-Redirect` to serve files.
 - **Configuration includes and CLI overrides.** Split configuration across files with `include`, and update array-of-table entries with `-o`.

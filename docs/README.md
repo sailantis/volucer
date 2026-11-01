@@ -11,7 +11,7 @@ This guide explains how to configure, run, and maintain Volucer.
 ## Start here
 
 - **[Getting Started](00-GETTING-STARTED.md)** — Install the binary, write a
-  `volucer.toml`, serve your first request, and move off `php-fpm`.
+  `volucer.toml` (or `.volucer.toml`), serve your first request, and move off `php-fpm`.
 
 ## Running your application
 

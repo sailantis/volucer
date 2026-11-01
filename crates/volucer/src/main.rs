@@ -1,5 +1,6 @@
 //! The `volucer` command line interface.
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -45,12 +46,16 @@ enum Command {
             .args(["php_cgi", "worker", "fcgi"])
     ))]
     Serve {
-        /// Path to `volucer.toml`.
+        /// Path to the configuration file.
         ///
-        /// Defaults to `volucer.toml` in the working directory when that file exists. Without a
-        /// file — no `-c`, and no `volucer.toml` beside the working directory — the configuration
-        /// comes from the command line alone, so at least one listener must be given with
-        /// `--listen`, `--fastcgi` or `-o server.http=…`.
+        /// Without `-c`, `VOLUCER_CONFIG` names the file; without either, `volucer.toml` and then
+        /// `.volucer.toml` are looked for in the working directory. **A missing default is not an
+        /// error** — with no file at all the configuration comes from the command line alone, so at
+        /// least one listener must be given with `--listen`, `--fastcgi` or `-o server.http=…`. A
+        /// file named explicitly, by `-c` or by the variable, is a hard error when it cannot be
+        /// read.
+        ///
+        /// The content is always TOML; the name and extension are not inspected.
         #[arg(short, long)]
         config: Option<PathBuf>,
 
@@ -176,7 +181,8 @@ enum Command {
             .args(["php_cgi", "worker", "fcgi"])
     ))]
     Check {
-        /// Path to `volucer.toml`. Optional, with the same rule as `serve`.
+        /// Path to the configuration file. Optional, with the same resolution as `serve`:
+        /// `VOLUCER_CONFIG`, then `volucer.toml`, then `.volucer.toml`.
         #[arg(short, long)]
         config: Option<PathBuf>,
 
@@ -261,13 +267,13 @@ enum Command {
         /// present, because the two share one listener. An unspecified host (`0.0.0.0`, `::`) is
         /// probed on loopback, which is what a container's own address means from inside it.
         ///
-        /// Defaults to `VOLUCER_HEALTH_CONFIG`, and then to `volucer.toml` beside the working
-        /// directory — so a `HEALTHCHECK` written for the documented `/etc/volucer/volucer.toml`
-        /// keeps working when a deployment overrides `CMD` to point somewhere else, without the
-        /// image having to guess. A file that cannot be read is a *failed* probe rather than a
-        /// skipped one: a container with no configuration cannot serve, and reporting it healthy
-        /// because the check could not read its file is the failure a health check exists to
-        /// prevent.
+        /// Defaults to `VOLUCER_HEALTH_CONFIG`, then `VOLUCER_CONFIG`, then `volucer.toml` and
+        /// `.volucer.toml` beside the working directory — so a `HEALTHCHECK` written for the
+        /// documented `/etc/volucer/volucer.toml` keeps working when a deployment overrides `CMD`
+        /// to point somewhere else, without the image having to guess. A file that cannot be read is
+        /// a *failed* probe rather than a skipped one: a container with no configuration cannot
+        /// serve, and reporting it healthy because the check could not read its file is the failure
+        /// a health check exists to prevent.
         #[arg(long, conflicts_with = "url")]
         config: Option<PathBuf>,
 
@@ -327,8 +333,9 @@ enum WorkersAction {
 
         /// Take the address from this configuration file's `[status] listen`.
         ///
-        /// Defaults to `VOLUCER_STATUS_CONFIG`, and then to `volucer.toml` beside the working
-        /// directory — the same resolution `health` uses, so one file answers both.
+        /// Defaults to `VOLUCER_STATUS_CONFIG`, then `VOLUCER_CONFIG`, then `volucer.toml` and
+        /// `.volucer.toml` beside the working directory — the same resolution `health` uses, so one
+        /// file answers both.
         #[arg(long, conflicts_with = "url")]
         config: Option<PathBuf>,
 
@@ -775,11 +782,14 @@ fn health(
         (Some(url), _) => url.to_string(),
         (None, Some(config)) => probe_url_for(config, path)?,
         (None, None) => {
-            // Last resort, and deliberately the same default `serve` has: a `HEALTHCHECK` that
-            // passes nothing at all should probe the file the `CMD` would have served.
-            let default = std::env::var_os("VOLUCER_HEALTH_CONFIG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("volucer.toml"));
+            // Last resort, deliberately the same resolution `serve` uses: a `HEALTHCHECK` that
+            // passes nothing at all should probe the file the `CMD` would have served. The default
+            // name is kept even when *no* file exists, so the probe fails on a file it cannot read
+            // rather than silently probing nothing.
+            let default = resolve_config_path(None, Some("VOLUCER_HEALTH_CONFIG"), &|name| {
+                std::env::var_os(name)
+            })
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_NAMES[0]));
             probe_url_for(&default, path)?
         }
     };
@@ -823,9 +833,10 @@ fn workers_restart(
         None => {
             let config = match config {
                 Some(config) => config.to_path_buf(),
-                None => std::env::var_os("VOLUCER_STATUS_CONFIG")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("volucer.toml")),
+                None => resolve_config_path(None, Some("VOLUCER_STATUS_CONFIG"), &|name| {
+                    std::env::var_os(name)
+                })
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_NAMES[0])),
             };
             let loaded = Config::load(&config).map_err(|err| HealthError::Config(Box::new(err)))?;
             let address = loaded
@@ -1278,6 +1289,32 @@ impl Source {
         backend: Backends,
         sizing: Sizing,
     ) -> Self {
+        Self::resolve_from_env(
+            config,
+            listen,
+            fastcgi,
+            overrides,
+            backend,
+            sizing,
+            &|name| std::env::var_os(name),
+        )
+    }
+
+    /// [`Source::resolve_with_backends`], with the environment supplied by the caller.
+    ///
+    /// The lookup is a parameter for the reason [`volucer_core::env::expand_with`] takes one: the
+    /// process environment is global, so a test that wrote it would race every other test in this
+    /// binary — and the four-source precedence rule is exactly what needs a test, because it is
+    /// stated in one place and relied on by four subcommands.
+    fn resolve_from_env(
+        config: Option<PathBuf>,
+        listen: Option<String>,
+        fastcgi: Option<String>,
+        overrides: Vec<String>,
+        backend: Backends,
+        sizing: Sizing,
+        lookup: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Self {
         let mut pairs = Vec::with_capacity(overrides.len() + 2);
         for (key, address) in [("server.http", listen), ("server.fastcgi", fastcgi)] {
             if let Some(address) = address {
@@ -1331,17 +1368,13 @@ impl Source {
 
         pairs.extend(overrides);
 
-        // The default file is used only when it is *there*. A missing `volucer.toml` and no `-c`
-        // means the command line is the whole configuration; an explicit `-c` naming a missing file
-        // stays an error, because that is the difference between "I said nothing" and "I named a
-        // file that is not there".
-        let path = match config {
-            Some(path) => Some(path),
-            None => {
-                let default = PathBuf::from(DEFAULT_CONFIG);
-                default.exists().then_some(default)
-            }
-        };
+        // One resolution, for `serve`, `check` and the probes alike: `-c`, then the subcommand's
+        // own variable, then `VOLUCER_CONFIG`, then the default names that exist. A *missing*
+        // default is not an error — no flag, no variable and no file means the command line is the
+        // whole configuration — while an explicitly named file that cannot be read stays an error,
+        // because that is the difference between "I said nothing" and "I named a file that is not
+        // there".
+        let path = resolve_config_path(config, None, lookup);
 
         Self { path, pairs }
     }
@@ -1417,8 +1450,81 @@ impl Source {
     }
 }
 
-/// The file used when `-c` is not given and this exists.
-const DEFAULT_CONFIG: &str = "volucer.toml";
+/// The file names used when neither `-c` nor [`ENV_CONFIG`] names one, in precedence order.
+///
+/// The undotted name comes first so that the documented spelling keeps winning: a directory
+/// holding both is ambiguous, and the file `README` and every page of `docs/` write is the one an
+/// operator expects to be read.
+///
+/// The dotted name exists because of two things this binary cannot otherwise reconcile. The first
+/// is the document root: `volucer.toml` beside `document_root = "."` is a file the static layer
+/// would happily serve, which is why the tests write their configuration *outside* the root, and
+/// why `dotfiles = "deny"` was already the one answer. `.volucer.toml` is a dotfile, so a
+/// deployment that keeps its configuration in the root answers `404` for it by default. The second
+/// is convention: `.rr.yaml`, `.env`, `.editorconfig` and `.gitignore` are the same shape, so an
+/// operator arriving from RoadRunner will look for this name first.
+const DEFAULT_CONFIG_NAMES: [&str; 2] = ["volucer.toml", ".volucer.toml"];
+
+/// The environment variable that names the configuration file, for every subcommand.
+///
+/// The command line wins, so an operator debugging by hand is never surprised by a variable they
+/// forgot — the same rule `VOLUCER_HEALTH_URL` follows. It exists for the deployments that cannot
+/// easily write one: a `CMD` baked into an image, and a `HEALTHCHECK` whose command is fixed at
+/// build time, both of which can only be overridden through the environment.
+const ENV_CONFIG: &str = "VOLUCER_CONFIG";
+
+/// How a configuration file is chosen, for every subcommand — one rule rather than four.
+///
+/// Four sources, in this order:
+///
+/// 1. **The file named on the command line.** `-c` wins over everything, so an explicit path always
+///    means what it says.
+/// 2. **The subcommand's own variable** (`VOLUCER_HEALTH_CONFIG`, `VOLUCER_STATUS_CONFIG`), which a
+///    container can set to point a probe at a file a `CMD` was not given.
+/// 3. **[`ENV_CONFIG`]**, which is what an image with a fixed `CMD` can actually override.
+/// 4. **The default names that exist** in the working directory, in
+///    [`DEFAULT_CONFIG_NAMES`] order.
+///
+/// `None` means nothing named a file at all — which is not the same as "nothing to do": `serve` and
+/// `check` treat it as a fileless deployment, while the probes substitute
+/// [`DEFAULT_CONFIG_NAMES`]`[0]` so a missing file **fails** them rather than leaving them with
+/// nothing to probe. The lookup is a parameter so a test can answer for the environment instead of
+/// writing it, which is global and would race every other test in the binary — the same reason
+/// [`volucer_core::env::expand_with`] takes one.
+fn resolve_config_path(
+    named: Option<PathBuf>,
+    own: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    named
+        .or_else(|| own.and_then(|name| named_by(lookup, name)))
+        .or_else(|| named_by(lookup, ENV_CONFIG))
+        .or_else(|| first_existing(Path::new(""), &DEFAULT_CONFIG_NAMES))
+}
+
+/// A variable, when it names a file rather than holding nothing.
+///
+/// An empty value is treated as unset rather than as the path `""`, which would fail to read with a
+/// message about a directory that is not one. `serve`'s `VOLUCER_CONFIG=""` is therefore the same
+/// statement as leaving it out, which is what a shell variable interpolated from nothing should
+/// mean.
+fn named_by(lookup: &dyn Fn(&str) -> Option<OsString>, name: &str) -> Option<PathBuf> {
+    lookup(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The first of `names` that exists in `dir`, in the order given.
+///
+/// The directory is a parameter so that the precedence rule — and nothing else — is what a test
+/// checks, without either writing the process's working directory (global, and a race against
+/// every other test in the binary) or depending on what happens to sit in the crate root.
+fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.exists())
+}
 
 /// One override's text as a TOML value.
 ///
@@ -5770,6 +5876,119 @@ mod tests {
         // And a key that merely starts with `include` is not swept up by the refusal.
         apply_override(&mut table, "server.include_timeout=5")
             .expect("only the directive names are refused");
+    }
+
+    /// A directory of its own per test, so nothing here writes the process's working directory.
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("volucer-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the temp directory");
+        dir
+    }
+
+    /// The default names are tried in order, and a directory holding neither yields nothing.
+    ///
+    /// The second half is the half that makes a fileless deployment possible: `None` is what `serve`
+    /// reads as "the command line is the whole configuration", so a rule that invented a path here
+    /// would turn every container with no file into a startup error.
+    #[test]
+    fn the_default_names_are_tried_in_the_documented_order() {
+        let dir = temp_dir("defaults");
+
+        assert_eq!(
+            first_existing(&dir, &DEFAULT_CONFIG_NAMES),
+            None,
+            "an empty directory names no file"
+        );
+
+        std::fs::write(dir.join(".volucer.toml"), "[server]\n").expect("write the dotfile");
+        assert_eq!(
+            first_existing(&dir, &DEFAULT_CONFIG_NAMES),
+            Some(dir.join(".volucer.toml")),
+            "the dotfile is found when it is the only one"
+        );
+
+        std::fs::write(dir.join("volucer.toml"), "[server]\n").expect("write the documented name");
+        assert_eq!(
+            first_existing(&dir, &DEFAULT_CONFIG_NAMES),
+            Some(dir.join("volucer.toml")),
+            "with both present the documented name wins, so an existing deployment is unchanged"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-c` beats both variables, the subcommand's own variable beats `VOLUCER_CONFIG`, and
+    /// `VOLUCER_CONFIG` beats the defaults.
+    ///
+    /// One rule for four subcommands, so it is asserted once rather than four times: a probe that
+    /// resolved differently from `serve` would pass a health check against a configuration the
+    /// server is not running.
+    #[test]
+    fn the_configuration_sources_are_tried_in_precedence_order() {
+        // A directory with no default file, so the environment is the only source left and the
+        // assertions cannot accidentally pass because a fixture happened to exist.
+        let dir = temp_dir("precedence");
+        let lookup = |name: &str| -> Option<OsString> {
+            match name {
+                "VOLUCER_CONFIG" => Some(OsString::from("general.toml")),
+                "VOLUCER_HEALTH_CONFIG" => Some(OsString::from("probe.toml")),
+                _ => None,
+            }
+        };
+
+        assert_eq!(
+            resolve_config_path(Some(PathBuf::from("named.toml")), None, &lookup),
+            Some(PathBuf::from("named.toml")),
+            "-c always means what it says"
+        );
+        assert_eq!(
+            resolve_config_path(None, Some("VOLUCER_HEALTH_CONFIG"), &lookup),
+            Some(PathBuf::from("probe.toml")),
+            "a subcommand's own variable is more specific than the shared one"
+        );
+        assert_eq!(
+            resolve_config_path(None, None, &lookup),
+            Some(PathBuf::from("general.toml")),
+            "serve has no variable of its own, so it reads VOLUCER_CONFIG"
+        );
+
+        // Nothing named at all: the answer is `None`, which `serve` reads as fileless.
+        let nothing = |_: &str| -> Option<OsString> { None };
+        assert_eq!(
+            resolve_config_path(None, Some("VOLUCER_HEALTH_CONFIG"), &nothing),
+            None,
+            "with no variable and no default file, nothing is named"
+        );
+
+        // An empty value is unset, not the path `""` — a shell variable interpolated from nothing
+        // must not become a file name.
+        let empty = |name: &str| -> Option<OsString> {
+            (name == "VOLUCER_CONFIG").then(|| OsString::from(""))
+        };
+        assert_eq!(
+            resolve_config_path(None, None, &empty),
+            None,
+            "VOLUCER_CONFIG=\"\" names no file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The environment is read through one seam, so the four subcommands cannot disagree.
+    #[test]
+    fn the_environment_names_a_file_and_an_empty_value_does_not() {
+        let lookup = |name: &str| -> Option<OsString> {
+            match name {
+                "SET" => Some(OsString::from("a.toml")),
+                "EMPTY" => Some(OsString::from("")),
+                _ => None,
+            }
+        };
+
+        assert_eq!(named_by(&lookup, "SET"), Some(PathBuf::from("a.toml")));
+        assert_eq!(named_by(&lookup, "EMPTY"), None);
+        assert_eq!(named_by(&lookup, "UNSET"), None);
     }
 
     /// `--listen` becomes a quoted `server.http` pair, placed before every `-o`.
