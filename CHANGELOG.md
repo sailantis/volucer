@@ -978,6 +978,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The docs claimed arrays of tables and maps could only be set in a file.** Maps always took
   dotted keys, and an array of tables could already be replaced with an inline TOML value
   (`-o 'server.routes=[{ path_prefix = "/api" }]'`). Both pages now describe what the parser does.
+- **The `{path}` loop message described a loop that does not occur.** It said `/old{path}` "sends
+  every request back to the path it asked for"; it sends `/old/x` to `/old/old/x`, which is still a
+  loop — the route matches the target again — but by growth rather than by repetition. The refusal
+  is unchanged; the message now says what happens.
+
+### Added
+
+- **A redirect's `to` gains `{rest}` and `{query}`, and both are verbatim.** `{path}` was the only
+  substitution, and it is the whole path-and-query — so the migration the docs advertise,
+  `path_prefix = "/blog"` → `to = "/news{path}"`, actually lands on `/news/blog/a/b`: the prefix
+  being retired is preserved inside the new URL. `{rest}` is the same request with the route's own
+  `path_prefix` removed, so `/blog/a/b` becomes `/news/a/b` — one token, no capture group, and the
+  feature finally does what its example says. `{query}` is the part after `?`, for a form that moved
+  path: `to = "/find?{query}"`.
+
+  All three are still slices of what the client sent, never decoded or re-encoded, and substitution
+  is one left-to-right pass so a token inside a client-supplied value is not re-expanded.
+  **Deliberately not added: a token that reads *into* the request** (`{query.id}`, captures). Every
+  such token needs a policy for the ordinary cases — a missing parameter, a repeated one, a value
+  that is `%2F%2Fevil.com` once decoded — and a policy per request is a rewrite engine however small
+  it looks.
+
+  Two more misconfigurations are refused at startup: a `{rest}` on a route with no `path_prefix`,
+  which has nothing to subtract, and a target that puts the prefix back by hand (`to = "/old{rest}"`
+  is a fixed point).
+
+- **A route can mount its own directory: `root`.** A `[[server.routes]]` entry that states `root`
+  serves its subtree from that absolute directory, with the route's `path_prefix` as the mount point
+  — `/downloads/x` resolves from `<root>/x`. This is nginx's `alias`, with one root per route rather
+  than a path suffix to concatenate, and with a single rule for the concatenation instead of two
+  spellings that differ by a slash.
+
+  Publishing a directory outside the document root previously took a symlink the operator had to
+  re-create on every deploy, or an application route answering `X-Sendfile` — a backend round trip
+  for a static asset. It touches files only: script resolution still uses the site's
+  `document_root`, so a `.php` under a route root is refused rather than executed, and the `..` and
+  dotfile refusals are the same code that resolves the site's root. A relative root is refused by
+  name (there is no configuration directory to resolve it against in the site table), and a root
+  that does not exist is a startup error rather than a mount that silently 404s. `root` beside
+  `redirect` or `policy = "backend"` is refused, because neither consults the static layer, and so
+  is a `root` with no `path_prefix` — a mount with no mount point would fall back to the site's root
+  without saying so.
+
+  `volucer check` prints each route's root and an expanded example of each redirect, so the token is
+  visible without a `curl -I` against a live host.
 
 ## [0.3.0] - 2026-10-26
 

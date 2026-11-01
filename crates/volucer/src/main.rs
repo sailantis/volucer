@@ -4850,16 +4850,45 @@ fn check(
         let prefix = route.path_prefix.as_deref().unwrap_or("*");
         let suffix = route.path_suffix.as_deref().unwrap_or("*");
         // A route with no backend is a files-only location, and saying so is the point: it
-        // explains why a missing file there is a 404 rather than a dispatch.
-        match &route.backend {
-            Some(backend) => println!("{indent}{host}{prefix}{suffix} -> {backend}"),
-            None => println!("{indent}{host}{prefix}{suffix} -> (files only: no backend)"),
+        // explains why a missing file there is a 404 rather than a dispatch. A redirect reaches no
+        // backend at all, so naming one would be a line that does nothing — the validator refuses it,
+        // and this prints the answer rather than a misleading `-> (files only)`.
+        if route.redirect.is_some() {
+            // Printed below, with the expanded target.
+        } else {
+            match &route.backend {
+                Some(backend) => println!("{indent}{host}{prefix}{suffix} -> {backend}"),
+                None => println!("{indent}{host}{prefix}{suffix} -> (files only: no backend)"),
+            }
         }
         // Only what the route *states*, which is the same rule the site table uses: printing
         // `all` under every route would make the table read as though every route had been
         // configured with it.
         if route.policy != volucer_core::config::RoutePolicy::All {
             println!("{indent}  policy: {}", route.policy.as_str());
+        }
+        // A root stands in for the site's for this subtree, so printing it under the route says what
+        // the request path will actually use. Without it, a mount is invisible in `check` and the
+        // operator reads the site's document root above as though it applied everywhere.
+        if let Some(root) = &route.root {
+            println!("{indent}  root: {}", root.display());
+        }
+        // What a redirect will actually send, expanded with a plausible request: the token is not
+        // obvious from the template alone, and printing it is cheaper than a `curl -I` on a live host.
+        if let Some(redirect) = &route.redirect {
+            // The example path is deliberately *under* the route's own prefix when it states one, so
+            // the expansion shows what `{rest}` subtracts rather than leaving the operator to work it
+            // out. A route with no prefix gets a neutral path, which is also the only shape that can
+            // reach a `path_suffix` route.
+            let example = match route.path_prefix.as_deref() {
+                Some(prefix) => format!("{}/example?q=1", prefix.trim_end_matches('/')),
+                None => "/example?q=1".to_string(),
+            };
+            println!(
+                "{indent}{host}{prefix}{suffix} -> {} {example} => {}",
+                redirect.status,
+                redirect.location_for(&example, route.path_prefix.as_deref())
+            );
         }
         if volucer_core::config::skip_stat(route, interprets_path, extensions) {
             println!("{indent}  stat: skipped (the pattern proves the extension)");

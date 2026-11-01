@@ -994,7 +994,7 @@ socket = "unix:/run/php/php-fpm.sock"
 # ```toml
 # [[server.routes]]
 # path_prefix = "/blog"
-# redirect = { status = 308, to = "/news{path}" }
+# redirect = { status = 308, to = "/news{rest}" }
 # ```
 #
 #   It reaches no backend, so `backend` must be absent and `policy` must be left
@@ -1006,9 +1006,24 @@ socket = "unix:/run/php/php-fpm.sock"
 #   there is what you are retiring. It is also answered before the body is read,
 #   so a redirected POST costs nothing.
 #
-#   `{path}` is the request's path AND query, verbatim -- the only substitution.
-#   There are no regexes, no captures and no rewrite engine, deliberately: that
-#   is the part of nginx's configuration nobody can read.
+#   `to` may contain three tokens, each a verbatim slice of what the client sent:
+#
+#     {path}   the request's whole path AND query
+#     {rest}   the path and query with this route's own `path_prefix` removed
+#     {query}  the query string alone, without the `?`
+#
+#   `{rest}` is what the migration above needs: `{path}` keeps the prefix, so the
+#   same route written with it lands on `/news/blog/...`. `{rest}` carries its own
+#   leading `/`, so `"/news{rest}"` is right and `"/news/{rest}"` gives `//`.
+#
+#   `{query}` is for a form that moved path: `to = "/find?{query}"` sends
+#   `/search?q=x` to `/find?q=x`.
+#
+#   There is deliberately no fourth token. `{query.id}` would need a startup
+#   answer for a missing parameter, a repeated one, and a value that is
+#   `%2F%2Fevil.com` once decoded; a policy per request is a rewrite engine
+#   however small it looks. An application that must read into the request has a
+#   front controller for it.
 #
 #   `status` decides what a cache may keep. 301/308 are sent with
 #   `Cache-Control: public`, because being cached is what permanent means;
@@ -1017,10 +1032,34 @@ socket = "unix:/run/php/php-fpm.sock"
 #   GET, so an API redirect wants the first pair.
 #
 #   Refused at startup rather than at request time, because a client cannot
-#   recover from either: a `to` that is neither an absolute URL nor starts with
+#   recover from any of it: a `to` that is neither an absolute URL nor starts with
 #   '/' (a client reads `example.com/x` as a relative path, so it resolves to
-#   `/example.com/x` here), and a `to` that sends a request back into the route's
-#   own prefix, which is a loop.
+#   `/example.com/x` here), a `to` that sends a request back into the route's own
+#   prefix, and a `{rest}` on a route with no prefix to subtract.
+#
+# `root` mounts an absolute directory at this route's prefix, which is how a
+# subtree outside the document root is published without a symlink or a script:
+#
+# ```toml
+# [[server.routes]]
+# path_prefix = "/downloads"
+# root = "/srv/files"
+# policy = "static"
+# ```
+#
+#   `/downloads/x` is served from `/srv/files/x` -- the prefix is the mount point
+#   and is stripped, which is nginx's `alias`. It answers files only: a `.php`
+#   under a route root is refused rather than executed, and the `..` and dotfile
+#   refusals are the ones the site's own root uses.
+#
+#   Absolute, and it must be a directory that exists: a relative root would have
+#   to resolve against this file's directory, which the site table cannot do, and
+#   a root that is not there is a mount that silently 404s. `root` beside
+#   `redirect` or `policy = "backend"` is refused, because neither consults the
+#   static layer.
+#
+#   It also needs a `path_prefix`: the prefix is the mount point and is what the
+#   root replaces, so a root without one would have nowhere to be served from.
 
 # ---------------------------------------------------------------------------
 # php-cgi pool: N processes on N ports. The only option on Windows, where

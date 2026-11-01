@@ -1041,19 +1041,23 @@ fn serve_connection(
         // `REQUEST_URI` is what the client asked for, including the query, so `{path}` expands to the
         // same thing it does on the HTTP path — nginx's `fastcgi_params` sets it from `$request_uri`,
         // which is the raw request line's target rather than a decoded path.
-        if let Some(redirect) = volucer_core::config::select_route(
+        if let Some((redirect, prefix)) = volucer_core::config::select_route(
             &site.routes,
             host.as_deref(),
             param(request.params.as_slice(), b"REQUEST_URI")
                 .and_then(|uri| uri.split('?').next())
                 .unwrap_or("/"),
         )
-        .and_then(|route| route.redirect.as_ref())
-        {
+        .and_then(|route| {
+            route
+                .redirect
+                .as_ref()
+                .map(|redirect| (redirect, route.path_prefix.as_deref()))
+        }) {
             let path = param(request.params.as_slice(), b"REQUEST_URI")
                 .map(|uri| uri.to_string())
                 .unwrap_or_else(|| "/".to_string());
-            let target = redirect.location(&path);
+            let target = redirect.location_for(&path, prefix);
             stats.requests.fetch_add(1, Ordering::Relaxed);
             if observe.is_active() {
                 // The record is written before the answer, like the refusals above and unlike a

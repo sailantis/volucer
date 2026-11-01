@@ -3923,6 +3923,203 @@ redirect = { status = 301, to = "/new{path}" }
     );
 }
 
+#[test]
+fn the_rest_token_drops_the_prefix_being_retired() {
+    // The migration the documentation advertises, and the reason `{rest}` exists: `{path}` keeps the
+    // prefix, so `/blog/a/b` would land on `/news/blog/a/b` — the old prefix preserved inside the new
+    // URL. `{rest}` is the same route, one prefix over.
+    let Some(server) = redirect_server(
+        r#"
+[[server.routes]]
+path_prefix = "/blog"
+redirect = { status = 308, to = "/news{rest}" }
+"#,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/blog/a/b?x=1&y=2");
+    assert_eq!(answer.status, 308, "{answer:?}");
+    let location = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(
+        location.as_deref(),
+        Some("/news/a/b?x=1&y=2"),
+        "the prefix is subtracted, the separator and the query travel with the rest"
+    );
+
+    // The prefix itself, with nothing after it: no doubled slash, no empty path.
+    let answer = get(&server.address, "/blog");
+    let location = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(location.as_deref(), Some("/news"), "{answer:?}");
+}
+
+#[test]
+fn the_query_token_carries_the_parameters_to_another_path() {
+    // `{query}` is the part after `?`, verbatim. It is what makes "send this old form to the new one,
+    // keeping what the client typed" expressible without a capture group — and without a decoder,
+    // which is what keeps the token from being a policy per request.
+    let Some(server) = redirect_server(
+        r#"
+[[server.routes]]
+path_prefix = "/search"
+redirect = { status = 302, to = "/find?{query}" }
+"#,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/search?q=rust&page=2");
+    assert_eq!(answer.status, 302, "{answer:?}");
+    let location = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(
+        location.as_deref(),
+        Some("/find?q=rust&page=2"),
+        "the query travels verbatim, including a parameter the server never parses"
+    );
+
+    // A `?` with nothing after it is not the same as no `?`: the token is what the client sent.
+    let answer = get(&server.address, "/search");
+    let location = answer
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(location.as_deref(), Some("/find?"), "{answer:?}");
+}
+
+// ------------------------------------------------------------ a route's own root
+//
+// A route that states `root` serves its subtree from that directory while scripts still resolve
+// against the site's. These tests pin the two halves that matter: the file is served from the mount,
+// and the site's own document root is *not* consulted for that prefix — a route root is a mount, not a
+// fall-through.
+
+fn mounted_server(
+    routes: &str,
+    site_root: &std::path::Path,
+    mount: &std::path::Path,
+) -> Option<Server> {
+    // `routes` carries `{mount}` as a placeholder, because the root has to be interpolated into a TOML
+    // string and a Windows path is full of backslashes — `{:?}` on the path is what makes it a legal
+    // TOML literal, and a second `format!` over the body would try to read its braces.
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {site_root:?}
+static_files = {{ enabled = true }}
+{routes}
+"#,
+        site_root = site_root.to_string_lossy(),
+        routes = routes.replace("{mount}", &format!("{:?}", mount.to_string_lossy())),
+    );
+    let config = Config::from_toml(&text).expect("the fixture parses");
+    let routing = Routing {
+        document_root: site_root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(Sites::from_config(&config, site_root));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )));
+    Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+}
+
+#[test]
+fn a_route_root_serves_files_from_outside_the_document_root() {
+    let site_root = static_root("mount-site");
+    let mount = static_root("mount-files");
+    // A file the mount holds and the site's own root does not, so a 200 can only be the mount's.
+    std::fs::write(mount.join("report.pdf"), b"%PDF-1.7 mount").expect("write into the mount");
+
+    let Some(server) = mounted_server(
+        r#"
+[[server.routes]]
+path_prefix = "/downloads"
+root = {mount}
+policy = "static"
+"#,
+        &site_root,
+        &mount,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/downloads/report.pdf");
+    assert_eq!(
+        answer.status, 200,
+        "a route root is served, not the site's document root: {answer:?}"
+    );
+    assert_eq!(answer.text(), "%PDF-1.7 mount");
+
+    // And the same file is *not* reachable without the prefix: the mount is a subtree, not a second
+    // document root.
+    let outside = get(&server.address, "/report.pdf");
+    assert_ne!(
+        outside.status, 200,
+        "the mount must not be reachable outside its prefix: {outside:?}"
+    );
+
+    // The site's own root keeps working beside it.
+    let own = get(&server.address, "/assets/app.css");
+    assert_eq!(own.status, 200, "{own:?}");
+
+    let _ = std::fs::remove_dir_all(&site_root);
+    let _ = std::fs::remove_dir_all(&mount);
+}
+
+#[test]
+fn a_route_root_never_executes_or_serves_a_script() {
+    // The source guard is the site's, and it is checked before the mount is: a `.php` under a route
+    // root goes to the backend, exactly like one under the site's root. Otherwise a mount would be a
+    // way to publish the source of a script somebody dropped there.
+    let site_root = static_root("mount-guard-site");
+    let mount = static_root("mount-guard-files");
+    std::fs::write(mount.join("leak.php"), "<?php echo 'SECRET-SOURCE';").expect("write a script");
+
+    let Some(server) = mounted_server(
+        r#"
+[[server.routes]]
+path_prefix = "/downloads"
+root = {mount}
+policy = "static"
+"#,
+        &site_root,
+        &mount,
+    ) else {
+        return;
+    };
+
+    let answer = get(&server.address, "/downloads/leak.php");
+    assert_ne!(answer.status, 200, "{answer:?}");
+    assert!(
+        !answer.text().contains("SECRET-SOURCE"),
+        "a script must never be served from disk, wherever the root points"
+    );
+
+    // A `..` under the mount is refused by the same rule the site's root uses.
+    let escape = get(&server.address, "/downloads/../../etc/passwd");
+    assert_ne!(escape.status, 200, "{escape:?}");
+
+    let _ = std::fs::remove_dir_all(&site_root);
+    let _ = std::fs::remove_dir_all(&mount);
+}
+
 //
 // `[server].trace_context` decides one thing: **what the backend receives.** These tests are about
 // that, through a real origin, because the header is written by the listener and a unit test of

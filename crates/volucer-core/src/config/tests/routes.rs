@@ -198,6 +198,7 @@ fn a_files_only_route_never_skips_the_stat() {
         policy: RoutePolicy::Static,
         backend: None,
         redirect: None,
+        root: None,
     };
     let extensions = crate::script::ScriptExtensions::default();
     assert!(
@@ -487,6 +488,308 @@ redirect = { status = 301, to = "/new" }
         .validate()
         .expect_err("a redirect makes the policy inert");
     assert!(format!("{err}").contains("policy"), "{err}");
+}
+
+#[test]
+fn the_three_tokens_expand_to_what_the_client_sent() {
+    // The whole token list, expanded against one request. `{path}` is everything, `{rest}` is
+    // everything after the route's own prefix, and `{query}` is the part after `?` — all three
+    // verbatim, none of them decoded.
+    let redirect = |to: &str| RedirectConfig {
+        status: 308,
+        to: to.to_string(),
+    };
+
+    assert_eq!(
+        redirect("/news{rest}").location_for("/blog/a/b?x=1&y=2", Some("/blog")),
+        "/news/a/b?x=1&y=2",
+        "{{rest}} keeps the separator and the query"
+    );
+    assert_eq!(
+        redirect("/news{path}").location_for("/blog/a/b?x=1", Some("/blog")),
+        "/news/blog/a/b?x=1",
+        "{{path}} keeps the prefix, which is what makes {{rest}} worth having"
+    );
+    assert_eq!(
+        redirect("/search?{query}").location_for("/anything?x=1", None),
+        "/search?x=1"
+    );
+
+    // A request with no query expands `{query}` to nothing rather than to a stray `?`.
+    assert_eq!(
+        redirect("/search?{query}").location_for("/anything", None),
+        "/search?"
+    );
+
+    // A `{rest}` of exactly the prefix is empty, and `/blog` under `/blog` is a plausible
+    // request: the answer is the template's own path, not a panic or a doubled slash.
+    assert_eq!(
+        redirect("/news{rest}").location_for("/blog", Some("/blog")),
+        "/news"
+    );
+
+    // A trailing slash on the prefix is the separator, not part of the name: the two spellings of
+    // one subtree must not differ in whether `{rest}` keeps a slash.
+    assert_eq!(
+        redirect("/news{rest}").location_for("/blog/a", Some("/blog/")),
+        "/news/a"
+    );
+
+    // `/blogger` is not under `/blog`, and the whole path is the honest answer. The router matches
+    // textually and can reach here with such a path, so `{rest}` must not invent a remainder.
+    assert_eq!(
+        redirect("/news{rest}").location_for("/blogger/a", Some("/blog")),
+        "/news/blogger/a"
+    );
+
+    // A route with no prefix has nothing to subtract, which validation refuses — but a table built by
+    // hand must still behave: the whole path, never an empty string.
+    assert_eq!(
+        redirect("/news{rest}").location_for("/a/b", None),
+        "/news/a/b"
+    );
+}
+
+#[test]
+fn a_token_is_expanded_once_and_never_re_expanded() {
+    // The replacement for a token is client-supplied, so a `replace` per token would rewrite it
+    // again: a `{rest}` the *client* put in a query parameter would have its own `/blog` stripped by
+    // the second pass. One left-to-right pass is what makes the expansion idempotent, and this is the
+    // request that proves it — the `{rest}` survives as the literal text the client sent.
+    let redirect = RedirectConfig {
+        status: 302,
+        to: "/login?next={path}".to_string(),
+    };
+    assert_eq!(
+        redirect.location_for("/blog/x?next=/{rest}", Some("/blog")),
+        "/login?next=/blog/x?next=/{rest}",
+        "the `{{rest}}` inside the client's own query must survive verbatim"
+    );
+}
+
+#[test]
+fn a_rest_beside_no_prefix_is_refused() {
+    // `{rest}` means "this route's `path_prefix`, removed", so a route with no prefix has nothing to
+    // remove. Expanded to the whole path it would look like it worked, which is the failure mode this
+    // configuration refuses everywhere.
+    let config = redirect_config(
+        r#"
+[[server.routes]]
+host = "old.example.com"
+redirect = { status = 301, to = "/news{rest}" }
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a {rest} needs a prefix to subtract");
+    assert!(format!("{err}").contains("{rest}"), "{err}");
+    assert!(format!("{err}").contains("path_prefix"), "{err}");
+}
+
+#[test]
+fn a_rest_that_puts_its_own_prefix_back_is_refused() {
+    // `/old` → `/old{rest}` is a fixed point: `{rest}` removes the prefix and the template prepends
+    // it, so every request under it is redirected to itself for ever.
+    let config = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/old"
+redirect = { status = 301, to = "/old{rest}" }
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a {rest} behind its own prefix is a fixed point");
+    assert!(format!("{err}").contains("/old{rest}"), "{err}");
+}
+
+#[test]
+fn the_migration_shape_the_documentation_advertises_is_accepted_and_is_what_rest_is_for() {
+    // The documented example. It is the reason `{rest}` exists: with `{path}` the same route lands on
+    // `/news/blog/...`, keeping the prefix being retired.
+    let config = redirect_config(
+        r#"
+[[server.routes]]
+path_prefix = "/blog"
+redirect = { status = 308, to = "/news{rest}" }
+"#,
+    );
+    config
+        .validate()
+        .expect("/blog -> /news{rest} is the migration this feature exists for");
+}
+
+#[test]
+fn a_route_root_must_be_an_absolute_existing_directory() {
+    // A relative root would have to resolve against the configuration file's directory, and the site
+    // table that builds the static layer has no such directory — so it is refused by name rather than
+    // resolved somewhere the operator cannot predict.
+    let relative = Config::from_toml(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app"
+
+[[server.routes]]
+path_prefix = "/downloads"
+root = "files"
+policy = "static"
+"#,
+    )
+    .expect("the fixture parses");
+    let err = relative
+        .validate()
+        .expect_err("a relative root has no honest meaning here");
+    assert!(format!("{err}").contains("absolute"), "{err}");
+
+    // A root that is not there is refused rather than skipped: a skipped root is a feature that
+    // silently 404s.
+    let missing_root = std::env::temp_dir().join("volucer-a-directory-that-cannot-exist");
+    let _ = std::fs::remove_dir_all(&missing_root);
+    let missing = Config::from_toml(&format!(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app"
+
+[[server.routes]]
+path_prefix = "/downloads"
+root = {missing:?}
+policy = "static"
+"#,
+        missing = missing_root.to_string_lossy(),
+    ))
+    .expect("the fixture parses");
+    let err = missing
+        .validate()
+        .expect_err("a root that is not there is refused");
+    assert!(format!("{err}").contains("not a directory"), "{err}");
+}
+
+#[test]
+fn a_route_root_is_refused_where_it_would_do_nothing() {
+    let root = std::env::temp_dir().join("volucer-route-root-refusals");
+    std::fs::create_dir_all(&root).expect("create the fixture directory");
+    let root = root.canonicalize().expect("the fixture resolves");
+
+    // Beside a redirect: the request is answered before the static layer is consulted.
+    let with_redirect = Config::from_toml(&format!(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app"
+
+[[server.routes]]
+path_prefix = "/downloads"
+root = {root:?}
+redirect = {{ status = 301, to = "/elsewhere" }}
+"#,
+        root = root.to_string_lossy(),
+    ))
+    .expect("the fixture parses");
+    let err = with_redirect
+        .validate()
+        .expect_err("a redirect never serves a file");
+    assert!(format!("{err}").contains("root"), "{err}");
+
+    // Beside `policy = "backend"`: the static layer is not consulted for that subtree at all.
+    let with_backend_policy = Config::from_toml(&format!(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app"
+default_backend = "app"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[[server.routes]]
+path_prefix = "/downloads"
+root = {root:?}
+policy = "backend"
+backend = "app"
+"#,
+        root = root.to_string_lossy(),
+    ))
+    .expect("the fixture parses");
+    let err = with_backend_policy
+        .validate()
+        .expect_err("a backend-only route never serves a file");
+    assert!(format!("{err}").contains("backend"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_route_root_is_accepted_where_it_serves_files() {
+    let root = std::env::temp_dir().join("volucer-route-root-accepted");
+    std::fs::create_dir_all(&root).expect("create the fixture directory");
+    let root = root.canonicalize().expect("the fixture resolves");
+
+    // `static` needs no backend at all; `all` is the ordinary "files first, then the application" shape
+    // and therefore names one. Both consult the static layer for this subtree, which is the question.
+    for (policy, backend) in [
+        ("static", String::new()),
+        ("all", "backend = \"app\"".to_string()),
+    ] {
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app"
+default_backend = "app"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[[server.routes]]
+path_prefix = "/downloads"
+root = {root:?}
+policy = "{policy}"
+{backend}
+"#,
+            root = root.to_string_lossy(),
+        );
+        let config = Config::from_toml(&text).expect("the fixture parses");
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("policy {policy} serves files: {err}"));
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_route_root_without_a_prefix_is_refused() {
+    // A root is a mount *at* a prefix — the prefix is what is stripped before the path is joined. Without
+    // one there is no mount point, and the request path would silently resolve against the site's root
+    // instead: a root that is written down and never used.
+    let root = std::env::temp_dir().join("volucer-route-root-no-prefix");
+    std::fs::create_dir_all(&root).expect("create the fixture directory");
+    let root = root.canonicalize().expect("the fixture resolves");
+
+    let config = Config::from_toml(&format!(
+        r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/app"
+
+[[server.routes]]
+host = "files.example.com"
+root = {root:?}
+policy = "static"
+"#,
+        root = root.to_string_lossy(),
+    ))
+    .expect("the fixture parses");
+    let err = config
+        .validate()
+        .expect_err("a root with no prefix has no mount point");
+    assert!(format!("{err}").contains("path_prefix"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

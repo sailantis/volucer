@@ -627,6 +627,46 @@ pub struct RouteConfig {
     /// `host` *and* redirecting would be the same table answering "which site" twice.
     #[serde(default)]
     pub redirect: Option<RedirectConfig>,
+
+    /// The directory this route's **static files** resolve against, instead of the site's
+    /// `document_root`.
+    ///
+    /// ```toml
+    /// [[server.routes]]
+    /// path_prefix = "/downloads"
+    /// root = "/srv/files"
+    /// policy = "static"
+    /// ```
+    ///
+    /// This is the mount this server otherwise lacks: a directory outside the document root served
+    /// under a URL prefix, without an application script and without a symlink an operator has to
+    /// remember to re-create on every deploy. nginx spells it `alias`; this is the same idea with one
+    /// root per route rather than a path suffix to concatenate, because the concatenation is exactly
+    /// where nginx's `alias` surprises people.
+    ///
+    /// # Why it is a route key and not a second `document_root`
+    ///
+    /// A route stating a root still cannot change where *scripts* resolve. `php-cgi`'s
+    /// `SCRIPT_FILENAME` comes from the site, because a root that could move it would be a way to
+    /// execute an arbitrary file under an unrelated directory. A route root only ever answers
+    /// `GET`/`HEAD`/`OPTIONS` from disk through the static layer's source guard — the narrower grant.
+    ///
+    /// # What the root is checked against
+    ///
+    /// **An absolute path is required**, and that is deliberate: it is the one meaning that does not
+    /// depend on where the process was started, which is the rule `sendfile.roots` already follows.
+    /// A *relative* root would resolve against this file's directory, and the site table that builds
+    /// the static layer has no configuration directory to resolve it with — so a relative root is a
+    /// typo this refuses rather than a path that resolves somewhere surprising.
+    ///
+    /// A root that does not exist, or that is not a directory, is **refused at startup** rather than
+    /// skipped: a skipped root is a feature that silently 404s, and the operator would blame the file.
+    ///
+    /// Escapes are refused by the same rules the site's own root uses — `..` is refused before any
+    /// filesystem access, and dotfiles are hidden — so a route root is a *narrower* place to serve
+    /// from, never a way out of one.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
 }
 
 /// A route's answer: a status and where to send the client.
@@ -664,23 +704,125 @@ pub struct RedirectConfig {
 }
 
 impl RedirectConfig {
-    /// Whether this redirect can be answered without the request's path.
+    /// The tokens a `to` may contain, in the order they are substituted.
     ///
-    /// A `to` with no `{path}` is a constant, so the `Location` is one header written from the
-    /// configuration — see `validate` for the one property that has to hold for it to be correct.
+    /// **A closed list of three, and that is the whole design.** `{path}` is the request's whole
+    /// path-and-query, `{rest}` is that path with the route's own `path_prefix` removed, and
+    /// `{query}` is the query string alone. Every one of them is a verbatim slice of what the client
+    /// sent: nothing is decoded, parsed, or re-encoded. That is what keeps a `Location` this server
+    /// writes from ever meaning something other than what the client asked for.
+    ///
+    /// What is deliberately *not* here — and would make this a rewrite engine — is anything that
+    /// reads *into* the request: `{query.id}`, `{arg:1}`, captures. Those have no answer at startup
+    /// for the ordinary cases (`?q=5` with no `id`, `?id=1&id=2`, `%2F%2Fevil.com` after decoding),
+    /// so each one would have to invent a policy per request, and a policy per request is a program.
+    pub const TOKENS: [&'static str; 3] = ["{path}", "{rest}", "{query}"];
+
+    /// Whether this redirect can be answered without knowing anything about the request.
+    ///
+    /// Only a `to` naming none of [`RedirectConfig::TOKENS`] is constant, so the `Location` is one
+    /// header written from the configuration — see `validate` for the one property that has to hold
+    /// for it to be correct.
     #[must_use]
     pub fn is_constant(&self) -> bool {
-        !self.to.contains("{path}")
+        !Self::TOKENS.iter().any(|token| self.to.contains(token))
     }
 
-    /// The `Location` for a request whose path-and-query is `path`.
+    /// The `Location` for a request whose path-and-query is `path`, with no route prefix.
     ///
-    /// `{path}` is substituted verbatim, and **only that token**: a bare `{` or `}` a deployment
-    /// meant literally is left alone rather than treated as an error, because a URL may legitimately
-    /// contain either and refusing them would refuse a valid target.
+    /// The shorthand for a caller that has no `path_prefix` in hand — and what a `{rest}` beside no
+    /// prefix expands to, which validation refuses anyway. See [`RedirectConfig::location_for`].
     #[must_use]
     pub fn location(&self, path: &str) -> String {
-        self.to.replace("{path}", path)
+        self.expand(path, None)
+    }
+
+    /// The `Location` for one request, given the route that matched it.
+    ///
+    /// `path` is the request's path-and-query, verbatim; `prefix` is the route's own `path_prefix`,
+    /// which is what `{rest}` subtracts. Both front ends call *this* rather than
+    /// [`RedirectConfig::location`], so a `{rest}` means the same thing on the FastCGI path as on the
+    /// HTTP one.
+    ///
+    /// **One left-to-right pass, not a `replace` per token.** A token's replacement is
+    /// client-supplied, so `?next=/{rest}` would be rewritten again by a later pass if the
+    /// replacements were applied sequentially; a single pass makes the expansion idempotent by
+    /// construction.
+    #[must_use]
+    pub fn location_for(&self, path: &str, prefix: Option<&str>) -> String {
+        self.expand(path, prefix)
+    }
+
+    fn expand(&self, path: &str, prefix: Option<&str>) -> String {
+        let mut out = String::with_capacity(self.to.len() + path.len());
+        let mut rest = self.to.as_str();
+        while !rest.is_empty() {
+            // The earliest of the tokens, so a template naming two of them is expanded in one pass and
+            // neither replacement is scanned again.
+            let Some((at, token)) = Self::TOKENS
+                .iter()
+                .filter_map(|token| rest.find(token).map(|at| (at, *token)))
+                .min_by_key(|(at, _)| *at)
+            else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(&rest[..at]);
+            out.push_str(match token {
+                "{path}" => path,
+                "{rest}" => rest_after(path, prefix),
+                "{query}" => query_of(path),
+                other => other,
+            });
+            rest = &rest[at + token.len()..];
+        }
+        out
+    }
+}
+
+/// The query of a path-and-query, without the `?`; empty when there is none.
+///
+/// **Verbatim, and never decoded.** A `{query}` is the bytes the client sent after the `?`, which is
+/// the only form that can be put back into a `Location` without a decoding policy — and a decoding
+/// policy (`%2F%2Fevil.com` becoming `//evil.com`) is precisely how a template would stop being a
+/// list of answers and become a program.
+fn query_of(path: &str) -> &str {
+    path.split_once('?').map_or("", |(_, query)| query)
+}
+
+/// The request's path with a route's `path_prefix` removed, and its query.
+///
+/// `/blog/a/b?x=1` under `/blog` is `/a/b?x=1`. Two callers share this rule and must not each grow a
+/// copy: a redirect's `{rest}` token, and the static layer's per-route `root` — where the prefix is the
+/// *mount point*, so `/downloads/x` resolves to `<root>/x` rather than `<root>/downloads/x`. Those are
+/// the same question ("what is this request's path relative to the route?") asked twice, which is the
+/// drift this server refuses everywhere else.
+///
+/// The remainder carries its own leading `/` and its query, so it is literally "everything after the
+/// prefix": an author writing `"/news{rest}"` does not add a second slash, and one who writes
+/// `"/news/{rest}"` gets `/news//a/b` — a visible mistake rather than a plausible URL that is wrong.
+///
+/// A path that does not begin with the prefix on a **segment boundary** — `/blogger` under `/blog` — is
+/// returned whole. The router matches textually and can reach here with such a path, and treating
+/// `ger/a` as a remainder would redirect to, or serve, something that never existed.
+#[must_use]
+pub fn path_after_prefix<'a>(path: &'a str, prefix: &str) -> &'a str {
+    // One trailing slash is the separator, not part of the name: `/blog/` and `/blog` must describe the
+    // same subtree, or the two spellings differ on whether the remainder keeps a slash.
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    let path_only = &path[..path.find('?').unwrap_or(path.len())];
+    match path_only.strip_prefix(prefix) {
+        // Contiguous with the query, so the remainder is one slice of `path` and nothing is copied.
+        Some(after) if after.is_empty() || after.starts_with('/') => &path[prefix.len()..],
+        _ => path,
+    }
+}
+
+/// [`path_after_prefix`] for a route that may state none, which is then the whole path.
+fn rest_after<'a>(path: &'a str, prefix: Option<&str>) -> &'a str {
+    match prefix {
+        Some(prefix) => path_after_prefix(path, prefix),
+        None => path,
     }
 }
 

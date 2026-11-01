@@ -219,6 +219,68 @@ pub(super) fn validate_route(
     if let Some(host) = &route.host {
         validate_host_pattern(host, &format!("{where_}[{index}].host"))?;
     }
+    if let Some(root) = &route.root {
+        validate_route_root(root, where_, index, route)?;
+    }
+    Ok(())
+}
+
+/// Validate a route's `root`.
+///
+/// Four failures, all of them things that would otherwise be discovered as a request-time 404 from a
+/// layer the operator believed was configured:
+///
+/// - **A relative path.** It would have to resolve against the configuration file's directory, and the
+///   site table that builds the static layer has no such directory — so the only honest answer is to
+///   require the absolute path an operator can check with `ls`.
+/// - **A path that is not there, or is not a directory.** Refused by name rather than skipped: a skipped
+///   root is a feature that silently 404s.
+/// - **No `path_prefix`.** A root is a mount *at* a prefix: the prefix is what is stripped before the
+///   path is joined, so a root without one has no mount point. The request path would silently resolve
+///   against the site's root instead, which is the "looks configured, does nothing" shape.
+/// - **A route that never serves a file.** `policy = "backend"` (or a redirect) means the static layer is
+///   not consulted for this subtree, so the root would do nothing.
+fn validate_route_root(
+    root: &std::path::Path,
+    where_: &str,
+    index: usize,
+    route: &RouteConfig,
+) -> Result<()> {
+    if !root.is_absolute() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].root is {}, which is not an absolute path. A relative root would have \
+             to resolve against the configuration file's directory, which this table does not have; \
+             write the directory an operator can check, e.g. \"/srv/files\"",
+            root.display()
+        )));
+    }
+    if route.path_prefix.is_none() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}] states `root` without a `path_prefix`, so there is no point at which to \
+             mount it: the prefix is what the root replaces. Add the `path_prefix` this directory is \
+             served at, e.g. \"/downloads\""
+        )));
+    }
+    if !root.is_dir() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].root is {}, which is not a directory. Refused rather than skipped: a \
+             root that is not there is a feature that silently 404s",
+            root.display()
+        )));
+    }
+    if route.redirect.is_some() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}] has both `root` and `redirect`. A redirect answers the request itself and \
+             never serves a file, so `root` would do nothing; remove one of them"
+        )));
+    }
+    if route.policy == RoutePolicy::Backend {
+        return Err(Error::Config(format!(
+            "{where_}[{index}] has both `root` and policy \"backend\". The static layer is not \
+             consulted for a backend-only route, so `root` would do nothing; remove the policy, or \
+             the root"
+        )));
+    }
     Ok(())
 }
 
@@ -282,22 +344,46 @@ fn validate_redirect(
     }
 
     // The loop check. A redirect loops when the `Location` it produces for a request under its own
-    // prefix is a request the *same route* matches — which for `to` beginning with the prefix and
-    // then `{path}` is every request, because `{path}` already starts with that prefix.
+    // prefix is a request the *same route* matches — which for a target made of the prefix and then a
+    // token that re-adds it is every request.
     //
     // The check is deliberately about the *route's own pattern* rather than about the whole table: a
     // redirect to a different route's subtree is a legitimate migration, and only sending a client
     // back to the pattern it just matched is provably a loop.
+    //
+    // It no longer refuses `prefix + {path}` as "the path it asked for", because it is not: `/old{path}`
+    // sends `/old/x` to `/old/old/x`, which grows rather than repeats. That was a real loop for a
+    // scraper and is still refused — `{path}` re-adds the prefix, so the target is under it — but the
+    // message now says what happens instead of describing a self-loop that does not occur.
     if let Some(prefix) = &route.path_prefix {
-        if let Some(tail) = to.strip_prefix(prefix.as_str()) {
-            // `{path}` expands to a path that starts with `prefix`, so a target of exactly
-            // `prefix + {path}` maps every matched request onto itself.
-            if tail == "{path}" {
-                return Err(Error::Config(format!(
-                    "{where_}[{index}].redirect.to is {to:?}, which sends every request under \
-                     {prefix:?} back to the path it asked for: a client would follow it for ever, \
-                     and a scraper would not stop. Change the prefix or the target"
-                )));
+        if to.contains("{rest}") && !to.is_empty() {
+            // `{rest}` *removes* the prefix, so the only way it can loop is a target that puts the
+            // prefix straight back: `/old` → `/old{rest}` is a fixed point, because `{rest}` of a path
+            // under `/old` is exactly what the template prepends.
+            if let Some(tail) = to.strip_prefix(prefix.as_str()) {
+                if tail.starts_with("{rest}") {
+                    return Err(Error::Config(format!(
+                        "{where_}[{index}].redirect.to is {to:?}, which removes the prefix {prefix:?} \
+                         with {{rest}} and then puts it back: every request under it would be \
+                         redirected to itself for ever. Change the target, or use {{path}} if the \
+                         prefix is meant to be kept"
+                    )));
+                }
+            }
+        }
+        if to.contains("{path}") {
+            // `{path}` starts with `prefix`, so a target that begins with the prefix lands under it:
+            // `/old{path}` maps `/old/x` to `/old/old/x`, which the same route matches again. Not a
+            // fixed point but a loop all the same, and one no client will break out of.
+            if let Some(tail) = to.strip_prefix(prefix.as_str()) {
+                if tail.starts_with("{path}") {
+                    return Err(Error::Config(format!(
+                        "{where_}[{index}].redirect.to is {to:?}, which keeps the prefix {prefix:?} \
+                         inside the path {{path}} and prepends it again: every request would be \
+                         redirected to a path this route matches, for ever. Use {{rest}} to drop the \
+                         prefix, or name a target outside {prefix:?}"
+                    )));
+                }
             }
         }
         // The same loop with a constant target: every matched path redirects to `to`, and if `to` is
@@ -314,6 +400,16 @@ fn validate_redirect(
             }
         }
     }
+
+    // `{rest}` is "the request path after this route's prefix", so a route with no prefix has nothing
+    // to subtract. Refused rather than expanded to the whole path, which would look like it worked.
+    if to.contains("{rest}") && route.path_prefix.is_none() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].redirect.to names {{rest}}, but the route states no path_prefix to \
+             remove it from; add a path_prefix, or use {{path}} for the whole path"
+        )));
+    }
+
     Ok(())
 }
 

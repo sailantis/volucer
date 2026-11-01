@@ -179,6 +179,42 @@ pub fn inspect_with_front_controller(
         )));
     }
 
+    // A route's own `root` is validated as an absolute directory at parse time, but the *contents* are
+    // not: a mount that exists and is empty is a valid thing to configure before a deploy populates it.
+    // What is worth saying out loud is the ordinary mistake — a root pointing at the parent of the
+    // directory the deployment wanted, so `/downloads/x` resolves one level too high.
+    //
+    // Reported for the default site's table and for each named site's, because a site replaces the
+    // route list rather than extending it: a root written in `[server]` does not apply to a site that
+    // states its own `routes`.
+    for (site_name, routes) in std::iter::once(("<default>", &config.server.routes)).chain(
+        config
+            .sites
+            .iter()
+            .filter_map(|(name, site)| site.routes.as_ref().map(|routes| (name.as_str(), routes))),
+    ) {
+        for route in routes {
+            let Some(root) = &route.root else { continue };
+            let mounted = format!("{site_name}{}", route.path_prefix.as_deref().unwrap_or("*"));
+            if !root.is_dir() {
+                warnings.push(Warning::with_hint(
+                    format!(
+                        "route {mounted}: root {} is not a directory",
+                        root.display()
+                    ),
+                    "create it, or point the route's `root` at the directory the URL prefix should \
+                     serve; every request under that prefix will 404 meanwhile",
+                ));
+            } else if std::fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none()) {
+                warnings.push(Warning::plain(format!(
+                    "route {mounted}: root {} is empty, so every file request under it will 404 — \
+                     expected before a deploy populates it, a mistake otherwise",
+                    root.display()
+                )));
+            }
+        }
+    }
+
     // Each site's own root and front controller, because those are what a request to that
     // site actually uses. A site whose root is missing is not visible in the default site's
     // checks at all, and it answers 404 or 500 for every request it receives.

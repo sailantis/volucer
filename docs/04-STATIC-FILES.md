@@ -54,6 +54,35 @@ disk. Otherwise, it dispatches the request to the application. For example,
 `/assets/app.css` may resolve to a file, while `/about` can continue to the front
 controller.
 
+## A route can mount its own directory
+
+A `[[server.routes]]` entry that states `root` serves its subtree from that directory
+instead. The route's `path_prefix` is the mount point and is **stripped** before the path is
+joined, so the directory replaces the document root rather than nesting inside it:
+
+```toml
+[[server.routes]]
+path_prefix = "/downloads"
+root = "/srv/files"
+policy = "static"
+```
+
+`/downloads/report.pdf` is served from `/srv/files/report.pdf`, with the layer's ranges,
+`ETag`, `If-Range` and precompressed-variant handling unchanged. This is the way to publish
+a directory that is not under the document root without a symlink or an application script.
+
+Two things a route root does not change:
+
+- **Script resolution.** A `.php`, `.php3` or `.phtml` file under a route root is never
+  served from disk, exactly as under the document root — the guard is the site's list, so a
+  mount cannot become a way to publish source.
+- **The refusals.** `..` is refused before any filesystem access and dotfiles are hidden, by
+  the same code that resolves the site's root.
+
+The root is written as an absolute path, and a root that does not exist is a startup error
+rather than a silently empty mount. It also requires a `path_prefix`: the prefix is the mount
+point, so a root without one would have nowhere to be served from.
+
 ## Two rules that always hold
 
 These protections apply whether or not static serving is enabled:

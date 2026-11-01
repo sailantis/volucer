@@ -89,6 +89,19 @@ pub async fn respond(
     request: Request<'_>,
     files: &StaticFiles,
 ) -> Option<Result<StaticResponse, HttpError>> {
+    respond_with_root(request, files, None).await
+}
+
+/// [`respond`] for a request whose route states its own `root`.
+///
+/// `route_root` is the root and the `path_prefix` it is mounted at. The prefix is required rather than
+/// optional because a root without one is refused at startup: a mount with no mount point is the site's
+/// document root, which is the other variant.
+pub async fn respond_with_root(
+    request: Request<'_>,
+    files: &StaticFiles,
+    route_root: Option<(&Path, &str)>,
+) -> Option<Result<StaticResponse, HttpError>> {
     if !files.config.enabled {
         return None;
     }
@@ -103,7 +116,7 @@ pub async fn respond(
         return None;
     }
 
-    let plan = decide(&request, files).await;
+    let plan = decide(&request, files, route_root).await;
     Some(match plan {
         Plan::NotAFile => return None,
         Plan::NotFound => Ok(status_only(StatusCode::NOT_FOUND)),
@@ -163,20 +176,33 @@ impl Wanted {
 }
 
 /// Run the blocking decision, then the asynchronous answer.
-async fn decide(request: &Request<'_>, files: &StaticFiles) -> Plan {
+async fn decide(
+    request: &Request<'_>,
+    files: &StaticFiles,
+    route_root: Option<(&Path, &str)>,
+) -> Plan {
     let owned = Owned {
         path: request.path.to_string(),
         host: request.host.map(str::to_string),
         wanted: Wanted::from(request),
     };
+    // The root and its prefix are copied rather than borrowed, because the closure must be `'static`.
+    // Only a route that states a root pays for the clone, and a route root is a deployment's static
+    // mount — never the application's own document root, which is already on `files`.
+    let route_root = route_root.map(|(root, prefix)| (root.to_path_buf(), prefix.to_string()));
     let files = files.clone();
 
-    tokio::task::spawn_blocking(move || plan(&owned, &files))
-        .await
-        // A panic in the closure means a bug, but the honest answer to the
-        // client is that the file is not available, not a 500 from the layer
-        // that exists to serve files.
-        .unwrap_or(Plan::NotFound)
+    tokio::task::spawn_blocking(move || {
+        let root = route_root
+            .as_ref()
+            .map(|(root, prefix)| (root.as_path(), prefix.as_str()));
+        plan(&owned, &files, root)
+    })
+    .await
+    // A panic in the closure means a bug, but the honest answer to the
+    // client is that the file is not available, not a 500 from the layer
+    // that exists to serve files.
+    .unwrap_or(Plan::NotFound)
 }
 
 /// What `decide` carries across the thread boundary.
@@ -188,13 +214,31 @@ struct Owned {
 }
 
 /// The decision, made off the runtime thread.
-fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
+///
+/// `route_root` is a route's `root` when the matching route states one, and `None` for the site's own
+/// `document_root`. A route root is a **mount point**: the prefix is stripped before the path is joined,
+/// so `path_prefix = "/downloads"` with `root = "/srv/files"` serves `/downloads/report.pdf` from
+/// `/srv/files/report.pdf` — nginx's `alias`, which is what this key exists to be.
+///
+/// It stands in only for the *file* lookup: the script guard below still asks the site's list, so a
+/// `.php` under a route root is refused rather than executed — a route root is a mount, not a second
+/// application root.
+fn plan(owned: &Owned, files: &StaticFiles, root: Option<(&Path, &str)>) -> Plan {
     let path = owned.path.as_str();
     if path.contains('\0') {
         return Plan::BadRequest("the path contains a NUL byte".to_string());
     }
 
-    let resolved = match resolve_under_root(&files.document_root, path) {
+    // A route root is a mount: `{ path_prefix = "/downloads", root = "/srv/files" }` means the URL
+    // `/downloads/x` names `/srv/files/x`. Without the strip the prefix would be looked for *inside* the
+    // mount as a directory, which is the bug nginx's `alias` documentation is a warning about.
+    //
+    // The site's root is joined as written, because there the prefix is part of the path.
+    let (root, path) = match root {
+        Some((root, prefix)) => (root, volucer_core::config::path_after_prefix(path, prefix)),
+        None => (files.document_root.as_path(), path),
+    };
+    let resolved = match resolve_under_root(root, path) {
         Resolution::Path(path) => path,
         // A dotfile is reported as missing rather than forbidden, matching how
         // nginx hides one: whether a file exists is not a client's business.
@@ -216,7 +260,10 @@ fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
     // Checked *before* the stat because it is pure string work: asking the
     // filesystem about a path this layer may never serve is a round trip to learn
     // something the extension already answered.
-    if files.script_extensions.matches(path) {
+    // The script guard asks about the *request* path, not the stripped one: a route root may make the
+    // two differ (the prefix is not inside the mount), and what must never be served is the path the
+    // client asked for. `owned.path` is that, so this reads it rather than the local `path`.
+    if files.script_extensions.matches(owned.path.as_str()) {
         return Plan::NotAFile;
     }
 
@@ -1520,28 +1567,28 @@ mod tests {
         // A directory with no index reaches the backend, not a redirect to nothing.
         fs::create_dir_all(root.join("empty")).expect("create the directory");
         assert_eq!(
-            name_of(&plan(&owned("/empty", &headers), &files)),
+            name_of(&plan(&owned("/empty", &headers), &files, None)),
             "not a file"
         );
         assert_eq!(
-            name_of(&plan(&owned("/empty/", &headers), &files)),
+            name_of(&plan(&owned("/empty/", &headers), &files, None)),
             "not a file"
         );
 
         // A directory *with* an index still gets its redirect, from the same stat.
         assert_eq!(
-            name_of(&plan(&owned("/docs", &headers), &files)),
+            name_of(&plan(&owned("/docs", &headers), &files, None)),
             "redirect"
         );
 
         // A path that exists nowhere.
         assert_eq!(
-            name_of(&plan(&owned("/about", &headers), &files)),
+            name_of(&plan(&owned("/about", &headers), &files, None)),
             "not a file"
         );
 
         // And a real file is still served, from the metadata the plan already had.
-        match plan(&owned("/file.txt", &headers), &files) {
+        match plan(&owned("/file.txt", &headers), &files, None) {
             Plan::File { length, .. } => assert_eq!(length, 1),
             other => panic!("unexpected: {}", name_of(&other)),
         };
@@ -1560,16 +1607,16 @@ mod tests {
 
         // Not a file: PHP's business, which is how a front controller survives.
         for path in ["/about", "/api/users"] {
-            let outcome = plan(&owned(path, &headers), &files);
+            let outcome = plan(&owned(path, &headers), &files, None);
             assert_eq!(name_of(&outcome), "not a file", "{path}");
         }
 
         // A real file: this layer's.
-        let outcome = plan(&owned("/assets/logo.svg", &headers), &files);
+        let outcome = plan(&owned("/assets/logo.svg", &headers), &files, None);
         assert_eq!(name_of(&outcome), "a file");
 
         // A directory with an index is served through the index.
-        match plan(&owned("/assets/", &headers), &files) {
+        match plan(&owned("/assets/", &headers), &files, None) {
             Plan::NotAFile => {}
             Plan::File { path, .. } => assert!(path.ends_with("index.html"), "{}", path.display()),
             other => panic!("unexpected: {}", name_of(&other)),
@@ -1577,13 +1624,13 @@ mod tests {
 
         // A directory with no index is not a file, so PHP gets it.
         fs::create_dir_all(root.join("empty")).expect("create the directory");
-        let outcome = plan(&owned("/empty/", &headers), &files);
+        let outcome = plan(&owned("/empty/", &headers), &files, None);
         assert_eq!(name_of(&outcome), "not a file");
 
         // And the refusals.
-        let outcome = plan(&owned("/../secret", &headers), &files);
+        let outcome = plan(&owned("/../secret", &headers), &files, None);
         assert_eq!(name_of(&outcome), "forbidden");
-        let outcome = plan(&owned("/.env", &headers), &files);
+        let outcome = plan(&owned("/.env", &headers), &files, None);
         assert_eq!(name_of(&outcome), "not found");
 
         let _ = fs::remove_dir_all(&root);
@@ -1613,19 +1660,19 @@ mod tests {
         let headers = no_headers();
 
         for path in ["/index.php", "/app.php", "/legacy.phtml", "/old.php3"] {
-            let outcome = plan(&owned(path, &headers), &files);
+            let outcome = plan(&owned(path, &headers), &files, None);
             assert_eq!(name_of(&outcome), "not a file", "{path} must go to PHP");
         }
 
         // Extension matching is case-insensitive, like the routing layer's.
         assert_eq!(
-            name_of(&plan(&owned("/INDEX.PHP", &headers), &files)),
+            name_of(&plan(&owned("/INDEX.PHP", &headers), &files, None)),
             "not a file"
         );
 
         // A plain file with a misleading name is still a file.
         assert_eq!(
-            name_of(&plan(&owned("/public/style.css", &headers), &files)),
+            name_of(&plan(&owned("/public/style.css", &headers), &files, None)),
             "a file"
         );
 
@@ -1657,29 +1704,29 @@ mod tests {
         let headers = no_headers();
 
         assert_eq!(
-            name_of(&plan(&owned("/app.py", &headers), &files)),
+            name_of(&plan(&owned("/app.py", &headers), &files, None)),
             "not a file",
             "a Python script must go to the backend, never to the client"
         );
         assert_eq!(
-            name_of(&plan(&owned("/APP.PY", &headers), &files)),
+            name_of(&plan(&owned("/APP.PY", &headers), &files, None)),
             "not a file",
             "the comparison is case-insensitive, like the router's"
         );
         // The list is the whole list: naming `py` stops `.php` being a script, which is what lets
         // a site say "this tree is Python and nothing else".
         assert_eq!(
-            name_of(&plan(&owned("/worker.rb", &headers), &files)),
+            name_of(&plan(&owned("/worker.rb", &headers), &files, None)),
             "a file",
             "an extension the site did not name is an ordinary file"
         );
         assert_eq!(
-            name_of(&plan(&owned("/index.php", &headers), &files)),
+            name_of(&plan(&owned("/index.php", &headers), &files, None)),
             "a file",
             "the site replaced the list rather than adding to it"
         );
         assert_eq!(
-            name_of(&plan(&owned("/public/app.js", &headers), &files)),
+            name_of(&plan(&owned("/public/app.js", &headers), &files, None)),
             "a file"
         );
 
@@ -1692,7 +1739,7 @@ mod tests {
         let files = layer(&root, true);
         let headers = no_headers();
 
-        match plan(&owned("/docs", &headers), &files) {
+        match plan(&owned("/docs", &headers), &files, None) {
             Plan::Redirect(location) => assert_eq!(location, "//example.test/docs/"),
             other => panic!("expected a redirect, got {}", name_of(&other)),
         }
@@ -1717,9 +1764,9 @@ mod tests {
 
         // Without the feature the path is not a file at all, so there is nothing
         // to redirect to and nothing to serve.
-        let outcome = plan(&owned("/docs", &headers), &files);
+        let outcome = plan(&owned("/docs", &headers), &files, None);
         assert_eq!(name_of(&outcome), "not a file");
-        let outcome = plan(&owned("/docs/", &headers), &files);
+        let outcome = plan(&owned("/docs/", &headers), &files, None);
         assert_eq!(name_of(&outcome), "not a file");
 
         let _ = fs::remove_dir_all(&root);

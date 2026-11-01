@@ -525,6 +525,11 @@ fn suppress_unused_static_layer(site: &mut ResolvedSite, layer_could_run: bool, 
         || site.front_controller.as_deref().is_none_or(str::is_empty)
         || !site.document_root.is_dir()
         || has_static_assets(&site.document_root)
+        // A route that mounts its own root is an asset story even when the site's own root has none:
+        // `/downloads` may be the only file this site serves, and turning the layer off for it would
+        // 404 the mount the file configured. The root is already validated to exist, so asking is a
+        // decision about *this* table rather than a second filesystem check that could disagree.
+        || site.routes.iter().any(|route| route.root.is_some())
     {
         return;
     }

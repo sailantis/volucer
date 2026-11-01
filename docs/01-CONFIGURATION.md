@@ -805,6 +805,7 @@ it would leak the path it meant to keep internal.
 | `policy` | string | `"all"` | `"all"`, `"backend"` or `"static"`. |
 | `backend` | string | absent | The backend for matched requests. Required unless `policy = "static"` or `redirect` is set. |
 | `redirect` | table | absent | Answer the matched requests with a redirect: `{ status = 301, to = "/new{path}" }`. |
+| `root` | path | absent | Serve this route's files from an absolute directory instead of the site's `document_root`. See [`root`](#root). |
 
 These routes belong to the unnamed site and are declared as `[[server.routes]]` alongside
 the other `[server]` settings. A `[sites.<name>]` table can define its own `routes`; that
@@ -815,23 +816,48 @@ list **replaces** the global list rather than extending it.
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `status` | integer | **required** | `301`, `302`, `303`, `307` or `308`. |
-| `to` | string | **required** | A path, an absolute `http(s)` URL, or one containing `{path}`. |
+| `to` | string | **required** | A path, an absolute `http(s)` URL, or one containing a token. |
 
 A redirect answers the request itself: it reaches no backend, so `backend` must be absent
 and `policy` must be left at its default. It is answered **before the static layer**, so
 it wins over a file that still exists at the old path — which is the whole point of a
 migration — and before the request body is read, so a redirected `POST` costs nothing.
 
-`{path}` expands to the request's path **and query**, verbatim. That is the only
-substitution; there are no regular expressions, no captures and no rewrite engine, and
-that is deliberate:
+#### The three tokens
+
+`to` may contain these, and nothing else. Each is a **verbatim slice of what the client
+sent** — never decoded, parsed, or re-encoded.
+
+| Token | Expands to |
+|---|---|
+| `{path}` | The request's whole path **and query**. |
+| `{rest}` | The request's path and query with the route's own `path_prefix` removed. |
+| `{query}` | The request's query string, without the `?`. |
 
 ```toml
 # Move a blog to a new prefix, keeping the rest of every URL.
 [[server.routes]]
 path_prefix = "/blog"
-redirect = { status = 308, to = "/news{path}" }
+redirect = { status = 308, to = "/news{rest}" }
 ```
+
+`/blog/a/b?x=1` becomes `/news/a/b?x=1`. `{rest}` carries its own leading `/`, so the
+template does not add another one — `"/news/{rest}"` would produce `/news//a/b`.
+
+`{path}` keeps the prefix, which is why `{rest}` exists: the same route written with
+`{path}` would land on `/news/blog/a/b`, preserving the prefix being retired.
+
+`{query}` is for a form moved to a new path: `to = "/find?{query}"` sends
+`/search?q=rust&page=2` to `/find?q=rust&page=2`.
+
+**There is no fourth token, and this is deliberate.** `{query.id}` would have to answer
+questions with no startup answer — what to do when `id` is missing, repeated, or
+percent-encoded as `%2F%2Fevil.com` — and each answer is a policy per request. That is the
+point at which a table of answers becomes a program. If an application needs to read into
+the request, its front controller is the layer for it.
+
+Substitution is **one left-to-right pass**, so a token inside a client-supplied value is
+never re-expanded.
 
 The status decides what a cache may keep: `301`/`308` are sent with `Cache-Control: public`
 because being cached is what permanent means, and `302`/`303`/`307` with `no-store`
@@ -839,13 +865,48 @@ because a cached temporary redirect outlives the condition it described. The met
 preserved by `307`/`308` and turned into `GET` by `302`/`303`, which is why an API
 redirect wants the first pair and a "moved page" wants the second.
 
-Two misconfigurations are refused at startup rather than at request time, because a client
-cannot recover from either:
+Misconfigurations are refused at startup rather than at request time, because a client
+cannot recover from any of them:
 
 - a `to` that is neither an absolute URL nor starts with `/` — a client reads
   `example.com/x` as a *relative* path, so it would resolve to `/example.com/x` on the
   deploying host;
-- a `to` that sends a request back into the route's own `path_prefix`, which is a loop.
+- a `to` that sends a request back into the route's own `path_prefix`, which is a loop —
+  whether the prefix is re-added by `{path}` or put back by hand beside `{rest}`;
+- a `{rest}` on a route that states no `path_prefix`, which has nothing to subtract.
+
+### `root`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `root` | path | absent | An **absolute** directory this route's static files resolve from, instead of the site's `document_root`. |
+
+This is a mount point: the route's `path_prefix` is stripped before the path is joined, so
+the directory is *replaced*, not nested inside.
+
+```toml
+[[server.routes]]
+path_prefix = "/downloads"
+root = "/srv/files"
+policy = "static"
+```
+
+`/downloads/report.pdf` is served from `/srv/files/report.pdf`. This is nginx's `alias`,
+with one root per route rather than a path suffix to concatenate — the concatenation is
+where `alias` surprises people.
+
+A route root answers **files only**. Script resolution still uses the site's
+`document_root`, so a `.php` under a route root is refused rather than executed; the source
+guard and the `..` refusal are the site root's, unchanged.
+
+A root must be absolute — a relative one would have to resolve against the configuration
+file's directory, which the site table has no access to. A root that does not exist, or is
+not a directory, is **refused at startup** rather than skipped, and `root` beside
+`redirect` or `policy = "backend"` is refused because neither consults the static layer.
+
+A root is a mount *at* a prefix, so it is refused without a `path_prefix`: the prefix is
+what is stripped before the path is joined, and a root with no mount point would silently
+fall back to the site's `document_root`.
 
 
 **Configuration changed in 0.3.0:** `[[routes]]` and the top-level `default_backend`

@@ -2679,12 +2679,16 @@ async fn prepare(
     // `POST` is answered without this server ever buffering its body: the client is told where to go
     // and sends it there. Buffering first would spend the upload on an answer that never needed it.
     if let Some(redirect) = route.and_then(|route| route.redirect.as_ref()) {
-        let target = redirect.location(
+        // `location_for` rather than `location`: the route's own `path_prefix` is what `{rest}`
+        // subtracts, and only the route knows it. The path handed over is the request's
+        // path-and-query verbatim, which is what `{path}` and `{query}` expand to.
+        let target = redirect.location_for(
             parts
                 .uri
                 .path_and_query()
                 .map(|pq| pq.as_str())
                 .unwrap_or(parts.uri.path()),
+            route.and_then(|route| route.path_prefix.as_deref()),
         );
         let location = HeaderValue::from_str(&target).map_err(|_| {
             // Refused by `validate` for a control character, so this is a table built by hand.
@@ -2728,7 +2732,16 @@ async fn prepare(
             headers: &parts.headers,
             host,
         };
-        if let Some(answer) = static_files::respond(static_request, statics).await {
+        // A route that states `root` serves *this subtree* from that directory while its scripts still
+        // resolve against the site's, which is why the root travels beside the site's layer rather than
+        // replacing it. The route's own prefix is passed too: a root is a mount point, so the prefix is
+        // stripped before the path is joined — nginx's `alias`, which is what the key exists to be.
+        // `None` is the ordinary case: the site's own `document_root`, where the prefix is part of the path.
+        let route_root =
+            route.and_then(|route| route.root.as_deref().zip(route.path_prefix.as_deref()));
+        if let Some(answer) =
+            static_files::respond_with_root(static_request, statics, route_root).await
+        {
             // **A configured page replaces the static layer's bare 404 and 403 too**, and this is
             // the code that matters most in practice: a missing file is the common way a deployment
             // reaches a 404 at all, and `static_files::respond` answers it with a status and no

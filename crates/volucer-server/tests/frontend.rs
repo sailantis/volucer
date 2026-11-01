@@ -280,6 +280,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
                 policy: volucer_core::config::RoutePolicy::All,
                 backend: Some("api_pool".to_string()),
                 redirect: None,
+                root: None,
             }],
             ..Default::default()
         },

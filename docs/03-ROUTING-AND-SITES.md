@@ -139,6 +139,19 @@ Route host matching happens after script resolution. A route can select a backen
 cannot select the document root used to resolve the script. Volucer selects a site first,
 so each host can use a separate document root.
 
+A route **can** name its own root for *files*. `root` replaces the site's `document_root` for
+that subtree, with the route's own `path_prefix` as the mount point — so `/downloads/x`
+resolves from `<root>/x`. Scripts still resolve against the site's root; a route root answers
+`GET`/`HEAD`/`OPTIONS` from disk and nothing else. See
+[Routes](01-CONFIGURATION.md#root).
+
+```toml
+[[server.routes]]
+path_prefix = "/downloads"
+root = "/srv/files"          # an absolute, existing directory
+policy = "static"            # a mount serves files and has no backend
+```
+
 ### How a host is matched
 
 - `hosts` accepts exact names, matched case-insensitively with any `:port` ignored, or
