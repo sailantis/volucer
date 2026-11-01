@@ -17,6 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **HTTP/3 and gRPC over QUIC.** An optional `http3` feature adds an HTTP/3 listener and supports gRPC requests and trailers over HTTP/3.
 - **RPC services for non-worker backends.** FastCGI and HTTP applications can use worker services; Python and Ruby SDKs now include RPC clients.
 - **Route redirects and roots.** Routes can redirect using `{path}`, `{rest}` and `{query}`, or mount a directory with `root`.
+- **Live tests against real websites.** An opt-in suite (`VOLUCER_LIVE=1`) runs the binary against real origins to prove what a loopback fixture cannot: a genuine public certificate chain accepted by the default trust store, ALPN negotiating HTTP/2 to the upstream, and real response shapes (compressed chunked bodies, origin statuses and redirects, request bodies parsed by the origin). It also covers a virtual host selecting the backend that reaches a real origin, and runs daily in a scheduled CI workflow, where a skipped test is a failure.
 - **Server operations settings.** Configure backend `request_timeout_ms`, `[server] max_connections` and `shutdown_timeout_ms`; `access_log.path = "-"` writes logs to stdout.
 - **Tracing controls.** Configure trace sampling and backend `traceparent` propagation; access-log entries include the trace ID.
 - **Unix-socket listeners.** HTTP and FastCGI front ends can listen on Unix sockets.

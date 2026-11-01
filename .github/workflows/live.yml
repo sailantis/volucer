@@ -1,0 +1,138 @@
+name: Live
+
+# The suite that reaches **real websites**: `crates/volucer/tests/live.rs`.
+#
+# # Why this is a workflow of its own rather than a job in `ci.yml`
+#
+# Because its dependency is not this repository. Every other suite is hermetic — a fixture on
+# `127.0.0.1` — so a red `CI` run always means the diff changed something. This one talks to
+# `example.com`, `httpbin.org` and a CDN, and any of those can be slow, change a response, or block a
+# runner for reasons that have nothing to do with a commit. Putting it in `ci.yml` would either make a
+# pull request red for somebody else's outage, or force every other job into a `if:` expression to
+# exempt it.
+#
+# So: a schedule, and a manual trigger for the times you want an answer now. A push does not run it.
+#
+# # What it is for
+#
+# Four properties no loopback test can reach — a genuine public certificate chain accepted by
+# `webpki-roots`, ALPN negotiating HTTP/2 to the *upstream* (the client half of the hazard `connect.rs`
+# documents, which the listener's half in `volucer-http` does not cover), real response shapes, and a
+# virtual host selecting the backend that reaches a real origin.
+# The file's own header states each one and why a fixture cannot stand in for it.
+#
+# # Why `VOLUCER_LIVE=1` is not optional here
+#
+# It is what makes a **skip** a failure. Without it, a runner with no egress — or a run where the
+# binary was not built — reports seven green "skipping:" lines, which is the same shape of false pass
+# `ci.yml` already guards against for PHP with `VOLUCER_E2E`.
+
+on:
+  schedule:
+    # Daily, at a quiet hour. Not more often: an outage that a fixture has does not need to be
+    # discovered twice, and one run a day is enough to notice that a third party changed something
+    # before a release does.
+    - cron: '17 4 * * *'
+  # So a branch can be tried before it is merged, which is the only way to learn that a fixture has
+  # rotted without waiting a day — and the only way to check a change to this file at all.
+  #
+  # The `env:` block below is **empty unless an override was asked for**, and that is deliberate. An
+  # `env:` entry whose expression is an empty `workflow_dispatch` input still sets the variable to the
+  # empty string, and `tests/live.rs` panics on a present-but-empty override rather than falling back
+  # to the default — it is the property that keeps a run's report honest about what it tested. So the
+  # override has to be *absent*, and a map that omits it is the only way to make it absent.
+  workflow_dispatch:
+    inputs:
+      h2_origin:
+        description: >-
+          Overrides VOLUCER_LIVE_H2_ORIGIN: an origin that answers HTTP/2 and serves a `key=value`
+          trace document at /cdn-cgi/trace. Leave empty for the default.
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    name: Live (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A live run that hangs is a run nobody reads, and the failure mode this suite most needs to
+    # exclude — a resolver that never answers — would otherwise hold a slot for the default six hours.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      # Linux is enough for the assertion this suite exists for: it is about the *client's* TLS and
+      # ALPN behaviour, which is `rustls` and `webpki-roots` on every platform. macOS and Windows are
+      # added because the two things that do differ there are the DNS resolver and the platform's own
+      # trust store — and a live run is the only place either is exercised.
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+
+      # `aws-lc-sys` is C and assembly, so every platform needs NASM, exactly as in `ci.yml`.
+      - name: Install NASM (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+
+      # A debug build, like the installer job in `ci.yml`: the binary only has to proxy a request, and
+      # a release build would be minutes spent on nothing this suite measures.
+      - name: Build
+        run: cargo build -p volucer
+
+      # **A failure must say whether the origin or the server is at fault**, and the difference is
+      # usually one log line. The suite prints the server's stderr in its own assertion messages; this
+      # raises the level so the line is worth printing.
+      #
+      # `env` is a *map* rather than a fixed block so the override can be **absent** when the input was
+      # left empty — see the note on `workflow_dispatch` above for why it cannot be present and empty.
+      # `if` is a *truthiness* test rather than a comparison, because on a `schedule` event
+      # `inputs.h2_origin` is `null` and `null == ''` is false — which would have skipped both steps
+      # and made a scheduled run report success having executed nothing.
+      - name: Run the live suite
+        if: ${{ inputs.h2_origin }}
+        env:
+          VOLUCER_LIVE: '1'
+          RUST_LOG: info
+          VOLUCER_LIVE_H2_ORIGIN: ${{ inputs.h2_origin }}
+        run: cargo test -p volucer --test live -- --test-threads=1 --nocapture
+
+      - name: Run the live suite (default origins)
+        if: ${{ !inputs.h2_origin }}
+        env:
+          VOLUCER_LIVE: '1'
+          RUST_LOG: info
+        run: cargo test -p volucer --test live -- --test-threads=1 --nocapture
+
+      # **The count is the assertion that the suite ran at all.** libtest reports `0 passed` for a
+      # binary whose tests were compiled away, and seven green skips look identical to seven green passes
+      # in the log. `VOLUCER_LIVE=1` already turns a skip into a panic, so this is the second check on
+      # the same property — kept because the first one is a line of code in the test and this one is
+      # the thing that notices if that line is ever removed.
+      - name: Assert the live tests were not compiled away
+        if: runner.os == 'Linux'
+        run: |
+          listed=$(cargo test -p volucer --test live -- --list --format terse)
+          count=$(echo "$listed" | grep -c ': test$' || true)
+          echo "live tests: $count"
+          if [ "$count" -lt 7 ]; then
+            echo "::error::expected at least 7 live tests, found $count — a cfg gate or a deletion has removed one"
+            exit 1
+          fi

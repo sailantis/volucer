@@ -292,6 +292,33 @@ has everything it needs — the fix is a commit in one repository or the other, 
 git -C /path/to/volucer-php-sdk log --oneline -3   # is this checkout the one CI will use?
 ```
 
+### Live tests
+
+Everything above is hermetic: it talks to fixtures on `127.0.0.1` and needs no network.
+`crates/volucer/tests/live.rs` is the exception — it runs the real binary against **real
+websites** to prove the four things a fixture cannot: a genuine public certificate chain
+accepted by `webpki-roots`, ALPN negotiating HTTP/2 to the *upstream*, real response
+shapes, and a virtual host selecting the backend that reaches a real origin. It is opt-in,
+because a suite that depends on a third party's server must not make a pull request red for
+that party's outage:
+
+```sh
+VOLUCER_LIVE=1 cargo test -p volucer --test live
+```
+
+`VOLUCER_LIVE=1` also turns a skip into a failure, so a run that could not reach the network
+cannot report success. Each origin can be replaced with one of your own through
+`VOLUCER_LIVE_<NAME>_ORIGIN` — `VOLUCER_LIVE_H2_ORIGIN`, `VOLUCER_LIVE_ECHO_ORIGIN` and so on,
+which is what a release check against an internal deployment wants. The same suite runs daily
+in [`.github/workflows/live.yml`](.github/workflows/live.yml), and a push does not run it.
+
+Writing the virtual-host test turned up a limitation worth knowing before putting an `https:`
+origin behind a site: over an **HTTP/2** upstream hop the origin receives its own authority as
+`Host` (e.g. `httpbin.org:443`) rather than the client's, because an h2 request carries its
+identity in `:authority` and that is built from the origin. An HTTP/1.1 hop forwards the
+client's `Host` verbatim. The test asserts the HTTP/1.1 behaviour and its doc explains why it
+does not encode the h2 one.
+
 `cargo fmt --all --check` is a CI job, so a commit that is not formatted is a red run. Turn the
 hook on once per clone and it is refused before it is made:
 
