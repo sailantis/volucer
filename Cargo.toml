@@ -47,7 +47,15 @@ volucer-worker = { version = "0.3.0", path = "crates/volucer-worker" }
 volucer-fcgi = { version = "0.3.0", path = "crates/volucer-fcgi" }
 # Test-only. Not a `[workspace.dependencies]` entry used by any crate's `[dependencies]`: every
 # consumer below puts it in `[dev-dependencies]`, and `publish = false` keeps it off crates.io.
-volucer-testkit = { version = "0.3.0", path = "crates/volucer-testkit" }
+#
+# **No `version`, and that is what makes `cargo package --workspace` work.** Every other entry here
+# carries one, because they are published and a registry copy has to be named. This one is not, so a
+# version turns into a registry lookup: `cargo package` resolves a `dev-dependency` against crates.io
+# even though it never appears in the archive, and fails on `volucer-fcgi` with "no matching package
+# named `volucer-testkit`". A path with no version cannot be looked up, so nothing is asked of the
+# registry. Measured — adding a version, a `publish = false` here, or one on the `dev-dependency`
+# itself all reproduce the failure.
+volucer-testkit = { path = "crates/volucer-testkit" }
 volucer-server = { version = "0.3.0", path = "crates/volucer-server" }
 volucer-http = { version = "0.3.0", path = "crates/volucer-http" }
 volucer-watch = { version = "0.3.0", path = "crates/volucer-watch" }
