@@ -1908,6 +1908,9 @@ fn a_workers_streamed_response_is_re_framed_as_separate_records() {
         ));
         return;
     }
+    // The route this test drives, before the pool starts: a stale checkout otherwise answers with the
+    // worker's default page and the failure lands on the front-end instead of on the SDK.
+    volucer_testkit::require_example_routes(&["/stream"]);
 
     let worker = WorkerConfig {
         command: format!("php \"{}\"", script.display()),

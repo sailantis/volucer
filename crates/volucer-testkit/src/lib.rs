@@ -171,6 +171,65 @@ pub fn example_worker() -> PathBuf {
     sdk_dir().join("example").join("worker.php")
 }
 
+/// The routes a suite is about to drive, missing from the example worker it was pointed at.
+///
+/// **A stale SDK checkout reports itself as stale rather than as a bug in the server.** The suites
+/// reach the SDK's example worker over the wire and assert on what comes back, so a route the
+/// checkout does not implement answers with the worker's default page — which reads exactly like a
+/// front-end that dropped a stream, and sent the investigation to the wrong repository twice. It is
+/// also the failure mode CI has: `actions/checkout` clones the SDK's default branch, so a volucer
+/// commit that pairs with an unpushed SDK change passes locally and fails in CI with a message about
+/// relaying.
+///
+/// The check is a substring search of the example worker's source, which is honest about its limits:
+/// it proves the route is *mentioned*, not that it works. That is enough for what it is for — a
+/// route added to the suite and not to the SDK cannot be silent about it — and doing more would mean
+/// running PHP to find out something the tests that follow will find out anyway.
+///
+/// Returns the routes that are absent, in the order they were asked about.
+pub fn missing_example_routes(routes: &[&str]) -> Vec<String> {
+    let script = example_worker();
+    let Ok(source) = std::fs::read_to_string(&script) else {
+        // Unreadable is [`php_worker_skip_reason`]'s question, not this one's: a caller that reached
+        // here has already established the file exists, and reporting it twice would mean two
+        // different messages for one problem.
+        return Vec::new();
+    };
+
+    routes
+        .iter()
+        .filter(|route| !source.contains(&format!("'{route}'")))
+        .map(|route| route.to_string())
+        .collect()
+}
+
+/// Panic if the example worker at [`sdk_dir`] does not implement `routes`.
+///
+/// A **panic**, not a skip, and the distinction is the whole reason this exists. The machine has
+/// everything it needs; what is wrong is that the two checkouts disagree, and the pair of commits
+/// that fixes it is a code change rather than an install. Skipping would let CI stay green on a
+/// suite that cannot pass, which is the failure this whole crate was written to remove.
+///
+/// ```ignore
+/// volucer_testkit::require_example_routes(&["/stream", "/stream-boom"]);
+/// ```
+pub fn require_example_routes(routes: &[&str]) {
+    let missing = missing_example_routes(routes);
+    if missing.is_empty() {
+        return;
+    }
+
+    panic!(
+        "the PHP SDK at {} does not implement {missing:?}, which this suite drives. The checkout \
+         is stale or from a different branch: the volucer tests and the SDK's `example/worker.php` \
+         are two repositories that have to agree. Point VOLUCER_SDK_DIR at a newer checkout, or \
+         push the SDK change — a CI run clones the SDK's default branch, so an unpushed SDK commit \
+         is exactly how this fails there while passing locally. The worker it did find answers \
+         unknown routes with this page instead, which is what the failure looks like further down.",
+        sdk_dir().display(),
+    );
+}
+
 /// Why a suite that needs a PHP worker cannot run here, if it cannot.
 pub fn php_worker_skip_reason() -> Option<String> {
     if find_php().is_none() && std::env::var_os("VOLUCER_SDK_DIR").is_none() {

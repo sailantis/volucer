@@ -272,6 +272,26 @@ the machine lacks, so it prints and continues even under `VOLUCER_E2E=1`; making
 turn an occasional rerun into a red build naming the wrong cause. `volucer_testkit` spells that
 distinction `skip` versus `skip_transient`.
 
+### When the SDK and the server disagree
+
+The worker suites reach the SDK's `example/worker.php` over the wire and assert on the bytes that
+come back, which means the two repositories have to agree on the routes it serves. They do not fail
+to agree very often, but when they do the symptom is misleading: an unknown route answers with the
+worker's default page, so a route the checkout has never heard of looks like a server that dropped a
+stream. `/stream`, `/stream-boom` and `/upload` each arrived in an SDK commit, so a `volucer` commit
+that pairs with one of them passes against a developer's checkout and fails in CI, where
+`actions/checkout` fetches the SDK's *default branch* rather than the local one.
+
+`volucer_testkit::require_example_routes(&["/stream"])` is the guard. A test names the routes it is
+about to drive, and a checkout that does not mention one **panics naming the path**, instead of
+failing later on an assertion about relaying. It is a panic rather than a skip because the machine
+has everything it needs — the fix is a commit in one repository or the other, not an install
+— and a skip would let CI stay green on a suite that cannot pass.
+
+```sh
+git -C /path/to/volucer-php-sdk log --oneline -3   # is this checkout the one CI will use?
+```
+
 `cargo fmt --all --check` is a CI job, so a commit that is not formatted is a red run. Turn the
 hook on once per clone and it is refused before it is made:
 

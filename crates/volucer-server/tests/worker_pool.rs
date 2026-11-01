@@ -102,10 +102,26 @@ fn config(workers: u32) -> WorkerConfig {
 
 /// Start a pool, or report why the test cannot run.
 fn start(workers: u32) -> Option<WorkerPool> {
+    start_driving(workers, &[])
+}
+
+/// Start a pool that this test is about to drive `routes` against.
+///
+/// The route list exists because **the SDK is a separate repository, so a suite can be paired with a
+/// checkout that predates the route it drives.** That is not hypothetical: `/stream`, `/stream-boom`
+/// and `/upload` arrived over three SDK commits, and CI clones the SDK's default branch, so an
+/// unpushed SDK change passes locally and fails in CI. The failure looks like a front-end that
+/// dropped a stream, because an unknown route answers with the worker's default page — five tests in
+/// this file and one in `frontend.rs` failed that way, and it read as a server bug.
+///
+/// [`volucer_testkit::require_example_routes`] panics with the checkout named, so the two
+/// repositories' disagreement is reported as that instead.
+fn start_driving(workers: u32, routes: &[&str]) -> Option<WorkerPool> {
     if let Some(reason) = skip_reason() {
         report_skip(reason);
         return None;
     }
+    volucer_testkit::require_example_routes(routes);
     match WorkerPool::start("test", &config(workers)) {
         Ok(pool) => Some(pool),
         Err(err) => {
@@ -243,7 +259,7 @@ fn request_with_type(method: &str, uri: &str, body: &[u8], content_type: &str) -
 #[test]
 fn a_multipart_upload_reaches_the_worker_as_post_and_files() {
     let _serial = serial();
-    let Some(pool) = start(1) else {
+    let Some(pool) = start_driving(1, &["/upload"]) else {
         return;
     };
 
@@ -315,7 +331,7 @@ fn a_multipart_upload_reaches_the_worker_as_post_and_files() {
 #[test]
 fn a_streamed_request_body_reaches_the_worker_in_order() {
     let _serial = serial();
-    let Some(pool) = start(1) else {
+    let Some(pool) = start_driving(1, &["/upload"]) else {
         return;
     };
 
@@ -670,6 +686,7 @@ fn a_worker_that_asks_to_be_recycled_is_replaced() {
 fn a_worker_stream_reaches_the_dispatcher() {
     let _serial = serial();
     require_sdk!();
+    volucer_testkit::require_example_routes(&["/stream"]);
 
     let backend = BackendConfig::Worker(WorkerConfig {
         command: format!("php \"{}\"", example_worker().display()),
@@ -747,7 +764,7 @@ fn a_worker_stream_reaches_the_dispatcher() {
 #[test]
 fn a_streamed_response_arrives_before_its_body_is_complete() {
     let _serial = serial();
-    let Some(pool) = start(1) else {
+    let Some(pool) = start_driving(1, &["/stream"]) else {
         return;
     };
     let pool = std::sync::Arc::new(pool);
@@ -821,7 +838,7 @@ fn a_streamed_response_arrives_before_its_body_is_complete() {
 #[test]
 fn a_stream_that_never_ends_is_reported_as_truncated() {
     let _serial = serial();
-    let Some(pool) = start(1) else {
+    let Some(pool) = start_driving(1, &["/stream-boom"]) else {
         return;
     };
     let pool = std::sync::Arc::new(pool);
