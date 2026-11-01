@@ -63,8 +63,15 @@ redis = ["volucer-kv/redis", "volucer-core/redis", "volucer-lock/redis", "voluce
 # rather than starting a server whose every push would fail.
 amqp = ["volucer-jobs/amqp", "volucer-core/amqp"]
 [dev-dependencies]
+# The skip gate. Shared rather than copied: VOLUCER_E2E=1 has to mean the same thing in every
+# suite, and it did not — see the crate's own docs for what that cost.
+volucer-testkit.workspace = true
 # An empty request body, so an upstream test needs no listener to make one.
 http-body-util.workspace = true
+# A log sink for the one test that asserts a `warn!` line an operator would see — the worker whose
+# stderr the startup hint points at. A writer that appends to a `String` is all that is wanted; this
+# brings the subscriber to put it behind, not a test harness.
+tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -32,3 +32,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# The skip gate. Shared rather than copied: VOLUCER_E2E=1 has to mean the same thing in every
+# suite, and it did not — see the crate's own docs for what that cost.
+volucer-testkit.workspace = true

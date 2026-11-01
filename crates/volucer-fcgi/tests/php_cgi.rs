@@ -1,9 +1,12 @@
 //! End-to-end tests against a real `php-cgi` process.
 //!
-//! These are the tests that prove the codec and client work against PHP rather
-//! than against our own fixtures. They are skipped, with a printed reason, when
-//! no `php-cgi` binary is available, so the suite stays green on a machine
-//! without PHP.
+//! These are the tests that prove the codec and client work against PHP rather than against our own
+//! fixtures. They are skipped, with a printed reason, when no `php-cgi` binary is available, so the
+//! suite stays green on a machine without PHP — **and `VOLUCER_E2E=1` turns that skip into a
+//! failure**, because a green skip and a green pass are the same line in libtest and only one of them
+//! is evidence. That gate used to be absent here while `serve.rs` and `worker_pool.rs` honoured it,
+//! which made this suite the one place a CI run could report success without execution; it now comes
+//! from `volucer_testkit` like every other suite's.
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -12,25 +15,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use volucer_fcgi::{build_params, Client, Endpoint, Request, RequestInfo, Routing};
-
-/// Find `php-cgi` on `PATH`.
-fn find_php_cgi() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php-cgi.exe", "php-cgi"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php-cgi"];
-
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
 
 /// Ask the OS for an unused port, then release it.
 ///
@@ -82,7 +66,7 @@ struct PhpCgi {
 
 impl PhpCgi {
     fn start() -> Option<Self> {
-        let binary = find_php_cgi()?;
+        let binary = volucer_testkit::find_php_cgi()?;
         // Held until php-cgi is listening: the port `free_port` read is released when its
         // reserving listener drops, so releasing the lock any earlier reopens the race.
         let _serial = port_lock();
@@ -122,7 +106,7 @@ impl PhpCgi {
     /// are about.
     #[cfg(windows)]
     fn start_on_pipe(label: &str) -> Option<Self> {
-        let binary = find_php_cgi()?;
+        let binary = volucer_testkit::find_php_cgi()?;
         let name = pipe_name(label);
 
         let child = Command::new(&binary)
@@ -235,7 +219,7 @@ fn header<'a>(headers: &'a [(&'a str, &'a str)], name: &str) -> Option<&'a str> 
 #[test]
 fn serves_a_script_over_fastcgi() {
     let Some(server) = PhpCgi::start() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -274,7 +258,7 @@ fn serves_a_script_over_fastcgi() {
 #[test]
 fn passes_the_request_body_through_as_stdin() {
     let Some(server) = PhpCgi::start() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -312,7 +296,7 @@ fn passes_the_request_body_through_as_stdin() {
 #[test]
 fn a_status_header_from_the_script_is_preserved() {
     let Some(server) = PhpCgi::start() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -343,7 +327,7 @@ fn a_status_header_from_the_script_is_preserved() {
 #[test]
 fn a_missing_script_is_reported_by_the_backend_not_hung_on() {
     let Some(server) = PhpCgi::start() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -370,7 +354,7 @@ fn a_missing_script_is_reported_by_the_backend_not_hung_on() {
 #[test]
 fn get_values_is_answered_or_declined_without_hanging() {
     let Some(server) = PhpCgi::start() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -390,7 +374,7 @@ fn get_values_is_answered_or_declined_without_hanging() {
 #[test]
 fn the_cgi_environment_builder_produces_a_working_request() {
     let Some(server) = PhpCgi::start() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -478,7 +462,7 @@ echo "INPUT=", file_get_contents('php://input');
 #[test]
 fn serves_a_script_over_a_named_pipe() {
     let Some(server) = PhpCgi::start_on_pipe("serve") else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -535,7 +519,7 @@ fn a_pipe_read_without_an_answer_times_out_rather_than_hanging() {
     use std::io::Read as _;
 
     let Some(server) = PhpCgi::start_on_pipe("timeout") else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 

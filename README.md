@@ -245,7 +245,32 @@ cargo test            # unit and integration tests, including live php-cgi
 cargo build --release
 ```
 
-Integration tests that spawn PHP processes require `php` and `php-cgi` on `PATH`.
+### What the suites need beyond Rust
+
+Integration tests that spawn PHP processes require `php` **and** `php-cgi` on `PATH` — they are
+separate packages on most systems, so `brew install php` is not enough for the second. The worker
+suites additionally need the [PHP worker SDK](https://github.com/sailantis/volucer-php-sdk) checked
+out; `VOLUCER_SDK_DIR` names it, and without the variable a sibling `volucer-php-sdk` directory is
+assumed.
+
+None of that is required to build or to run the rest of the suite. What *is* required is being
+honest about which suites ran:
+
+```sh
+VOLUCER_E2E=1 VOLUCER_SDK_DIR=/path/to/volucer-php-sdk cargo test --workspace
+```
+
+`VOLUCER_E2E=1` turns a skip into a failure, and it exists because libtest prints the same
+`ok` for a test that passed and a test that quietly decided not to run. On a machine that is
+*supposed* to have PHP, "48 passed" must not be able to mean "48 skips". The gate itself lives in
+`crates/volucer-testkit` — one function every suite calls, rather than each suite deciding for
+itself, which is a distinction that earned its keep: three suites used to skip without consulting
+the variable at all.
+
+Contention is exempt on purpose. "No free port" is a race the suite lost today, not a capability
+the machine lacks, so it prints and continues even under `VOLUCER_E2E=1`; making it fatal would
+turn an occasional rerun into a red build naming the wrong cause. `volucer_testkit` spells that
+distinction `skip` versus `skip_transient`.
 
 `cargo fmt --all --check` is a CI job, so a commit that is not formatted is a red run. Turn the
 hook on once per clone and it is refused before it is made:

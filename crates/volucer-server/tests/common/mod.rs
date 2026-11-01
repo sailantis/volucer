@@ -19,23 +19,13 @@ pub fn serial() -> MutexGuard<'static, ()> {
 }
 
 /// Find `php-cgi` on `PATH`.
-pub fn find_php_cgi() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php-cgi.exe", "php-cgi"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php-cgi"];
-
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
+///
+/// A re-export rather than a copy: the probe is the same one every other suite uses, and the copy
+/// that lived here is how `pool.rs` ended up skipping without honouring `VOLUCER_E2E`.
+///
+/// Re-exported for the suites that spell it bare; `pool.rs` and `frontend.rs` import it from here.
+#[allow(unused_imports)]
+pub use volucer_testkit::find_php_cgi;
 
 /// Find a run of `count` consecutive unused ports, returning the first.
 ///

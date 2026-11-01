@@ -1,0 +1,12 @@
+[package]
+name = "volucer-testkit"
+description = "Shared skip gate and environment probes for volucer's integration tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Deliberately not published: this crate exists for `cargo test` and nothing else.
+publish = false
+
+[dependencies]

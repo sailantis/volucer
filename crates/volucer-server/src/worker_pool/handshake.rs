@@ -11,8 +11,9 @@ use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use volucer_core::config::WORKER_SOCKET_ENV;
 use volucer_fcgi::{Endpoint, FcgiError, Stream};
@@ -305,6 +306,7 @@ fn accept_with_deadline(
     spec: &Spec,
     child: &mut Child,
     timeout: Duration,
+    stderr_log: Option<&StderrLog>,
 ) -> Result<Stream> {
     let binary = spec
         .binary()
@@ -339,6 +341,12 @@ fn accept_with_deadline(
                 // useful than waiting out the full handshake budget, and the exit status is
                 // usually the reason: a fatal error, a missing extension, a bad path.
                 if let Ok(Some(status)) = child.try_wait() {
+                    // The evidence first, so the error that follows is read in context — this exit
+                    // is one of the two cases the socket hint describes, and the worker's own
+                    // stderr is what tells them apart.
+                    if let Some(log) = stderr_log {
+                        report_worker_stderr(&spec.describe(), log);
+                    }
                     return Err(ServerError::StartupExited {
                         binary: binary.clone(),
                         status: status.to_string(),
@@ -381,6 +389,37 @@ fn install_call_handler(channel: &mut Channel, handler: Option<&Arc<MethodRegist
     };
     let registry = Arc::clone(registry);
     channel.set_call_handler(Box::new(move |call| registry.serve(call)));
+}
+
+/// Read a worker's retained `stderr` and write it where an operator will see it.
+///
+/// # Why this is `warn` and not the `debug` the drain thread uses
+///
+/// Because of what it is for. The startup failure these lines explain is logged at `error`, and its
+/// hint says the worker's own stderr "is logged above". At the default filter (`volucer=info`) a
+/// `debug` line is invisible, so before this existed the hint pointed at nothing — for the *likeliest*
+/// first-run failure on Windows, where the socket transport is the default and a worker written
+/// against `Worker::create()` dies in its handshake.
+///
+/// It is `warn` rather than `error` because the error is the failure and this is its evidence: two
+/// `error` lines for one startup abort reads as two things having gone wrong.
+///
+/// # Why an empty log is reported
+///
+/// "The worker wrote nothing to stderr" is itself the answer when a startup failure is otherwise
+/// unexplained — it rules out the most common cause and sends the reader to the exit status and the
+/// command instead. Silence here would look like the mechanism had failed to capture something.
+fn report_worker_stderr(name: &str, log: &StderrLog) {
+    let text = log.take();
+    if text.is_empty() {
+        tracing::warn!(
+            backend = %name,
+            "the worker wrote nothing to stderr before it exited, so the reason is not in its own \
+             diagnostics — check the command, the working directory and the exit status"
+        );
+        return;
+    }
+    tracing::warn!(backend = %name, "worker stderr, before it exited:\n{text}");
 }
 
 /// The hint for a startup failure, given how the worker was going to be reached.
@@ -451,7 +490,14 @@ fn boot_attached(
     let (writer, reader) = connect_relay(name, attach)?;
     let channel = BoundedChannel::new(writer, reader);
 
-    finish_boot(name, spec, Link::Attached { pid: 0 }, channel, handler)
+    finish_boot(
+        name,
+        spec,
+        Link::Attached { pid: 0 },
+        channel,
+        handler,
+        None,
+    )
 }
 
 /// One connection to the relay, as a writer and a reader.
@@ -496,6 +542,7 @@ fn finish_boot(
     mut link: Link,
     mut channel: Channel,
     handler: Option<&Arc<MethodRegistry>>,
+    stderr_log: Option<&StderrLog>,
 ) -> Result<Ready> {
     // The call handler goes on **before the handshake**, and the order matters. A worker may send
     // a `CALL` at any point in its life, and the first thing it does after connecting is boot the
@@ -520,6 +567,12 @@ fn finish_boot(
                 target = %spec.describe(),
                 "worker ready"
             );
+            // The boot is over, so nothing is going to ask for the retained lines. Cleared here
+            // rather than left to accumulate: a worker that logs for a week would otherwise be a
+            // leak with a log attached.
+            if let Some(log) = stderr_log {
+                log.finish();
+            }
             Ok(Ready {
                 link,
                 exchange: ChannelExchange::start(channel),
@@ -533,6 +586,14 @@ fn finish_boot(
                 let _ = link.kill();
             }
             let status = link.wait().ok().flatten();
+
+            // **Before the error, not after.** The hint on that error points at these lines, and an
+            // operator reading a log reads downwards: evidence first, verdict second. This is also
+            // the only moment they can be read, because the process has exited and no more will
+            // arrive.
+            if let Some(log) = stderr_log {
+                report_worker_stderr(name, log);
+            }
 
             let source = match failure {
                 HandshakeFailure::TimedOut => WorkerError::Timeout(HANDSHAKE_TIMEOUT),
@@ -610,6 +671,8 @@ fn boot_spawned(
         // Piped, never nulled: PHP writes its diagnostics here, and a worker
         // whose stderr pipe fills up blocks for ever on its next write.
         .stderr(Stdio::piped());
+    let mut stderr_log: Option<StderrLog> = None;
+
     command.args(args);
     if let Some(dir) = working_dir {
         command.current_dir(dir);
@@ -660,23 +723,29 @@ fn boot_spawned(
     }
 
     if let Some(stderr) = child.stderr.take() {
-        drain_stderr(name.to_string(), child.id(), stderr);
+        let log = StderrLog::default();
+        drain_stderr(name.to_string(), child.id(), stderr, log.clone());
+        stderr_log = Some(log);
     }
-
     let channel = match listener {
         // The worker connects back to the listener bound above. The timeout matters: a
         // worker that never connects must fail here rather than hold startup for ever, and
         // it is bounded by the same budget the handshake gets.
         Some(listener) => {
-            let accepted =
-                match accept_with_deadline(&listener, spec, &mut child, HANDSHAKE_TIMEOUT) {
-                    Ok(stream) => stream,
-                    Err(source) => {
-                        let _ = crate::lifecycle::kill(&mut child);
-                        let _ = child.wait();
-                        return Err(source);
-                    }
-                };
+            let accepted = match accept_with_deadline(
+                &listener,
+                spec,
+                &mut child,
+                HANDSHAKE_TIMEOUT,
+                stderr_log.as_ref(),
+            ) {
+                Ok(stream) => stream,
+                Err(source) => {
+                    let _ = crate::lifecycle::kill(&mut child);
+                    let _ = child.wait();
+                    return Err(source);
+                }
+            };
             // The protocol is latency-sensitive and its frames are small; Nagle would
             // only add delay to a request that is written frame by frame. A unix socket has
             // no Nagle to disable — `set_nodelay` on one is `ENOPROTOOPT`, which is why this
@@ -699,7 +768,14 @@ fn boot_spawned(
         }
     };
 
-    finish_boot(name, spec, Link::Process(child), channel, handler)
+    finish_boot(
+        name,
+        spec,
+        Link::Process(child),
+        channel,
+        handler,
+        stderr_log.as_ref(),
+    )
 }
 
 /// Why a boot handshake did not produce a `HELLO_ACK`.
@@ -746,20 +822,133 @@ fn handshake_with_timeout(
     }
 }
 
-/// Log a worker's `stderr` until it ends.
+/// A worker's `stderr`, kept where a startup failure can read it back.
 ///
-/// This thread exists so the pipe cannot fill up, and it logs because for PHP
-/// this is where errors go: the SDK points `display_errors` at `stderr` precisely
-/// so that diagnostics cannot corrupt the protocol stream. For a worker written
-/// without the SDK it is simply free-form output.
+/// # Why the text is kept as well as logged
 ///
-/// It must run on its own thread, and that is not incidental: reading `stderr` to
-/// end-of-file blocks until the worker exits, so doing it inline would deadlock
-/// the boot — the worker waits for `HELLO` while we wait for a line that will
-/// never come. This is the hazard "drain `STDERR` for every
-/// backend, always", seen from the other side: draining it on the caller's thread
-/// is the same bug with a different shape.
-fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {
+/// Because the log level it is written at is `debug`, while the hint it is offered to sits on the
+/// `error` line for a **startup** failure — and those two can never be read together. At the
+/// default filter (`volucer=info`, which is what `serve` with no `--verbose` and no `RUST_LOG`
+/// uses) an operator sees the hint and not one line of the evidence it points at.
+///
+/// It is not academic. The socket transport is the **default on Windows**, so the likeliest
+/// first-run failure there — a worker written against `Worker::create()` — aborts startup with a
+/// message saying "Anything the worker wrote to stderr is logged above", above which there is
+/// nothing. The worker had in fact written a full `Uncaught ProtocolException` trace.
+///
+/// So the lines are retained, and the failure path reads them out with [`Self::take`] and writes
+/// them at `warn` *before* the error that points at them. Retaining costs one `String` per worker,
+/// and only for as long as the worker is booting.
+///
+/// # Why it stops buffering once the boot ends
+///
+/// A long-lived worker keeps writing, and a server that accumulated every line for its lifetime
+/// would be a leak with a log attached. [`Self::finish`] is called on both halves of the boot, so a
+/// successful start and a failed one both stop the growth — the failure path just also stops it by
+/// reading.
+#[derive(Debug, Clone, Default)]
+struct StderrLog {
+    /// The lines so far, in arrival order. Capped at [`Self::LIMIT`].
+    lines: Arc<Mutex<String>>,
+    /// Set when the boot ended, so the drain thread stops appending.
+    finished: Arc<AtomicBool>,
+    /// Set by the drain thread when the pipe reached end-of-file.
+    ///
+    /// **This is what makes a report deterministic.** The child exiting and the drain thread having
+    /// *read* what it wrote are two different events: a worker that dies writing a fatal error leaves
+    /// those bytes in the pipe for the thread to pick up microseconds later. A `take` that ran in
+    /// between would report "the worker wrote nothing" while holding the opposite in its hand — a
+    /// failure message that actively lies about the evidence. So a report waits for this flag, which
+    /// is set exactly when there is nothing more to read.
+    drained: Arc<AtomicBool>,
+}
+
+impl StderrLog {
+    /// How much text will be kept. Enough for a PHP fatal error and its stack trace, which is the
+    /// case this exists for. A worker that logs a megabyte while booting is a problem of its own, and
+    /// the **last** lines are the ones that say why it died, so the cap drops the oldest.
+    const LIMIT: usize = 16 * 1024;
+
+    /// How long a report waits for the drain thread to reach end-of-file.
+    ///
+    /// Short because the wait is only ever spent after the worker is known to be gone, when the pipe
+    /// is already at end-of-file or microseconds from it. The bound exists so that a worker which
+    /// somehow holds its stderr open cannot delay the startup failure it is being reported for.
+    const SETTLE: Duration = Duration::from_millis(250);
+
+    /// Append a line, unless the boot is over or the cap has been reached.
+    fn push(&self, line: &str) {
+        if self.finished.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(mut guard) = self.lines.lock() else {
+            return;
+        };
+        // Re-checked inside the lock: `take` clears the buffer and then sets the flag, so a line that
+        // arrived between those two steps would otherwise be retained for the life of the process.
+        if self.finished.load(Ordering::Acquire) {
+            return;
+        }
+        if guard.len() + line.len() + 1 > Self::LIMIT {
+            return;
+        }
+        guard.push_str(line);
+        guard.push('\n');
+    }
+
+    /// Record that the pipe ended, so a waiting report knows the log is complete.
+    fn mark_drained(&self) {
+        self.drained.store(true, Ordering::Release);
+    }
+
+    /// Take everything the worker wrote, waiting briefly for the drain thread to finish reading.
+    ///
+    /// Returns an empty string when the worker said nothing, which the caller reports differently
+    /// from "the worker said something": "it wrote no diagnostics" is itself a fact worth stating
+    /// when a startup failure is otherwise unexplained.
+    fn take(&self) -> String {
+        let deadline = Instant::now() + Self::SETTLE;
+        while !self.drained.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        self.finished.store(true, Ordering::Release);
+        let mut guard = match self.lines.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let text = guard.trim_end().to_string();
+        guard.clear();
+        guard.shrink_to_fit();
+        text
+    }
+
+    /// Stop buffering without reading, for the boot that succeeded.
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.lines.lock() {
+            guard.clear();
+            guard.shrink_to_fit();
+        }
+    }
+}
+
+/// Log a worker's `stderr` until it ends, keeping the lines while the boot is running.
+///
+/// The thread exists so the pipe cannot fill up, and it logs because for PHP this is where errors go:
+/// the SDK points `display_errors` at `stderr` precisely so that diagnostics cannot corrupt the
+/// protocol stream. For a worker written without the SDK it is simply free-form output.
+///
+/// It must run on its own thread, and that is not incidental: reading `stderr` to end-of-file blocks
+/// until the worker exits, so doing it inline would deadlock the boot — the worker waits for `HELLO`
+/// while we wait for a line that will never come. This is the hazard "drain `STDERR` for every
+/// backend, always", seen from the other side: draining it on the caller's thread is the same bug
+/// with a different shape.
+///
+/// The `debug` line and the retained copy are not redundant. The line is for a worker that is running
+/// normally; the copy is for one that died before it could run at all, where the failure path reports
+/// it at `warn` because the hint points at it.
+fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr, log: StderrLog) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = Vec::new();
@@ -772,6 +961,7 @@ fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {
                     let text = text.trim_end();
                     if !text.is_empty() {
                         tracing::debug!(backend = %backend, pid, line = %text, "worker stderr");
+                        log.push(text);
                     }
                 }
                 Err(err) => {
@@ -780,14 +970,55 @@ fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {
                 }
             }
         }
+        // Last, so a report woken by this flag can never read a buffer the loop was about to add to.
+        log.mark_drained();
     });
 }
 
 #[cfg(test)]
-use std::collections::BTreeMap;
-#[cfg(test)]
 #[cfg(test)]
 use volucer_core::config::WorkerTransport;
+
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+/// An in-memory log sink, so a test can assert what an operator would have seen.
+///
+/// `tracing`'s own test helpers (`tracing_test`, `tracing-mock`) are not dependencies of this
+/// workspace, and adding one to assert a single `warn!` line is a dependency bought for a test's
+/// scaffolding. A writer that appends to a `String` under a mutex is the whole of what is needed, and
+/// it goes through the same `tracing` path the real server uses.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("not poisoned")).into_owned()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("not poisoned").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for Capture {
+    type Writer = Capture;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// The pieces of a worker specification `boot` does not read.
 ///
@@ -849,6 +1080,7 @@ mod tests {
             &bare_spec(WorkerTransport::Socket),
             &mut child,
             Duration::from_secs(5),
+            None,
         )
         .expect_err("a listener nobody connects to must not succeed");
         let elapsed = started.elapsed();
@@ -896,6 +1128,7 @@ mod tests {
             &bare_spec(WorkerTransport::Socket),
             &mut child,
             Duration::from_millis(200),
+            None,
         )
         .expect_err("a live worker that never connects must not hold startup for ever");
 
@@ -917,5 +1150,118 @@ mod tests {
             }
             other => panic!("expected a startup timeout, got {other:?}"),
         }
+    }
+
+    /// **The retained `stderr` is readable after a startup failure**, which is the whole point of
+    /// keeping it: the hint on that failure says the worker's own output "is logged above", and at
+    /// the default filter the `debug` line that carries it is invisible.
+    ///
+    /// A child that writes a line and exits, driven through the same `accept_with_deadline` a real
+    /// boot uses, so what is asserted is the mechanism rather than a hand-built buffer. The line is
+    /// deliberately the wording PHP produces for the case this exists for.
+    #[test]
+    fn a_failed_startup_retains_the_workers_stderr_for_the_error_path() {
+        let listener = WorkerListener::Tcp(TcpListener::bind(("127.0.0.1", 0)).unwrap());
+        let log = StderrLog::default();
+
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                // `1>&2` is cmd's spelling; `>&2` is a syntax error there and the child would then
+                // write nothing, making this test pass or fail for a reason of its own.
+                vec!["/C", "echo Uncaught ProtocolException 1>&2 & exit 3"]
+            } else {
+                vec!["-c", "echo 'Uncaught ProtocolException' >&2; exit 3"]
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stderr = child.stderr.take().expect("stderr was piped");
+        drain_stderr("app".to_string(), child.id(), stderr, log.clone());
+
+        // The subscriber is installed for the duration of this test only, and `set_default` scopes it
+        // to this thread — which is all that is needed, because the `warn!` being asserted is written
+        // on the thread that called `accept_with_deadline`, not on the drain thread.
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let err = accept_with_deadline(
+            &listener,
+            &bare_spec(WorkerTransport::Socket),
+            &mut child,
+            Duration::from_secs(5),
+            Some(&log),
+        )
+        .expect_err("a worker that exited cannot connect");
+
+        let _ = crate::lifecycle::kill(&mut child);
+        let _ = child.wait();
+
+        assert!(
+            matches!(err, ServerError::StartupExited { .. }),
+            "the exit status is still the error: {err:?}"
+        );
+
+        // **The assertion is on what was logged, not on what is left in the buffer.** The failure
+        // path reports the retained lines and *then* builds the error, so reading the log a second
+        // time here would find it cleared — and a test that read the buffer directly would be
+        // asserting the mechanism that feeds the report rather than the report an operator sees.
+        let logged = capture.text();
+        assert!(
+            logged.contains("Uncaught ProtocolException"),
+            "the worker's own diagnostic must reach the log, because the hint on the error that \
+             follows points at it. An operator at the default filter sees only `warn` and above, so \
+             a `debug` line is not evidence. log was: {logged:?}"
+        );
+    }
+
+    /// The other half: a successful boot must not leave the buffer growing for the process's life.
+    ///
+    /// A worker that logs a line a second for a week would otherwise be an unbounded `String` with a
+    /// log attached. `finish` is what stops it, and this pins that it stops *and* releases the text
+    /// rather than merely setting a flag over the top of it.
+    #[test]
+    fn a_successful_boot_stops_retaining_stderr() {
+        let log = StderrLog::default();
+        log.push("while booting");
+        log.finish();
+        log.push("after the boot");
+
+        assert_eq!(
+            log.take(),
+            "",
+            "nothing may be retained once the boot ended — otherwise a long-lived worker is a leak"
+        );
+    }
+
+    /// The cap: a worker that logs a great deal while booting keeps the lines that fit and no more.
+    ///
+    /// Asserted because the alternative reading of the cap is to keep appending and trim later, which
+    /// is a buffer with no bound at all during exactly the burst it is meant to bound.
+    #[test]
+    fn the_retained_stderr_is_capped() {
+        let log = StderrLog::default();
+        let line = "x".repeat(1024);
+        for _ in 0..64 {
+            log.push(&line);
+        }
+        let retained = log.take();
+        assert!(
+            retained.len() <= StderrLog::LIMIT,
+            "the retained text must stay within {} bytes, got {}",
+            StderrLog::LIMIT,
+            retained.len()
+        );
+        assert!(
+            !retained.is_empty(),
+            "the cap must not be so eager that it keeps nothing"
+        );
     }
 }

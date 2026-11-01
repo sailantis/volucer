@@ -82,11 +82,11 @@ fn fixture(name: &str) -> (PathBuf, String) {
 fn a_slot_receives_the_configured_environment_and_the_server_version() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base_port) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -154,7 +154,7 @@ fn a_slot_receives_the_configured_environment_and_the_server_version() {
 fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -230,7 +230,7 @@ fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
 fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let (root, script_name) = fixture("pipe");
@@ -289,7 +289,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
 fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -363,11 +363,11 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
 fn children_lets_one_slot_serve_several_requests_at_once() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(2) else {
-        eprintln!("skipping: no run of free ports");
+        volucer_testkit::skip_transient("no run of free ports");
         return;
     };
 
@@ -531,11 +531,11 @@ fn children_lets_one_slot_serve_several_requests_at_once() {
 fn starts_a_pool_and_serves_requests_through_every_slot() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(3) else {
-        eprintln!("skipping: no run of three free ports");
+        volucer_testkit::skip_transient("no run of three free ports");
         return;
     };
 
@@ -579,11 +579,11 @@ fn starts_a_pool_and_serves_requests_through_every_slot() {
 fn every_slot_started_at_startup_is_still_running_a_moment_later() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(3) else {
-        eprintln!("skipping: no run of three free ports");
+        volucer_testkit::skip_transient("no run of three free ports");
         return;
     };
 
@@ -624,11 +624,11 @@ fn every_slot_started_at_startup_is_still_running_a_moment_later() {
 fn a_killed_slot_is_replaced_and_the_pool_keeps_serving() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -661,11 +661,11 @@ fn a_killed_slot_is_replaced_and_the_pool_keeps_serving() {
 fn recycling_replaces_the_process_after_max_requests() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -717,11 +717,11 @@ fn recycling_replaces_the_process_after_max_requests() {
 fn dropping_the_pool_leaves_no_processes_behind() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(2) else {
-        eprintln!("skipping: no run of two free ports");
+        volucer_testkit::skip_transient("no run of two free ports");
         return;
     };
 
@@ -756,7 +756,7 @@ fn dropping_the_pool_leaves_no_processes_behind() {
 fn a_pool_skips_ports_that_are_already_in_use() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -769,7 +769,7 @@ fn a_pool_skips_ports_that_are_already_in_use() {
     let next_free = (base.saturating_add(1)..base.saturating_add(100))
         .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok());
     let Some(next_free) = next_free else {
-        eprintln!("skipping: no free port after {base}");
+        volucer_testkit::skip_transient("no free port after {base}");
         return;
     };
 
@@ -797,11 +797,11 @@ fn a_pool_skips_ports_that_are_already_in_use() {
 fn a_command_driver_serves_through_the_address_it_was_given() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base_port) = free_port_run(2) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -852,7 +852,7 @@ fn a_command_driver_serves_through_the_address_it_was_given() {
 fn a_command_with_no_address_placeholder_is_a_misconfiguration() {
     let _serial = serial();
     let Some(base_port) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -897,7 +897,7 @@ fn a_command_with_no_address_placeholder_is_a_misconfiguration() {
 fn a_command_that_exits_is_not_retried_across_ports() {
     let _serial = serial();
     let Some(base_port) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -990,11 +990,11 @@ fn is_running(pid: u32) -> bool {
 fn a_sweep_replaces_every_idle_cgi_slot_and_keeps_its_addresses() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(3) else {
-        eprintln!("skipping: no run of free ports");
+        volucer_testkit::skip_transient("no run of free ports");
         return;
     };
     let (root, script) = fixture("sweep");
@@ -1054,11 +1054,11 @@ fn a_sweep_leaves_a_busy_cgi_slot_alone() {
 
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(2) else {
-        eprintln!("skipping: no run of free ports");
+        volucer_testkit::skip_transient("no run of free ports");
         return;
     };
 
@@ -1122,11 +1122,11 @@ fn a_sweep_leaves_a_busy_cgi_slot_alone() {
 fn a_command_driven_slot_is_swept_on_the_address_it_was_given() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
     let (root, script) = fixture("sweep-command");

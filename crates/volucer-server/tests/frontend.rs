@@ -175,11 +175,11 @@ fn params_for(root: &Path, uri: &str, body_len: usize) -> Vec<(Vec<u8>, Vec<u8>)
 fn a_fastcgi_request_travels_the_whole_chain_and_comes_back_intact() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -225,11 +225,11 @@ echo "BODY=", file_get_contents('php://input');
 fn the_front_end_serves_several_requests_in_a_row() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -1179,7 +1179,7 @@ fn fastcgi_round_trip_with_trace(
     traceparent: Option<&str>,
 ) -> Option<String> {
     let Some(php) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return None;
     };
     let root = std::env::temp_dir().join(format!(
@@ -1413,7 +1413,7 @@ fn echo_params_script(root: &Path, names: &[&str]) -> std::path::PathBuf {
 /// attributable to the grant and nothing else.
 fn fastcgi_rpc_body(granted: bool) -> Option<String> {
     let Some(php) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return None;
     };
     let root =
@@ -1624,11 +1624,11 @@ fn a_backend_that_grants_nothing_is_handed_neither_an_address_nor_a_token() {
 fn a_large_response_is_relayed_chunk_by_chunk_and_never_assembled() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -1765,11 +1765,11 @@ echo str_repeat('m', 8192);
 fn a_large_response_is_relayed_through_the_fastcgi_front_end_as_separate_records() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 
@@ -1896,15 +1896,16 @@ fn a_workers_streamed_response_is_re_framed_as_separate_records() {
 
     let _serial = serial();
     let Some(php) = find_php() else {
-        eprintln!("skipping: no php on PATH");
+        volucer_testkit::skip("no php on PATH");
         return;
     };
     let script = worker_script();
     if !script.is_file() {
-        eprintln!(
-            "skipping: the SDK example worker is not at {} — set VOLUCER_SDK_DIR",
+        volucer_testkit::skip(&format!(
+            "the PHP worker SDK is not at {} — set VOLUCER_SDK_DIR to a volucer-php-sdk \
+             checkout, whose `example/worker.php` owns the `/stream` route this test drives",
             script.display()
-        );
+        ));
         return;
     }
 
@@ -2027,39 +2028,15 @@ fn worker_request(uri: &str) -> Request {
     }
 }
 
-/// `php` on `PATH`.
-fn find_php() -> Option<std::path::PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php.exe", "php"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php"];
-
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
+/// `php` on `PATH`, from the shared probe.
+use volucer_testkit::find_php;
 
 /// The SDK's example worker, which owns the `/stream` route this test drives.
+///
+/// Delegated rather than rebuilt, so that the path a skip message names is the path the probe
+/// actually looked at.
 fn worker_script() -> std::path::PathBuf {
-    match std::env::var_os("VOLUCER_SDK_DIR") {
-        Some(dir) => std::path::PathBuf::from(dir)
-            .join("example")
-            .join("worker.php"),
-        None => Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("volucer-php-sdk")
-            .join("example")
-            .join("worker.php"),
-    }
+    volucer_testkit::example_worker()
 }
 
 /// A slot mid-relay is **not** idle, so a rolling restart leaves it alone.
@@ -2076,11 +2053,11 @@ fn worker_script() -> std::path::PathBuf {
 fn a_slot_serving_a_relayed_response_is_not_idle() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
     let Some(base) = free_port_run(1) else {
-        eprintln!("skipping: no free port");
+        volucer_testkit::skip_transient("no free port");
         return;
     };
 

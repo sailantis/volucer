@@ -46,6 +46,12 @@ fn addr() -> Option<String> {
 #[test]
 fn get_values_reports_whatever_the_server_is_willing_to_say() {
     let Some(addr) = addr() else {
+        // **Deliberately not gated on `VOLUCER_E2E`.** This file is a diagnostic rather than a
+        // gate — it needs a FastCGI server the test cannot start, so there is no machine that is
+        // "supposed to" have one, and claiming a skip is a failure would make a file whose whole
+        // purpose is to be run by hand at a server you already started fail every automated run.
+        // See the module doc: every assertion here is about *not hanging*, because both answers are
+        // legitimate.
         eprintln!("skipping: set FCGI_ADDR=host:port to a running FastCGI server");
         return;
     };

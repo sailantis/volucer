@@ -38,40 +38,12 @@ fn volucer_binary() -> Option<PathBuf> {
 }
 
 fn find_php_cgi() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php-cgi.exe", "php-cgi"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php-cgi"];
-
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    volucer_testkit::find_php_cgi()
 }
 
 /// Find `php` on `PATH`, for the worker-backend test.
 fn find_php() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php.exe", "php"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php"];
-
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    volucer_testkit::find_php()
 }
 
 /// A run of consecutive free ports, since the pool increments from `base_port`.
@@ -580,24 +552,18 @@ fn start_server(
     Server::start(binary, &config_path)
 }
 
-/// The SDK the example worker lives in, which is now a repository of its own.
+/// The SDK the example worker lives in, which is a repository of its own.
 ///
-/// `VOLUCER_SDK_DIR` overrides it; otherwise the sibling layout is assumed:
-/// `sailantis/volucer` and `sailantis/volucer-php-sdk` next to each other.
+/// Unused only because `sdk_skip_reason` delegates the whole check, which looks the directory up
+/// itself; the wrapper stays so the probe name a reader looks for resolves in this file.
+#[allow(dead_code)]
 fn sdk_dir() -> PathBuf {
-    match std::env::var_os("VOLUCER_SDK_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("volucer-php-sdk"),
-    }
+    volucer_testkit::sdk_dir()
 }
 
 /// The SDK's example worker, which is what the worker backend is pointed at.
 fn example_worker() -> PathBuf {
-    sdk_dir().join("example").join("worker.php")
+    volucer_testkit::example_worker()
 }
 
 /// Why a worker-backed test cannot run here, if it cannot.
@@ -605,16 +571,12 @@ fn example_worker() -> PathBuf {
 /// The SDK is a separate checkout, so "the test ran" and "the test was skipped"
 /// are easy to confuse. `VOLUCER_E2E=1` turns the skip into a failure, because
 /// libtest hides the stderr of a passing test and a skip is otherwise invisible.
+///
+/// The check also covers `php` itself, which this suite used to ask for separately: a
+/// `[backends.app]` worker is started with `php`, so an SDK checkout and no interpreter is the same
+/// failure one step later, reported by the wrong test.
 fn sdk_skip_reason() -> Option<String> {
-    let script = example_worker();
-    if !script.is_file() {
-        return Some(format!(
-            "the SDK example worker is not at {} — set VOLUCER_SDK_DIR to a \
-             volucer-php-sdk checkout",
-            script.display()
-        ));
-    }
-    None
+    volucer_testkit::php_worker_skip_reason()
 }
 
 /// Why a test that needs two loopback destinations cannot run here, if it cannot.
@@ -677,20 +639,18 @@ macro_rules! require_second_loopback {
 /// Leave a test unrun, unless something says a skip is a failure.
 ///
 /// **`VOLUCER_E2E` is what makes the difference**, and the reason is libtest: it hides the stderr of
-/// a passing test, so a skipped test and a test that ran are the same green line. Five suites in this
-/// repository can skip — a missing binary, a missing `php`, a host with no second loopback address, a
-/// `unix` host the job is not on — and a CI run that skipped all of them would report the same
-/// success as one that exercised them.
+/// a passing test, so a skipped test and a test that ran are the same green line. Eight suites in
+/// this repository can skip — a missing binary, a missing `php`, a missing `php-cgi`, a missing SDK
+/// checkout, a host with no second loopback address, a `unix` host the job is not on — and a CI run
+/// that skipped all of them would report the same success as one that exercised them.
+///
+/// The decision itself lives in `volucer_testkit`, so that this suite and the eight others cannot
+/// disagree about what `VOLUCER_E2E` means. They did: `php_cgi.rs` printed its skip and never looked
+/// at the variable at all.
 macro_rules! skip_or_fail {
     ($reason:expr) => {{
         let reason = $reason;
-        if std::env::var("VOLUCER_E2E")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-        {
-            panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
-        }
-        eprintln!("skipping: {reason}");
+        volucer_testkit::skip(&reason);
         return;
     }};
 }

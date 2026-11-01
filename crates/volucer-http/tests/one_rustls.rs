@@ -69,7 +69,7 @@ fn rustls_versions(lock: &str) -> Vec<String> {
 #[test]
 fn exactly_one_rustls_is_in_the_graph() {
     let Some(lockfile) = lockfile() else {
-        eprintln!("skipping: no workspace lockfile beside this crate");
+        volucer_testkit::skip("no workspace lockfile beside this crate");
         return;
     };
     let lock = std::fs::read_to_string(&lockfile).expect("the lockfile is readable");

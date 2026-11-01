@@ -26,10 +26,16 @@ mod common;
 use common::serial;
 
 /// Find a PHP binary on `PATH`.
+///
+/// The versioned names are this suite's own: `attach` needs `pcntl`, and a distro that installs
+/// `php8.4` without a bare `php` symlink would otherwise be reported as having no PHP at all.
 fn find_php() -> Option<PathBuf> {
+    if let Some(found) = volucer_testkit::find_php() {
+        return Some(found);
+    }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        for name in ["php", "php8.5", "php8.4", "php8.3"] {
+        for name in ["php8.5", "php8.4", "php8.3"] {
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -41,14 +47,7 @@ fn find_php() -> Option<PathBuf> {
 
 /// The SDK the fixture's `require` line points at.
 fn sdk_dir() -> PathBuf {
-    match std::env::var_os("VOLUCER_SDK_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("volucer-php-sdk"),
-    }
+    volucer_testkit::sdk_dir()
 }
 
 /// Why this test cannot run here, if it cannot.
@@ -83,12 +82,7 @@ fn skip_reason() -> Option<String> {
 
 /// Report that this test cannot run here.
 fn report_skip(reason: String) {
-    match std::env::var("VOLUCER_E2E") {
-        Ok(value) if !value.is_empty() && value != "0" => {
-            panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}")
-        }
-        _ => eprintln!("skipping: {reason}"),
-    }
+    volucer_testkit::skip(&reason);
 }
 
 macro_rules! require_php {
@@ -513,7 +507,7 @@ fn a_prefork_supervisor_reaps_its_children() {
     );
     let Ok(list) = std::fs::read_to_string(&children) else {
         // `/proc` without `CONFIG_PROC_CHILDREN` is a kernel build this test cannot read.
-        eprintln!("skipping: {children} is unreadable");
+        volucer_testkit::skip(&format!("{children} is unreadable"));
         return;
     };
 

@@ -41,6 +41,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **AMQP publishing.** Treat unroutable mandatory publishes as failures and correctly parse the default virtual host in AMQP URLs.
+- **Skipped tests that reported success.** `VOLUCER_E2E=1` now has one implementation, in the new `volucer-testkit` crate, so every suite that can skip honours it. Three did not: the `php-cgi` suite and the `serve.rs` and `frontend.rs` FastCGI front ends printed `skipping:` and never consulted the variable, so a CI run without PHP reported success for suites that had not executed. A skip for a *missing capability* is now a failure under `VOLUCER_E2E=1`; a skip for port contention is not, because that is a race rather than a missing tool.
+- **Worker startup diagnostics.** A worker that dies while the server is waiting for its socket connection now has its own `stderr` reported at `warn`, before the error that refers to it. The hint on that error said the worker's output "is logged above", but the drain thread wrote it at `debug` — invisible at the default log level, which is what `serve` uses. This was the likeliest first-run failure on Windows, where the socket transport is the default and a worker written against `Worker::create()` exits during its handshake.
 - **Cache TTL precision.** File-backed cache entries now retain sub-second TTLs without expiring immediately.
 - **Concurrency test reliability.** The prefork test measures request overlap instead of comparing machine-dependent timings.
 - **HTTP/2 site selection.** Resolve the request host from either `Host` or the URI authority, including for redirects and CGI variables.

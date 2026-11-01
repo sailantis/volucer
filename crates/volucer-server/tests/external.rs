@@ -243,7 +243,7 @@ fn request_for(root: &Path, marker: &str) -> Request {
 fn an_external_backend_serves_requests_over_its_socket() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -275,7 +275,7 @@ fn an_external_backend_serves_requests_over_its_socket() {
 fn an_external_backend_reuses_its_connection_across_requests() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 
@@ -374,7 +374,7 @@ fn a_connection_cap_serialises_requests_instead_of_refusing_them() {
 fn an_external_backend_reconnects_after_the_server_is_replaced() {
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
+        volucer_testkit::skip("no php-cgi on PATH");
         return;
     };
 

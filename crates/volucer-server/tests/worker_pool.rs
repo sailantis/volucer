@@ -30,63 +30,30 @@ use volucer_server::{Consumers, Dispatcher, WorkerPool};
 mod common;
 use common::serial;
 
-/// Find `php` on `PATH`.
-fn find_php() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php.exe", "php"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php"];
-
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-/// The SDK the example worker lives in, which is now a repository of its own.
+/// ``php`` on ``PATH``, from the shared probe.
 ///
-/// `VOLUCER_SDK_DIR` overrides it, which is how a CI checkout at any path —
-/// or a sibling clone under a different name — is pointed at. Otherwise the
-/// layout this project is developed in is assumed: `sailantis/volucer` and
-/// `sailantis/volucer-php-sdk` next to each other.
+/// Unused in this file only because `skip_reason` delegates the whole check; the import stays so the
+/// probe name a reader looks for resolves here as it does in every sibling suite.
+#[allow(unused_imports)]
+use volucer_testkit::find_php;
+
+/// The SDK checkout, from the shared probe.
 fn sdk_dir() -> PathBuf {
-    match std::env::var_os("VOLUCER_SDK_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("volucer-php-sdk"),
-    }
+    volucer_testkit::sdk_dir()
 }
 
 /// The SDK's example worker, which is what the pool is pointed at.
 fn example_worker() -> PathBuf {
-    sdk_dir().join("example").join("worker.php")
+    volucer_testkit::example_worker()
 }
 
 /// Why this test cannot run here, if it cannot.
+///
+/// Delegated: the probe, the sibling-checkout fallback and the wording of the reason all live in
+/// `volucer_testkit`, so a machine that fails to find the SDK is told the same thing whichever
+/// suite noticed first.
 fn skip_reason() -> Option<String> {
-    if find_php().is_none() {
-        return Some("no php on PATH".to_string());
-    }
-
-    let script = example_worker();
-    if !script.is_file() {
-        return Some(format!(
-            "the SDK example worker is not at {} — set VOLUCER_SDK_DIR to a \
-             volucer-php-sdk checkout",
-            script.display()
-        ));
-    }
-
-    None
+    volucer_testkit::php_worker_skip_reason()
 }
 
 /// Report that this test cannot run here.
@@ -95,18 +62,7 @@ fn skip_reason() -> Option<String> {
 /// ordinary run. Set `VOLUCER_E2E=1` on a machine that is *supposed* to have
 /// PHP and the SDK, and a skip becomes a failure instead.
 fn report_skip(reason: String) {
-    if skip_is_a_failure() {
-        panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
-    }
-    eprintln!("skipping: {reason}");
-}
-
-/// Whether `VOLUCER_E2E` asks for skips to be failures. `0` or empty means no.
-fn skip_is_a_failure() -> bool {
-    match std::env::var("VOLUCER_E2E") {
-        Ok(value) => !value.is_empty() && value != "0",
-        Err(_) => false,
-    }
+    volucer_testkit::skip(&reason);
 }
 
 /// Skip the test, loudly, when PHP or the SDK checkout is missing.
@@ -2287,10 +2243,7 @@ fn a_redis_lock_is_shared_between_two_servers() {
         Ok(locks) => locks,
         Err(err) => {
             let reason = format!("no Redis at {url}: {err}");
-            if skip_is_a_failure() {
-                panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
-            }
-            eprintln!("skipping: {reason}");
+            volucer_testkit::skip(&reason);
             return;
         }
     };

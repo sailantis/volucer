@@ -82,6 +82,9 @@ signal-hook.workspace = true
 ctrlc = "3"
 
 [dev-dependencies]
+# The skip gate. Shared rather than copied: VOLUCER_E2E=1 has to mean the same thing in every
+# suite, and it did not — see the crate's own docs for what that cost.
+volucer-testkit.workspace = true
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # Certificates are generated per test run rather than committed: a committed key is a key that
 # ends up in someone's deployment.

@@ -26,40 +26,16 @@ use volucer_worker::{
     Codec, Control, Header, HelloAck, Json, MessageType, RequestHeader, WorkerChannel, UNSOLICITED,
 };
 
-/// Find `php` on `PATH`.
-fn find_php() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let names: &[&str] = &["php.exe", "php"];
-    #[cfg(not(windows))]
-    let names: &[&str] = &["php"];
+/// Find `php` on `PATH`, from the shared probe.
+use volucer_testkit::find_php;
 
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-/// The SDK the example worker lives in, which is now a repository of its own.
+/// The SDK the example worker lives in, which is a repository of its own.
 ///
-/// `VOLUCER_SDK_DIR` overrides it, which is how a CI checkout at any path —
-/// or a sibling clone under a different name — is pointed at. Otherwise the
-/// layout this project is developed in is assumed: `sailantis/volucer` and
-/// `sailantis/volucer-php-sdk` next to each other.
+/// Unused here only because `skip_reason` delegates the whole check, which looks the directory up
+/// itself; the wrapper stays so the two probe names a reader looks for resolve in this file.
+#[allow(dead_code)]
 fn sdk_dir() -> PathBuf {
-    match std::env::var_os("VOLUCER_SDK_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("volucer-php-sdk"),
-    }
+    volucer_testkit::sdk_dir()
 }
 
 /// The SDK's example worker.
@@ -67,7 +43,7 @@ fn sdk_dir() -> PathBuf {
 /// This keeps the test pointing at the shipped example rather than a fixture
 /// that could drift away from it.
 fn example_worker() -> PathBuf {
-    sdk_dir().join("example").join("worker.php")
+    volucer_testkit::example_worker()
 }
 
 /// Why this test cannot run here, if it cannot.
@@ -77,20 +53,7 @@ fn example_worker() -> PathBuf {
 /// a skip with a reason — silently returning would report success for a codec
 /// that was never exercised.
 fn skip_reason() -> Option<String> {
-    if find_php().is_none() {
-        return Some("no php on PATH".to_string());
-    }
-
-    let script = example_worker();
-    if !script.is_file() {
-        return Some(format!(
-            "the SDK example worker is not at {} — set VOLUCER_SDK_DIR to a \
-             volucer-php-sdk checkout",
-            script.display()
-        ));
-    }
-
-    None
+    volucer_testkit::php_worker_skip_reason()
 }
 
 /// Report that this test cannot run here.
@@ -102,18 +65,7 @@ fn skip_reason() -> Option<String> {
 /// cannot support. Set `VOLUCER_E2E=1` on a machine that is *supposed* to have
 /// PHP and the SDK, and a skip becomes a failure instead.
 fn report_skip(reason: String) {
-    if skip_is_a_failure() {
-        panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
-    }
-    eprintln!("skipping: {reason}");
-}
-
-/// Whether `VOLUCER_E2E` asks for skips to be failures. `0` or empty means no.
-fn skip_is_a_failure() -> bool {
-    match std::env::var("VOLUCER_E2E") {
-        Ok(value) => !value.is_empty() && value != "0",
-        Err(_) => false,
-    }
+    volucer_testkit::skip(&reason);
 }
 
 /// A `php worker.php` process, killed when the test ends however it ends.

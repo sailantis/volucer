@@ -2144,6 +2144,7 @@ dependencies = [
  "volucer-observe",
  "volucer-otlp",
  "volucer-server",
+ "volucer-testkit",
  "x509-parser",
 ]
 
@@ -2177,6 +2178,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "volucer-core",
+ "volucer-testkit",
  "windows-sys 0.61.2",
 ]
 
@@ -2211,6 +2213,7 @@ dependencies = [
  "volucer-metrics",
  "volucer-observe",
  "volucer-server",
+ "volucer-testkit",
  "volucer-upstream",
  "volucer-watch",
  "volucer-worker",
@@ -2297,6 +2300,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "volucer-core",
  "volucer-fcgi",
  "volucer-jobs",
@@ -2304,11 +2308,16 @@ dependencies = [
  "volucer-lock",
  "volucer-metrics",
  "volucer-observe",
+ "volucer-testkit",
  "volucer-upstream",
  "volucer-watch",
  "volucer-worker",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "volucer-testkit"
+version = "0.3.0"
 
 [[package]]
 name = "volucer-upstream"
@@ -2347,6 +2356,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+ "volucer-testkit",
 ]
 
 [[package]]
