@@ -344,9 +344,9 @@ impl Server {
     /// reached the end of its shutdown rather than dying partway, so a test can tell "drained and
     /// summarised" from "exited for some other reason".
     ///
-    /// Only the Linux-only [`Server::stop_gracefully`] calls it: a graceful stop needs a signal, and
-    /// the platforms that have one are the ones that can assert on the summary.
-    #[cfg(target_os = "linux")]
+    /// Only [`Server::stop_gracefully`] calls it: a graceful stop needs a signal, and the platforms
+    /// that have one are the ones that can assert on the summary.
+    #[cfg(unix)]
     fn summary(&mut self) -> String {
         let Some(handle) = self.stdout_tail.take() else {
             return String::new();
@@ -410,9 +410,17 @@ impl Server {
     /// exercises the path a deployment exercises. Returns the exit status, because "exited 0" is
     /// half of what "clean" means.
     ///
-    /// Linux only: Windows has no `SIGTERM`, and the shutdown path there is a console control event
-    /// a child cannot be sent from a test. `serve` states the same limitation for `SIGHUP`.
-    #[cfg(target_os = "linux")]
+    /// **Unix, not Linux.** This said `target_os = "linux"` and that restriction is what made the
+    /// `unix:` socket test fail on macOS: the graceful-stop block there is also `linux`-only, so on
+    /// macOS the server was only ever `SIGKILL`ed, and a `SIGKILL`ed process cannot unlink its
+    /// socket path — the assertion then failed against correct server code, reporting a leak that
+    /// the harness itself had created. `SIGTERM` and `signal_hook` are Unix, and `serve` installs
+    /// the same handler on both, so the only platforms excluded here are the ones without a
+    /// signal at all.
+    ///
+    /// Windows stays out: it has no `SIGTERM`, and the shutdown path there is a console control
+    /// event a child cannot be sent from a test. `serve` states the same limitation for `SIGHUP`.
+    #[cfg(unix)]
     fn stop_gracefully(&mut self, within: Duration) -> (std::process::ExitStatus, String) {
         let pid = self.child.id() as libc::pid_t;
         // SAFETY: `kill` on a pid we own. A failure here means the child is already gone, which the
@@ -5011,8 +5019,10 @@ fn a_unix_http_listener_serves_a_request_and_cleans_up_its_socket() {
     );
 
     // A **graceful** stop, not `drop`: `Drop` is `SIGKILL`, which runs no shutdown path at all, so
-    // asserting the unlink after one would assert what the kill made impossible.
-    #[cfg(target_os = "linux")]
+    // asserting the unlink after one would assert what the kill made impossible. `unix` rather than
+    // `linux` for the same reason as `stop_gracefully` — this assertion is exactly what failed on
+    // macOS while the graceful half was skipped there.
+    #[cfg(unix)]
     {
         let (status, summary) = server.stop_gracefully(Duration::from_secs(30));
         assert!(
@@ -5150,7 +5160,7 @@ fn a_unix_fastcgi_listener_answers_a_get_values_probe() {
 /// been written back yet. Draining means that request still completes; the old behaviour failed it
 /// 100% of the time rather than intermittently, which is why this is a real assertion and not a
 /// race.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_stop_finishes_a_request_that_is_already_in_flight() {
     require_binary!(binary);
