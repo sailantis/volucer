@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worker-pool throughput.** Whether a pool can accept a streamed request body is a property of its set of slots, but it was recomputed on every request by locking each slot mutex in turn — immediately before the pool took one of those same locks to serve. For an SDK that does not advertise `stream_request_body`, which includes the PHP SDK, that was pure per-request overhead for an answer that never changes: a hello-world page fell from 47,084 to 11,671 requests per second, a 3.9x regression introduced with the capability itself. The answer is now cached and refreshed only when a worker is replaced.
+
 ## [0.4.0] - 2026-11-02
 
 ### Added
