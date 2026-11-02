@@ -418,6 +418,10 @@ impl OriginSpec {
                 return Ok(OriginSpec::Socket {
                     path: PathBuf::from(path),
                     protocol,
+                    // Defaulted for the reason the `Network` arms give: parsing names an origin,
+                    // it does not describe a deployment. `with_preserve_host` is what a caller
+                    // holding the backend's table uses.
+                    preserve_host: false,
                 });
             }
             #[cfg(not(unix))]
