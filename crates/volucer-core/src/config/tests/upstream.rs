@@ -561,6 +561,56 @@ fn a_plaintext_origin_can_be_declared_to_speak_h2_and_a_tls_one_cannot() {
     );
 }
 
+#[test]
+fn preserve_host_reaches_the_spec_the_client_reads() {
+    // The key exists to change what an **h2** origin is told the request is for, and the value has
+    // to survive every hop from the file to the client or it is a setting nothing consumes. The
+    // `protocol` test above makes the same point one key over.
+    let config = Config::from_toml(&upstream_config(
+        "origin = \"http://127.0.0.1:3000\"\npreserve_host = true",
+    ))
+    .expect("the file parses");
+    config.validate().expect("preserve_host is valid");
+    let Some(BackendConfig::Upstream(upstream)) = config.backends.get("node") else {
+        panic!("the backend is an upstream");
+    };
+    assert!(upstream.preserve_host, "the file set it");
+    let resolved = config
+        .backends
+        .get("node")
+        .expect("the backend")
+        .origin()
+        .expect("an upstream names an origin")
+        .expect("a loopback origin");
+    assert!(
+        resolved.preserve_host(),
+        "and `BackendConfig::origin` is what the client builds from, so the key has to reach it"
+    );
+
+    // Off by default, and off stays off through the same path: a deployment that never heard of the
+    // key must keep the behaviour it had, which is the origin's own authority on an h2 hop.
+    let plain =
+        Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\"")).expect("parses");
+    let Some(BackendConfig::Upstream(upstream)) = plain.backends.get("node") else {
+        panic!("the backend is an upstream");
+    };
+    assert!(!upstream.preserve_host, "absent is off rather than on");
+    let resolved = plain
+        .backends
+        .get("node")
+        .expect("the backend")
+        .origin()
+        .expect("an upstream names an origin")
+        .expect("a loopback origin");
+    assert!(!resolved.preserve_host());
+
+    // And a bare `OriginSpec::parse` — the four call sites with no backend table — cannot set it,
+    // which is why the builder exists rather than a fourth parameter.
+    let parsed = OriginSpec::parse("http://127.0.0.1:3000", None).expect("a loopback origin");
+    assert!(!parsed.preserve_host());
+    assert!(parsed.with_preserve_host(true).preserve_host());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_unix_socket_can_be_declared_to_speak_h2_too() {

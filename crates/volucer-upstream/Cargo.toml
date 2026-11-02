@@ -30,3 +30,9 @@ rcgen = "0.13"
 rustls = { version = "0.23", features = ["custom-provider"] }
 tokio-rustls = "0.26"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# `tests/host_on_the_wire.rs` asserts what an h2 origin is told the request is for, and on an h2
+# hop that identity is the `:authority` pseudo-header — inside an HPACK-compressed block, whose
+# frame layout differs between RFC 7540 and RFC 9113. Decoding it with `h2`, the implementation
+# hyper already uses, rather than with a hand-written decoder: that decoder is what this test
+# first got wrong, and re-deriving a spec is not what the test is for.
+h2 = "0.4"

@@ -314,12 +314,19 @@ cannot report success. Each origin can be replaced with one of your own through
 which is what a release check against an internal deployment wants. The same suite runs daily
 in [`.github/workflows/live.yml`](.github/workflows/live.yml), and a push does not run it.
 
-Writing the virtual-host test turned up a limitation worth knowing before putting an `https:`
+Writing the virtual-host test turned up a divergence worth knowing before putting an `https:`
 origin behind a site: over an **HTTP/2** upstream hop the origin receives its own authority as
 `Host` (e.g. `httpbin.org:443`) rather than the client's, because an h2 request carries its
 identity in `:authority` and that is built from the origin. An HTTP/1.1 hop forwards the
-client's `Host` verbatim. The test asserts the HTTP/1.1 behaviour and its doc explains why it
-does not encode the h2 one.
+client's `Host` verbatim. The test asserts the HTTP/1.1 behaviour; the three cases — HTTP/1.1,
+h2 without the key, h2 with it — are measured in
+`crates/volucer-upstream/tests/host_on_the_wire.rs`, and
+[`docs/02-BACKENDS.md`](docs/02-BACKENDS.md) documents `preserve_host = true`, which is what an
+h2 origin that selects a virtual host by name needs.
+
+The h2 behaviour is opt-in rather than the default because the two deployments want opposite
+answers: an origin that validates its own name answers a foreign one with `421 Misdirected
+Request`. See the backend docs for when to set it.
 
 `cargo fmt --all --check` is a CI job, so a commit that is not formatted is a red run. Turn the
 hook on once per clone and it is refused before it is made:

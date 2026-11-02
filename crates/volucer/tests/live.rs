@@ -840,24 +840,28 @@ fn a_real_compressed_chunked_body_arrives_with_its_framing_intact() {
 ///
 /// # Why the real origin is `http://` by default
 ///
-/// Measured, not assumed, and the measurement is worth recording because it is a real limitation:
+/// Measured, not assumed, and the measurement is worth recording:
 ///
-/// | upstream spoken to | `Host` the origin receives |
-/// |---|---|
-/// | HTTP/1.1 | the client's own `Host`, verbatim |
-/// | HTTP/2 | the origin's own authority, e.g. `httpbin.org:443` |
+/// | upstream spoken to | `preserve_host` | `Host`/`:authority` the origin receives |
+/// |---|---|---|
+/// | HTTP/1.1 | either | the client's own `Host`, verbatim |
+/// | HTTP/2 | unset | the origin's own authority, e.g. `httpbin.org:443` |
+/// | HTTP/2 | `true` | the client's own name |
 ///
-/// `prepare_request` forwards the `host` header faithfully in both cases (`the_clients_host_is_kept_verbatim`
-/// pins that in `volucer-upstream`), but an HTTP/2 request carries its identity in the `:authority`
-/// pseudo-header instead, and `client.rs`'s `destination` builds that from the origin. hyper's h2
-/// client then sends `:authority`, and a server echoes *that* as `Host`. So an origin that selects a
-/// virtual host by name is told the name this server dialled rather than the one the client asked
-/// for — on the h2 hop only, and `https:` origins negotiate h2 by ALPN.
+/// The middle row is the divergence. `prepare_request` forwards the `host` header faithfully in
+/// every case (`the_clients_host_is_kept_verbatim` pins that in `volucer-upstream`), but an HTTP/2
+/// request carries its identity in the `:authority` pseudo-header, which RFC 9113 §8.3.1 makes the
+/// authoritative one — and `client.rs`'s `destination` builds it from the origin. So an origin that
+/// selects a virtual host by name is told the name this server dialled rather than the one the
+/// client asked for, on the h2 hop only. `https:` origins negotiate h2 by ALPN.
 ///
-/// This test therefore asserts the property on an HTTP/1.1 hop, which is where it holds, rather than
-/// asserting the h2 behaviour either way: encoding a known divergence into a test would freeze it.
-/// The default is plaintext for exactly that reason; overriding it with an `https://` origin will
-/// fail the `Host` assertion, and that failure is the limitation above rather than a bad fixture.
+/// `preserve_host = true` on the backend sends the client's name instead, which is the third row.
+/// All three are asserted directly in `crates/volucer-upstream/tests/host_on_the_wire.rs`, against
+/// an h2c origin and a recorded socket; this test stays on an HTTP/1.1 hop because what *it* is for
+/// is the site-selection path, and a live third party is the wrong place to measure a protocol
+/// difference. Overriding the origin with an `https://` one will exercise the second or third row
+/// depending on the backend's `preserve_host`, and fail the `Host` assertion on the second — that is
+/// the divergence rather than a bad fixture.
 #[test]
 fn two_virtual_hosts_reach_two_different_real_origins() {
     require_live!();

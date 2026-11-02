@@ -199,11 +199,13 @@ impl BackendConfig {
     /// into a configuration error, `preflight` into a warning.
     pub fn origin(&self) -> Option<std::result::Result<OriginSpec, String>> {
         match self {
-            BackendConfig::Upstream(upstream) => Some(OriginSpec::parse_with(
-                &upstream.origin,
-                upstream.tls.clone(),
-                upstream.protocol,
-            )),
+            BackendConfig::Upstream(upstream) => Some(
+                OriginSpec::parse_with(&upstream.origin, upstream.tls.clone(), upstream.protocol)
+                    // Set here rather than threaded through `parse_with` as a fourth argument: the
+                    // one caller that has the backend's own table is the one caller that knows, and
+                    // the four sites that parse a bare address should not have to state an opinion.
+                    .map(|spec| spec.with_preserve_host(upstream.preserve_host)),
+            ),
             _ => None,
         }
     }

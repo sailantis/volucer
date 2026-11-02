@@ -75,6 +75,12 @@ pub enum Origin {
         /// `validate` refuses a `protocol` beside a handshake, so a TLS origin's protocol is ALPN's
         /// answer and nothing else can claim otherwise.
         h2c: bool,
+        /// That this origin routes on the name the client asked for, on an h2 hop too.
+        ///
+        /// See [`UpstreamConfig::preserve_host`](volucer_core::config::UpstreamConfig::preserve_host)
+        /// for why this is not the default. Read by [`Origin::preserves_host`], and by
+        /// `client.rs`'s `destination` when it builds the URI whose authority becomes `:authority`.
+        preserve_host: bool,
     },
 
     /// A unix socket on this host. There is no scheme and no port to speak of.
@@ -84,6 +90,8 @@ pub enum Origin {
         path: PathBuf,
         /// That this socket speaks h2c. See [`Origin::speaks_h2`].
         h2c: bool,
+        /// That this origin routes on the name the client asked for. See [`Origin::preserves_host`].
+        preserve_host: bool,
     },
 }
 
@@ -116,12 +124,14 @@ impl Origin {
                     // A TLS origin negotiates through ALPN, and `spec.protocol()` is `None` for one
                     // by construction, so this cannot be `true` where it would be wrong.
                     h2c,
+                    preserve_host: spec.preserve_host(),
                 })
             }
             #[cfg(unix)]
             volucer_core::config::OriginSpec::Socket { path, .. } => Ok(Origin::Socket {
                 path: path.clone(),
                 h2c,
+                preserve_host: spec.preserve_host(),
             }),
         }
     }
@@ -164,6 +174,18 @@ impl Origin {
             Origin::Network { h2c, .. } => *h2c,
             #[cfg(unix)]
             Origin::Socket { h2c, .. } => *h2c,
+        }
+    }
+
+    /// Whether this origin routes on the name the client asked for, on an h2 hop too.
+    ///
+    /// `false` for every origin that did not ask for it, and `false` is the safe answer: it preserves
+    /// the behaviour every deployment had before the key existed.
+    pub fn preserves_host(&self) -> bool {
+        match self {
+            Origin::Network { preserve_host, .. } => *preserve_host,
+            #[cfg(unix)]
+            Origin::Socket { preserve_host, .. } => *preserve_host,
         }
     }
 

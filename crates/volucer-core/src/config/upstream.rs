@@ -53,6 +53,35 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub protocol: Option<UpstreamProtocol>,
 
+    /// That this origin selects a virtual host by the name the **client** asked for, even on an
+    /// HTTP/2 hop.
+    ///
+    /// Off by default, and the default is not an oversight. An origin reached over HTTP/1.1 already
+    /// receives the client's `Host` verbatim, so this key changes nothing there. On an **HTTP/2** hop
+    /// the same identity travels in the `:authority` pseudo-header, and that is built from the
+    /// origin's own address — so an origin that routes on `:authority` (nginx's `server_name`, any
+    /// multi-tenant application) is told the name *this server dialled*. Measured in
+    /// `crates/volucer-upstream/tests/host_on_the_wire.rs`, both hops, and the divergence is not
+    /// visible to a header-level unit test because the forwarded `Host` header is correct at the same
+    /// time.
+    ///
+    /// # Why this is opt-in
+    ///
+    /// Because the two configurations want opposite things and there is no way to tell them apart
+    /// from the request. A **vhost target** expects the client's name and will misroute without it. A
+    /// **fixed origin** — an application server behind a proxy, a service that validates `Host`
+    /// against its own name — expects its own authority, and sending it a foreign name is a request
+    /// it is entitled to reject. Guessing would break the second to fix the first, so the deployment
+    /// states which it is.
+    ///
+    /// # What it refuses
+    ///
+    /// Nothing, deliberately. `true` on an ordinary HTTP/1.1 origin is a no-op rather than a
+    /// misconfiguration: the header is already forwarded, and a name `:authority` would carry is not
+    /// sent on that hop at all.
+    #[serde(default)]
+    pub preserve_host: bool,
+
     /// Command line that starts the origin, e.g.
     /// `gunicorn myapp.wsgi --bind unix:/run/app.sock`.
     ///
@@ -216,6 +245,7 @@ impl UpstreamConfig {
             origin: origin.into(),
             tls: None,
             protocol: None,
+            preserve_host: false,
             command: None,
             working_dir: None,
             env: BTreeMap::new(),
@@ -307,6 +337,11 @@ pub enum OriginSpec {
         /// has the protocol, which is what makes "`protocol` beside a handshake was refused" a
         /// property of the type rather than of `validate` having run.
         protocol: Option<UpstreamProtocol>,
+        /// That this origin routes on the client's name, not the dialled address.
+        ///
+        /// Defaulted rather than required, so the four call sites that have no opinion get `false`
+        /// and an operator writing the key gets the same value `UpstreamConfig` holds.
+        preserve_host: bool,
     },
     /// A unix socket on this host.
     ///
@@ -322,6 +357,8 @@ pub enum OriginSpec {
         /// ordinary unix-socket origin is `php-fpm` or gunicorn speaking HTTP/1.1, and assuming h2
         /// for every socket would break them.
         protocol: Option<UpstreamProtocol>,
+        /// That this origin routes on the client's name. See the `Network` arm.
+        preserve_host: bool,
     },
 }
 
@@ -448,6 +485,9 @@ impl OriginSpec {
                 port,
                 tls: Some(tls.unwrap_or_default()),
                 protocol: None,
+                // Defaulted here and set by the caller that has the backend's table: `parse` names
+                // an origin, it does not describe a deployment.
+                preserve_host: false,
             }),
             _ => {
                 if tls.is_some() {
@@ -463,6 +503,7 @@ impl OriginSpec {
                     port,
                     tls: None,
                     protocol,
+                    preserve_host: false,
                 })
             }
         }
@@ -534,6 +575,40 @@ impl OriginSpec {
             #[cfg(unix)]
             OriginSpec::Socket { protocol, .. } => *protocol,
         }
+    }
+
+    /// That this origin routes on the name the client asked for, on an h2 hop too.
+    ///
+    /// One accessor over both variants for the reason [`OriginSpec::protocol`] gives, and defaulted
+    /// to `false` in [`OriginSpec::parse`] because parsing names an address rather than describing a
+    /// deployment. The caller holding the backend's table is what sets it, through
+    /// [`OriginSpec::with_preserve_host`].
+    pub fn preserve_host(&self) -> bool {
+        match self {
+            OriginSpec::Network { preserve_host, .. } => *preserve_host,
+            #[cfg(unix)]
+            OriginSpec::Socket { preserve_host, .. } => *preserve_host,
+        }
+    }
+
+    /// State that this origin routes on the client's name.
+    ///
+    /// A builder rather than a fifth parameter on `parse`, because only the one caller that has the
+    /// backend's `[backends.<n>]` table in hand knows the answer — the other four call sites parse an
+    /// address and nothing else.
+    pub fn with_preserve_host(mut self, preserve_host: bool) -> Self {
+        match &mut self {
+            OriginSpec::Network {
+                preserve_host: field,
+                ..
+            } => *field = preserve_host,
+            #[cfg(unix)]
+            OriginSpec::Socket {
+                preserve_host: field,
+                ..
+            } => *field = preserve_host,
+        }
+        self
     }
 
     /// Whether the origin is on this host rather than across a network.

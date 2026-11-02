@@ -293,6 +293,7 @@ async fn a_ca_file_that_cannot_be_read_is_a_startup_error() {
             sni: None,
         }),
         h2c: false,
+        preserve_host: false,
     };
 
     let error = UpstreamClient::<Empty<Bytes>>::new(origin, None)
@@ -320,6 +321,7 @@ async fn a_ca_file_with_no_certificate_in_it_is_a_startup_error() {
             sni: None,
         }),
         h2c: false,
+        preserve_host: false,
     };
 
     let error = UpstreamClient::<Empty<Bytes>>::new(origin, None)
@@ -338,6 +340,7 @@ fn an_https_origin_is_not_reachable_without_a_configuration() {
         // Not reachable from configuration either — an `https:` origin has no `protocol` key to set,
         // because the handshake answers that question.
         h2c: false,
+        preserve_host: false,
     };
     assert!(!origin.is_tls());
 }

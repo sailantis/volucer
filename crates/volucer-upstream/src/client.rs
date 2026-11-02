@@ -128,9 +128,22 @@ where
         let connector = connect::Connector::new(&origin)?;
         let mut builder = Client::builder(TokioExecutor::new());
         builder.pool_timer(hyper_util::rt::TokioTimer::new());
-        // The `Host` header is kept explicitly rather than re-derived (see
+        // The `Host` header is kept as the client sent it rather than re-derived (see
         // `translate::prepare_request`): the origin is addressed separately from the name the
         // client asked for, and only the latter is semantic to the origin.
+        //
+        // **Measured, and defensive rather than load-bearing.** Turning this to `true` does not
+        // change the HTTP/1.1 wire while the request carries a `Host` header — `prepare_request`
+        // always copies the client's, and hyper writes the URI's authority only when the header is
+        // absent. `tests/host_on_the_wire.rs` asserts the header either way. It is `false` because
+        // the URI's authority is the *origin*, so deriving from it would be right only by accident.
+        //
+        // On an h2 hop this line cannot reach `:authority`, which is hyper's own derivation from
+        // that URI — which is why `preserve_host` changes the URI instead. See `destination`.
+        //
+        // It stays `false` rather than `true` because the distinction is real even though the
+        // current wire does not show it: `true` would make hyper's own derivation the source of the
+        // header whenever the client sent none, and that derivation names the origin.
         builder.set_host(false);
         match idle_timeout {
             Some(idle_timeout) => {
@@ -171,11 +184,14 @@ where
     /// The body of the answer is **not** read here: a caller that streams hands the `Incoming` on,
     /// and one that buffers collects it itself. Reading it here would decide that for both.
     pub async fn request(&self, request: UpstreamRequest<B>) -> Result<UpstreamResponse> {
-        let uri = destination(&self.origin, &request.uri)?;
+        let host = request.headers.get(hyper::header::HOST).cloned();
+        let uri = destination(&self.origin, &request.uri, host.as_ref())?;
         let mut outgoing = Request::builder()
             .method(request.method)
             .uri(uri)
             .version(request.version);
+        // `set_host(false)` below keeps this header as the client sent it, so the copy is what an
+        // HTTP/1.1 origin reads and what an h2 origin reads beside `:authority`.
         if let Some(headers) = outgoing.headers_mut() {
             *headers = request.headers;
         }
@@ -215,7 +231,27 @@ fn box_body(body: hyper::body::Incoming) -> UpstreamBody {
 /// A `unix:` origin has no authority to name, and the connector ignores the URI entirely, so the
 /// placeholder is honest rather than load-bearing. The client's own `Host` header is what the
 /// origin reads in that case.
-fn destination(origin: &Origin, path_and_query: &hyper::Uri) -> Result<hyper::Uri> {
+///
+/// # The authority is the vhost identity on an h2 hop
+///
+/// On HTTP/1.1 the authority here is invisible to the origin: `set_host(false)` on the client keeps
+/// the forwarded `Host` header, and `client-legacy` sends origin-form, so the URI's authority is
+/// only ever a pool key and a dial target. On an **h2** hop it is not invisible — hyper derives the
+/// `:authority` pseudo-header from it, and RFC 9113 §8.3.1 makes that the name an origin routes on.
+///
+/// So an origin configured to select a virtual host has to name the *client's* authority here, which
+/// is what [`Origin::preserves_host`] asks for. It cannot be inferred: an origin that validates its
+/// own name would answer with a 421 Misdirected Request to a foreign one, and both deployments look
+/// identical from a request.
+///
+/// The connector ignores the URI entirely — it dials `Origin::host_port` and verifies
+/// `Origin::verification_name`, both read off the origin — so a different authority here changes what
+/// the origin is *told* and nothing about where the connection goes.
+fn destination(
+    origin: &Origin,
+    path_and_query: &hyper::Uri,
+    host: Option<&hyper::header::HeaderValue>,
+) -> Result<hyper::Uri> {
     let path = path_and_query
         .path_and_query()
         .map(|path| path.as_str())
@@ -226,11 +262,27 @@ fn destination(origin: &Origin, path_and_query: &hyper::Uri) -> Result<hyper::Ur
     // A socket path is refused at parse time on every platform that cannot dial one, so the
     // fallback is only reachable on unix — where it is a placeholder the connector ignores.
     let builder = builder.scheme(origin.scheme().unwrap_or("unix"));
-    let builder = match origin.authority() {
-        Some(authority) => builder.authority(authority.clone()),
-        // Nothing dials this; the connector has already been given the socket path.
-        None => builder.authority("localhost"),
+    let authority = match (origin.preserves_host(), host) {
+        // The client's own name, which is what a vhost origin routes on. `header::HeaderValue` is
+        // already a validated token, so this cannot fail for a reason the origin did not cause —
+        // and a `Host` that is not a valid authority is refused rather than silently replaced with
+        // the dialled one, because guessing would route the request to the wrong site.
+        (true, Some(host)) => host.to_str().map_err(|_| {
+            UpstreamError::BadRequest(format!(
+                "the client's Host header {:?} is not a valid authority, and this origin is \
+                 configured to route on it (`preserve_host = true`)",
+                String::from_utf8_lossy(host.as_bytes())
+            ))
+        })?,
+        // Every other case, including `preserve_host` on a request with no `Host` at all: the
+        // origin's own authority, which is the behaviour this client had before the key existed.
+        _ => match origin.authority() {
+            Some(authority) => authority.as_str(),
+            // Nothing dials this; the connector has already been given the socket path.
+            None => "localhost",
+        },
     };
+    let builder = builder.authority(authority);
     builder.path_and_query(path).build().map_err(|source| {
         UpstreamError::BadRequest(format!("{path:?} cannot be sent to an origin: {source}"))
     })
@@ -320,14 +372,15 @@ mod tests {
         // `Uri`'s authority renders `[::1]:3000`, and a client that stripped the brackets would
         // send a request line naming a malformed host.
         let origin = Origin::parse("http://[::1]:3000").expect("parses");
-        let uri = destination(&origin, &hyper::Uri::from_static("/api")).expect("builds");
+        let uri = destination(&origin, &hyper::Uri::from_static("/api"), None).expect("builds");
         assert_eq!(uri.to_string(), "http://[::1]:3000/api");
     }
 
     #[test]
     fn the_query_survives_the_destination() {
         let origin = Origin::parse("http://127.0.0.1:3000").expect("parses");
-        let uri = destination(&origin, &hyper::Uri::from_static("/api?x=1&y=2")).expect("builds");
+        let uri =
+            destination(&origin, &hyper::Uri::from_static("/api?x=1&y=2"), None).expect("builds");
         assert_eq!(uri.to_string(), "http://127.0.0.1:3000/api?x=1&y=2");
     }
 
@@ -336,7 +389,7 @@ mod tests {
         // `/api/` and `/api` are different routes to many frameworks, so normalising one into the
         // other here would silently change which handler the origin picks.
         let origin = Origin::parse("http://127.0.0.1:3000").expect("parses");
-        let uri = destination(&origin, &hyper::Uri::from_static("/api/")).expect("builds");
+        let uri = destination(&origin, &hyper::Uri::from_static("/api/"), None).expect("builds");
         assert_eq!(uri.to_string(), "http://127.0.0.1:3000/api/");
     }
 

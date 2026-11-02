@@ -2324,6 +2324,7 @@ name = "volucer-upstream"
 version = "0.3.0"
 dependencies = [
  "bytes",
+ "h2",
  "http-body-util",
  "hyper",
  "hyper-util",

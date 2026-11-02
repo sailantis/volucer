@@ -4719,6 +4719,18 @@ fn check(
                 println!("      expands to:        {}", expanded.join(", "));
             }
         }
+        // Printed for an upstream, and **only when it was set**, because it changes what the origin
+        // is told the request is for on an HTTP/2 hop and nothing else in this report would reveal
+        // it. An operator who set it wants to see that it reached the client; one who did not should
+        // not have to read a line restating the default.
+        if let volucer_core::config::BackendConfig::Upstream(upstream) = backend {
+            if upstream.preserve_host {
+                println!(
+                    "      preserve host:     yes (:authority carries the client's name on an \
+                     HTTP/2 hop; `Host` already does on HTTP/1.1)"
+                );
+            }
+        }
         // Concurrency, because it is the first thing an operator tunes and the one place where
         // the answer differs between kinds for a reason that is invisible in the configuration.
         // `external` has no `workers` key at all, and saying so is more useful than leaving the

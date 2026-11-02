@@ -498,6 +498,37 @@ passes the application's `grpc-status` in the response trailers. `.proto` files 
 part of the server build, so schema changes require an application deployment, not a
 Volucer rebuild.
 
+### Virtual hosts behind an HTTP/2 origin
+
+An origin that selects a virtual host by name — nginx's `server_name`, any multi-tenant
+application — routes on the name the *client* asked for, not on the address Volucer dialled.
+Those are usually the same string and they are not the same thing.
+
+On an **HTTP/1.1** hop they are handled separately and correctly: the client's `Host` header is
+forwarded verbatim. On an **HTTP/2** hop the same identity travels in the `:authority`
+pseudo-header instead, and by default that names the origin itself — so an origin reached with
+`https://` (ALPN negotiates h2) or with `protocol = "h2c"` is told the dialled address:
+
+```toml
+[backends.shop]
+kind = "upstream"
+origin = "https://backend.internal:8443"
+# The client asked for shop.example.com; without this, backend.internal is what it is told.
+preserve_host = true
+```
+
+`preserve_host = true` puts the client's name in `:authority` on an HTTP/2 hop. It changes
+nothing on an HTTP/1.1 hop, where the header was already forwarded.
+
+It is **opt-in** because the two deployments want opposite answers and a request cannot tell
+them apart: an origin that validates its own name will answer a foreign one with `421 Misdirected
+Request`, and sending every origin the client's name would break exactly the configuration that
+works today. Set it on the backends that are virtual-host targets and leave it off on the ones
+that are not.
+
+The forwarded `Host` header and `X-Forwarded-Host` are correct either way — an origin configured
+to route on `X-Forwarded-Host` needs no change.
+
 ### Supervising the origin
 
 Volucer can also start and supervise the process that serves an upstream. This lets a
