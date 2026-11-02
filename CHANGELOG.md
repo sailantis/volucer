@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-02
+
 ### Added
 
 - **Access controls and custom error pages.** Client-address allow/deny rules and status-specific pages for server-generated errors.
@@ -17,6 +19,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Deployment guidance.** Container PHP setup and end-to-end rolling deployments are documented.
 - **HTTP/3 and gRPC over QUIC.** The optional `http3` feature adds an HTTP/3 listener with gRPC requests and trailers.
 - **Live tests against real origins.** The opt-in suite (`VOLUCER_LIVE=1`) covers public certificate chains, ALPN-negotiated HTTP/2, and real response shapes. It runs daily in CI, where a skipped test counts as a failure.
+- **Rolling worker restarts.** `volucer workers restart` replaces idle workers one at a time, so a deploy does not drop a request. It reports why a sweep is incomplete.
+- **Graceful shutdown.** A stop drains in-flight requests for `shutdown_timeout_ms` before exiting, instead of dropping them.
 - **Route redirects and roots.** Redirects can use `{path}`, `{rest}` and `{query}`. Routes can mount a directory with `root`.
 - **RPC clients for non-worker backends.** FastCGI and HTTP applications can use worker services. The Python and Ruby SDKs include RPC clients.
 - **Server operations settings.** Backend `request_timeout_ms`, `[server] max_connections` and `shutdown_timeout_ms`. `access_log.path = "-"` writes logs to stdout.
@@ -30,14 +34,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **Backend selection.** A single configured backend no longer requires `default_backend`.
-- **Configuration format.** Configuration is parsed as TOML 1.1.
+- **Configuration format.** Configuration is parsed as TOML 1.1, so an inline table may span lines and end with a trailing comma.
 - **Configuration reload.** `SIGHUP` reloads configuration only. `SIGUSR2` restarts workers to load updated application code.
-- **Metrics and status.** `[metrics]` and `[status]` are consolidated under `[status]` on one listener.
-- **Service grants.** Grants can target individual methods, including worker-control methods. `attach` backends validate their service lists, and `volucer check` displays them.
+- **One status listener.** `[metrics]` and `[status]` are replaced by `[status]` with a single `listen`, and the exposition lives at `[status.metrics]`. The Prometheus endpoint used to name an `address` of its own for the same socket; two settings for one fact could only be reconciled by refusing a file where they disagreed.
+- **Worker control is granted per method.** `allow_worker_reset` becomes `[status.workers] allow = ["workers.list", "workers.restart"]`, so a deployment can expose the list without the lever.
+- **Service grants can target individual methods**, including worker-control methods. `attach` backends validate their service lists, and `volucer check` displays them.
 - **Worker gate.** A missing gate now fails closed.
 - **Worker reset.** `workers.reset` is refused for backends without a worker pool.
 - **Validation.** `[status].listen` rejects Unix sockets. The metrics path cannot shadow a built-in listener route.
 - **RPC errors.** Refused gRPC calls return `PERMISSION_DENIED` instead of HTTP `403`.
+
+### Upgrade notes
+
+- **`[metrics]` and `[status] address` move under one listener.** A file carrying either the old
+  `[metrics]` table or `[status] address` is refused at startup with a message naming the
+  replacement, rather than `unknown field 'metrics'`. Write `[status] listen` and, if you exposed
+  Prometheus, `[status.metrics]`.
+- **`allow_worker_reset` becomes a method list.** `[status] allow_worker_reset = true` is refused;
+  write `[status.workers] allow = ["workers.list", "workers.restart"]`. A method left out of the
+  list has no route at all, so an upgrade does not gain a mutation surface it was not given.
 
 ### Fixed
 
@@ -269,7 +284,8 @@ The first release: one binary that serves PHP without embedding it.
 - **`volucer check`** reports listeners, backends, PHP binaries and selection reasons.
 - **Release archives for six targets**, platform installers and a systemd unit.
 
-[Unreleased]: https://github.com/sailantis/volucer/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sailantis/volucer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sailantis/volucer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sailantis/volucer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sailantis/volucer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sailantis/volucer/releases/tag/v0.1.0

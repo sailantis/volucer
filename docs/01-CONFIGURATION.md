@@ -960,6 +960,12 @@ fall back to the site's `document_root`.
 moved under `[server]`. The old forms are rejected at startup, with an error that names
 the replacement setting.
 
+**Configuration changed in 0.4.0:** the `[metrics]` table is gone and `[status]` names one
+listener. Write `[status] listen` where you wrote `[status] address`, and `[status.metrics]`
+where you wrote `[metrics]`. `[status] allow_worker_reset = true` becomes
+`[status.workers] allow = ["workers.list", "workers.restart"]`. Both old spellings are
+rejected by name at startup, so a file cannot half-work.
+
 ## `[sites.<name>]`
 
 A site represents an application selected by the `Host` header. It normally requires

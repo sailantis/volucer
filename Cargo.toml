@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Not 1.85, which is what this said until CI checked it. `cargo check` on 1.85 refuses the
 # workspace: `time` 0.3.55 and `time-core` 0.1.9 declare `rust-version = 1.88.0`, and they reach
@@ -41,10 +41,10 @@ repository = "https://github.com/sailantis/volucer"
 # works. Keep every entry here on the same version as `[workspace.package] version`:
 # a published crate cannot depend on a version that does not exist, so these move together.
 [workspace.dependencies]
-volucer-core = { version = "0.3.0", path = "crates/volucer-core" }
+volucer-core = { version = "0.4.0", path = "crates/volucer-core" }
 arc-swap = "1"
-volucer-worker = { version = "0.3.0", path = "crates/volucer-worker" }
-volucer-fcgi = { version = "0.3.0", path = "crates/volucer-fcgi" }
+volucer-worker = { version = "0.4.0", path = "crates/volucer-worker" }
+volucer-fcgi = { version = "0.4.0", path = "crates/volucer-fcgi" }
 # Test-only. Not a `[workspace.dependencies]` entry used by any crate's `[dependencies]`: every
 # consumer below puts it in `[dev-dependencies]`, and `publish = false` keeps it off crates.io.
 #
@@ -56,19 +56,19 @@ volucer-fcgi = { version = "0.3.0", path = "crates/volucer-fcgi" }
 # registry. Measured — adding a version, a `publish = false` here, or one on the `dev-dependency`
 # itself all reproduce the failure.
 volucer-testkit = { path = "crates/volucer-testkit" }
-volucer-server = { version = "0.3.0", path = "crates/volucer-server" }
-volucer-http = { version = "0.3.0", path = "crates/volucer-http" }
-volucer-watch = { version = "0.3.0", path = "crates/volucer-watch" }
-volucer-observe = { version = "0.3.0", path = "crates/volucer-observe" }
-volucer-metrics = { version = "0.3.0", path = "crates/volucer-metrics" }
-volucer-kv = { version = "0.3.0", path = "crates/volucer-kv" }
-volucer-lock = { version = "0.3.0", path = "crates/volucer-lock" }
-volucer-jobs = { version = "0.3.0", path = "crates/volucer-jobs" }
+volucer-server = { version = "0.4.0", path = "crates/volucer-server" }
+volucer-http = { version = "0.4.0", path = "crates/volucer-http" }
+volucer-watch = { version = "0.4.0", path = "crates/volucer-watch" }
+volucer-observe = { version = "0.4.0", path = "crates/volucer-observe" }
+volucer-metrics = { version = "0.4.0", path = "crates/volucer-metrics" }
+volucer-kv = { version = "0.4.0", path = "crates/volucer-kv" }
+volucer-lock = { version = "0.4.0", path = "crates/volucer-lock" }
+volucer-jobs = { version = "0.4.0", path = "crates/volucer-jobs" }
 # The OTLP/HTTP trace exporter. A crate of its own for the same reason `volucer-upstream` is: it is
 # the second user of the *client* half of `hyper`, and a deployment with no `[telemetry]` table must
 # not link it. It depends on `volucer-upstream` rather than re-implementing a connector, which is
 # also why it adds **no new package** to this workspace's lockfile.
-volucer-otlp = { version = "0.3.0", path = "crates/volucer-otlp" }
+volucer-otlp = { version = "0.4.0", path = "crates/volucer-otlp" }
 # The Redis client, **optional** and behind a feature. A deployment using the in-memory store must not
 # link a Redis to get it, which is the rule for every driver: features are grouped per driver, so a
 # build without one carries no code for it. Default
@@ -106,8 +106,8 @@ amqprs = { version = "2", default-features = false }
 amqp_serde = "0.4"
 # `ChannelCallback` is an `async_trait`, so the trait macro has to be nameable to implement one.
 async-trait = "0.1"
-volucer-acme = { version = "0.3.0", path = "crates/volucer-acme" }
-volucer-upstream = { version = "0.3.0", path = "crates/volucer-upstream" }
+volucer-acme = { version = "0.4.0", path = "crates/volucer-acme" }
+volucer-upstream = { version = "0.4.0", path = "crates/volucer-upstream" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"

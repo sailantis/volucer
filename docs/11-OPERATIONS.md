@@ -443,11 +443,11 @@ uses a Debian base and always has a `-glibc` suffix:
 
 | Tag                                        | Image                         |
 | ------------------------------------------ | ----------------------------- |
-| `0.3.0`, `0.3`, `latest`                   | musl, `scratch` base          |
-| `0.3.0-glibc`, `0.3-glibc`, `latest-glibc` | glibc, `debian:bookworm-slim` |
+| `0.4.0`, `0.4`, `latest`                   | musl, `scratch` base          |
+| `0.4.0-glibc`, `0.4-glibc`, `latest-glibc` | glibc, `debian:bookworm-slim` |
 
-The `latest` tag changes only for final releases. A pre-release such as `v0.4.0-rc.1`
-publishes the `0.4.0` and `0.4` tags without moving `latest`. Pin a version such as `0.3.0`
+The `latest` tag changes only for final releases. A pre-release such as `v0.5.0-rc.1`
+publishes the `0.4.0` and `0.4` tags without moving `latest`. Pin a version such as `0.4.0`
 for deployments that must not change when a new release is published.
 
 The package must be made public after the first release publishes it. See
@@ -541,7 +541,7 @@ FROM php:8.5-cli-bookworm
 
 # Use the `-glibc` image, not the default `musl` tag. This base is Debian, and the `glibc` stage
 # of `packaging/docker/Dockerfile` builds the matching binary. Pin the version.
-COPY --from=ghcr.io/sailantis/volucer:0.3.0-glibc /usr/local/bin/volucer /usr/local/bin/volucer
+COPY --from=ghcr.io/sailantis/volucer:0.4.0-glibc /usr/local/bin/volucer /usr/local/bin/volucer
 
 # Add the extensions the application needs. Each one is a compile step in this Dockerfile,
 # not a version in this project's release matrix.
@@ -685,7 +685,7 @@ Use a published image, or build from the checkout:
 ```yaml
 services:
   app:
-    image: ghcr.io/sailantis/volucer:0.3.0 # or: build: {context: ., target: musl}
+    image: ghcr.io/sailantis/volucer:0.4.0 # or: build: {context: ., target: musl}
     ports:
       - "8080:8080"
       - "9080:9080"
