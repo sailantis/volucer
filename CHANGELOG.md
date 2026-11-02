@@ -9,63 +9,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Access controls and custom error pages.** Configure client-address allow/deny rules and status-specific pages for server-generated errors.
-- **`.volucer.toml` and `VOLUCER_CONFIG`.** The configuration file may now be named `.volucer.toml`, which the static layer answers `404` for and can therefore sit inside the document root, and `VOLUCER_CONFIG` names a file without a `--config` flag — the way an image overrides a `CMD` fixed at build time. `volucer.toml` still wins when both names exist, so an existing deployment reads the file it already has. Every subcommand resolves the file by one rule: `-c`, then the subcommand's own variable (`VOLUCER_HEALTH_CONFIG`, `VOLUCER_STATUS_CONFIG`), then `VOLUCER_CONFIG`, then the default names.
-- **AMQP job queues.** An optional `amqp` feature adds RabbitMQ as a job driver and passes queue arguments through to the broker.
-- **Backend response streaming and file offload.** Large responses can be relayed past `stream_threshold_bytes`; backends can also use `X-Sendfile` or `X-Accel-Redirect` to serve files.
-- **Configuration includes and CLI overrides.** Split configuration across files with `include`, and update array-of-table entries with `-o`.
-- **Deployment guidance.** Document container PHP setup and end-to-end rolling deployments.
-- **HTTP/3 and gRPC over QUIC.** An optional `http3` feature adds an HTTP/3 listener and supports gRPC requests and trailers over HTTP/3.
-- **RPC services for non-worker backends.** FastCGI and HTTP applications can use worker services; Python and Ruby SDKs now include RPC clients.
-- **Route redirects and roots.** Routes can redirect using `{path}`, `{rest}` and `{query}`, or mount a directory with `root`.
-- **Live tests against real websites.** An opt-in suite (`VOLUCER_LIVE=1`) runs the binary against real origins to prove what a loopback fixture cannot: a genuine public certificate chain accepted by the default trust store, ALPN negotiating HTTP/2 to the upstream, and real response shapes (compressed chunked bodies, origin statuses and redirects, request bodies parsed by the origin). It also covers a virtual host selecting the backend that reaches a real origin, and runs daily in a scheduled CI workflow, where a skipped test is a failure.
-- **Server operations settings.** Configure backend `request_timeout_ms`, `[server] max_connections` and `shutdown_timeout_ms`; `access_log.path = "-"` writes logs to stdout.
-- **Virtual hosting to an HTTP/2 origin.** `preserve_host = true` on a backend sends the client's own name in `:authority`, so an origin behind an `https:` or `h2c` hop that selects a virtual host by name is told what the client asked for rather than the address Volucer dialled.
-- **Tracing controls.** Configure trace sampling and backend `traceparent` propagation; access-log entries include the trace ID.
+- **Access controls and custom error pages.** Client-address allow/deny rules and status-specific pages for server-generated errors.
+- **AMQP job queues.** The optional `amqp` feature adds RabbitMQ as a job driver and passes queue arguments to the broker.
+- **Backend response streaming and file offload.** Responses larger than `stream_threshold_bytes` are relayed as a stream. Backends can serve files through `X-Sendfile` or `X-Accel-Redirect`.
+- **Configuration file names.** `.volucer.toml` is accepted and answered with `404` by the static layer, so it can sit inside the document root. `VOLUCER_CONFIG` selects a file without `--config`. `volucer.toml` takes precedence when both names exist. Resolution order: `-c`, the subcommand variable (`VOLUCER_HEALTH_CONFIG`, `VOLUCER_STATUS_CONFIG`), `VOLUCER_CONFIG`, then the default names.
+- **Configuration includes and CLI overrides.** `include` splits configuration across files. `-o` updates array-of-table entries.
+- **Deployment guidance.** Container PHP setup and end-to-end rolling deployments are documented.
+- **HTTP/3 and gRPC over QUIC.** The optional `http3` feature adds an HTTP/3 listener with gRPC requests and trailers.
+- **Live tests against real origins.** The opt-in suite (`VOLUCER_LIVE=1`) covers public certificate chains, ALPN-negotiated HTTP/2, and real response shapes. It runs daily in CI, where a skipped test counts as a failure.
+- **Route redirects and roots.** Redirects can use `{path}`, `{rest}` and `{query}`. Routes can mount a directory with `root`.
+- **RPC clients for non-worker backends.** FastCGI and HTTP applications can use worker services. The Python and Ruby SDKs include RPC clients.
+- **Server operations settings.** Backend `request_timeout_ms`, `[server] max_connections` and `shutdown_timeout_ms`. `access_log.path = "-"` writes logs to stdout.
+- **TLS documentation.** States that client-certificate authentication is unsupported and lists the available service-to-service authentication options.
+- **Tracing controls.** Trace sampling and backend `traceparent` propagation. Access-log entries include the trace ID.
 - **Unix-socket listeners.** HTTP and FastCGI front ends can listen on Unix sockets.
-- **Worker request streaming and multipart uploads.** Stream request bodies to capable workers and spool uploaded files to disk; PHP worker mode populates `$_POST` and `$_FILES` while preserving `$request->body`. SDKs and framework bridges support the streamed form.
-- **Worker response streaming.** Workers can send unknown-length responses incrementally; PHP's `StreamedResponse` supports generated downloads and server-sent events.
+- **Virtual hosting to HTTP/2 origins.** `preserve_host = true` on a backend sends the client's name in `:authority`. See [02-BACKENDS.md](docs/02-BACKENDS.md).
+- **Worker request and response streaming.** Request bodies stream to capable workers and uploads spool to disk. PHP worker mode populates `$_POST` and `$_FILES` and keeps `$request->body`. Workers can send unknown-length responses incrementally using the `STREAMED` flag. PHP's `StreamedResponse` supports downloads and server-sent events.
 - **Worker restart diagnostics.** `volucer workers restart` reports why a restart sweep is incomplete.
-- **Worker protocol streaming support.** The protocol now represents unknown-length response bodies with an explicit `STREAMED` flag.
-- **TLS documentation.** Clarify that client-certificate authentication is unsupported and document the available service-to-service authentication options.
 
 ### Changed
 
 - **Backend selection.** A single configured backend no longer requires `default_backend`.
-- **Configuration format.** Parse TOML 1.1.
-- **Configuration reload semantics.** `SIGHUP` reloads configuration only; `SIGUSR2` restarts workers to load updated application code.
-- **Metrics and status configuration.** `[metrics]` and `[status]` are consolidated under `[status]` on one listener.
-- **Service grants.** Grants can target individual methods, including worker-control methods; `attach` backends validate their service lists and `volucer check` displays them.
-- **Worker gate behavior.** A missing gate now fails closed.
-- **Worker reset validation.** `workers.reset` is refused for backends without a worker pool.
-- **Status and metrics validation.** `[status].listen` rejects Unix sockets, and the metrics path cannot shadow a built-in listener route.
-- **RPC errors.** Refused gRPC calls use `PERMISSION_DENIED` rather than an HTTP `403`.
+- **Configuration format.** Configuration is parsed as TOML 1.1.
+- **Configuration reload.** `SIGHUP` reloads configuration only. `SIGUSR2` restarts workers to load updated application code.
+- **Metrics and status.** `[metrics]` and `[status]` are consolidated under `[status]` on one listener.
+- **Service grants.** Grants can target individual methods, including worker-control methods. `attach` backends validate their service lists, and `volucer check` displays them.
+- **Worker gate.** A missing gate now fails closed.
+- **Worker reset.** `workers.reset` is refused for backends without a worker pool.
+- **Validation.** `[status].listen` rejects Unix sockets. The metrics path cannot shadow a built-in listener route.
+- **RPC errors.** Refused gRPC calls return `PERMISSION_DENIED` instead of HTTP `403`.
 
 ### Fixed
 
-- **A virtual host behind an HTTP/2 origin received the dialled name instead of the client's.** An HTTP/2 request carries its identity in the `:authority` pseudo-header rather than the `Host` header, and RFC 9113 §8.3.1 makes it the authoritative one — so an origin that selects a virtual host by name (nginx's `server_name`, any multi-tenant application) was told the address Volucer dialled. HTTP/1.1 hops were unaffected, which is why a header-level unit test could not see it: the forwarded `Host` header is correct in both cases. Measured on both hops in `crates/volucer-upstream/tests/host_on_the_wire.rs`. `preserve_host = true` on a backend sends the client's name instead; it is opt-in because an origin that validates its own name answers a foreign one with `421 Misdirected Request`, so the two deployments cannot share a default. `https:` origins are affected by default because ALPN negotiates HTTP/2.
-- **AMQP publishing.** Treat unroutable mandatory publishes as failures and correctly parse the default virtual host in AMQP URLs.
-- **A stale SDK checkout reported itself as a server bug.** The worker suites drive the `volucer-php-sdk`'s `example/worker.php` over the wire and assert on the bytes, so a checkout that predates a route answered with the worker's default page — which reads exactly like a front-end that dropped a stream. `/stream`, `/stream-boom` and `/upload` arrived over three SDK commits, and because `actions/checkout` clones the SDK's default branch, an unpushed SDK change passed locally and failed in CI with a message pointing at `volucer-server`. Six tests failed that way against a checkout four commits behind. `volucer-testkit::require_example_routes` now checks the route the test is about to drive and panics naming the checkout, so the two repositories' disagreement is reported as that rather than as a bug in whichever one ran second.
-- **Skipped tests that reported success.** `VOLUCER_E2E=1` now has one implementation, in the new `volucer-testkit` crate, so every suite that can skip honours it. Three did not: the `php-cgi` suite and the `serve.rs` and `frontend.rs` FastCGI front ends printed `skipping:` and never consulted the variable, so a CI run without PHP reported success for suites that had not executed. A skip for a *missing capability* is now a failure under `VOLUCER_E2E=1`; a skip for port contention is not, because that is a race rather than a missing tool.
-- **The graceful-stop tests were Linux-only, and macOS failed because of it.** `Server::stop_gracefully` and the three tests that use it were gated on `target_os = "linux"`, but the signal handling they exercise is `cfg(unix)`: `serve` installs the same `signal_hook` handler on macOS. So on macOS the unix-socket test sent no `SIGTERM`, stopped the server with `Drop` — which is `SIGKILL` — and then asserted the socket path had been unlinked, which a killed process cannot do. A correct server reported a socket leak its own harness had created, and the gate that hid the cause was one line above the assertion. Widened to `unix`; Windows stays out, having no `SIGTERM` to send.
-- **Worker startup diagnostics.** A worker that dies while the server is waiting for its socket connection now has its own `stderr` reported at `warn`, before the error that refers to it. The hint on that error said the worker's output "is logged above", but the drain thread wrote it at `debug` — invisible at the default log level, which is what `serve` uses. This was the likeliest first-run failure on Windows, where the socket transport is the default and a worker written against `Worker::create()` exits during its handshake.
-- **Cache TTL precision.** File-backed cache entries now retain sub-second TTLs without expiring immediately.
-- **Concurrency test reliability.** The prefork test measures request overlap instead of comparing machine-dependent timings.
-- **HTTP/2 site selection.** Resolve the request host from either `Host` or the URI authority, including for redirects and CGI variables.
-- **HTTP/3 upstream requests.** Map inbound HTTP/2 and HTTP/3 versions to a version supported by the upstream client.
-- **KV batch keys.** `kv.getMultiple` and `kv.setMultiple` now decode keys consistently with single-key methods.
-- **Metrics exposition.** Declared collected metrics render their HELP and TYPE metadata even before they have samples.
-- **Route precedence.** Ties now select the earlier configured route.
-- **Trace sampling.** Preserve unsampled flags when exporting traces and handle requests without a parent `traceparent` correctly.
+- **HTTP/2 virtual hosts.** Origins reached over HTTP/2 received the dialed address instead of the client's name, because the name travels in `:authority`. HTTP/1.1 was not affected. Use `preserve_host = true` on the backend to send the client's name. It is opt-in because origins that validate their own name answer foreign names with `421 Misdirected Request`.
+- **HTTP/2 site selection.** The request host is resolved from either `Host` or the URI authority, including for redirects and CGI variables.
+- **HTTP/3 upstream requests.** Inbound HTTP/2 and HTTP/3 versions are mapped to a version the upstream client supports.
+- **AMQP publishing.** Unroutable mandatory publishes are treated as failures. The default virtual host in AMQP URLs is parsed correctly.
+- **Worker startup diagnostics.** A worker that exits during startup has its `stderr` logged at `warn` instead of `debug`, so the error is visible at the default log level.
 - **Worker stream truncation.** A response that ends without `LAST` is reported as truncated, and its worker is not reused.
-- **Worker reset routing.** Correct the method name so `workers.reset` reaches its registered service.
-- **Documentation accuracy.** Correct the route-loop explanation and CLI override guidance for arrays of tables and maps.
+- **Worker reset routing.** `workers.reset` reaches its registered service.
+- **Skipped tests.** `VOLUCER_E2E=1` is honored by every suite that can skip, via the shared `volucer-testkit` crate. A skip for a missing capability fails under this setting. A skip for port contention does not.
+- **Graceful-stop tests on macOS.** The tests now run on all Unix platforms, not only Linux.
+- **Stale SDK checkouts.** `volucer-testkit::require_example_routes` checks the routes a test drives and names the checkout when one is missing.
+- **Cache TTL.** File-backed cache entries keep sub-second TTLs.
+- **Concurrency tests.** The prefork test measures request overlap instead of machine-dependent timings.
+- **KV batch keys.** `kv.getMultiple` and `kv.setMultiple` decode keys the same way as single-key methods.
+- **Metrics exposition.** Declared metrics render their HELP and TYPE metadata before they have samples.
+- **Route precedence.** Ties select the earlier configured route.
+- **Trace sampling.** Unsampled flags are preserved on export. Requests without a parent `traceparent` are handled correctly.
+- **Documentation.** The route-loop explanation and CLI override guidance for arrays of tables and maps are corrected.
 
 ### Security
 
-- **Dependency advisories.** Add `cargo-deny` and address three vulnerabilities in the dependency graph.
-- **HTTP/3 header limits.** Bound header-section size to mitigate the unpatched `h3` amplification issue (hyperium/h3#379).
-- **Unmaintained PEM parser advisory.** Record RUSTSEC-2025-0134 in `deny.toml`; migration to `rustls-pki-types` remains separate.
+- **Dependency advisories.** Adds `cargo-deny` and resolves three vulnerabilities in the dependency graph.
+- **HTTP/3 header limits.** Header-section size is bounded to mitigate the unpatched `h3` amplification issue (hyperium/h3#379).
+- **PEM parser advisory.** RUSTSEC-2025-0134 (unmaintained PEM parser) is recorded in `deny.toml`. Migration to `rustls-pki-types` is tracked separately.
 
 ## [0.3.0] - 2026-10-26
 

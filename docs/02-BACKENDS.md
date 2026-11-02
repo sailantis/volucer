@@ -500,34 +500,35 @@ Volucer rebuild.
 
 ### Virtual hosts behind an HTTP/2 origin
 
-An origin that selects a virtual host by name — nginx's `server_name`, any multi-tenant
-application — routes on the name the *client* asked for, not on the address Volucer dialled.
-Those are usually the same string and they are not the same thing.
+An origin that selects a virtual host by name (nginx's `server_name`, or a multi-tenant
+application) routes on the name the client requested, not on the address Volucer dialed. The two
+are often the same string, but they are distinct values.
 
-On an **HTTP/1.1** hop they are handled separately and correctly: the client's `Host` header is
-forwarded verbatim. On an **HTTP/2** hop the same identity travels in the `:authority`
-pseudo-header instead, and by default that names the origin itself — so an origin reached with
-`https://` (ALPN negotiates h2) or with `protocol = "h2c"` is told the dialled address:
+On an **HTTP/1.1** hop, the client's `Host` header is forwarded unchanged, so the origin receives
+the requested name. On an **HTTP/2** hop, the same name is carried in the `:authority`
+pseudo-header, and by default that field contains the origin's own address. An origin reached
+over `https://` (ALPN negotiates h2) or with `protocol = "h2c"` therefore receives the dialed
+address:
 
 ```toml
 [backends.shop]
 kind = "upstream"
 origin = "https://backend.internal:8443"
-# The client asked for shop.example.com; without this, backend.internal is what it is told.
+# The client requests shop.example.com; without this setting, the origin receives backend.internal.
 preserve_host = true
 ```
 
-`preserve_host = true` puts the client's name in `:authority` on an HTTP/2 hop. It changes
-nothing on an HTTP/1.1 hop, where the header was already forwarded.
+`preserve_host = true` places the client's name in `:authority` on an HTTP/2 hop. It has no
+effect on an HTTP/1.1 hop, where the `Host` header is already forwarded.
 
-It is **opt-in** because the two deployments want opposite answers and a request cannot tell
-them apart: an origin that validates its own name will answer a foreign one with `421 Misdirected
-Request`, and sending every origin the client's name would break exactly the configuration that
-works today. Set it on the backends that are virtual-host targets and leave it off on the ones
-that are not.
+The setting is **opt-in** because the two deployment types need opposite behavior, and a request
+alone does not reveal which one applies. An origin that validates its own name responds to a
+foreign name with `421 Misdirected Request`. Sending the client's name to every origin would
+break configurations that work today. Enable it only for backends that serve as virtual-host
+targets.
 
-The forwarded `Host` header and `X-Forwarded-Host` are correct either way — an origin configured
-to route on `X-Forwarded-Host` needs no change.
+The forwarded `Host` header and `X-Forwarded-Host` are set in both cases, so an origin that
+routes on `X-Forwarded-Host` requires no change.
 
 ### Supervising the origin
 
