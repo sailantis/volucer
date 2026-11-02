@@ -3,6 +3,25 @@
 # Validate it with:  volucer check --config volucer.example.toml
 # Extra PHP search directories can be added with `--php-dir`.
 #
+# WHICH FILE IS READ. With no `--config`, the working directory is searched for
+# `volucer.toml` and then `.volucer.toml`; the first that exists is read, and a
+# file with neither name means the command line is the whole configuration.
+# `VOLUCER_CONFIG` names a file without a flag -- the way an image overrides a
+# `CMD` baked at build time. The order is `--config`, the subcommand's own
+# variable (`VOLUCER_HEALTH_CONFIG`, `VOLUCER_STATUS_CONFIG`), `VOLUCER_CONFIG`,
+# then the two default names. An empty variable is unset, and a file named by a
+# flag or a variable that cannot be read is an error rather than a fallback.
+#
+# The dotted name exists so a configuration can sit inside the document root: with
+# `document_root = "."`, `volucer.toml` is a file the static layer would answer
+# for, while `.volucer.toml` is a dotfile and `dotfiles = "deny"` -- the default of
+# `[server.static_files]` -- answers 404 for it. Setting `dotfiles = "allow"`
+# removes that, so keep the file outside the root if you need to allow dotfiles.
+#
+# The name and extension are never inspected: every file is parsed as TOML, so a
+# file called `app.yaml` works when `--config` names it. See
+# docs/01-CONFIGURATION.md, "Which file is read".
+#
 # ${NAME} and ${NAME:-default} anywhere in this file are expanded from the
 # server's environment BEFORE it is parsed, so they work in a number, a port or a
 # listener address as well as in a string:
