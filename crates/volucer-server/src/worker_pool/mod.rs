@@ -101,6 +101,18 @@ mod exchange;
 mod handshake;
 mod request;
 mod response;
+
+/// Render a worker's response into the crate's `Response`, with the duration it took.
+///
+/// Re-exported beside `render_head` for the async streamed path, which reaches a complete response
+/// after the relay policy has already been consulted and must answer with the same bytes the
+/// synchronous path would have produced.
+pub(crate) fn render_worker(
+    response: volucer_worker::codec::WorkerResponse,
+    duration: std::time::Duration,
+) -> volucer_fcgi::Response {
+    response::render(response, duration)
+}
 mod spec;
 
 /// How long a single request may take before the worker is replaced.
@@ -350,10 +362,9 @@ impl Drop for Lease<'_> {
     }
 }
 
-/// A [`Lease`] that owns a share of the pool, so it can be released from another thread.
+/// A slot released from wherever an async request finished, rather than borrowed from the caller.
 ///
-/// # Why the ordinary lease cannot do this
-///
+/// # Why the ordinary lease cannot do this///
 /// A streamed response keeps its slot until the last byte of its body, and that byte is read on the
 /// worker's **exchange thread** — created when the worker boots, outliving every request. So the
 /// thing that releases the slot cannot borrow the pool: the borrow ends when `request_relayed`
@@ -1475,6 +1486,352 @@ impl WorkerPool {
                 .map_err(|failure| failure.source),
             outcome => outcome.map_err(|failure| failure.source),
         }
+    }
+
+    /// [`Self::request_relayed`], without parking the calling thread while the worker thinks.
+    ///
+    /// The async counterpart of the streamed path, and it exists for the same reason
+    /// [`Self::request_async`] does: the exchange is unchanged, only the waiting moves. The body
+    /// still travels on `crate::relay`'s bounded channel from the worker's exchange thread to the
+    /// front-end, so back-pressure and truncation behave exactly as they did.
+    ///
+    /// The lease is released by the exchange thread when the last frame is read — that is what
+    /// `on_end` is for, and it is why this takes `&Arc<Self>` — so a relayed body outliving this
+    /// call is the ordinary case, not a leak.
+    pub async fn request_relayed_async(
+        self: &Arc<Self>,
+        request: &Request,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        match self.attempt_relayed_async(request, relay).await {
+            Err(failure) if failure.retryable => self
+                .attempt_relayed_async(request, relay)
+                .await
+                .map_err(|failure| failure.source),
+            outcome => outcome.map_err(|failure| failure.source),
+        }
+    }
+
+    /// One try at an async relayed request. The counterpart of [`Self::attempt_relayed`].
+    async fn attempt_relayed_async(
+        self: &Arc<Self>,
+        request: &Request,
+        relay: volucer_fcgi::Relay,
+    ) -> std::result::Result<Delivery, FailedAttempt> {
+        let queued_at = Instant::now();
+        let lease = self.acquire_owned().map_err(|source| FailedAttempt {
+            source,
+            retryable: false,
+        })?;
+        let index = lease.index;
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        let head = {
+            let translated = borrowed_request(request);
+            let draft = translated.draft(Some(request.body.len() as u64));
+            encode_head(&draft)
+        };
+        let timeout = self.spec.request_timeout;
+
+        // The ending, built while the slot is held: it needs the pool's own state, and it runs on the
+        // exchange thread once the last frame is read. Exactly the synchronous path's ending.
+        let waiting = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if !slot.is_available() {
+                tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
+                let outcome = respawn(
+                    &self.name,
+                    &self.spec,
+                    index as u32,
+                    &self.guard,
+                    self.call_handler.as_ref(),
+                    &mut slot,
+                );
+                drop(slot);
+                self.refresh_stream_capability(None);
+                return Err(FailedAttempt {
+                    source: match outcome {
+                        Ok(()) => ServerError::NoWorker {
+                            backend: self.name.clone(),
+                        },
+                        Err(source) => source,
+                    },
+                    retryable: true,
+                });
+            }
+
+            let ending = PoolEnding {
+                pool: Arc::clone(self),
+                spec: self.spec.clone(),
+                call_handler: self.call_handler.clone(),
+                lease,
+                started,
+            };
+            // Posted under the lock and awaited outside it, and the exchange stays in the slot — see
+            // `attempt_async` for what moving it out cost.
+            match slot.exchange.as_ref() {
+                Some(exchange) => match exchange.post_streamed_async(
+                    head,
+                    &request.body,
+                    relay,
+                    Box::new(move |done| ending.finish(done)),
+                ) {
+                    Ok(waiting) => waiting,
+                    Err((stage, source)) => {
+                        drop(slot);
+                        return Err(FailedAttempt {
+                            source: ServerError::WorkerProtocol {
+                                backend: self.name.clone(),
+                                source,
+                            },
+                            retryable: may_retry(stage, request),
+                        });
+                    }
+                },
+                None => {
+                    drop(slot);
+                    return Err(FailedAttempt {
+                        source: ServerError::WorkerProtocol {
+                            backend: self.name.clone(),
+                            source: WorkerError::Closed("the worker has no exchange".to_string()),
+                        },
+                        // The ending was consumed by the match above; the lease it holds is dropped
+                        // with it, which returns the slot.
+                        retryable: false,
+                    });
+                }
+            }
+        };
+
+        let outcome = match tokio::time::timeout(timeout, waiting).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+        };
+
+        // A fatal failure leaves the slot unusable, so it is replaced exactly as the synchronous
+        // relayed path does. The lease is *not* released here on the success paths: the ending owns
+        // it, and releases the slot after the last body frame.
+        if matches!(&outcome, Err((_, source)) if source.is_fatal()) {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.terminate();
+            replace(
+                &self.name,
+                &self.spec,
+                &self.guard,
+                self.call_handler.as_ref(),
+                &mut slot,
+            );
+            self.refresh_stream_capability(Some((index, &slot)));
+        }
+
+        match outcome {
+            Ok(crate::pool::Opened::Buffered(response)) => Ok(Delivery::Buffered(response)),
+            Ok(crate::pool::Opened::Relayed(opened)) => Ok(Delivery::Relayed(opened.relayed)),
+            Err((stage, source)) => Err(FailedAttempt {
+                source: ServerError::WorkerProtocol {
+                    backend: self.name.clone(),
+                    source,
+                },
+                retryable: may_retry(stage, request),
+            }),
+        }
+    }
+
+    /// Serve one request without parking the calling thread while the worker thinks.
+    ///
+    /// # Why this exists beside [`Self::request`]
+    ///
+    /// `request` is correct and is what the FastCGI front-end and every synchronous caller use. Its
+    /// cost is not the work — a worker reads a request and writes a response, and that is the job —
+    /// but *waiting*: it blocks the thread that called it for the whole exchange. On the HTTP
+    /// front-end that thread is a `tokio` runtime thread, and measured on this codebase the
+    /// consequence was severe: a `c=100` run carried **150 threads** for 12 workers, throughput went
+    /// flat at the thread count, and 31 µs of every request went on thread hand-offs.
+    ///
+    /// The exchange itself does not move — [`ChannelExchange`] is still the one thread allowed to
+    /// touch a worker's pipe — so this saves no hops. What it saves is *parking*: the caller awaits a
+    /// `oneshot`, so one runtime thread can hold many requests in flight instead of one.
+    ///
+    /// # The slot lock is not held while the worker thinks
+    ///
+    /// It does not have to be. The [`OwnedLease`] already grants this request this slot exclusively —
+    /// no other request can be *given* it — so the lock only ever guards a mutation, and every
+    /// mutation below happens in one short critical section. Holding it across the `await` would be
+    /// both unnecessary and a deadlock waiting to happen: a `std::sync::MutexGuard` held across an
+    /// `await` makes the future `!Send`, and the front-end spawns it.
+    pub async fn request_async(self: &Arc<Self>, request: &Request) -> Result<Response> {
+        match self.attempt_async(request).await {
+            Err(failure) if failure.retryable => {
+                // The same replay rule `request` applies, for the same reason: `invoke`'s failure
+                // says whether the request could have been delivered and the verb says whether a
+                // second delivery would matter. Doing it twice is what `request` does.
+                self.attempt_async(request)
+                    .await
+                    .map_err(|failure| failure.source)
+            }
+            outcome => outcome.map_err(|failure| failure.source),
+        }
+    }
+
+    /// One try at an async request. The counterpart of [`Self::attempt`].
+    async fn attempt_async(
+        &self,
+        request: &Request,
+    ) -> std::result::Result<Response, FailedAttempt> {
+        let queued_at = Instant::now();
+        // `acquire` parks on a `Condvar` when the pool is full, which is the same behaviour the
+        // synchronous path has and is deliberate: a request that must wait for a worker is waiting
+        // for *capacity*, not for this worker, and there is nothing else useful to do meanwhile.
+        let lease = self.acquire().map_err(|source| FailedAttempt {
+            source,
+            retryable: false,
+        })?;
+        let index = lease.index();
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        // The head is encoded here, while the CGI environment it borrows is alive — the exchange
+        // thread cannot borrow it, for the reason `invoke` documents.
+        let head = {
+            let translated = borrowed_request(request);
+            let draft = translated.draft(Some(request.body.len() as u64));
+            encode_head(&draft)
+        };
+        let timeout = self.spec.request_timeout;
+
+        // Everything that needs the slot is done in one critical section, and the answer is awaited
+        // *outside* it. The guard is a plain `MutexGuard`, so it must not cross an `await`; a block is
+        // what enforces that, rather than a comment saying so.
+        let waiting = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if !slot.is_available() {
+                tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
+                let outcome = respawn(
+                    &self.name,
+                    &self.spec,
+                    index as u32,
+                    &self.guard,
+                    self.call_handler.as_ref(),
+                    &mut slot,
+                );
+                drop(slot);
+                self.refresh_stream_capability(None);
+                return Err(FailedAttempt {
+                    source: match outcome {
+                        Ok(()) => ServerError::NoWorker {
+                            backend: self.name.clone(),
+                        },
+                        Err(source) => source,
+                    },
+                    retryable: true,
+                });
+            }
+
+            // Posted **under the slot lock**, which is then released before the wait. The exchange
+            // never leaves the slot, and that is not tidiness: `is_available` reads whether it is
+            // `Some`, so moving it out would make this slot look like a dead worker to the next
+            // request and the pool would respawn it — a respawn loop, measured at 2.4k rps before it
+            // was fixed.
+            match slot.exchange.as_ref() {
+                Some(exchange) => match exchange.post_request_async(head, &request.body) {
+                    Ok(waiting) => waiting,
+                    Err((stage, source)) => {
+                        drop(slot);
+                        return Err(FailedAttempt {
+                            source: ServerError::WorkerProtocol {
+                                backend: self.name.clone(),
+                                source,
+                            },
+                            retryable: may_retry(stage, request),
+                        });
+                    }
+                },
+                // A slot is only chosen while it has an exchange, so this cannot happen; reported
+                // rather than panicked, because a panic here would take the server down for one
+                // request.
+                None => {
+                    drop(slot);
+                    return Err(FailedAttempt {
+                        source: ServerError::WorkerProtocol {
+                            backend: self.name.clone(),
+                            source: WorkerError::Closed("the worker has no exchange".to_string()),
+                        },
+                        retryable: false,
+                    });
+                }
+            }
+        };
+
+        let outcome = match tokio::time::timeout(timeout, waiting).await {
+            Ok(outcome) => outcome,
+            // The exchange thread is still blocked in a read on this worker, so the caller kills it
+            // — the same contract `round_trip`'s timeout has, and `is_fatal` is what tells it to.
+            Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+        };
+
+        // Its fate is decided exactly as `invoke` decides it.
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let response = match outcome {
+            Ok(response) => response,
+            Err((stage, source)) => {
+                if source.is_fatal() {
+                    slot.terminate();
+                }
+                // A slot without an exchange needs a replacement, exactly as in `attempt`.
+                if slot.exchange.is_none() {
+                    replace(
+                        &self.name,
+                        &self.spec,
+                        &self.guard,
+                        self.call_handler.as_ref(),
+                        &mut slot,
+                    );
+                    self.refresh_stream_capability(Some((index, &slot)));
+                }
+                return Err(FailedAttempt {
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                    // The same rule the synchronous path uses, from the same two facts.
+                    retryable: may_retry(stage, request),
+                });
+            }
+        };
+
+        if !response.metrics.is_empty() {
+            self.stash_metrics(response.metrics.to_vec());
+        }
+
+        let duration = started.elapsed();
+        self.after_response(&mut slot, &response);
+        Ok(render(response, duration))
     }
 
     /// One try at a relayed request. The counterpart of [`Self::attempt`].

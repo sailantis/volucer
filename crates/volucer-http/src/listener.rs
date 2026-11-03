@@ -2904,6 +2904,111 @@ async fn prepare(
     // being served under, and a streamed response has to be started under the same one.
     let stream_threshold = front_end.limits.max_stream_bytes;
     let streaming_dispatch = pump.is_some();
+    // **The request is prepared on a blocking thread and answered without parking one.**
+    //
+    // Both halves are load-bearing, and each is the fix for a different measured cost:
+    //
+    // - *Preparation* stats the filesystem to resolve `SCRIPT_FILENAME`, which must not happen on a
+    //   runtime thread, so it is handed to the blocking pool exactly as before.
+    // - *The exchange* must not park a thread at all. A worker reads a request and writes a response
+    //   on its own exchange thread; there is nothing for this process to do meanwhile, and parking a
+    //   thread for it cost 31 µs of every request and one thread per in-flight connection. Measured:
+    //   a `c=100` run carried 150 threads for 12 workers and stopped gaining throughput at the thread
+    //   count. So the exchange is awaited instead.
+    //
+    // A request whose body is still arriving (`pump`) keeps the old path below: its body crosses to
+    // the exchange thread a frame at a time by construction, so what it costs is the client's upload
+    // rather than the server's throughput.
+    if !streaming_dispatch {
+        // Taken before `front_end` is cloned into the closure: `Arc::clone` needs a reference, and
+        // `prepare_front_end` shadows the name below for the duration of the preparation.
+        let prepare_front_end = Arc::clone(&front_end);
+        let prepare_routing = routing.clone();
+        let prepare_routes = site.routes.clone();
+        let prepare_parts = parts.clone();
+        let prepare_body = body.clone();
+        let prepare_remote = remote_addr.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
+                let mut cgi_request = if skips_stat {
+                    to_cgi_routed(
+                        &prepare_parts,
+                        prepare_body.unwrap_or_default(),
+                        &prepare_routing,
+                        prepare_front_end.server_port,
+                        prepare_remote.as_deref(),
+                    )?
+                } else {
+                    to_cgi(
+                        &prepare_parts,
+                        prepare_body.unwrap_or_default(),
+                        &prepare_routing,
+                        prepare_front_end.server_port,
+                        prepare_remote.as_deref(),
+                    )?
+                };
+                if let Some(traceparent) = &outbound_traceparent {
+                    set_cgi_param(&mut cgi_request, "HTTP_TRACEPARENT", traceparent);
+                }
+                let selected: String = prepare_front_end
+                    .dispatcher
+                    .backend_for_routes(&prepare_routes, &cgi_request)
+                    .to_string();
+                prepare_front_end
+                    .dispatcher
+                    .inject_rpc_params(&selected, &mut cgi_request);
+                Ok((selected, cgi_request))
+            })
+            .await;
+
+        let delivery = match prepared {
+            Ok(Ok((selected, cgi_request))) => front_end
+                .dispatcher
+                .dispatch_to_relayed_async(
+                    &selected,
+                    &cgi_request,
+                    stream_threshold,
+                    volucer_fcgi::Relay::for_threshold(stream_threshold),
+                )
+                .await
+                .map_err(BackendFailure::Backend),
+            Ok(Err(failure)) => Err(failure),
+            Err(err) => {
+                return Err(HttpError::BadGateway(format!(
+                    "the dispatch task failed: {err}"
+                )))
+            }
+        };
+
+        let response = match delivery {
+            Ok(volucer_server::Delivery::Buffered(response)) => response,
+            Ok(volucer_server::Delivery::Relayed(relayed)) => {
+                if !relayed.stderr().is_empty() {
+                    tracing::debug!(
+                        stderr = %String::from_utf8_lossy(&relayed.stderr()).trim_end(),
+                        "backend wrote to STDERR"
+                    );
+                }
+                return relayed_response(relayed, site_compression);
+            }
+            Err(BackendFailure::Request(err)) => return Err(err),
+            Err(BackendFailure::Backend(err)) => return Err(map_backend_failure(err, is_grpc)),
+        };
+
+        return finish_response(
+            response,
+            is_grpc,
+            &sendfile_front_end,
+            statics,
+            &request_headers,
+            &static_method,
+            &static_path,
+            static_host.as_deref(),
+            site_compression,
+        )
+        .await;
+    }
+
     let blocking =
         tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
             let mut cgi_request = if streaming_dispatch {
@@ -2996,19 +3101,7 @@ async fn prepare(
         // A request that never reached a backend: a 404 and a 403 mean what they always meant,
         // because there is no call whose outcome a gRPC status could describe.
         Ok(Err(BackendFailure::Request(err))) => return Err(err),
-        // A backend that was asked and failed. For a gRPC call the outcome travels in the trailers —
-        // the failure is "the call did not happen", which is a *protocol* fact rather than a
-        // component one, so the mapping is chosen by protocol before it is chosen by component.
-        Ok(Err(BackendFailure::Backend(err))) if is_grpc => return Err(grpc_failure(err)),
-        // **A client that sent too much is told so, and gets `413`.** Every other worker failure is a
-        // `502`, but this one is not the backend's fault: the client exceeded `max_body_bytes` and is
-        // the only party that can act on it. Reporting a gateway error would blame the application
-        // for a decision this server made.
-        Ok(Err(BackendFailure::Backend(volucer_server::ServerError::WorkerProtocol {
-            source: volucer_worker::WorkerError::BodyTooLarge { limit },
-            ..
-        }))) => return Err(HttpError::BodyTooLarge { limit }),
-        Ok(Err(BackendFailure::Backend(err))) => return Err(map_server_error(err)),
+        Ok(Err(BackendFailure::Backend(err))) => return Err(map_backend_failure(err, is_grpc)),
         Err(err) => {
             return Err(HttpError::BadGateway(format!(
                 "the dispatch task failed: {err}"
@@ -3033,6 +3126,38 @@ async fn prepare(
         }
     };
 
+    finish_response(
+        response,
+        is_grpc,
+        &sendfile_front_end,
+        statics,
+        &request_headers,
+        &static_method,
+        &static_path,
+        static_host.as_deref(),
+        site_compression,
+    )
+    .await
+}
+
+/// The tail both dispatch paths share: diagnostics, gRPC, `X-Sendfile`, then the response.
+///
+/// A function rather than a block so the async and the streaming paths cannot drift: every rule
+/// below — which failures are a `413` rather than a `502`, that a gRPC outcome travels in trailers,
+/// that a named file is resolved and the produced body discarded — is one that used to be written
+/// once and would now be written twice.
+#[allow(clippy::too_many_arguments)]
+async fn finish_response(
+    response: volucer_fcgi::Response,
+    is_grpc: bool,
+    sendfile_front_end: &FrontEnd,
+    statics: &static_files::StaticFiles,
+    request_headers: &hyper::HeaderMap,
+    static_method: &hyper::Method,
+    static_path: &str,
+    static_host: Option<&str>,
+    site_compression: &volucer_core::config::CompressionSetting,
+) -> Result<Response<ResponseBody>> {
     if !response.stderr.is_empty() {
         // Where a developer looks first when PHP complains, exactly as in the
         // FastCGI front-end.
@@ -3063,10 +3188,10 @@ async fn prepare(
                 let files = statics.clone();
                 return static_files::sendfile(
                     static_files::Request {
-                        method: &static_method,
-                        path: &static_path,
-                        headers: &request_headers,
-                        host: static_host.as_deref(),
+                        method: static_method,
+                        path: static_path,
+                        headers: request_headers,
+                        host: static_host,
                     },
                     &files,
                     resolved,
@@ -3104,7 +3229,7 @@ async fn prepare(
         }
     }
 
-    from_cgi(response, site_compression, &request_headers)
+    from_cgi(response, site_compression, request_headers)
 }
 
 /// Turn a relayed backend response into an HTTP response whose body arrives as it is produced.
@@ -4063,6 +4188,30 @@ fn with_error_page(
 /// A deployment with no backends at all is the exception, and it is checked first: it has no
 /// capacity *to be* exhausted, and answering 503 would tell a load balancer to take a healthy
 /// node out of rotation. It maps to a 500 through [`HttpError::NoBackend`].
+/// Map a backend failure to the status the client is owed.
+///
+/// Protocol first, then component, and the order is the point: for a gRPC call the failure is a
+/// status in the trailers rather than a `502`, so the protocol decides before the component does.
+///
+/// **A client that sent too much gets `413`, not `502`.** Every other worker failure is a gateway
+/// error, but this one is not the backend's fault: the client exceeded `max_body_bytes` and is the
+/// only party who can act on it. Reporting it as a gateway error would blame the application for a
+/// decision this server made — which is why this is one function rather than the rule written at
+/// each of the two dispatch paths.
+fn map_backend_failure(err: ServerError, is_grpc: bool) -> HttpError {
+    if let ServerError::WorkerProtocol {
+        source: volucer_worker::WorkerError::BodyTooLarge { limit },
+        ..
+    } = &err
+    {
+        return HttpError::BodyTooLarge { limit: *limit };
+    }
+    if is_grpc {
+        return grpc_failure(err);
+    }
+    map_server_error(err)
+}
+
 fn map_server_error(err: ServerError) -> HttpError {
     if matches!(err, ServerError::NoBackend) {
         HttpError::NoBackend(err.to_string())

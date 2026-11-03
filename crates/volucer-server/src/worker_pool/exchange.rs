@@ -111,6 +111,43 @@ pub(super) enum Exchange {
         events: std::sync::mpsc::Sender<StreamEvent>,
         on_end: Box<dyn FnOnce(StreamDone) + Send>,
     },
+    /// Send one request and answer on a `tokio` channel, so the caller can `await` it.
+    ///
+    /// The counterpart of [`Exchange::Request`] for the HTTP front-end, and it exists because the
+    /// *wait* is the cost. A request reaches a worker on this thread and nowhere else — that is the
+    /// invariant the whole file is built on — but the thread that *posts* it does not have to be
+    /// parked while the worker thinks. Blocking it is what made a `c=100` run carry 150 threads and
+    /// spend 31 µs of every request on thread hand-offs (measured; see the branch this came from).
+    ///
+    /// # Why a second variant rather than a second answer type
+    ///
+    /// The answer travels as `Result<Option<Completed>, …>` on `answers` for every other exchange, and
+    /// a `tokio` sender cannot be substituted for that without making the thread's own loop async. So
+    /// this carries its own sender and the thread's arm sends on it directly. Everything else — the
+    /// stage tracking, the timeout, the worker's fate on a fatal error — stays exactly where it was.
+    RequestAsync {
+        head: Vec<u8>,
+        body: Vec<u8>,
+        /// Told once, whatever the outcome, because the caller is awaiting it with a deadline.
+        answer:
+            tokio::sync::oneshot::Sender<Result<Option<Completed>, (RequestStage, WorkerError)>>,
+    },
+    /// Send one request, hand the caller its opening asynchronously, and relay the body into a
+    /// `tokio` channel.
+    ///
+    /// The counterpart of [`Exchange::Streamed`] for the HTTP front-end, and the two arrive
+    /// together because a response this server promised to relay cannot fall back to buffering just
+    /// because the *caller* is async. `on_end` still runs on this thread — it releases the slot, and
+    /// it is the only point at which the body channel is closed *and* the slot may be reused.
+    RequestStreamedAsync {
+        head: Vec<u8>,
+        body: Vec<u8>,
+        relay: volucer_fcgi::Relay,
+        /// The opening, told once. `Head` means the caller already has a response head and the body
+        /// is arriving on `crate::relay`'s channel; the other two are complete answers.
+        opening: tokio::sync::oneshot::Sender<StreamEvent>,
+        on_end: Box<dyn FnOnce(StreamDone) + Send>,
+    },
 }
 
 /// What a streamed exchange tells its caller, in order.
@@ -193,6 +230,64 @@ impl Exchange {
                 let result = channel.request_encoded(head, &body, &mut *on_stage);
                 result.map(|response| Some(Completed::Response(response)))
             }
+            Exchange::RequestAsync { head, body, answer } => {
+                // The whole exchange, run here and nowhere else: this thread still owns the pipes,
+                // and the only thing that changed is that the *caller* is not parked while it runs.
+                // Always `Ok(None)`: the outcome travels on `answer`, because `run`'s return value
+                // is queued on the shared `answers` channel that no caller of this variant reads.
+                //
+                // The stage is tracked here rather than by `start`'s closure, because this arm is the
+                // one that has to hand it *beside* the error: the caller decides whether a replay is
+                // sound from it.
+                let mut stage = RequestStage::Sending;
+                let outcome = {
+                    let mut track = |reported: RequestStage| {
+                        stage = reported;
+                        on_stage(reported);
+                    };
+                    channel
+                        .request_encoded(head, &body, &mut track)
+                        .map(|response| Some(Completed::Response(response)))
+                        .map_err(|source| (stage, source))
+                };
+                // A receiver that has gone means the caller gave up (a deadline, or a dropped
+                // connection). The response is simply dropped, exactly as a timed-out
+                // `round_trip` drops it.
+                let _ = answer.send(outcome);
+                Ok(None)
+            }
+            Exchange::RequestStreamedAsync {
+                head,
+                body,
+                relay,
+                opening,
+                on_end,
+            } => {
+                // The same rule as `Exchange::Streamed`: always `Ok(None)`, because every outcome
+                // leaves through `opening` and `on_end`, and `run`'s return value would sit on the
+                // shared `answers` channel until the next request read it as its own.
+                //
+                // `opening` is consumed by the first emission, so the remaining events after a
+                // `Head` have nowhere to go — which is correct: after the head the caller reads the
+                // body on `crate::relay`'s channel, and the pump reports the ending through
+                // `on_end`.
+                let opening = std::cell::RefCell::new(Some(opening));
+                pump_streamed(
+                    channel,
+                    head,
+                    &body,
+                    relay,
+                    &mut |event| match opening.borrow_mut().take() {
+                        Some(sender) => sender.send(event).is_ok(),
+                        // A second event means there was more than one opening, which the pump
+                        // cannot produce; treat it as "nobody is listening".
+                        None => false,
+                    },
+                    on_end,
+                    &mut *on_stage,
+                );
+                Ok(None)
+            }
             Exchange::RequestStreaming {
                 head,
                 mut chunks,
@@ -253,7 +348,15 @@ impl Exchange {
                 // `round_trip` consumed it and failed for a reason that had nothing to do with it.
                 // Every outcome therefore leaves through `events` (for the opening) and `on_end`
                 // (for the ending), which are this exchange's own channels and nobody else's.
-                pump_streamed(channel, head, &body, relay, &events, on_end, &mut *on_stage);
+                pump_streamed(
+                    channel,
+                    head,
+                    &body,
+                    relay,
+                    &mut |event| events.send(event).is_ok(),
+                    on_end,
+                    &mut *on_stage,
+                );
                 Ok(None)
             }
         }
@@ -296,7 +399,7 @@ fn pump_streamed(
     head: Vec<u8>,
     body: &[u8],
     relay: volucer_fcgi::Relay,
-    events: &std::sync::mpsc::Sender<StreamEvent>,
+    emit: &mut dyn FnMut(StreamEvent) -> bool,
     on_end: Box<dyn FnOnce(StreamDone) + Send>,
     on_stage: &mut dyn FnMut(RequestStage),
 ) {
@@ -344,7 +447,7 @@ fn pump_streamed(
                         }
                         response.logs = channel.logs().to_vec();
                         response.metrics = channel.metrics().to_vec();
-                        let _ = events.send(StreamEvent::Buffered(response));
+                        let _ = emit(StreamEvent::Buffered(response));
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -356,7 +459,9 @@ fn pump_streamed(
                     body: receiver,
                     verdict: verdict.clone(),
                 };
-                if events.send(StreamEvent::Head(answered)).is_err() {
+                // Emitted through a closure that cannot fail in the async case, so the answer to
+                // "will anybody read this body?" is passed in rather than inferred from a send.
+                if !emit(StreamEvent::Head(answered)) {
                     // Nobody will read this body, so pumping it is pointless — but the pipe still
                     // has to reach `END`, or the worker blocks writing into a full one and the slot
                     // is lost.
@@ -370,14 +475,14 @@ fn pump_streamed(
         // and the caller answers with it exactly as `request` would have.
         Ok(volucer_worker::Delivery::Buffered(response)) => {
             drop(sender);
-            let _ = events.send(StreamEvent::Buffered(response));
+            let _ = emit(StreamEvent::Buffered(response));
             Ok(())
         }
         Err(err) => {
             drop(sender);
             // Nothing was opened, so the caller is still waiting: told on `events` rather than
             // through `on_end`, which is only installed once a response exists.
-            let _ = events.send(StreamEvent::Failed(StreamFailure::from_error(&err)));
+            let _ = emit(StreamEvent::Failed(StreamFailure::from_error(&err)));
             Err(err)
         }
     };
@@ -455,7 +560,7 @@ fn drain_stream(channel: &mut Channel) -> std::result::Result<(), WorkerError> {
 /// asked to run first. So the *thread* is not generic and this is: the answer travels as a value, and
 /// the two callers destructure the variant they asked for. A caller that finds the other one has a bug
 /// in this file, not a protocol condition, which is why both arms report it as a closed worker.
-enum Completed {
+pub(super) enum Completed {
     Response(WorkerResponse),
     /// The consumer's answer, and the telemetry it emitted while producing it.
     ///
@@ -863,6 +968,142 @@ impl ChannelExchange {
                 ))
             }
         }
+    }
+
+    /// Post one streamed request, handing back the opening as a future to await.
+    ///
+    /// The counterpart of [`Self::request_streamed`] for an async caller. The body is then forwarded
+    /// by the exchange thread into `crate::relay`'s channel, and the ending arrives through `on_end`
+    /// on that same thread — neither of which the caller waits for, which is the whole point: a client
+    /// that stops reading must not pin a runtime thread.
+    ///
+    /// # Why it takes `&self` and returns the wait rather than doing it
+    ///
+    /// The pool has to post this **under its slot lock and release the lock for the wait**, and it
+    /// must not take the exchange out of the slot to do so: `Slot::is_available` asks whether the
+    /// exchange is `Some`, so a slot whose exchange had been moved out looks like a dead worker and
+    /// the pool respawns it — which is a respawn loop, measured at 2.4k rps before this was fixed.
+    /// Cloning the sender is what makes that possible, and returning the wait is what lets the caller
+    /// drop the guard before awaiting.
+    pub fn post_streamed_async(
+        &self,
+        head: Vec<u8>,
+        body: &[u8],
+        relay: volucer_fcgi::Relay,
+        on_end: Box<dyn FnOnce(StreamDone) + Send>,
+    ) -> std::result::Result<
+        impl std::future::Future<
+                Output = std::result::Result<crate::pool::Opened, (RequestStage, WorkerError)>,
+            > + Send,
+        (RequestStage, WorkerError),
+    > {
+        let (opening_tx, opening) = tokio::sync::oneshot::channel();
+        let work = self.sender()?;
+        work.send(Exchange::RequestStreamedAsync {
+            head,
+            body: body.to_vec(),
+            relay,
+            opening: opening_tx,
+            on_end,
+        })
+        .map_err(|_| {
+            (
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            )
+        })?;
+
+        Ok(async move {
+            match opening.await {
+                // The relay policy refused it, so this is an ordinary complete response and is
+                // handed back exactly as `request_streamed`'s `Ok(Ok(response))` would be.
+                Ok(StreamEvent::Buffered(response)) => Ok(crate::pool::Opened::Buffered(
+                    crate::pool::rendered(response),
+                )),
+                Ok(StreamEvent::Head(head)) => Ok(crate::pool::Opened::Relayed(
+                    crate::pool::RelayOpening::new(head.into_relayed()),
+                )),
+                Ok(StreamEvent::Failed(failure)) => {
+                    Err((failure.stage, WorkerError::Closed(failure.message)))
+                }
+                // The channel is closed only if the exchange thread ended without answering.
+                Err(_) => Err((
+                    RequestStage::Reading,
+                    WorkerError::Closed("the exchange thread ended without answering".to_string()),
+                )),
+            }
+        })
+    }
+
+    /// Post one request, handing back a future that yields its response.
+    ///
+    /// The counterpart of [`Self::request`] for a caller that is itself async. The exchange thread is
+    /// unchanged — it is still the only thing that touches this worker's pipe — and the deadline is
+    /// enforced by the *caller*, who still owns the exchange and can therefore kill the worker, which
+    /// is what makes the blocked read on the exchange thread return.
+    ///
+    /// **The only difference is that nothing is parked while the worker thinks.** A `std` channel's
+    /// `recv_timeout` blocks the calling thread; a `oneshot` does not, so the front-end's runtime
+    /// thread is free to drive other connections.
+    pub fn post_request_async(
+        &self,
+        head: Vec<u8>,
+        body: &[u8],
+    ) -> std::result::Result<
+        impl std::future::Future<
+                Output = std::result::Result<WorkerResponse, (RequestStage, WorkerError)>,
+            > + Send,
+        (RequestStage, WorkerError),
+    > {
+        let (answer, awaited) = tokio::sync::oneshot::channel();
+        let work = self.sender()?;
+        work.send(Exchange::RequestAsync {
+            head,
+            body: body.to_vec(),
+            answer,
+        })
+        .map_err(|_| {
+            (
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            )
+        })?;
+
+        Ok(async move {
+            match awaited.await {
+                Ok(Ok(Some(Completed::Response(response)))) => Ok(response),
+                Ok(Ok(_)) => Err((
+                    RequestStage::Reading,
+                    WorkerError::Closed(
+                        "the exchange thread answered without a response".to_string(),
+                    ),
+                )),
+                Ok(Err(failure)) => Err(failure),
+                // Closed only if the thread ended without answering — `round_trip`'s `Disconnected`.
+                Err(_) => Err((
+                    RequestStage::Reading,
+                    WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+                )),
+            }
+        })
+    }
+
+    /// The work sender, or the reason this exchange cannot accept one.
+    ///
+    /// Shared by the three synchronous post sites and the two async ones, because "the thread is gone"
+    /// is one condition and the answer to it must not vary by protocol. `&self` rather than `&mut self`
+    /// is what lets an async caller post under a lock it then releases.
+    fn sender(&self) -> std::result::Result<&Sender<Exchange>, (RequestStage, WorkerError)> {
+        if self.ended {
+            return Err((
+                RequestStage::Reading,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            ));
+        }
+        self.work.as_ref().ok_or((
+            RequestStage::Sending,
+            WorkerError::Closed("the worker's exchange thread has already ended".to_string()),
+        ))
     }
 
     fn round_trip(

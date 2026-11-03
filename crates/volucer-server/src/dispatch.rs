@@ -1264,6 +1264,30 @@ impl Dispatcher {
         backend.request(request)
     }
 
+    /// [`Self::dispatch_to`], without parking the calling thread while a worker answers.
+    ///
+    /// The same lookup and the same errors; the difference is only whether this process keeps a
+    /// thread for the duration of the exchange. See [`Backend::request_async`] for which backends
+    /// can and cannot answer without a parked thread.
+    pub async fn dispatch_to_async(&self, name: &str, request: &Request) -> Result<Response> {
+        let backend = self.backend_named(name)?;
+        backend.request_async(request).await
+    }
+
+    /// [`Self::dispatch_to_relayed`], without parking the calling thread while a worker answers.
+    ///
+    /// Same lookup, same errors, same relay policy. See [`Backend::request_relayed_async`].
+    pub async fn dispatch_to_relayed_async(
+        &self,
+        name: &str,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        let backend = self.backend_named(name)?;
+        backend.request_relayed_async(request, buffer, relay).await
+    }
+
     /// Send a request to a named backend, relaying the response body when it is large.
     ///
     /// The same lookup, the same error shapes and the same route decision as [`Self::dispatch_to`]:

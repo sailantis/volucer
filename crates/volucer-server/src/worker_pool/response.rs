@@ -14,7 +14,7 @@ use volucer_worker::LogRecord;
 /// Split out from [`render`] because a streamed response needs the head **before** the body exists,
 /// and the two must produce byte-identical header blocks or the same response would look different
 /// depending on whether the client's deployment relayed it.
-pub(super) fn render_head(head: &volucer_worker::ResponseHead) -> Vec<u8> {
+pub(crate) fn render_head(head: &volucer_worker::ResponseHead) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(
         format!("Status: {} {}\r\n", head.status, reason_phrase(head.status)).as_bytes(),
@@ -36,7 +36,7 @@ pub(super) fn render_head(head: &volucer_worker::ResponseHead) -> Vec<u8> {
 /// of headers, while a front-end relays a `Status:`-prefixed block. Translating
 /// once, at the backend, is what keeps both front-ends identical for every
 /// backend kind.
-pub(super) fn render(response: WorkerResponse, duration: Duration) -> Response {
+pub(crate) fn render(response: WorkerResponse, duration: Duration) -> Response {
     let mut stdout = render_head(&response.head);
     stdout.extend_from_slice(&response.body);
 
