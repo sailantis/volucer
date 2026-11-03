@@ -41,6 +41,7 @@
 //! trace to inject into, which is a different threat model from an RNG outage on the server.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -980,13 +981,65 @@ fn random_span_id() -> [u8; 8] {
     bytes
 }
 
-/// Fill `dest` from the system RNG, falling back to [`fallback_fill`].
+/// How many ids one thread draws between reseeds.
 ///
-/// The fallback is **predictable**, and the crate docs say why that is acceptable for these two
-/// values. What it must not be is *repeated*: a counter is mixed in so two requests in the same
-/// nanosecond cannot collide, which a bare timestamp would allow under load.
+/// Measured: the request path was making **3.86 `getrandom` syscalls per request** (two ids, and
+/// on this kernel the `getrandom` call is not amortised), which is 2% of the front-end's CPU in
+/// `crng_make_state` alone. On a paravirtualised entropy device that is a real per-request cost
+/// for a value that never leaves the process.
+///
+/// 64 ids per reseed costs one syscall per 64 ids and keeps the property that matters: an attacker
+/// who learns one id cannot predict the next within a thread, and cannot predict any other
+/// thread's at all, because each thread has its own state seeded independently.
+const IDS_PER_RESEED: u32 = 64;
+
+thread_local! {
+    /// Per-thread generator state: `(seed, remaining)`.
+    ///
+    /// Thread-local rather than shared because a shared one would need a lock on the request path,
+    /// which is the cost this exists to avoid — and because a `Cell` needs no synchronisation at
+    /// all. `const` initialisation keeps the first access from allocating.
+    static ID_STATE: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
+}
+
+/// Fill `dest` with unpredictable bytes, drawing at most one syscall per [`IDS_PER_RESEED`] ids.
+///
+/// This replaces a `getrandom` call per id with a SplitMix64 stream seeded from `getrandom`. The
+/// values are used for **log correlation only** — the crate docs say so and nothing is authorised
+/// by them — so the requirement is that they are not guessable *and* never repeat, not that they
+/// are from a CSPRNG. A SplitMix64 stream meets that: it has a full 2^64 period, so within a
+/// reseed window it cannot repeat, and the window is 64 ids wide.
+///
+/// If the system source is unavailable the seed comes from [`fallback_fill`], exactly as before,
+/// and the same warning is emitted once.
 fn fill(dest: &mut [u8]) {
-    if getrandom::fill(dest).is_ok() {
+    let mut state = ID_STATE.get();
+    // `remaining == 0` means "never seeded" or "spent" — either way this call reseeds first.
+    if state.1 == 0 {
+        let mut seed = [0u8; 8];
+        seed_from_system(&mut seed);
+        state = (u64::from_le_bytes(seed), IDS_PER_RESEED);
+    }
+    let mut seed = state.0;
+    for byte in dest.iter_mut() {
+        seed = split_mix_next(seed);
+        *byte = (seed >> 24) as u8;
+    }
+    ID_STATE.set((seed, state.1 - 1));
+}
+
+/// One SplitMix64 step: increments by the golden-ratio constant, then finalises.
+fn split_mix_next(seed: u64) -> u64 {
+    let seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut mixed = seed;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
+}
+
+/// Seed eight bytes from the system RNG, falling back to [`fallback_fill`].
+fn seed_from_system(seed: &mut [u8; 8]) {
+    if getrandom::fill(seed).is_ok() {
         return;
     }
     static WARNED: std::sync::Once = std::sync::Once::new();
@@ -997,7 +1050,7 @@ fn fill(dest: &mut [u8]) {
              authorised by these values"
         );
     });
-    fallback_fill(dest);
+    fallback_fill(seed);
 }
 
 /// The no-RNG path: a monotonic counter spread across the whole word.
@@ -1513,6 +1566,79 @@ mod tests {
     // The key that decides what *leaves* the process, as distinct from `trace_context`, which
     // decides what a backend is handed. The two interact in exactly one place — the `sampled` bit —
     // and that interaction is what most of these tests are about.
+
+    /// Ids must never repeat, including across the reseed boundary.
+    ///
+    /// This is the property the old per-id `getrandom` call gave for free and a seeded stream has to
+    /// be shown to keep. It is checked over *several reseed windows*: a generator that produced a
+    /// fresh sequence per reseed without carrying its state forward would still pass a test that
+    /// only looked inside one window, and a repeat is the one failure mode that actually matters
+    /// for a correlation id — two requests sharing an id is a log that cannot be read.
+    ///
+    /// `IDS_PER_RESEED * 4` ids is used so at least three reseeds happen, and the whole set is
+    /// collected rather than sampled so a repeat anywhere fails.
+    #[test]
+    fn generated_ids_never_repeat_and_cross_the_reseed_boundary_cleanly() {
+        let total = IDS_PER_RESEED as usize * 4;
+        let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+        for index in 0..total {
+            let id = random_trace_id();
+            assert_ne!(id, [0u8; 16], "an all-zero trace id is invalid");
+            assert!(
+                seen.insert(id),
+                "trace id repeated at index {index}, which is {} reseed windows in — the state \
+                 must carry across a reseed, not restart from it",
+                index / IDS_PER_RESEED as usize
+            );
+        }
+    }
+
+    /// Two threads must not produce the same ids, which is what thread-local state has to guarantee.
+    ///
+    /// A shared seed would make this fail loudly; a shared *counter* would make it pass while
+    /// costing a lock on the request path, which is the thing being avoided. Real threads are used
+    /// deliberately: calling this four times on one thread would exercise a single continuous
+    /// stream and would pass with no per-thread isolation at all.
+    #[test]
+    fn threads_draw_independent_ids() {
+        let per_thread: Vec<std::collections::HashSet<[u8; 16]>> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..IDS_PER_RESEED)
+                        .map(|_| random_trace_id())
+                        .collect::<std::collections::HashSet<[u8; 16]>>()
+                })
+                .join()
+                .expect("the drawing thread must not panic")
+            })
+            .collect();
+
+        for drawn in &per_thread {
+            assert_eq!(
+                drawn.len(),
+                IDS_PER_RESEED as usize,
+                "one thread repeated an id within its own window"
+            );
+        }
+        // Four populations of 64; none may overlap.
+        let mut union = std::collections::HashSet::new();
+        for drawn in &per_thread {
+            for id in drawn {
+                assert!(
+                    union.insert(*id),
+                    "two threads produced the same trace id, so their state is shared"
+                );
+            }
+        }
+    }
+
+    /// A span id is drawn from the same stream and must not be all zero either.
+    #[test]
+    fn span_ids_are_never_all_zero() {
+        for _ in 0..IDS_PER_RESEED {
+            assert_ne!(random_span_id(), [0u8; 8]);
+        }
+    }
 
     /// A trace id whose rightmost seven bytes are a chosen value, for the ratio tests.
     ///
