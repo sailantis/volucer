@@ -81,7 +81,6 @@ use crate::lifecycle::LifecycleGuard;
 use crate::pool::worker_count;
 use crate::pool::Delivery;
 use crate::respawn::RespawnReport;
-use exchange::ChannelExchange;
 use handshake::{boot, Link, Ready};
 use request::{encode_head, text_param};
 use response::render;
@@ -101,6 +100,13 @@ mod exchange;
 mod handshake;
 mod request;
 mod response;
+/// The worker protocol over `AsyncRead`/`AsyncWrite`, for a slot whose transport can be awaited.
+///
+/// Separate from [`exchange`] rather than a mode of it because the difference is the *shape*: an
+/// exchange thread parks on a blocking read and answers over a channel, while this owns the
+/// connection and is driven by a runtime. Everything that decides what a frame looks like stays in
+/// `volucer-worker`; see the module's own docs.
+mod wire;
 
 /// Render a worker's response into the crate's `Response`, with the duration it took.
 ///
@@ -422,6 +428,14 @@ pub struct WorkerPool {
     /// waiting, so on a default pool this is never waited on and the fast path never touches
     /// it.
     released: Condvar,
+    /// Wakes an **awaited** request that is waiting for a slot.
+    ///
+    /// The counterpart of [`Self::released`] for a caller that must not park a runtime thread: at
+    /// `c=100` with twelve workers, a hundred requests parked on that `Condvar` consume all twelve
+    /// runtime threads and nothing is left to run the code that releases a slot. One `Notify` rather
+    /// than a channel per waiter, so one release is one wake and every waiter re-checks the free
+    /// list — the same shape as the `Condvar`.
+    slot_freed: tokio::sync::Notify,
     /// How long a request may wait for a slot before it is refused, or `None` to be
     /// refused the moment no slot is free.
     ///
@@ -670,6 +684,7 @@ impl WorkerPool {
                 waiters: 0,
             }),
             released: Condvar::new(),
+            slot_freed: tokio::sync::Notify::new(),
             max_wait: MAX_SLOT_WAIT,
             slots,
             wait_us: (0..count as usize).map(|_| AtomicU64::new(0)).collect(),
@@ -947,7 +962,26 @@ impl WorkerPool {
         };
 
         let outcome = match slot.exchange.as_mut() {
-            Some(exchange) => exchange.request_streaming(head, chunks, self.spec.request_timeout),
+            Some(SlotExchange::Threaded(exchange)) => {
+                exchange.request_streaming(head, chunks, self.spec.request_timeout)
+            }
+            // **An attached slot answers this on the blocking bridge.** A streamed *request* body
+            // arrives from the client through a closure that blocks, so this path is already one
+            // thread per upload and gains nothing from being a future. The frame ownership and the
+            // deadline are the same either way, and the front-end takes this path only when the
+            // worker advertised `stream_request_body` and the body has no declared length.
+            Some(SlotExchange::Awaited(exchange)) => {
+                let connection = Arc::clone(exchange);
+                let waiting = Arc::clone(&connection);
+                connection.block_on(async move {
+                    let mut stage = RequestStage::Sending;
+                    let mut track = |reported: RequestStage| stage = reported;
+                    match waiting.request_streaming(head, chunks, &mut track).await {
+                        Ok(response) => Ok(response),
+                        Err(source) => Err((stage, source)),
+                    }
+                })
+            }
             None => Err((
                 RequestStage::Sending,
                 WorkerError::Closed("the worker has no exchange".to_string()),
@@ -1512,8 +1546,166 @@ impl WorkerPool {
         }
     }
 
-    /// One try at an async relayed request. The counterpart of [`Self::attempt_relayed`].
+    /// One try at an async relayed request, choosing the attempt that suits the pool's transport.
+    ///
+    /// Two attempts exist and the choice is a property of the *pool*, not of the request. A spawned
+    /// worker's pipes are blocking, so its exchange runs on the worker's own thread and only the
+    /// wait is awaited. An attached worker's connection is a socket the runtime drives, so its whole
+    /// exchange — **including the slot acquisition** — is awaited inline. The acquisition is the
+    /// part that had to differ: parking a runtime thread for a slot, a hundred times at `c=100`,
+    /// consumes all twelve and leaves nothing running to release one.
     async fn attempt_relayed_async(
+        self: &Arc<Self>,
+        request: &Request,
+        relay: volucer_fcgi::Relay,
+    ) -> std::result::Result<Delivery, FailedAttempt> {
+        if self.drives_connections() {
+            return self.attempt_relayed_awaited(request, relay).await;
+        }
+        self.attempt_relayed_async_threaded(request, relay).await
+    }
+
+    /// Whether this pool's slots are attached connections the runtime drives.
+    ///
+    /// A property of the spec, so constant for the pool's life — which is why it can be asked per
+    /// request without touching a slot, let alone locking one.
+    fn drives_connections(&self) -> bool {
+        matches!(&self.spec.launch, spec::Launch::Attach(_)) && self.spec.runtime.is_some()
+    }
+
+    /// One try at an async relayed request on an attached worker's connection.
+    ///
+    /// Every wait here is a future: the lease (via [`Self::acquire_owned_async`]), the exchange, and
+    /// the body's pump task. Nothing parks a thread, which is the whole reason this path exists.
+    ///
+    /// Everything *after* the acquisition — the slot lock, the liveness check, the respawn, the
+    /// ending, the recycling decision — is deliberately the same code in the same order as
+    /// [`Self::attempt_relayed`], because none of it differs for an awaited exchange. Only the wait
+    /// moved.
+    async fn attempt_relayed_awaited(
+        self: &Arc<Self>,
+        request: &Request,
+        relay: volucer_fcgi::Relay,
+    ) -> std::result::Result<Delivery, FailedAttempt> {
+        let queued_at = Instant::now();
+        let lease = self
+            .acquire_owned_async()
+            .await
+            .map_err(|source| FailedAttempt {
+                source,
+                retryable: false,
+            })?;
+        let index = lease.index;
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        // One critical section for everything that needs the slot, and the wait is `await`ed
+        // outside it: a `MutexGuard` across an `await` would make this future `!Send`, and the
+        // front-end spawns it.
+        let (connection, head) = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if !slot.is_available() {
+                tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
+                let outcome = respawn(
+                    &self.name,
+                    &self.spec,
+                    index as u32,
+                    &self.guard,
+                    self.call_handler.as_ref(),
+                    &mut slot,
+                );
+                drop(slot);
+                self.refresh_stream_capability(None);
+                return Err(FailedAttempt {
+                    source: match outcome {
+                        Ok(()) => ServerError::NoWorker {
+                            backend: self.name.clone(),
+                        },
+                        Err(source) => source,
+                    },
+                    retryable: true,
+                });
+            }
+
+            let Some(connection) = slot.exchange.as_ref().and_then(SlotExchange::awaited) else {
+                drop(slot);
+                return Err(FailedAttempt {
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source: WorkerError::Closed(
+                            "the worker has no awaited exchange".to_string(),
+                        ),
+                    },
+                    retryable: true,
+                });
+            };
+            (Arc::clone(connection), encode_relayed_head(request))
+        };
+
+        // The ending owns the lease, so the slot comes back when the body does — the same contract
+        // the blocking path has.
+        let ending = PoolEnding {
+            pool: Arc::clone(self),
+            spec: self.spec.clone(),
+            call_handler: self.call_handler.clone(),
+            lease,
+            started,
+        };
+        let ended = Arc::new(std::sync::Mutex::new(Some(ending)));
+        let finished = Arc::clone(&ended);
+        let callback = Box::new(move |done| {
+            if let Some(ending) = finished.lock().ok().and_then(|mut held| held.take()) {
+                ending.finish(done);
+            }
+        });
+
+        match connection
+            .post_streamed_async(head, &request.body, relay, callback)
+            .await
+        {
+            Ok(crate::pool::Opened::Buffered(response)) => Ok(Delivery::Buffered(response)),
+            Ok(crate::pool::Opened::Relayed(opening)) => {
+                Ok(crate::pool::Delivery::Relayed(opening.relayed))
+            }
+            Err((stage, source)) => {
+                if source.is_fatal() {
+                    let mut slot = self.slots[index]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if slot.exchange.is_some() {
+                        replace(
+                            &self.name,
+                            &self.spec,
+                            &self.guard,
+                            self.call_handler.as_ref(),
+                            &mut slot,
+                        );
+                    }
+                    self.refresh_stream_capability(None);
+                }
+                Err(FailedAttempt {
+                    retryable: may_retry(stage, request),
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                })
+            }
+        }
+    }
+
+    /// One try at an async relayed request on a spawned worker's exchange thread.
+    async fn attempt_relayed_async_threaded(
         self: &Arc<Self>,
         request: &Request,
         relay: volucer_fcgi::Relay,
@@ -1581,24 +1773,41 @@ impl WorkerPool {
             // Posted under the lock and awaited outside it, and the exchange stays in the slot — see
             // `attempt_async` for what moving it out cost.
             match slot.exchange.as_ref() {
-                Some(exchange) => match exchange.post_streamed_async(
-                    head,
-                    &request.body,
-                    relay,
-                    Box::new(move |done| ending.finish(done)),
-                ) {
-                    Ok(waiting) => waiting,
-                    Err((stage, source)) => {
-                        drop(slot);
-                        return Err(FailedAttempt {
-                            source: ServerError::WorkerProtocol {
-                                backend: self.name.clone(),
-                                source,
-                            },
-                            retryable: may_retry(stage, request),
-                        });
+                Some(SlotExchange::Threaded(exchange)) => {
+                    match exchange.post_streamed_async(
+                        head,
+                        &request.body,
+                        relay,
+                        Box::new(move |done| ending.finish(done)),
+                    ) {
+                        Ok(waiting) => waiting,
+                        Err((stage, source)) => {
+                            drop(slot);
+                            return Err(FailedAttempt {
+                                source: ServerError::WorkerProtocol {
+                                    backend: self.name.clone(),
+                                    source,
+                                },
+                                retryable: may_retry(stage, request),
+                            });
+                        }
                     }
-                },
+                }
+                // An awaited slot never reaches here: `attempt_relayed_async` routes it to
+                // `attempt_relayed_awaited` before the lease is taken. Reported rather than
+                // panicked, because a panic would take the server down for one request.
+                Some(SlotExchange::Awaited(_)) => {
+                    drop(slot);
+                    return Err(FailedAttempt {
+                        source: ServerError::WorkerProtocol {
+                            backend: self.name.clone(),
+                            source: WorkerError::Closed(
+                                "an awaited exchange reached the threaded attempt".to_string(),
+                            ),
+                        },
+                        retryable: false,
+                    });
+                }
                 None => {
                     drop(slot);
                     return Err(FailedAttempt {
@@ -1756,19 +1965,25 @@ impl WorkerPool {
             // request and the pool would respawn it — a respawn loop, measured at 2.4k rps before it
             // was fixed.
             match slot.exchange.as_ref() {
-                Some(exchange) => match exchange.post_request_async(head, &request.body) {
-                    Ok(waiting) => waiting,
-                    Err((stage, source)) => {
-                        drop(slot);
-                        return Err(FailedAttempt {
-                            source: ServerError::WorkerProtocol {
-                                backend: self.name.clone(),
-                                source,
-                            },
-                            retryable: may_retry(stage, request),
-                        });
+                Some(SlotExchange::Threaded(exchange)) => {
+                    match exchange.post_request_async(head, &request.body) {
+                        Ok(waiting) => Ok(Box::pin(waiting)
+                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>),
+                        Err((stage, source)) => Err((stage, source)),
                     }
-                },
+                }
+                // The same exchange on an awaited connection, and the wait is a future either way.
+                // The connection is held in an `Arc`, so the future owns a clone and needs no borrow
+                // of the slot — which is what lets the caller release the lock before awaiting it.
+                Some(SlotExchange::Awaited(exchange)) => {
+                    let connection = Arc::clone(exchange);
+                    Ok(Box::pin(
+                        async move { connection.post_request_async(head, &request.body).await },
+                    )
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = _> + Send>,
+                        >)
+                }
                 // A slot is only chosen while it has an exchange, so this cannot happen; reported
                 // rather than panicked, because a panic here would take the server down for one
                 // request.
@@ -1785,11 +2000,22 @@ impl WorkerPool {
             }
         };
 
-        let outcome = match tokio::time::timeout(timeout, waiting).await {
-            Ok(outcome) => outcome,
-            // The exchange thread is still blocked in a read on this worker, so the caller kills it
-            // — the same contract `round_trip`'s timeout has, and `is_fatal` is what tells it to.
-            Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+        let outcome = match waiting {
+            Ok(waiting) => match tokio::time::timeout(timeout, waiting).await {
+                Ok(outcome) => outcome,
+                // The exchange is still blocked in a read on this worker, so the caller kills it —
+                // the same contract `round_trip`'s timeout has, and `is_fatal` is what tells it to.
+                Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+            },
+            Err((stage, source)) => {
+                return Err(FailedAttempt {
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                    retryable: may_retry(stage, request),
+                });
+            }
         };
 
         // Its fate is decided exactly as `invoke` decides it.
@@ -1797,7 +2023,7 @@ impl WorkerPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let response = match outcome {
+        let response: WorkerResponse = match outcome {
             Ok(response) => response,
             Err((stage, source)) => {
                 if source.is_fatal() {
@@ -1909,13 +2135,67 @@ impl WorkerPool {
         };
 
         let outcome = match slot.exchange.as_mut() {
-            Some(exchange) => exchange.request_streamed(
+            Some(SlotExchange::Threaded(exchange)) => exchange.request_streamed(
                 head,
                 &request.body,
                 self.spec.request_timeout,
                 relay,
                 Box::new(move |done| ending.finish(done)),
             ),
+            // **An attached slot, reached from a synchronous caller.** The FastCGI front-end and the
+            // control plane arrive here, and they have no runtime to lend the connection, so the
+            // wait is bridged onto the pool's own — which is safe because these callers are not the
+            // HTTP front-end and cannot park twelve runtime threads between them.
+            //
+            // The slot lock is released first: `on_end` takes it, and on a buffered answer it runs
+            // inside `post_streamed_async` on this thread, so holding the guard is a self-deadlock.
+            // Observed as `too many connections` at 50 rps before this was fixed.
+            Some(SlotExchange::Awaited(connection)) => {
+                let connection = Arc::clone(connection);
+                let ended = Arc::new(std::sync::Mutex::new(Some(ending)));
+                let finished = Arc::clone(&ended);
+                drop(slot);
+                let opened = connection.block_on(connection.post_streamed_async(
+                    head,
+                    &request.body,
+                    relay,
+                    Box::new(move |done| {
+                        if let Some(ending) = finished.lock().ok().and_then(|mut held| held.take())
+                        {
+                            ending.finish(done);
+                        }
+                    }),
+                ));
+                return match opened {
+                    Ok(crate::pool::Opened::Buffered(response)) => Ok(Delivery::Buffered(response)),
+                    Ok(crate::pool::Opened::Relayed(opened)) => {
+                        Ok(crate::pool::Delivery::Relayed(opened.relayed))
+                    }
+                    Err((stage, source)) => {
+                        if source.is_fatal() {
+                            if let Ok(mut slot) = self.slots[index].lock() {
+                                if slot.exchange.is_some() {
+                                    replace(
+                                        &self.name,
+                                        &self.spec,
+                                        &self.guard,
+                                        self.call_handler.as_ref(),
+                                        &mut slot,
+                                    );
+                                }
+                            }
+                            self.refresh_stream_capability(None);
+                        }
+                        Err(FailedAttempt {
+                            retryable: may_retry(stage, request),
+                            source: ServerError::WorkerProtocol {
+                                backend: self.name.clone(),
+                                source,
+                            },
+                        })
+                    }
+                };
+            }
             None => unreachable!("the exchange was checked immediately above"),
         };
 
@@ -2395,6 +2675,103 @@ impl WorkerPool {
         })
     }
 
+    /// Take a slot for an **awaited** request, without parking a runtime thread.
+    ///
+    /// The waiting counterpart of [`Self::acquire_index`], and it exists because the two waits are
+    /// not interchangeable. `acquire_index` parks the calling thread on a `Condvar` when the pool is
+    /// full, and on the HTTP front-end that thread is a runtime thread: at `c=100` with twelve
+    /// workers, a hundred requests park twelve runtime threads and **nothing is left to run the code
+    /// that releases a slot**. Measured as a hard stall — 35–50 rps with `too many connections`.
+    ///
+    /// The fairness rule is the same one, deliberately: `take_available` refuses while a waiter is
+    /// counted, so a newcomer cannot barge into the gap between a release and a woken waiter
+    /// re-acquiring. What differs is only how this request waits — a `tokio` notification rather
+    /// than a parked thread — so the count is incremented before the first check and decremented on
+    /// every exit.
+    async fn acquire_owned_async(self: &Arc<Self>) -> Result<OwnedLease> {
+        if let Some(index) = self.take_free() {
+            return Ok(OwnedLease {
+                pool: Arc::clone(self),
+                index,
+            });
+        }
+        if self.slots.is_empty() {
+            return Err(ServerError::NoWorker {
+                backend: self.name.clone(),
+            });
+        }
+        let Some(limit) = self.max_wait else {
+            return Err(ServerError::AllBusy {
+                backend: self.name.clone(),
+            });
+        };
+
+        let deadline = tokio::time::Instant::now() + limit;
+        {
+            let mut free = self
+                .free
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            free.waiters += 1;
+            if let Some(index) = free.take_woken() {
+                free.waiters -= 1;
+                drop(free);
+                return Ok(OwnedLease {
+                    pool: Arc::clone(self),
+                    index,
+                });
+            }
+        }
+
+        loop {
+            // **Registered before the check**, which is what makes a release between the check and
+            // the wait impossible to lose: `enable()` arms the notification, and the loop re-checks
+            // after every wake, so a permit is never dropped on the floor.
+            let notified = self.slot_freed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            {
+                let mut free = self
+                    .free
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(index) = free.take_woken() {
+                    free.waiters -= 1;
+                    drop(free);
+                    return Ok(OwnedLease {
+                        pool: Arc::clone(self),
+                        index,
+                    });
+                }
+            }
+
+            match tokio::time::timeout_at(deadline, notified).await {
+                Ok(()) => continue,
+                Err(_) => {
+                    let mut free = self
+                        .free
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // The deadline can race a release, so the slot is taken if one appeared: a 503
+                    // for a slot that was handed back is the one outcome worth avoiding here.
+                    let index = free.take_woken();
+                    free.waiters -= 1;
+                    drop(free);
+                    return match index {
+                        Some(index) => Ok(OwnedLease {
+                            pool: Arc::clone(self),
+                            index,
+                        }),
+                        None => Err(ServerError::AllBusy {
+                            backend: self.name.clone(),
+                        }),
+                    };
+                }
+            }
+        }
+    }
+
     /// The acquisition every lease form shares.
     fn acquire_index(&self) -> Result<usize> {
         if self.slots.is_empty() {
@@ -2522,6 +2899,10 @@ impl WorkerPool {
             free.ids.push(index);
         }
         self.released.notify_one();
+        // And the awaited waiters, which are not parked on that `Condvar`. Both signals for one
+        // release is deliberate: whichever kind of request is queued takes the slot, and the other
+        // kind's `notify_one` finds nobody waiting and costs a lock-free no-op.
+        self.slot_freed.notify_one();
     }
 
     /// Decide what a completed response means for the worker that produced it.
@@ -2765,7 +3146,7 @@ fn invoke(
         // The body length is stamped in here because the channel no longer sees the body before the
         // head: it takes bytes that are already framed, so the declared length and the bytes sent
         // are reconciled at the one place that holds both.
-        Some(exchange) => {
+        Some(SlotExchange::Threaded(exchange)) => {
             // The head is encoded first, while the CGI environment it borrows is still alive.
             let head = {
                 let translated = borrowed_request(request);
@@ -2773,6 +3154,23 @@ fn invoke(
                 encode_head(&draft)
             };
             exchange.request(head, &request.body, timeout)
+        }
+        // The same exchange on an awaited connection, bridged to the pool's runtime: this function
+        // is synchronous and is where the FastCGI front-end and the control plane arrive.
+        Some(SlotExchange::Awaited(exchange)) => {
+            let head = {
+                let translated = borrowed_request(request);
+                let draft = translated.draft(Some(request.body.len() as u64));
+                encode_head(&draft)
+            };
+            let connection = Arc::clone(exchange);
+            let waiting = Arc::clone(&connection);
+            connection.block_on(async move {
+                let mut track = |_stage| {};
+                waiting
+                    .request_encoded_tracked(head, &request.body, &mut track)
+                    .await
+            })
         }
         // A slot is only chosen while it has an exchange, so this cannot happen;
         // it is reported rather than panicked because a panic here would take the
@@ -2831,7 +3229,19 @@ fn invoke_job(
     };
 
     let result = match slot.exchange.as_mut() {
-        Some(exchange) => exchange.job(head, &job.payload, JOB_TIMEOUT),
+        Some(SlotExchange::Threaded(exchange)) => exchange.job(head, &job.payload, JOB_TIMEOUT),
+        // A job on an awaited connection, bridged to the pool's runtime. A consumer pool is a
+        // `[jobs.pool]` table, which is a spawned worker today, so this is for completeness — and it
+        // exists because a connection with no way to answer a job would be a slot that silently
+        // could not serve its own backend's kind.
+        Some(SlotExchange::Awaited(exchange)) => {
+            let payload = job.payload.clone();
+            let connection = Arc::clone(exchange);
+            connection.block_on(async {
+                let waiting = Arc::clone(&connection);
+                waiting.request_job(head, &payload).await
+            })
+        }
         // A slot is only chosen while it has an exchange, so this cannot happen; reported rather than
         // panicked, for the same reason `invoke` reports it.
         None => Err((
@@ -2914,7 +3324,7 @@ struct Slot {
     /// the first.
     index: u32,
     link: Link,
-    exchange: Option<ChannelExchange>,
+    exchange: Option<SlotExchange>,
     /// The handshake answer, kept so a diagnostic can say which PHP and SAPI the
     /// slot is actually running.
     hello: HelloAck,
@@ -2941,6 +3351,144 @@ struct Slot {
     peak_memory_bytes: u64,
 }
 
+/// Where a slot gets a request, which is a property of *how the worker was reached* rather than of
+/// the protocol.
+///
+/// Both variants speak the same wire format and obey the same one-request-at-a-time rule; what
+/// differs is which thread owns the connection. A spawned worker's pipes are blocking and have no
+/// portable read timeout, so a thread parks on them and can be given up on — the process is the
+/// cancellation token. An attached worker's socket is awaitable, so the front-end's runtime drives
+/// it and there is nothing to park.
+///
+/// **This is the whole of the optimisation.** Measured before it existed, an attach request cost
+/// two cross-thread wakeups and ~13 µs of CPU per request in thread bookkeeping, while an
+/// `upstream` backend — which awaits hyper's pooled client inline — cost none. The transport was
+/// never the difference; the thread was.
+#[derive(Debug)]
+enum SlotExchange {
+    /// A spawned worker's pipes, and the thread that owns them for the worker's whole life.
+    Threaded(exchange::ChannelExchange),
+    /// An attached worker's connection, driven by a runtime.
+    Awaited(Arc<wire::AsyncExchange>),
+}
+
+impl SlotExchange {
+    /// The awaited connection, when this slot has one.
+    fn awaited(&self) -> Option<&Arc<wire::AsyncExchange>> {
+        match self {
+            SlotExchange::Awaited(exchange) => Some(exchange),
+            SlotExchange::Threaded(_) => None,
+        }
+    }
+}
+
+/// The runtime that drives an attached pool's connections.
+///
+/// # Why the pool owns a runtime
+///
+/// Because it cannot borrow the front-end's. A `WorkerPool` is built by `Dispatcher::from_config`,
+/// which runs **before** any listener exists — the backends are started first so a misconfigured
+/// one is reported before a port is occupied — so at the moment a worker is booted there is no
+/// front-end runtime to adopt a socket into.
+///
+/// The consequence is a rule, not a preference: a connection's waker belongs to whichever runtime
+/// first polls it, and that runtime must outlive the connection. A socket whose runtime was shut
+/// down fails its next poll with *"a Tokio 1.x context was found, but it is being shutdown"*
+/// (measured). So this runtime is held for the pool's whole life, and it is the one a *synchronous*
+/// caller bridges to — the FastCGI front-end, the control plane, the tests.
+///
+/// The HTTP front-end does **not** bridge here: it awaits an attached slot's connection on its own
+/// runtime, because that is the runtime that first polls it. Bridging would park one front-end
+/// thread per in-flight request, and twelve of those is the whole runtime.
+///
+/// # Why there is exactly one of these
+///
+/// A pool with twelve attached slots costs one runtime with a small pool of threads, not twelve.
+/// The connections are idle most of the time and the work is I/O-bound, so the thread count is what
+/// decides whether this is cheap: a runtime sized to the slot count would rebuild, thread for
+/// thread, the population the exchange threads already were — the cost this change removes.
+pub struct AsyncRuntime {
+    runtime: tokio::runtime::Runtime,
+}
+
+impl std::fmt::Debug for AsyncRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncRuntime")
+            .field("threads", &self.runtime.metrics().num_workers())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsyncRuntime {
+    /// Start a runtime sized for `slots` attached connections.
+    ///
+    /// Two to four threads, not `slots`. The connections are readiness-driven rather than blocking,
+    /// so one thread holds many; a pool that gave each connection a thread would be the design this
+    /// replaces.
+    fn start(slots: usize) -> std::io::Result<Self> {
+        let threads = slots.clamp(2, 4);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .enable_all()
+            .thread_name("volucer-attach")
+            .build()?;
+        Ok(AsyncRuntime { runtime })
+    }
+
+    /// The handle a synchronous caller bridges through.
+    pub(crate) fn handle(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
+    }
+
+    /// Adopt a handshaken connection, so a runtime may drive it.
+    ///
+    /// The two calls that make adoption legal are in `Stream::prepare_for_async`, and the caller runs
+    /// them first: **non-blocking**, or `tokio` refuses the descriptor outright, and **timeouts
+    /// cleared**, or a pending operation against `SO_RCVTIMEO` is documented to panic.
+    ///
+    /// `from_std` needs a runtime *context* but does not register the socket: registration happens
+    /// on the first poll, with whichever runtime does it. So this does not need the pool's runtime to
+    /// be the one that ends up driving the connection — which is why the adopting context here is a
+    /// throwaway rather than `self`.
+    fn adopt(
+        reader: &volucer_fcgi::Stream,
+        writer: &volucer_fcgi::Stream,
+        fail: impl Fn(volucer_fcgi::FcgiError) -> ServerError,
+    ) -> Result<(wire::AsyncStream, wire::AsyncStream)> {
+        let current = tokio::runtime::Handle::try_current();
+        let to_async = |stream: &volucer_fcgi::Stream| -> Result<wire::AsyncStream> {
+            // A context is required, and outside a runtime one must be entered for the call. The
+            // runtime is dropped immediately: its only job is to satisfy the check, because
+            // registration belongs to the first poll.
+            let borrowed;
+            let _inside = match &current {
+                Ok(handle) => Some(handle.enter()),
+                Err(_) => {
+                    borrowed = own_context()?;
+                    Some(borrowed.enter())
+                }
+            };
+            wire::AsyncStream::from_std(stream)
+                .map_err(|source| fail(volucer_fcgi::FcgiError::Io(source)))
+        };
+        Ok((to_async(reader)?, to_async(writer)?))
+    }
+}
+
+/// A runtime context for one adoption call outside a runtime.
+///
+/// Two threads on a current-thread-free builder would be overkill; a current-thread runtime that is
+/// never driven is enough, because nothing is polled in it. Returned rather than leaked so a boot
+/// failure cannot leave one behind per attached slot.
+fn own_context() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| ServerError::Misconfigured {
+            backend: "attach".to_string(),
+            reason: format!("could not create a runtime context to adopt a connection: {source}"),
+        })
+}
 impl Slot {
     fn from_boot(ready: Ready, index: u32) -> Self {
         Slot {
@@ -2992,14 +3540,22 @@ impl Slot {
     /// acknowledgement would need a deadline for no gain. Killing is only the
     /// fallback for a worker that ignores both.
     fn stop(&mut self) {
-        if let Some(mut exchange) = self.exchange.take() {
-            // The control frame is unsolicited — no request id — and the
-            // exchange thread will not return an answer, because nothing reads
-            // it: the next thing to happen is the close below.
-            let payload = <volucer_worker::Json as volucer_worker::Codec>::encode(&Control::Drain)
-                .expect("a unit enum serializes");
-            let _ = exchange.send(MessageType::Control, UNSOLICITED, &payload, 0);
-            exchange.close();
+        if let Some(exchange) = self.exchange.take() {
+            match exchange {
+                SlotExchange::Threaded(mut exchange) => {
+                    // The control frame is unsolicited — no request id — and the exchange thread
+                    // will not return an answer, because nothing reads it: the next thing to happen
+                    // is the close below.
+                    let payload =
+                        <volucer_worker::Json as volucer_worker::Codec>::encode(&Control::Drain)
+                            .expect("a unit enum serializes");
+                    let _ = exchange.send(MessageType::Control, UNSOLICITED, &payload, 0);
+                    exchange.close();
+                }
+                // The same frame and then the same close, on the connection's own runtime because
+                // nobody else may poll it.
+                SlotExchange::Awaited(exchange) => exchange.block_on(exchange.drain_and_close()),
+            }
         }
         self.wait_or_kill(EXIT_TIMEOUT);
     }

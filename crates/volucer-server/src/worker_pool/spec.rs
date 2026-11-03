@@ -6,6 +6,7 @@
 use crate::error::{Result, ServerError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use volucer_core::config::{
     AttachConfig, ChecksumMode, JobsPoolConfig, WorkerConfig, WorkerTransport,
@@ -75,6 +76,18 @@ pub(super) struct Spec {
     /// change it — the deadlines a running pool enforces are the ones it started with, which is what
     /// `restart_only` says out loud.
     pub(super) request_timeout: Duration,
+    /// The runtime that drives an attached worker's connection, or `None` for a spawned one.
+    ///
+    /// On the spec rather than passed to each `boot` because a *replacement* worker is booted from
+    /// the same spec at twenty call sites, and a runtime that had to be handed in at each of them is
+    /// a runtime that would eventually be forgotten at one — with the symptom being a replaced
+    /// worker that silently reverted to the blocking exchange thread. The spec is already cloned into
+    /// every replacement for the same reason.
+    ///
+    /// `None` for a spawned pool: its pipes are blocking and there is nothing to await. Kept as an
+    /// `Option` on the one spec type rather than a second spec type, because everything else about
+    /// reaching a worker is identical and two specs would be two sets of rules that must agree.
+    pub(super) runtime: Option<Arc<crate::worker_pool::AsyncRuntime>>,
 }
 
 impl Spec {
@@ -121,6 +134,8 @@ impl Spec {
             },
             checksum: checksum_of(config.checksum),
             request_timeout: request_timeout_of(config.request_timeout_ms, name)?,
+            // A spawned worker's pipes are blocking; there is nothing to await.
+            runtime: None,
         })
     }
 
@@ -185,6 +200,17 @@ impl Spec {
             // replacement is a reconnect, and the supervisor on the far side has its own timeouts.
             // Configurable on the backend it belongs to (`[backends.<n>]`), not on `attach`.
             request_timeout: crate::worker_pool::REQUEST_TIMEOUT,
+            // **Started here, on the spec, so every replacement inherits it.** An attached
+            // worker's transport is a socket, which the front-end's runtime drives instead of a
+            // thread. The count is the pool's concurrency, which is what the runtime is sized from.
+            runtime: Some(Arc::new(
+                crate::worker_pool::AsyncRuntime::start(config.workers as usize).map_err(
+                    |source| ServerError::Misconfigured {
+                        backend: name.to_string(),
+                        reason: format!("could not start the attach runtime: {source}"),
+                    },
+                )?,
+            )),
         })
     }
 

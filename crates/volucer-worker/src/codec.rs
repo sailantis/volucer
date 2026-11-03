@@ -48,7 +48,12 @@ const BUFFER_CAPACITY: usize = 8 * 1024;
 /// it before sending a byte, which turns a bad length into memory pressure rather than an
 /// error. Past the cap the body still grows to whatever actually arrives — this only decides
 /// whether the growth is paid up front.
-const BODY_RESERVE_LIMIT: usize = 1024 * 1024;
+///
+/// Public because a second reader of the same frames exists (one over `AsyncRead`, in
+/// `volucer-server`), and a cap that differed between them would make one path commit memory
+/// the other refuses to — a difference in policy that would look like a difference in the
+/// transport. Nothing on the wire depends on the value.
+pub const BODY_RESERVE_LIMIT: usize = 1024 * 1024;
 
 /// The writer half of a [`BoundedChannel`]: a buffered pipe that flushes per frame.
 pub type BufferedWriter = BufWriter<Box<dyn Write + Send>>;
@@ -574,12 +579,11 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         // did not understand the field decodes as `false`, and one from a worker that refused is
         // `false` too. Either way this end keeps verifying, which is the safe direction — a
         // worker cannot be sent unchecked frames it never agreed to.
-        if self.offer_no_checksum && ack.no_checksum {
-            self.checksum = Checksum::Optional;
-        } else if self.offer_no_checksum {
+        let adopted = Checksum::from_handshake(self.offer_no_checksum, ack.no_checksum);
+        if self.offer_no_checksum && !ack.no_checksum {
             tracing::debug!("worker did not accept skipping the checksum; keeping it on");
-            self.checksum = Checksum::Required;
         }
+        self.checksum = adopted;
 
         tracing::debug!(
             frame = header.message_type as u8,
