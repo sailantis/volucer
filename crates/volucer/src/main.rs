@@ -21,6 +21,33 @@ use volucer_server::{
     WorkerPool,
 };
 
+/// The allocator every thread in this process gets.
+///
+/// glibc's was **16% of this server's front-end CPU** on the `attach` arm — `malloc`,
+/// `_int_malloc`, `_int_free`, `cfree` and `malloc_consolidate` between them — because a
+/// request there allocates a complete CGI environment and a copy of its body. Replacing it
+/// is worth **+7.8% rps and 11 µs/request** (measured, rotated over three rounds; the
+/// figures are in the workspace manifest).
+///
+/// Two things worth knowing about the measurement, because the first attempt at it was
+/// wrong in a way that looked like a result:
+///
+/// - **The baseline has to be the same commit.** An early build compared a jemalloc binary
+///   against one taken before the async worker hand-off, and concluded jemalloc was 12%
+///   *slower*. It was measuring the hand-off, not the allocator.
+/// - **`MALLOC_ARENA_MAX=2` is not the lever.** It measures 36k rps against 57k, which is
+///   the arena contention this allocator removes rather than a tuning knob to reach for.
+///
+/// `#[global_allocator]` is per binary and this crate owns the only `main`, so this is the
+/// one place it can go. The workspace's test binaries each declare a counting allocator of
+/// their own and are unaffected.
+///
+/// Unix only, matching the dependency: Windows would need a C toolchain to build jemalloc
+/// and the gain was measured on Linux, so that build keeps the system allocator.
+#[cfg(unix)]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "volucer",
