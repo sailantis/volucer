@@ -3446,48 +3446,26 @@ impl AsyncRuntime {
     /// them first: **non-blocking**, or `tokio` refuses the descriptor outright, and **timeouts
     /// cleared**, or a pending operation against `SO_RCVTIMEO` is documented to panic.
     ///
-    /// `from_std` needs a runtime *context* but does not register the socket: registration happens
-    /// on the first poll, with whichever runtime does it. So this does not need the pool's runtime to
-    /// be the one that ends up driving the connection — which is why the adopting context here is a
-    /// throwaway rather than `self`.
+    /// **The runtime entered here is the one that owns the socket's waker, for its whole life.**
+    /// `from_std` resolves its driver from the *current* handle at the moment it is called; it does
+    /// not defer registration to the first poll. Adopting under a runtime that is then dropped
+    /// registers the socket against a dead driver, and every later poll on it fails with *"a Tokio
+    /// 1.x context was found, but it is being shutdown"* even though the adoption itself succeeded.
+    /// That is not a theory: it was 12 worker replacements per server start at 12 workers and 105 at
+    /// 96, one per slot, because a failed replacement leaves the slot with no exchange.
     fn adopt(
+        &self,
         reader: &volucer_fcgi::Stream,
         writer: &volucer_fcgi::Stream,
         fail: impl Fn(volucer_fcgi::FcgiError) -> ServerError,
     ) -> Result<(wire::AsyncStream, wire::AsyncStream)> {
-        let current = tokio::runtime::Handle::try_current();
+        let _inside = self.runtime.handle().enter();
         let to_async = |stream: &volucer_fcgi::Stream| -> Result<wire::AsyncStream> {
-            // A context is required, and outside a runtime one must be entered for the call. The
-            // runtime is dropped immediately: its only job is to satisfy the check, because
-            // registration belongs to the first poll.
-            let borrowed;
-            let _inside = match &current {
-                Ok(handle) => Some(handle.enter()),
-                Err(_) => {
-                    borrowed = own_context()?;
-                    Some(borrowed.enter())
-                }
-            };
             wire::AsyncStream::from_std(stream)
                 .map_err(|source| fail(volucer_fcgi::FcgiError::Io(source)))
         };
         Ok((to_async(reader)?, to_async(writer)?))
     }
-}
-
-/// A runtime context for one adoption call outside a runtime.
-///
-/// Two threads on a current-thread-free builder would be overkill; a current-thread runtime that is
-/// never driven is enough, because nothing is polled in it. Returned rather than leaked so a boot
-/// failure cannot leave one behind per attached slot.
-fn own_context() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| ServerError::Misconfigured {
-            backend: "attach".to_string(),
-            reason: format!("could not create a runtime context to adopt a connection: {source}"),
-        })
 }
 impl Slot {
     fn from_boot(ready: Ready, index: u32) -> Self {
@@ -3815,5 +3793,118 @@ mod tests {
         assert_eq!(wait_bucket(1_000_000), WAIT_BUCKETS - 1);
         assert_eq!(wait_bucket(u64::MAX), WAIT_BUCKETS - 1);
         assert!(bucket_upper_edge(WAIT_BUCKETS - 1) > 1_000_000);
+    }
+
+    /// A connection adopted by the pool is driven by the pool's runtime, not by a throwaway.
+    ///
+    /// **This is the regression test for a bug that was invisible for four phases.** `from_std`
+    /// resolves a socket's driver from the *current* runtime handle at the moment it is called, so
+    /// adopting under a transient runtime registers the socket against a driver that is dropped
+    /// moments later. Every subsequent poll then fails with *"a Tokio 1.x context was found, but it
+    /// is being shutdown"* — which the pool reports as a failed worker and answers as a 502. One
+    /// per slot, in the same millisecond, on the first request after startup: 12 replacements at 12
+    /// workers, 105 at 96.
+    ///
+    /// The test proves both directions rather than only the fixed one, because a test that can
+    /// only pass is not evidence. Adopting under the pool's runtime leaves a live driver that
+    /// simply waits; adopting under a throwaway — which is what the bug did — leaves a driver that
+    /// reports the shutdown. The second arm is why this file records the failure mode and not just
+    /// the fix.
+    ///
+    /// The shape matters. It adopts from a thread with **no** runtime context, which is the
+    /// production case (a pool is built on the main thread). A version written as `#[tokio::test]`
+    /// would adopt under the test's own runtime, which outlives the connection, and would pass
+    /// against the broken code too.
+    #[cfg(unix)]
+    #[test]
+    fn a_connection_adopted_outside_a_runtime_is_driven_by_the_pools_own() {
+        /// Adopt one end of a socket pair from **outside** a runtime, as a pool built on the main
+        /// thread does. The caller supplies the context, because entering it is the whole question.
+        fn adopt_pair() -> (volucer_fcgi::Stream, volucer_fcgi::Stream) {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+            // The peer is leaked deliberately: it must stay open and silent for the length of the
+            // test, and a `tokio` socket dropped on one side would close it and turn the wait into
+            // a readable EOF instead of the timeout this is looking for.
+            std::mem::forget(theirs);
+            let reader = ours
+                .try_clone()
+                .expect("a second handle on the same socket");
+            ours.set_nonblocking(true)
+                .expect("non-blocking, as adoption requires");
+            reader
+                .set_nonblocking(true)
+                .expect("non-blocking, as adoption requires");
+            let stream = volucer_fcgi::Stream::Unix(ours);
+            let read_stream = volucer_fcgi::Stream::Unix(reader);
+            stream.prepare_for_async().expect("prepared for a runtime");
+            read_stream
+                .prepare_for_async()
+                .expect("prepared for a runtime");
+            (stream, read_stream)
+        }
+
+        /// Wait for one byte that never comes, and classify what happened.
+        fn poll_once(runtime: &tokio::runtime::Runtime, stream: &mut wire::AsyncStream) -> String {
+            let mut one = [0u8; 1];
+            let outcome = runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    tokio::io::AsyncReadExt::read(stream, &mut one),
+                )
+                .await
+            });
+            match outcome {
+                // Alive and waiting on a silent peer: exactly what a live driver does.
+                Err(_elapsed) => String::new(),
+                Ok(Ok(read)) => format!("read {read} bytes from a silent peer"),
+                Ok(Err(err)) => err.to_string(),
+            }
+        }
+
+        let pool_runtime = AsyncRuntime::start(2).expect("the pool runtime");
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must adopt from outside a runtime, or it cannot reproduce the bug"
+        );
+        let fail = |source: volucer_fcgi::FcgiError| ServerError::WorkerProtocol {
+            backend: "test".to_string(),
+            source: volucer_worker::WorkerError::Io(match source {
+                volucer_fcgi::FcgiError::Io(err) => err,
+                other => std::io::Error::other(other.to_string()),
+            }),
+        };
+
+        // --- the pool's own runtime outlives the connection, so the driver stays live ---
+        let (stream, read_stream) = adopt_pair();
+        let (mut driver, _writer) = pool_runtime
+            .adopt(&read_stream, &stream, fail)
+            .expect("adoption");
+        let complaint = poll_once(&pool_runtime.runtime, &mut driver);
+        assert!(
+            complaint.is_empty(),
+            "a connection adopted by the pool must stay driven by it, but the wait failed: \
+             {complaint}"
+        );
+
+        // --- a throwaway runtime does not, which is the bug this pins ---
+        let (stream2, read_stream2) = adopt_pair();
+        let throwaway = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a throwaway runtime");
+        let (mut driver2, _writer2) = {
+            let _inside = throwaway.handle().enter();
+            (
+                wire::AsyncStream::from_std(&read_stream2).expect("adopted"),
+                wire::AsyncStream::from_std(&stream2).expect("adopted"),
+            )
+        };
+        drop(throwaway);
+        let verdict = poll_once(&pool_runtime.runtime, &mut driver2);
+        assert!(
+            verdict.contains("being shutdown"),
+            "adopting under a runtime that is then dropped must be detectable, or this test \
+             could not have caught the bug; got: {verdict:?}"
+        );
     }
 }
