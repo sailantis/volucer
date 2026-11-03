@@ -1167,11 +1167,12 @@ impl AsyncExchange {
         writer: AsyncStream,
         handle: tokio::runtime::Handle,
         checksum: Checksum,
+        call_handler: Option<Box<volucer_worker::codec::CallHandler>>,
     ) -> Self {
+        let mut wire = WireChannel::new_with_policy(reader, writer, checksum);
+        wire.call_handler = call_handler;
         AsyncExchange {
-            wire: Arc::new(tokio::sync::Mutex::new(WireChannel::new_with_policy(
-                reader, writer, checksum,
-            ))),
+            wire: Arc::new(tokio::sync::Mutex::new(wire)),
             handle,
             ended: AtomicBool::new(false),
         }

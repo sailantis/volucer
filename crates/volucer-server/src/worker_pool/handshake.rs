@@ -392,6 +392,24 @@ fn install_call_handler(channel: &mut Channel, handler: Option<&Arc<MethodRegist
     channel.set_call_handler(Box::new(move |call| registry.serve(call)));
 }
 
+/// The same handler, as the awaited path wants it.
+///
+/// [`install_call_handler`] serves the **blocking** channel; an awaited slot's connection is a
+/// [`super::wire::WireChannel`], which is a different type, and it had no equivalent. A worker on
+/// an awaited connection therefore reached a channel with no handler installed, so every `CALL` it
+/// made — `kv`, `lock` and `jobs` all reach the server from inside a request, and a framework asks
+/// during boot — was answered `"no call handler is installed"`, and the application saw a failure
+/// that had nothing to do with what it asked for.
+///
+/// Built here rather than at each call site so the two paths cannot drift: the closure is the same
+/// one, over the same registry, with the same refusal for anything not granted.
+fn call_handler_for(
+    handler: Option<&Arc<MethodRegistry>>,
+) -> Option<Box<volucer_worker::codec::CallHandler>> {
+    let registry = Arc::clone(handler?);
+    Some(Box::new(move |call| registry.serve(call)))
+}
+
 /// Read a worker's retained `stderr` and write it where an operator will see it.
 ///
 /// # Why this is `warn` and not the `debug` the drain thread uses
@@ -643,6 +661,7 @@ fn boot_attached_async(
             adopted_writer,
             handle,
             policy,
+            call_handler_for(handler),
         ))),
         ack,
     })
@@ -737,6 +756,7 @@ fn finish_boot(
                                         checked == Checksum::Optional,
                                         ack.no_checksum,
                                     ),
+                                    call_handler_for(handler),
                                 ),
                             ))
                         }

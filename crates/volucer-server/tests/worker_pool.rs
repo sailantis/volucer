@@ -2751,6 +2751,86 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
     assert!(message.contains("emails"), "{message}");
 }
 
+/// A worker's `CALL` reaches the server when the slot is **awaited**, not only when it is threaded.
+///
+/// A worker may call back into the server at any point in its life, and `kv`, `lock` and `jobs` are
+/// all built on that. The blocking channel had a call handler installed; the awaited channel is a
+/// different type and did not, so on an awaited slot every call was answered "no call handler is
+/// installed" and the application saw a failure unrelated to what it asked for. Seven `kv`/`lock`/
+/// `jobs` tests failed on Windows alone for exactly this reason, because `socket` is the transport
+/// that makes a *spawned* worker's connection awaited and it is the Windows default.
+///
+/// This test names the transport explicitly so it covers the awaited case on every platform, and it
+/// asserts on the *value the worker read back* rather than on a status: a refused call is answered
+/// with an error the application turns into a 500, and a 500 alone would not say which layer failed.
+#[test]
+fn a_worker_call_reaches_the_server_over_an_awaited_connection() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-kv-awaited-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("kv-call.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    $kv = $worker->kv('sessions');
+    $kv->set('greeting', 'hello', 60);
+    $found = null;
+    $value = $kv->get('greeting', $found);
+
+    return Response::json(['value' => $value, 'found' => $found]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        services: vec!["kv.sessions".to_string()],
+        ..socket_config(2)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        server: volucer_core::config::ServerConfig {
+            default_backend: Some("app".to_string()),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    configured.kv.insert(
+        "sessions".to_string(),
+        KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1 << 20 }),
+    );
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+
+    let answered = json_body(
+        &dispatcher
+            .dispatch(&get("/health"))
+            .expect("the request is served"),
+    );
+
+    assert_eq!(
+        answered["found"], true,
+        "the worker's `kv` call has to reach the server: {answered}"
+    );
+    assert_eq!(
+        answered["value"], "hello",
+        "and come back with what it stored: {answered}"
+    );
+}
+
 /// The JSON body of a response, as the fixtures write it.
 fn json_body(response: &volucer_fcgi::Response) -> serde_json::Value {
     let body = body_of(response);
