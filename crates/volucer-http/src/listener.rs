@@ -2920,49 +2920,73 @@ async fn prepare(
     // the exchange thread a frame at a time by construction, so what it costs is the client's upload
     // rather than the server's throughput.
     if !streaming_dispatch {
-        // Taken before `front_end` is cloned into the closure: `Arc::clone` needs a reference, and
-        // `prepare_front_end` shadows the name below for the duration of the preparation.
-        let prepare_front_end = Arc::clone(&front_end);
-        let prepare_routing = routing.clone();
-        let prepare_routes = site.routes.clone();
-        let prepare_parts = parts.clone();
-        let prepare_body = body.clone();
-        let prepare_remote = remote_addr.clone();
-        let prepared =
-            tokio::task::spawn_blocking(move || -> std::result::Result<_, BackendFailure> {
-                let mut cgi_request = if skips_stat {
-                    to_cgi_routed(
-                        &prepare_parts,
-                        prepare_body.unwrap_or_default(),
-                        &prepare_routing,
-                        prepare_front_end.server_port,
-                        prepare_remote.as_deref(),
-                    )?
-                } else {
-                    to_cgi(
-                        &prepare_parts,
-                        prepare_body.unwrap_or_default(),
-                        &prepare_routing,
-                        prepare_front_end.server_port,
-                        prepare_remote.as_deref(),
-                    )?
-                };
-                if let Some(traceparent) = &outbound_traceparent {
-                    set_cgi_param(&mut cgi_request, "HTTP_TRACEPARENT", traceparent);
-                }
-                let selected: String = prepare_front_end
-                    .dispatcher
-                    .backend_for_routes(&prepare_routes, &cgi_request)
-                    .to_string();
-                prepare_front_end
-                    .dispatcher
-                    .inject_rpc_params(&selected, &mut cgi_request);
-                Ok((selected, cgi_request))
+        // **A request whose path cannot name a script is prepared and dispatched without leaving
+        // the runtime thread.**
+        //
+        // `routes_without_a_stat` answers the one question the hop exists for — "will routing this
+        // path touch the filesystem?" — from the path and the site's extensions alone. For a
+        // front-controller deployment, which is every PHP application that is not a directory of
+        // scripts, the answer for an application path is *no*: `/`, `/items`, `/api/orders` are
+        // `PATH_INFO` for one front controller, and the router never stats any of them. So the
+        // request is built and routed here and only the exchange is awaited, which removes the
+        // `spawn_blocking` round trip — two thread wakeups — from every such request.
+        //
+        // The hop is kept for every path that really does have to be resolved on disk: a
+        // script-shaped path, a `..` traversal, a dotfile, and any deployment with no front
+        // controller. That is the conservative direction — paying a hand-off when unsure costs
+        // what it costs today, where moving a `stat` onto a runtime thread would be a correctness
+        // problem rather than a performance one.
+        let path_cannot_name_a_script =
+            routes_without_a_stat(parts.uri.path(), &routing, &site.script_extensions);
+
+        let prepared = if path_cannot_name_a_script {
+            // Nothing in `prepare_request` blocks on this path: the router is given a path it
+            // cannot resolve, so it goes straight to the front controller (see
+            // `cgi::dispatch_fallback`, which reads no file), and the rest is encoding.
+            prepare_request(
+                &parts,
+                body,
+                &routing,
+                &routes,
+                front_end.server_port,
+                remote_addr.as_deref(),
+                outbound_traceparent.as_deref(),
+                &front_end,
+                skips_stat,
+            )
+        } else {
+            // Taken before `front_end` is cloned into the closure: `Arc::clone` needs a reference,
+            // and the closure shadows the name for the duration of the preparation.
+            let prepare_front_end = Arc::clone(&front_end);
+            let prepare_routing = routing.clone();
+            let prepare_routes = routes.clone();
+            let prepare_parts = parts.clone();
+            let prepare_body = body.clone();
+            let prepare_remote = remote_addr.clone();
+            let prepare_traceparent = outbound_traceparent.clone();
+            tokio::task::spawn_blocking(move || {
+                prepare_request(
+                    &prepare_parts,
+                    prepare_body,
+                    &prepare_routing,
+                    &prepare_routes,
+                    prepare_front_end.server_port,
+                    prepare_remote.as_deref(),
+                    prepare_traceparent.as_deref(),
+                    &prepare_front_end,
+                    skips_stat,
+                )
             })
-            .await;
+            .await
+            .unwrap_or_else(|err| {
+                Err(BackendFailure::Request(HttpError::BadGateway(format!(
+                    "the dispatch task failed: {err}"
+                ))))
+            })
+        };
 
         let delivery = match prepared {
-            Ok(Ok((selected, cgi_request))) => front_end
+            Ok((selected, cgi_request)) => front_end
                 .dispatcher
                 .dispatch_to_relayed_async(
                     &selected,
@@ -2972,12 +2996,7 @@ async fn prepare(
                 )
                 .await
                 .map_err(BackendFailure::Backend),
-            Ok(Err(failure)) => Err(failure),
-            Err(err) => {
-                return Err(HttpError::BadGateway(format!(
-                    "the dispatch task failed: {err}"
-                )))
-            }
+            Err(failure) => Err(failure),
         };
 
         let response = match delivery {
@@ -3621,6 +3640,58 @@ where
     Ok(out)
 }
 
+/// Build the CGI request and decide which backend serves it.
+///
+/// One function for both branches in [`prepare`]: the hop-less path calls it on a runtime thread and
+/// the blocking path inside `spawn_blocking`, and the two must not be able to drift. Everything in
+/// it is encoding — the router is given a path that either cannot name a script or the caller has
+/// already decided must be resolved on a blocking thread — so it is only the *caller* that knows
+/// whether blocking is acceptable.
+///
+/// The body is taken by value rather than borrowed: it is the request's own `Vec`, and both call
+/// sites have already cloned it once if they needed to keep a copy.
+#[allow(clippy::too_many_arguments)]
+fn prepare_request(
+    parts: &hyper::http::request::Parts,
+    body: Option<Vec<u8>>,
+    routing: &Routing,
+    routes: &[volucer_core::config::RouteConfig],
+    server_port: Option<u16>,
+    remote_addr: Option<&str>,
+    outbound_traceparent: Option<&str>,
+    front_end: &FrontEnd,
+    skips_stat: bool,
+) -> std::result::Result<(String, volucer_fcgi::Request), BackendFailure> {
+    let mut cgi_request = if skips_stat {
+        to_cgi_routed(
+            parts,
+            body.unwrap_or_default(),
+            routing,
+            server_port,
+            remote_addr,
+        )?
+    } else {
+        to_cgi(
+            parts,
+            body.unwrap_or_default(),
+            routing,
+            server_port,
+            remote_addr,
+        )?
+    };
+    if let Some(traceparent) = outbound_traceparent {
+        set_cgi_param(&mut cgi_request, "HTTP_TRACEPARENT", traceparent);
+    }
+    let selected = front_end
+        .dispatcher
+        .backend_for_routes(routes, &cgi_request)
+        .to_string();
+    front_end
+        .dispatcher
+        .inject_rpc_params(&selected, &mut cgi_request);
+    Ok((selected, cgi_request))
+}
+
 /// Build the CGI request a backend understands.
 ///
 /// The request is expressed as the CGI environment plus a body, which is what
@@ -3656,6 +3727,78 @@ pub fn to_cgi_routed(
     remote_addr: Option<&str>,
 ) -> Result<volucer_fcgi::Request> {
     to_cgi_with(parts, body, routing, server_port, remote_addr, true)
+}
+
+/// Whether routing this request can be answered without touching the filesystem.
+///
+/// The router calls `is_file` to decide which script a path names, and that is the only reason
+/// the front-end hands a whole request to a blocking thread. Most requests cannot name a script
+/// at all: a path whose last segment has no script extension is application input, and the front
+/// controller — not the path — decides which file runs. Asking *that* before the hand-off is what
+/// lets such a request be prepared on the runtime thread instead, and it is deliberately the same
+/// predicate the router itself applies first, in [`cgi::route`], so the two cannot disagree about
+/// which paths are "looks like a script" and which are not.
+///
+/// # Why this is safe to decide from the path alone
+///
+/// The answer depends only on the request's path and the site's configured extensions — no I/O, no
+/// clock, no mutable state — so evaluating it here and again inside the router gives the same
+/// answer. It is a *permission*, not an optimisation that changes what the router does:
+/// [`to_cgi_routed`] is still what runs, and it still routes; this only says the routing will not
+/// block.
+///
+/// A path that names no front controller is `false`, because then a script-shaped path really does
+/// have to be resolved on disk before the answer is known.
+///
+/// # The three cases it must refuse
+///
+/// - **A path that could name a script.** `cgi::route` stats it, so the hop stays. This is the
+///   conservative direction: a wrong `false` costs a thread hand-off, a wrong `true` would move a
+///   `stat` onto a runtime thread.
+/// - **A path with `..` in it.** `climbs_out` refuses it before any stat, but the refusal has to
+///   be reachable, and answering `true` here would skip the very routing that produces it.
+/// - **A path with a dotfile segment.** `cgi::route_or_dispatch` refuses it in its fallback, and
+///   that fallback is reached *through* the routing this would skip.
+///
+/// # Every segment, not just the last
+///
+/// `cgi::split_at_script` walks the path's boundaries looking for a *prefix* that names a script,
+/// which is what makes `/index.php/foo/bar` resolve `SCRIPT_NAME = /index.php` and
+/// `PATH_INFO = /foo/bar`. It therefore stats a path whose **last** segment has no extension at
+/// all — `/app/index.php/orders` ends in `orders` — whenever an earlier segment is script-shaped.
+/// Checking only the final segment would have waved that through and moved its `stat` onto a
+/// runtime thread, so every segment is tested here.
+pub(crate) fn routes_without_a_stat(
+    path: &str,
+    routing: &Routing,
+    extensions: &volucer_core::ScriptExtensions,
+) -> bool {
+    // No front controller: an unmatched path is a 404 the router only learns by statting.
+    if routing.front_controller.is_none() {
+        return false;
+    }
+
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    // Refusals happen before the stat, but they happen *inside* the routing, which is the thing
+    // being skipped — so a path that would be refused keeps its hop.
+    if cgi::climbs_out(path) {
+        return false;
+    }
+    let decoded = cgi::percent_decode_cow(path);
+    let relative = decoded.trim_start_matches('/');
+
+    // A segment is a prefix boundary for `split_at_script` and the last one is what `route` tests
+    // first, so this is the same set of candidates the router will walk.
+    let mut statable = false;
+    for segment in relative.split('/') {
+        if segment.starts_with('.') {
+            return false;
+        }
+        if extensions.matches(segment) {
+            statable = true;
+        }
+    }
+    !statable
 }
 
 /// Build the CGI request for a **streamed** body, whose length is the client's own declaration.
@@ -4372,6 +4515,179 @@ mod tests {
             forbidden_extensions: vec![".htaccess".to_string()],
             ..Routing::default()
         }
+    }
+
+    /// The predicate that decides whether a request keeps its blocking hop must agree with what
+    /// the router would actually do.
+    ///
+    /// This is the whole safety argument for the hop-less path, so it is asserted as an
+    /// equivalence rather than as a list of expected booleans: for every path below, "I claimed
+    /// routing cannot stat" must be true exactly when the router, run for real against a document
+    /// root that contains no file at all, answers without a filesystem lookup.
+    ///
+    /// A root with nothing in it is what makes that observable: with no file present, `route` can
+    /// only reach its fallback by statting and rejecting, so any path it resolves to the front
+    /// controller without a `Script` variant is a path whose answer did not depend on the disk.
+    /// The paths that *do* name a script are the ones this function must refuse, and the
+    /// assertions that follow name them explicitly.
+    #[test]
+    fn a_path_that_cannot_name_a_script_is_exactly_one_the_router_resolves_in_the_fallback() {
+        let routing = routing();
+        let extensions = volucer_core::ScriptExtensions::default();
+
+        for path in [
+            "/",
+            "/items",
+            "/api/orders",
+            "/api/orders/42",
+            "/about",
+            "/a/b/c/d",
+            // Uppercase and mixed case: the extension test is case-insensitive, so `.PHP` is a
+            // script and `PHP` without a dot is not.
+            "/Items",
+            "/reports/2026",
+        ] {
+            assert!(
+                routes_without_a_stat(path, &routing, &extensions),
+                "{path:?} names no script and the router resolves it in the front-controller \
+                 fallback, so it must not pay a filesystem hop"
+            );
+            // And the router's own answer for it is the front controller, reached without a
+            // file existing anywhere.
+            match cgi::route_or_dispatch(path, &routing) {
+                Route::Script { script_name, .. } => assert_eq!(script_name, "/index.php"),
+                other => panic!("{path:?} should fall back to the front controller, got {other:?}"),
+            }
+        }
+    }
+
+    /// Everything that has to be resolved on disk, and every path whose refusal lives inside the
+    /// routing, must keep the hop.
+    ///
+    /// These are the cases where a wrong `true` would put a `stat` on a runtime thread, or skip a
+    /// refusal that only exists because the router runs. A wrong `false` is merely the cost this
+    /// change already pays today, so the list is deliberately generous.
+    #[test]
+    fn a_path_that_might_name_a_script_or_be_refused_keeps_its_hop() {
+        let routing = routing();
+        let extensions = volucer_core::ScriptExtensions::default();
+
+        for path in [
+            // Script-shaped, by extension.
+            "/index.php",
+            "/about.php",
+            "/deep/dir/thing.PHP",
+            "/index.phtml",
+            "/thing.php3",
+            // Script-shaped after percent-decoding, which the router decodes before testing.
+            "/index%2Ephp",
+            // Traversals: refused by the router, so the routing must not be skipped.
+            "/../secret",
+            "/a/../../etc/passwd",
+            "/%2e%2e/secret",
+            // Dotfiles: refused in the front-controller fallback.
+            "/.env",
+            "/.git/config",
+            "/a/.hidden/b",
+            // A script-shaped *intermediate* segment: `split_at_script` walks prefixes, so the
+            // router stats these even though the last segment names no extension.
+            "/app/index.php/orders",
+            "/index.php/foo/bar",
+            "/a/thing.PHP/deeper/path",
+        ] {
+            assert!(
+                !routes_without_a_stat(path, &routing, &extensions),
+                "{path:?} must keep the blocking hop: either the router stats it or its \
+                 refusal only happens when the router runs"
+            );
+        }
+    }
+
+    /// The intermediate-segment case is the one a last-segment check gets wrong, and the way to
+    /// show it is that the router really does reach the filesystem for it.
+    ///
+    /// A document root is built with a real `index.php` in it, and `/index.php/orders` must resolve
+    /// to that script with `/orders` as `PATH_INFO` — which it can only do by finding the file.
+    #[test]
+    fn a_script_shaped_intermediate_segment_is_resolved_on_disk() {
+        let root =
+            std::env::temp_dir().join(format!("volucer-listener-nostat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fixture root");
+        std::fs::write(root.join("index.php"), b"<?php echo 1;").expect("script");
+
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..routing()
+        };
+        let extensions = volucer_core::ScriptExtensions::default();
+
+        assert!(
+            !routes_without_a_stat("/index.php/orders", &routing, &extensions),
+            "the router resolves this by statting the script-shaped prefix, so the hop is needed"
+        );
+        match cgi::route_or_dispatch("/index.php/orders", &routing) {
+            Route::Script {
+                script_name,
+                path_info,
+                ..
+            } => {
+                assert_eq!(script_name, "/index.php");
+                assert_eq!(path_info, "/orders");
+            }
+            other => panic!("expected the real script, got {other:?}"),
+        }
+
+        // And the same path with the file absent is still script-shaped, so it is still not a
+        // candidate for the hop-less path — the decision cannot depend on what happens to be on
+        // disk, or it would differ between the two evaluators.
+        std::fs::remove_file(root.join("index.php")).expect("remove fixture");
+        assert!(!routes_without_a_stat(
+            "/index.php/orders",
+            &routing,
+            &extensions
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no front controller a path naming no script is a 404 the router only learns by
+    /// statting, so nothing may take the hop-less path.
+    #[test]
+    fn a_deployment_serving_only_real_files_never_takes_the_hop_less_path() {
+        let routing = Routing {
+            front_controller: None,
+            ..routing()
+        };
+        let extensions = volucer_core::ScriptExtensions::default();
+        for path in ["/", "/items", "/about"] {
+            assert!(
+                !routes_without_a_stat(path, &routing, &extensions),
+                "{path:?} must be resolved on disk when there is no front controller"
+            );
+        }
+    }
+
+    /// A site's own extension list widens what counts as script-shaped, so a path the default list
+    /// would wave through has to keep its hop when the site names its extension.
+    #[test]
+    fn a_site_that_widened_its_script_list_keeps_the_hop_for_those_paths() {
+        let extensions =
+            volucer_core::ScriptExtensions::from_config(&["py".to_string()], "test").unwrap();
+        let routing = routing();
+        assert!(
+            !routes_without_a_stat("/app.py", &routing, &extensions),
+            "`/app.py` is a script for this site"
+        );
+        assert!(
+            routes_without_a_stat(
+                "/app.py",
+                &routing,
+                &volucer_core::ScriptExtensions::default()
+            ),
+            "and is application input for a site that did not widen the list -- which is what \
+             makes the hop a property of the site rather than of the path"
+        );
     }
 
     /// The outbound version must be one `hyper-util`'s client can send, whatever arrived.
