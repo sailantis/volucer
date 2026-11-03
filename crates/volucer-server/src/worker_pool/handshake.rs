@@ -505,6 +505,7 @@ fn boot_attached(
         channel,
         handler,
         None,
+        None,
     )
 }
 
@@ -658,6 +659,7 @@ fn finish_boot(
     mut channel: Channel,
     handler: Option<&Arc<MethodRegistry>>,
     stderr_log: Option<&StderrLog>,
+    adoptable: Option<Adoptable>,
 ) -> Result<Ready> {
     // The call handler goes on **before the handshake**, and the order matters. A worker may send
     // a `CALL` at any point in its life, and the first thing it does after connecting is boot the
@@ -667,7 +669,11 @@ fn finish_boot(
     // support calls at all.
     install_call_handler(&mut channel, handler);
 
-    match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
+    // Taken before the channel is consumed by the handshake: these are the *originals* the accepted
+    // connection was cloned from, and they are what gets adopted when this slot will be awaited.
+    let checked = spec.checksum;
+
+    match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, checked) {
         Ok((channel, ack)) => {
             // An attached worker's pid arrives with its handshake, and is the only handle an
             // operator has on a process this server did not fork.
@@ -688,9 +694,68 @@ fn finish_boot(
             if let Some(log) = stderr_log {
                 log.finish();
             }
+
+            // **A spawned worker over a socket can be awaited, exactly as an attached one is.**
+            // The handshake ran on a blocking `dup` pair, which is now dropped with `channel`; the
+            // connection the slot keeps is the one the worker accepted. Both calls in
+            // `prepare_for_async` are mandatory and for the reasons that function states: a
+            // `tokio` socket must be non-blocking and must carry no `SO_RCVTIMEO`.
+            //
+            // A spec with no runtime — a test, or a configuration path that never started one —
+            // keeps the threaded exchange. That fallback is not a nicety: it is what every pipe
+            // worker still uses, since a pipe has no descriptor a runtime can register.
+            let exchange = match adoptable {
+                Some(Adoptable {
+                    writer,
+                    reader,
+                    runtime,
+                }) => {
+                    // `prepare_for_async` and `adopt` only ever fail with an I/O error, so the
+                    // mapping keeps the original `io::Error` rather than flattening it to a string —
+                    // a `WouldBlock` or `EAGAIN` here means a descriptor was left blocking, and that
+                    // is worth reading as itself.
+                    let fail = |source: FcgiError| ServerError::Spawn {
+                        binary: spec
+                            .binary()
+                            .cloned()
+                            .unwrap_or_else(|| std::path::PathBuf::from("worker")),
+                        source: match source {
+                            FcgiError::Io(err) => err,
+                            other => std::io::Error::other(other.to_string()),
+                        },
+                    };
+                    match prepare_and_adopt(&writer, &reader, &runtime, fail) {
+                        Ok((adopted_reader, adopted_writer)) => {
+                            let handle = tokio::runtime::Handle::try_current()
+                                .unwrap_or_else(|_| runtime.handle());
+                            super::SlotExchange::Awaited(Arc::new(
+                                super::wire::AsyncExchange::start(
+                                    adopted_reader,
+                                    adopted_writer,
+                                    handle,
+                                    Checksum::from_handshake(
+                                        checked == Checksum::Optional,
+                                        ack.no_checksum,
+                                    ),
+                                ),
+                            ))
+                        }
+                        // Adoption failing is a boot failure: the slot would otherwise be
+                        // recorded as ready with no way to reach it, which is the cascade the
+                        // attach path had to be fixed for.
+                        Err(source) => {
+                            let _ = link.kill();
+                            let _ = link.wait();
+                            return Err(source);
+                        }
+                    }
+                }
+                None => super::SlotExchange::Threaded(ChannelExchange::start(channel)),
+            };
+
             Ok(Ready {
                 link,
-                exchange: super::SlotExchange::Threaded(ChannelExchange::start(channel)),
+                exchange,
                 ack,
             })
         }
@@ -842,7 +907,7 @@ fn boot_spawned(
         drain_stderr(name.to_string(), child.id(), stderr, log.clone());
         stderr_log = Some(log);
     }
-    let channel = match listener {
+    let (channel, adoptable) = match listener {
         // The worker connects back to the listener bound above. The timeout matters: a
         // worker that never connects must fail here rather than hold startup for ever, and
         // it is bounded by the same budget the handshake gets.
@@ -874,12 +939,42 @@ fn boot_spawned(
                     binary: binary.clone(),
                     source,
                 })?;
-            BoundedChannel::new(accepted, reader)
+            // **The handshake gets its own `dup`s, and the originals are kept back.**
+            //
+            // The same rule `boot_attached_async` follows, and it is needed here for two
+            // reasons that point the same way. A `BufReader` inside the handshake channel may
+            // read ahead, and bytes sitting in its buffer are bytes the adopted handle never
+            // sees — the protocol is half-duplex, so there should be none, but the *only* way
+            // to know is to not share the descriptor. And an adopted connection must be the
+            // one the worker actually accepted, not a stream recovered from a channel that
+            // owns it.
+            //
+            // For the pipe-less `Threaded` case the originals are what the exchange thread
+            // gets, which is the same socket the handshake just used and therefore the same
+            // behaviour as before this split existed.
+            let handshake_writer =
+                accepted
+                    .try_clone_stream()
+                    .map_err(|source| ServerError::Spawn {
+                        binary: binary.clone(),
+                        source,
+                    })?;
+            let handshake_reader =
+                reader
+                    .try_clone_stream()
+                    .map_err(|source| ServerError::Spawn {
+                        binary: binary.clone(),
+                        source,
+                    })?;
+            (
+                BoundedChannel::new(handshake_writer, handshake_reader),
+                Some((accepted, reader)),
+            )
         }
         None => {
             let stdin = child.stdin.take().expect("stdin was piped");
             let stdout = child.stdout.take().expect("stdout was piped");
-            BoundedChannel::new(stdin, stdout)
+            (BoundedChannel::new(stdin, stdout), None)
         }
     };
 
@@ -890,7 +985,51 @@ fn boot_spawned(
         channel,
         handler,
         stderr_log.as_ref(),
+        adoptable_for(spec, adoptable),
     )
+}
+
+/// The connection a spawned slot may adopt, when its spec carries a runtime.
+///
+/// Split out so `boot_spawned` reads as one decision rather than a nested match at the end of a
+/// hundred-line function, and so the "no runtime, no adoption" rule lives in one place. A pipe
+/// worker has no `adoptable` at all — a pipe has no descriptor a runtime can register.
+fn adoptable_for(spec: &Spec, accepted: Option<(Stream, Stream)>) -> Option<Adoptable> {
+    let runtime = spec.runtime.as_ref()?;
+    let (writer, reader) = accepted?;
+    Some(Adoptable {
+        writer,
+        reader,
+        runtime: Arc::clone(runtime),
+    })
+}
+
+/// A connected socket, and the runtime that will drive it.
+struct Adoptable {
+    writer: Stream,
+    reader: Stream,
+    runtime: Arc<super::AsyncRuntime>,
+}
+
+/// Make a handshaken connection fit for a runtime, and adopt it.
+///
+/// The two `prepare_for_async` calls are mandatory and neither is optional — the function's own
+/// documentation states both failures, and they are the reason this is not inlined at the two call
+/// sites that need it. `adopt` then enters the runtime that will drive the socket, because
+/// `from_std` resolves the driver here rather than at the first poll.
+fn prepare_and_adopt(
+    writer: &Stream,
+    reader: &Stream,
+    runtime: &super::AsyncRuntime,
+    fail: impl Fn(FcgiError) -> ServerError,
+) -> Result<(super::wire::AsyncStream, super::wire::AsyncStream)> {
+    writer
+        .prepare_for_async()
+        .map_err(|source| fail(FcgiError::Io(source)))?;
+    reader
+        .prepare_for_async()
+        .map_err(|source| fail(FcgiError::Io(source)))?;
+    runtime.adopt(reader, writer, fail)
 }
 
 /// Why a boot handshake did not produce a `HELLO_ACK`.
