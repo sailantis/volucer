@@ -2210,6 +2210,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "flate2",
+ "futures",
  "futures-util",
  "h3",
  "h3-quinn",
