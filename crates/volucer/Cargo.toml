@@ -74,6 +74,15 @@ http3 = ["volucer-http/http3", "volucer-core/http3"]
 # "SIGHUP reloads, SIGTERM stops" expressible at all.
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true
+# The global allocator.
+#
+# `tikv-jemallocator` builds jemalloc from source and needs a C toolchain, which this
+# crate's Windows build does not otherwise require — so it is Unix-only, and that build
+# keeps the system allocator. Declared here rather than in a library because
+# `#[global_allocator]` is per binary and this crate owns the only `main`; a library must
+# not choose an allocator for whoever embeds it. The measurement is in the workspace
+# manifest and in `main.rs`.
+tikv-jemallocator.workspace = true
 
 # Windows has no `SIGHUP`. `ctrlc` covers `CTRL_C_EVENT`, `CTRL_BREAK_EVENT` and the
 # `CTRL_CLOSE_EVENT` a console window sends on close, and its default feature set is enough:

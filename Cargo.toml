@@ -43,6 +43,13 @@ repository = "https://github.com/sailantis/volucer"
 [workspace.dependencies]
 volucer-core = { version = "0.4.0", path = "crates/volucer-core" }
 arc-swap = "1"
+# The server binary's global allocator. Measured on the `attach` arm — the one that
+# allocates a whole CGI environment per request — rotated over three rounds on a 12-core
+# host: 55,194 / 54,264 / 56,683 rps with glibc against 58,895 / 59,477 / 60,762 with
+# jemalloc. That is +7.8% rps and 11 us less front-end CPU per request, and the same
+# build linked with `LD_PRELOAD` reproduces it, so the gain is the allocator and not the
+# build. Only the binary takes it: a library must not pick an allocator for its embedder.
+tikv-jemallocator = "0.6"
 volucer-worker = { version = "0.4.0", path = "crates/volucer-worker" }
 volucer-fcgi = { version = "0.4.0", path = "crates/volucer-fcgi" }
 # Test-only. Not a `[workspace.dependencies]` entry used by any crate's `[dependencies]`: every
