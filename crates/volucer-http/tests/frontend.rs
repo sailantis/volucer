@@ -201,6 +201,40 @@ impl Server {
         )
     }
 
+    /// The same, with the worker transport named rather than defaulted.
+    ///
+    /// `socket` is what makes a spawned worker's connection *awaited*, and that is the only way to
+    /// reach the awaited slot from a test on a platform whose default is `pipe`. See
+    /// [`a_streamed_body_reaches_an_awaited_worker`].
+    fn with_worker_transport(
+        workers: u32,
+        transport: volucer_core::config::WorkerTransport,
+    ) -> Option<Server> {
+        if let Some(reason) = skip_reason() {
+            report_skip(reason);
+            return None;
+        }
+        let mut config = worker_config(workers);
+        if let Some(BackendConfig::Worker(worker)) = config.backends.get_mut("app") {
+            worker.transport = transport;
+        }
+        let routing = front_controller_routing();
+        let dispatcher = match Dispatcher::from_config(&config, routing.clone()) {
+            Ok(dispatcher) => dispatcher,
+            Err(err) => {
+                eprintln!("skipping: the worker pool could not start: {err}");
+                return None;
+            }
+        };
+
+        Server::start(
+            dispatcher,
+            routing,
+            HttpLimits::default(),
+            Default::default(),
+        )
+    }
+
     /// Start a listener around an already-built dispatcher.
     fn start(
         dispatcher: Dispatcher,
@@ -472,6 +506,51 @@ fn a_post_body_reaches_the_application_byte_for_byte() {
     assert!(
         body.contains(&format!("body: {} bytes", payload.len())),
         "the declared length and the received body disagree: {body}"
+    );
+}
+
+/// A body with no declared length, to a worker whose connection is **awaited**.
+///
+/// Two things have to be true at once for this to be a meaningful test, and neither was covered
+/// before: the worker must advertise `stream_request_body` (so the front-end opens a pump rather
+/// than buffering), and its slot must hold an `Awaited` exchange (so the pump's pull closure is
+/// called from inside a runtime rather than from an exchange thread).
+///
+/// `socket` is the transport that makes the second true for a *spawned* worker, and it is the
+/// default only on Windows — so before this test existed, the awaited streamed path was exercised
+/// on exactly one platform, and a `pipe` platform had no coverage of it at all.
+///
+/// The body is sent chunked, which is what selects the streaming path: a declared `Content-Length`
+/// takes the buffered route and would pass even if streaming were broken.
+#[test]
+fn a_streamed_body_reaches_an_awaited_worker() {
+    let Some(server) =
+        Server::with_worker_transport(2, volucer_core::config::WorkerTransport::Socket)
+    else {
+        return;
+    };
+
+    let payload = "abcdefghij-a-marker-string";
+    let request = format!(
+        "POST /echo HTTP/1.1\r\nHost: example.test\r\nContent-Type: text/plain\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+         {:x}\r\n{payload}\r\n0\r\n\r\n",
+        payload.len()
+    );
+    let response = exchange(&server.address, request.as_bytes());
+
+    // A `502` here is the whole failure mode this guards: the pump's closure called
+    // `blocking_recv` from inside a runtime, panicked, and the request was answered as a bad
+    // gateway instead of reaching PHP.
+    assert_eq!(response.status, 200, "{response:?}");
+    let body = response.text();
+    assert!(
+        body.contains(&format!("payload: {payload}")),
+        "the streamed body did not arrive intact: {body}"
+    );
+    assert!(
+        body.contains(&format!("body: {} bytes", payload.len())),
+        "the streamed body's length disagreed with what PHP read: {body}"
     );
 }
 

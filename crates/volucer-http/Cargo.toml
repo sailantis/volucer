@@ -54,6 +54,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tokio-rustls.workspace = true
 tokio-util.workspace = true
+# The pull half of request-body streaming blocks on a channel from a thread that may or may not be
+# inside a runtime, and `futures::executor::block_on` is the only wait that is legal in both. See
+# `BodyPump::into_closure` in `src/listener.rs` for what `blocking_recv` cost.
+futures.workspace = true
 tracing.workspace = true
 rustls-acme.workspace = true
 # For the generated placeholder a `[server.tls]` without a certificate gets. A real dependency
