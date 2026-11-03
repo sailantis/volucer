@@ -31,19 +31,21 @@
 //! measured facts decide how it may be used, and both were checked on this codebase's target
 //! rather than assumed:
 //!
-//! - `tokio::net::UnixStream::from_std` requires a runtime *context*, and the socket is
-//!   registered with — and its waker belongs to — **whichever runtime first polls it**.
+//! - `tokio::net::UnixStream::from_std` requires a runtime *context*, and it resolves the socket's
+//!   driver — the waker behind every later readiness event — from that context **at the moment it
+//!   is called**. It does not defer registration to some later poll.
 //! - That runtime must therefore **outlive the connection**. A socket adopted under a runtime
 //!   that is then shut down fails on the next poll from anywhere else with *"a Tokio 1.x context
-//!   was found, but it is being shutdown"*, even though every prior poll succeeded.
+//!   was found, but it is being shutdown"*, even though the adoption and every poll before it
+//!   succeeded.
 //!
-//! So a connection must be driven by the long-lived runtime of the front-end that serves it —
-//! never by a transient runtime created for one call. What this buys is that no *cross-runtime
-//! transfer* needs to happen: with a single long-lived runtime, a socket adopted under it and
-//! awaited under it is the ordinary case. Measured for completeness: a socket adopted under one
-//! runtime that is never driven completed 2000/2000 round trips when awaited by another runtime,
-//! so adoption itself does not pin the connection — but the shutdown rule above still applies to
-//! whichever runtime ends up owning the waker.
+//! So a connection must be adopted **and** driven by the long-lived runtime of the front-end that
+//! serves it — never by a transient runtime created for one call. `AsyncRuntime::adopt` therefore
+//! enters the pool's own runtime rather than a throwaway, and the code that used a throwaway "to
+//! satisfy the context check" was wrong: at 12 workers it cost one worker replacement per slot on
+//! the first request (12 in the same millisecond) and at 96 it cost 105, because a replacement that
+//! fails leaves its slot with no exchange. Measured, pre-existing, and invisible in every table
+//! here because the failures land inside the first second of load.
 //!
 //! A synchronous caller (the FastCGI front-end, a test) bridges to that same runtime through the
 //! [`Handle`] the exchange stores, which keeps the waker's runtime alive for the connection's
@@ -1080,9 +1082,9 @@ pub(super) enum AsyncStream {
 impl AsyncStream {
     /// Adopt a connected transport, which must already be non-blocking.
     ///
-    /// Requires a runtime context — `tokio` will not register a descriptor without one — which is
-    /// why the caller enters the runtime first. The socket belongs to whichever runtime first
-    /// polls it, and that runtime must outlive the connection; see the module docs.
+    /// Requires a runtime context — `tokio` will not register a descriptor without one — and that
+    /// context's runtime becomes the socket's driver, because `from_std` resolves it here rather
+    /// than at the first poll. It must therefore outlive the connection; see the module docs.
     pub(super) fn from_std(stream: &volucer_fcgi::Stream) -> std::io::Result<Self> {
         match stream {
             volucer_fcgi::Stream::Tcp(stream) => stream

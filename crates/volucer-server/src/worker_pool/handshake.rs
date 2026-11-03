@@ -618,7 +618,11 @@ fn boot_attached_async(
     reader.prepare_for_async().map_err(io_fail)?;
 
     let policy = Checksum::from_handshake(offered, ack.no_checksum);
-    let (adopted_reader, adopted_writer) = super::AsyncRuntime::adopt(&reader, &stream, fail)?;
+    // Adopted **under the pool's own runtime**, which is the one that will drive the connection.
+    // This is the whole rule the module docs state, and it has to be the pool's runtime rather
+    // than whatever happens to be current: a socket adopted under a transient runtime registers
+    // against a driver that is then dropped, and fails on its next poll.
+    let (adopted_reader, adopted_writer) = runtime.adopt(&reader, &stream, fail)?;
     // The handle a *synchronous* caller bridges through — the FastCGI front-end, the control plane,
     // the tests. The HTTP front-end does not use it: it awaits the connection on its own runtime.
     let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| runtime.handle());
