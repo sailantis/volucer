@@ -86,6 +86,28 @@ impl RelayOpening {
     }
 }
 
+/// Render a worker response the way the synchronous streamed path does.
+///
+/// The relay policy can refuse to relay a response that arrived on the async path — an error page,
+/// an `X-Sendfile` instruction, a body the worker measured — and when it does the caller must get
+/// exactly the bytes it would have got from the ordinary path. One helper, so the two cannot drift.
+pub(crate) fn rendered(response: volucer_worker::codec::WorkerResponse) -> Response {
+    crate::worker_pool::render_worker(response, std::time::Duration::ZERO)
+}
+
+/// What an async streamed exchange opened: a body still arriving, or a complete response.
+///
+/// The distinction exists because `request_streamed_async` cannot know which it will get — the
+/// relay policy is consulted *after* the head, by the worker's own thread — so the caller is told
+/// which of the two meanings its answer has rather than having to ask again.
+pub(crate) enum Opened {
+    /// The relay policy refused to relay it: an error page, an `X-Sendfile` instruction, or a body
+    /// the worker measured. Complete, and answered exactly as a buffered dispatch would be.
+    Buffered(Response),
+    /// The head is known and the body is arriving.
+    Relayed(RelayOpening),
+}
+
 /// How long to wait for a slot to start accepting connections.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 

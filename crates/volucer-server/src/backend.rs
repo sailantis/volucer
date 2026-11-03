@@ -473,8 +473,7 @@ impl Backend {
         matches!(self, Backend::Worker { .. })
     }
 
-    /// Whether this backend reads the path as a file to execute.
-    ///
+    /// Whether this backend reads the path as a file to execute.    ///
     /// The question the route table's `stat` turns on, and the reason it is not `!is_worker()`: an
     /// upstream does not interpret the path either, for a different reason — it is an HTTP peer
     /// that routes on the URL itself, so volucer stat-ing the path first would check a file the
@@ -512,6 +511,37 @@ impl Backend {
             Backend::Upstream { name, .. } => Err(ServerError::WrongProtocol {
                 backend: name.clone(),
             }),
+        }
+    }
+
+    /// [`Backend::request`], without parking the calling thread while the worker thinks.
+    ///
+    /// Only a worker pool can answer this way, and that is not an accident of implementation: the
+    /// three CGI kinds reach a process through a blocking pipe read on a thread this crate owns, so
+    /// there is nothing to await. A backend that cannot answer async is answered synchronously and
+    /// the caller still gets a correct response — it simply keeps its thread while it waits, which is
+    /// what it did before this method existed.
+    pub async fn request_async(&self, request: &Request) -> Result<Response> {
+        match self {
+            Backend::Worker { pool, .. } => pool.request_async(request).await,
+            other => other.request(request),
+        }
+    }
+
+    /// [`Backend::request_relayed`], without parking the calling thread while the worker thinks.
+    ///
+    /// A worker answers this way; everything else is answered by the synchronous relayed path, which
+    /// is correct for a CGI process (its body is relayed by a thread this crate owns either way) and
+    /// for an upstream (there is nothing to relay — it is already an HTTP response).
+    pub async fn request_relayed_async(
+        &self,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        match self {
+            Backend::Worker { pool, .. } => pool.request_relayed_async(request, relay).await,
+            other => other.request_relayed(request, buffer, relay),
         }
     }
 
