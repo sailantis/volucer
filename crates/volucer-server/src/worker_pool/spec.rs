@@ -134,8 +134,28 @@ impl Spec {
             },
             checksum: checksum_of(config.checksum),
             request_timeout: request_timeout_of(config.request_timeout_ms, name)?,
-            // A spawned worker's pipes are blocking; there is nothing to await.
-            runtime: None,
+            // **A socket-transport worker's connection is adoptable; a pipe's is not.**
+            //
+            // Not `None` for every spawned pool, which is what this said: the distinction that
+            // matters is the *connection*, not who started the process. A `pipe` worker reaches the
+            // slot through stdin/stdout, which has no descriptor a runtime can register, so it keeps
+            // the exchange thread. A `socket` worker's connection is a unix socket or a loopback TCP
+            // stream — the same two things an `attach` relay is — so the slot awaits it exactly as an
+            // attached slot does, and the exchange thread disappears.
+            //
+            // Sized from `workers` for the same reason the attached runtime is: the connections are
+            // readiness-driven, so a handful of threads holds the whole pool.
+            runtime: match config.transport {
+                WorkerTransport::Socket => Some(Arc::new(
+                    crate::worker_pool::AsyncRuntime::start(config.workers as usize).map_err(
+                        |source| ServerError::Misconfigured {
+                            backend: name.to_string(),
+                            reason: format!("could not start the worker runtime: {source}"),
+                        },
+                    )?,
+                )),
+                WorkerTransport::Pipe => None,
+            },
         })
     }
 
@@ -377,6 +397,44 @@ mod tests {
     fn an_empty_command_is_a_misconfiguration() {
         let err = Spec::from_config("test", &worker_config("")).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    /// **The transport, not the launch variant, decides whether a slot is awaited.**
+    ///
+    /// This is the regression test for a gate that used to read
+    /// `matches!(launch, Launch::Attach(_)) && runtime.is_some()`, which conflated two different
+    /// questions: *who started the process* and *who drives the connection*. A `worker` on the
+    /// socket transport is spawned by this server and its connection is still a stream a runtime can
+    /// register, so it belongs on the awaited path — and while the old gate was in place it silently
+    /// took the threaded one, which is what made that arm cost ~11 µs per request more than it needed
+    /// to.
+    ///
+    /// Asserted in both directions on purpose. A test that only checked "socket has a runtime" would
+    /// pass against a spec that gave *every* spawned pool a runtime, and a pipe worker would then be
+    /// handed a connection it cannot adopt.
+    #[test]
+    fn a_socket_worker_gets_a_runtime_and_a_pipe_worker_does_not() {
+        // A program that exists and takes no arguments, so the spec resolves.
+        let binary = std::env::current_exe().expect("the test binary path");
+        let mut socket = worker_config(&binary.display().to_string());
+        socket.transport = WorkerTransport::Socket;
+        let runtime = Spec::from_config("test", &socket)
+            .expect("a socket worker's spec resolves")
+            .runtime;
+        assert!(
+            runtime.is_some(),
+            "a socket-transport worker must carry a runtime, or its connection can never be awaited"
+        );
+
+        let mut pipe = worker_config(&binary.display().to_string());
+        pipe.transport = WorkerTransport::Pipe;
+        let runtime = Spec::from_config("test", &pipe)
+            .expect("a pipe worker's spec resolves")
+            .runtime;
+        assert!(
+            runtime.is_none(),
+            "a pipe has no descriptor a runtime can register, so it must keep the exchange thread"
+        );
     }
 
     #[test]

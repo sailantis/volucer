@@ -1565,12 +1565,19 @@ impl WorkerPool {
         self.attempt_relayed_async_threaded(request, relay).await
     }
 
-    /// Whether this pool's slots are attached connections the runtime drives.
+    /// Whether this pool's slots are connections a runtime drives, rather than threads.
     ///
     /// A property of the spec, so constant for the pool's life — which is why it can be asked per
     /// request without touching a slot, let alone locking one.
+    ///
+    /// **One question, not two.** It used to be `Launch::Attach(_) && runtime.is_some()`, which
+    /// conflated *who started the process* with *who drives the connection*. Those are genuinely
+    /// different: a `worker` on the socket transport is spawned by this server and its connection is
+    /// still adoptable, so it should be awaited too. What actually decides it is the exchange the
+    /// slot holds, and asking the spec's runtime is the cheap proxy for that (a slot's exchange can
+    /// only be `Awaited` when a runtime exists to drive it).
     fn drives_connections(&self) -> bool {
-        matches!(&self.spec.launch, spec::Launch::Attach(_)) && self.spec.runtime.is_some()
+        self.spec.runtime.is_some()
     }
 
     /// One try at an async relayed request on an attached worker's connection.
