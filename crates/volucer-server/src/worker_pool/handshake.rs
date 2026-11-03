@@ -5,6 +5,7 @@
 
 use super::exchange::{Channel, ChannelExchange};
 use super::spec::{AttachSpec, Launch, Spec};
+use super::SlotExchange;
 use crate::calls::MethodRegistry;
 use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
 use crate::lifecycle::{configure_command, spawn, LifecycleGuard};
@@ -49,7 +50,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 #[derive(Debug)]
 pub(super) struct Ready {
     pub(super) link: Link,
-    pub(super) exchange: ChannelExchange,
+    pub(super) exchange: SlotExchange,
     pub(super) ack: HelloAck,
 }
 
@@ -460,7 +461,14 @@ pub(super) fn boot(
 ) -> Result<Ready> {
     match &spec.launch {
         Launch::Spawn { .. } => boot_spawned(name, spec, index, guard, handler),
-        Launch::Attach(attach) => boot_attached(name, spec, attach, handler),
+        // An attached worker's transport is a socket, so its slot awaits the connection when the
+        // spec carries a runtime to drive it. The fallback is not a nicety: a spec built by a test
+        // or by a configuration path that had no runtime still has to boot, and it does so on the
+        // blocking exchange thread — correct, and costing what it always did.
+        Launch::Attach(attach) => match &spec.runtime {
+            Some(runtime) => boot_attached_async(name, spec, attach, handler, runtime),
+            None => boot_attached(name, spec, attach, handler),
+        },
     }
 }
 
@@ -531,6 +539,109 @@ fn connect_relay(name: &str, attach: &AttachSpec) -> Result<(RelayWriter, RelayR
     Ok((RelayWriter(stream), RelayReader(reader)))
 }
 
+/// Connect to an attached worker, handshake it, and hand its connection to a runtime.
+///
+/// The same boot as [`boot_attached`] in every way that decides *what* is done — the same
+/// `Endpoint`, the same `HELLO`/`HELLO_ACK` exchange, the same deadline, the same errors — and
+/// different only in who owns the connection afterwards. That is the whole change: a slot whose
+/// transport can be awaited does not need a thread, and the thread is what cost ~13 µs of CPU per
+/// request (measured; see [`super::wire`]'s module docs).
+///
+/// # Why the handshake stays blocking
+///
+/// It happens **once per worker**, at startup, on a path that already blocks for every other
+/// transport. A future version would mean a second handshake implementation whose only benefit is
+/// a few milliseconds at boot, and whose risk is the two disagreeing about the version check or the
+/// checksum policy. So the socket is dialled and handshaken exactly as before, and only then
+/// adopted.
+///
+/// # Why adoption needs a runtime context
+///
+/// `tokio` refuses a blocking file descriptor, and it needs a runtime context to register one. The
+/// socket is therefore switched to non-blocking and its read/write timeouts are cleared (a `tokio`
+/// socket would panic on a pending operation against a `SO_RCVTIMEO`, and the deadline is enforced
+/// by the exchange instead). The runtime is the pool's own, held for the pool's lifetime, because a
+/// socket's waker belongs to whichever runtime first polls it and that runtime must outlive the
+/// connection.
+fn boot_attached_async(
+    name: &str,
+    spec: &Spec,
+    attach: &AttachSpec,
+    handler: Option<&Arc<MethodRegistry>>,
+    runtime: &super::AsyncRuntime,
+) -> Result<Ready> {
+    let fail = |source: FcgiError| ServerError::Attach {
+        backend: name.to_string(),
+        relay: attach.relay.clone(),
+        source,
+    };
+    let io_fail = |source: std::io::Error| fail(FcgiError::Io(source));
+
+    let endpoint = Endpoint::parse(&attach.relay).map_err(fail)?;
+    let stream = endpoint.connect(Some(CONNECT_TIMEOUT)).map_err(fail)?;
+    let reader = stream.try_clone_stream().map_err(io_fail)?;
+
+    // The handshake gets its own `dup`s, so the connection that is adopted afterwards is the one
+    // dialled here rather than something recovered from a channel that owns it.
+    //
+    // Handing over the *originals* would be simpler by one call and wrong: a `BufReader` inside the
+    // handshake channel may read ahead, and bytes sitting in its buffer are bytes the adopted
+    // handle will never see. Separate `dup`s do not remove that risk — they share one socket — but
+    // the protocol does: it is rigorously half-duplex, so a worker sends nothing after `HELLO_ACK`
+    // until it is sent a request, and there is nothing for the handshake's reader to have
+    // prefetched.
+    let handshake_reader = reader.try_clone_stream().map_err(io_fail)?;
+    let handshake_writer = stream.try_clone_stream().map_err(io_fail)?;
+    let mut channel = BoundedChannel::new(handshake_writer, handshake_reader);
+    install_call_handler(&mut channel, handler);
+    let offered = spec.checksum == Checksum::Optional;
+    let ack = match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
+        Ok((_channel, ack)) => ack,
+        Err(failure) => {
+            let source = match failure {
+                HandshakeFailure::TimedOut => WorkerError::Timeout(HANDSHAKE_TIMEOUT),
+                HandshakeFailure::Refused(err) => err,
+            };
+            return Err(ServerError::WorkerProtocol {
+                backend: name.to_string(),
+                source,
+            });
+        }
+    };
+
+    // **After the handshake, never before.** The handshake runs on the *blocking* channel, so a
+    // non-blocking socket makes its first `read` return `EAGAIN` — observed as
+    // `i/o error: Resource temporarily unavailable` at startup. Switching here is also the last
+    // moment it can be done: `tokio` will not register a blocking descriptor, and a pending
+    // operation against `SO_RCVTIMEO` is documented to panic.
+    stream.prepare_for_async().map_err(io_fail)?;
+    reader.prepare_for_async().map_err(io_fail)?;
+
+    let policy = Checksum::from_handshake(offered, ack.no_checksum);
+    let (adopted_reader, adopted_writer) = super::AsyncRuntime::adopt(&reader, &stream, fail)?;
+    // The handle a *synchronous* caller bridges through — the FastCGI front-end, the control plane,
+    // the tests. The HTTP front-end does not use it: it awaits the connection on its own runtime.
+    let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| runtime.handle());
+    tracing::debug!(
+        backend = %name,
+        pid = ack.pid,
+        php = %ack.php_version,
+        sapi = %ack.sapi,
+        target = %spec.describe(),
+        "worker ready, connection awaited"
+    );
+
+    Ok(Ready {
+        link: Link::Attached { pid: ack.pid },
+        exchange: super::SlotExchange::Awaited(Arc::new(super::wire::AsyncExchange::start(
+            adopted_reader,
+            adopted_writer,
+            handle,
+            policy,
+        ))),
+        ack,
+    })
+}
 /// The half of a boot that is the same whether the worker was spawned or attached.
 ///
 /// Split out because it holds the *interesting* rules — install the call handler before the
@@ -575,7 +686,7 @@ fn finish_boot(
             }
             Ok(Ready {
                 link,
-                exchange: ChannelExchange::start(channel),
+                exchange: super::SlotExchange::Threaded(ChannelExchange::start(channel)),
                 ack,
             })
         }
@@ -1038,6 +1149,8 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
         },
         checksum: Checksum::Optional,
         request_timeout: crate::worker_pool::REQUEST_TIMEOUT,
+        // A spawned worker's pipes are blocking, so no runtime drives anything.
+        runtime: None,
     }
 }
 

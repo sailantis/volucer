@@ -92,6 +92,26 @@ pub enum Checksum {
     Optional,
 }
 
+impl Checksum {
+    /// What a handshake settled on, from the offer and the worker's answer.
+    ///
+    /// The one decision from the handshake that a second implementation of it needs, and the reason
+    /// it lives here rather than being written out twice: a second spelling could disagree, and the
+    /// disagreement would be a connection that writes frames the worker was told it could send
+    /// unchecked while refusing to read them back — a failure on the first response rather than at
+    /// boot.
+    ///
+    /// Only both together turn verification off, which is the safe direction: an `ack` from a worker
+    /// that did not understand the field decodes as `false` and keeps this end verifying.
+    pub fn from_handshake(offered: bool, acknowledged: bool) -> Self {
+        if offered && acknowledged {
+            Checksum::Optional
+        } else {
+            Checksum::Required
+        }
+    }
+}
+
 /// What a frame carries.
 ///
 /// The numbering is part of the protocol: the PHP SDK has the same table, so
@@ -287,7 +307,13 @@ impl Header {
     }
 
     /// Whether this header's checksum field is meaningful.
-    fn declares_no_checksum(&self) -> bool {
+    ///
+    /// Public because a second reader exists — one that drives the same frames over
+    /// `AsyncRead` — and "does this frame carry a real checksum?" is a property of the *wire
+    /// format*, not of the I/O type the bytes happen to travel through. A reader that decided
+    /// this for itself could disagree with this one, and the disagreement would be a frame
+    /// accepted by the front-end and refused by the pool (or the reverse).
+    pub fn declares_no_checksum(&self) -> bool {
         self.flags & flags::NO_CHECKSUM != 0
     }
 
@@ -295,7 +321,10 @@ impl Header {
     ///
     /// A peer must not be able to turn the check off by itself, so this is a protocol
     /// violation rather than a quiet acceptance. Returns the error to raise, if any.
-    fn refuse_unchecked(&self, policy: Checksum) -> Option<WorkerError> {
+    ///
+    /// Public for the same reason [`Self::declares_no_checksum`] is: it is a rule about the
+    /// protocol, and every reader of the protocol must apply the same one.
+    pub fn refuse_unchecked(&self, policy: Checksum) -> Option<WorkerError> {
         if policy == Checksum::Required && self.declares_no_checksum() {
             return Some(WorkerError::NotA {
                 expected: "a checksummed frame (this end requires one)",

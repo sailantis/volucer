@@ -42,7 +42,12 @@ bytes.workspace = true
 # cross between the listener's runtime and this crate's client.
 hyper.workspace = true
 hyper-util.workspace = true
-tokio.workspace = true
+# The whole `tokio` runtime — not just `hyper`'s dependency on it — because an `attach` slot
+# drives a unix socket directly: `net` for the socket, `time` for the request deadline,
+# `rt-multi-thread` for the `Handle` that a synchronous caller bridges through, and `sync` for the
+# mutex the connection is behind. See `worker_pool::wire` for why the alternative — a thread per
+# worker parking on a blocking read — costs ~13 µs of CPU per request.
+tokio = { workspace = true, features = ["net"] }
 # Serializes the request frame's head. The server builds that head by borrowing it out of
 # the CGI environment, so it implements `Serialize` for its own borrowed header type rather
 # than collecting owned pairs for the worker crate to serialize.
@@ -72,6 +77,10 @@ http-body-util.workspace = true
 # stderr the startup hint points at. A writer that appends to a `String` is all that is wanted; this
 # brings the subscriber to put it behind, not a test harness.
 tracing-subscriber.workspace = true
+# `#[tokio::test]` for the async transport's tests, and `tokio::io::duplex` for a pair of
+# in-memory halves. Both are test-only: the crate's own code builds its runtimes explicitly, so it
+# needs neither the macro nor a test fixture at runtime. `rt` is what the macro expands to.
+tokio = { workspace = true, features = ["net", "macros", "rt", "io-util", "time", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -253,6 +253,49 @@ impl Stream {
     }
 }
 
+impl Stream {
+    /// Make this connection fit for a `tokio` runtime to drive.
+    ///
+    /// Two calls, and neither is optional — both were forced by `tokio` refusing the alternative,
+    /// and both fail in ways that look like something else if skipped:
+    ///
+    /// - **Non-blocking.** `from_std` refuses a blocking descriptor outright: *"registering a
+    ///   blocking socket with the tokio runtime is unsupported"*.
+    /// - **Timeouts cleared.** `Endpoint::connect` sets `SO_RCVTIMEO`/`SO_SNDTIMEO` for the
+    ///   handshake, and a `tokio` socket must not carry them: a pending operation against one is
+    ///   documented to panic, and a read that hits the timeout reports `WouldBlock` where the
+    ///   reader expects "nothing to do yet".
+    ///
+    /// What replaces the timeout is the caller's own deadline, enforced by killing the worker —
+    /// the same contract every other transport in this server has.
+    ///
+    /// A named windows implementation exists only to report that it cannot be done: the worker
+    /// protocol's async transport is for an `attach` relay over a unix socket or loopback TCP, and
+    /// a named pipe is neither.
+    pub fn prepare_for_async(&self) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(stream) => {
+                stream.set_nonblocking(true)?;
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                Ok(())
+            }
+            #[cfg(windows)]
+            Stream::Pipe(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a named pipe cannot be driven by a tokio runtime",
+            )),
+            #[cfg(unix)]
+            Stream::Unix(stream) => {
+                stream.set_nonblocking(true)?;
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
