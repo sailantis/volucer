@@ -3598,18 +3598,40 @@ impl BodyPump {
 
     /// The pull closure the exchange thread drives.
     ///
-    /// `blocking_recv` is called on a blocking thread, which is the one place it may be used: it is
-    /// `tokio`'s bridge from a synchronous consumer to an async producer, and the blocking is exactly
-    /// the backpressure described on [`BodyPump`].
+    /// # Why this waits with `futures` rather than `blocking_recv`
+    ///
+    /// The pull half of request-body streaming is deliberately synchronous — one thread per upload,
+    /// and blocking on it *is* the backpressure. `Receiver::blocking_recv` looks like exactly that,
+    /// but it panics unless it is given a **fresh** blocking region, and this closure cannot always
+    /// have one:
+    ///
+    /// - On an exchange thread (`pipe` workers) there is no runtime at all, so it works.
+    /// - On an **awaited** worker's connection — every `attach` slot, and now a spawned `socket`
+    ///   worker too — the pool bridges to it with `block_in_place` + `Handle::block_on`, and the
+    ///   second of those already holds the blocking region, so a nested one panics with "Cannot
+    ///   block the current thread from within a runtime". That turned **every** request against
+    ///   such a worker into a `502`, not only uploads: the pump is built for every request to a
+    ///   worker that advertises `stream_request_body`.
+    ///
+    /// `futures::executor::block_on` has no such precondition. It parks the thread on a
+    /// `ThreadNotify` waker instead of asking a runtime for a blocking region, so it is legal on a
+    /// plain thread, inside `spawn_blocking`, and inside `Handle::block_on` alike. Parking is
+    /// acceptable on all three because each is already a thread dedicated to this upload: an
+    /// exchange thread, or a runtime thread that `block_in_place` has replaced.
+    ///
+    /// The backpressure is unchanged — the channel is bounded, so a slow worker parks the pump task
+    /// in `send().await` and the client's socket stops being polled.
     fn into_closure(
         mut self,
     ) -> Box<dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send>
     {
-        Box::new(move || match self.frames.blocking_recv() {
-            Some(Ok(bytes)) => Ok(Some(bytes)),
-            Some(Err(err)) => Err(err),
-            None => Ok(None),
-        })
+        Box::new(
+            move || match futures::executor::block_on(self.frames.recv()) {
+                Some(Ok(bytes)) => Ok(Some(bytes)),
+                Some(Err(err)) => Err(err),
+                None => Ok(None),
+            },
+        )
     }
 }
 
