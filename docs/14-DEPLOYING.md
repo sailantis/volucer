@@ -294,6 +294,8 @@ server that has not read it yet.
 | A `503` during a roll                | Every slot is busy and `max_wait` expired. Capacity, not a broken deploy.      |
 | A truncated response at deploy time  | The supervisor's grace period is shorter than the drain.                      |
 | New code not live after `SIGHUP`     | Expected — `SIGHUP` does not deploy code.                                     |
+| The whole pool restarts after a quiet period | Every worker read a socket deadline as a close at once. See below. |
+
 
 The two error codes are worth telling apart, and the distinction is deliberate rather than
 incidental: a pool that could not take the request at all is `503` because nothing was attempted
@@ -303,3 +305,40 @@ application.
 
 The sweep logs one line per backend with what it replaced, skipped and failed, so a deploy log
 answers "did this roll?" without a second command.
+
+### A quiet minute, and why a whole pool can go at once
+
+The row about a quiet period is worth reading before it happens, because the failure is
+unmistakable once seen and silent until then.
+
+PHP caps how long a single stream read may block (`default_socket_timeout`, **60 s** by default),
+and a read that has hit that cap returns the *same value* as a peer closing the connection: an
+empty string. A worker that does not consult `stream_get_meta_data()['timed_out']` or `feof()`
+cannot tell them apart, and the SDK's loop read an empty string as *"the server is finished with
+me"* — which is the correct reading of a close and the wrong reading of an idle deadline. So every
+worker in a pool ends itself about one deadline after its last request, and the server replaces all
+of them at the first request after the gap. One deployment is fine under load and loses its whole
+pool every time it goes quiet.
+
+Two independent defences, and a deployment wants both:
+
+1. **The worker ignores its own read deadline** (`sailantis/volucer-php-sdk`, fixed after `v0.2.0`).
+   This is the real fix. A deadline belongs on a *request*, which the protocol already bounds with
+   `request_timeout_ms`; it must not be able to end an idle process.
+2. **The server pings idle slots** so no read ever goes long enough to hit a deadline:
+
+   ```toml
+   [backends.app]
+   idle_ping_ms = 20000   # under any deadline you cannot change
+   ```
+
+   `idle_ping_ms` is opt-in and capability-gated: nothing is sent until a worker advertises
+   `answers_ping` in its handshake, because an older worker treats an unknown frame as a protocol
+   error and exits rather than ignoring it. A misconfigured keepalive therefore costs nothing — it
+   logs `idle_ping_ms is set but no worker advertised answers_ping` once and stays quiet. It is not
+   a substitute for (1), because it cannot protect a pool with an un-upgraded worker *and* a
+   deadline shorter than the interval.
+
+If you cannot upgrade the SDK, `php -d default_socket_timeout=-1` on a worker's command line keeps
+the deadline out of its inherited connection — but treat that as a mitigation, not a fix, since
+anything the worker itself boots can put a deadline back.
