@@ -426,9 +426,50 @@ impl Drop for Lease<'_> {
     }
 }
 
+/// Invalidate an awaited connection if the request it belongs to is abandoned.
+///
+/// **A cancelled future releases its slot but leaves the wire mid-exchange.** Every awaited path
+/// holds its [`OwnedLease`] inside a local, and a dropped future drops that local — so the slot goes
+/// back on the free list while the connection still holds whatever half of an exchange was in
+/// flight. The next request to lease the slot then reads the abandoned answer as its own, which is
+/// the frame-desynchronisation failure the whole pool exists to avoid, and it presents as a
+/// mysterious wrong response rather than as an error.
+///
+/// Armed *after* the exchange has been posted and disarmed only on the paths that know the
+/// connection's position: a completed exchange, or a failure the caller has already decided to
+/// repair. Everything else — a client that went away, a `select!` that chose another branch, a
+/// shutdown — leaves it armed and the worker is replaced rather than trusted.
+struct InvalidateOnDrop {
+    connection: Arc<wire::AsyncExchange>,
+    armed: bool,
+}
+
+impl InvalidateOnDrop {
+    fn new(connection: Arc<wire::AsyncExchange>) -> Self {
+        InvalidateOnDrop {
+            connection,
+            armed: true,
+        }
+    }
+
+    /// The exchange ended where the caller can see it, so the connection's position is known.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InvalidateOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.connection.poison();
+        }
+    }
+}
+
 /// A slot released from wherever an async request finished, rather than borrowed from the caller.
 ///
-/// # Why the ordinary lease cannot do this///
+/// # Why the ordinary lease cannot do this
+///
 /// A streamed response keeps its slot until the last byte of its body, and that byte is read on the
 /// worker's **exchange thread** — created when the worker boots, outliving every request. So the
 /// thing that releases the slot cannot borrow the pool: the borrow ends when `request_relayed`
@@ -591,6 +632,14 @@ pub struct WorkerPool {
     /// already required.
     all_slots_stream_bodies: AtomicBool,
 
+    /// Each slot's last *observed* `stream_request_body`, one flag per slot.
+    ///
+    /// Kept beside the pool-wide cache so a refresh that cannot lock a busy slot has something
+    /// honest to fall back to: the value that slot's own handshake last reported, rather than a
+    /// guess in the conservative direction. See [`Self::refresh_stream_capability`] for why a
+    /// guessed `false` is not the safe answer — it is silently sticky.
+    stream_capable: Box<[AtomicBool]>,
+
     /// Whether the keepalive is still allowed to run, once it has been switched off.
     ///
     /// **Off is permanent, and that is the whole point.** The keepalive pings only a worker that
@@ -627,6 +676,14 @@ pub struct WorkerPool {
     /// Empty when no keepalive is configured, so a pool that never pings never writes to it.
     used_since_sweep: Box<[AtomicBool]>,
 
+    /// Whether each slot is **leased right now**, one flag per slot.
+    ///
+    /// Written at the same two moments the free list is: cleared where a slot is taken off it, set
+    /// where one is put back. The keepalive needs this rather than the slot `Mutex` because an
+    /// awaited request releases that mutex for the whole time its worker is thinking, so a locked
+    /// slot is not the same thing as a busy one — see [`is_leased`].
+    leased: Box<[AtomicBool]>,
+
     /// Whether [`Self::start_keepalive`] has run, so a second call cannot start a second thread.
     ///
     /// The pool is built unshared and only becomes an `Arc` in `Backend`, which is where the
@@ -657,6 +714,83 @@ pub struct WorkerPool {
 /// `a_keepalive_needs_the_capability_and_not_merely_the_key`.
 fn every_slot_answers_ping(advertised: &[bool]) -> bool {
     !advertised.is_empty() && advertised.iter().all(|answers| *answers)
+}
+
+/// Mark a slot as having served a request, the way [`WorkerPool::release`] does.
+///
+/// `true` is what makes the *next* sweep leave this slot alone: the worker's read has only now
+/// returned to waiting, and a `PING` written immediately after a response is a frame the worker may
+/// still be parsing its own answer around. Named rather than inlined so the direction is stated once
+/// and a test can drive it — see `a_released_slot_is_used_until_a_sweep_clears_it`, which exists
+/// because the store was `false` and the flag therefore never became `true` at all.
+fn mark_used(flags: &[AtomicBool], index: usize) {
+    if let Some(used) = flags.get(index) {
+        used.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Claim a slot for this sweep: `true` means it was used since the last one, so leave it alone.
+///
+/// A `swap`, so the claim and the clear are one operation and a slot that served a request between
+/// two sweeps is skipped exactly once. An index with no flag — a pool that never pings — answers
+/// `true`, because a slot nothing tracks has no evidence of being idle.
+fn claim_idle(flags: &[AtomicBool], index: usize) -> bool {
+    flags
+        .get(index)
+        .map(|used| used.swap(false, Ordering::Relaxed))
+        .unwrap_or(true)
+}
+
+/// Whether a slot is **leased right now**, which is the only honest idleness test for a sweep.
+///
+/// The slot's `Mutex` cannot answer this for an awaited request: `attempt_async` and the relayed
+/// paths post the exchange and then *release* the guard before awaiting it, so the mutex is
+/// unlocked for the entire time a worker is thinking. A sweep that used `try_lock` as its busiest
+/// test would therefore find an awaited slot "idle" mid-request, take the lock, and write a `PING`
+/// into the connection while the request's own answer is still on it.
+///
+/// The free list is the pool's existing answer to "may a request be given this slot", written under
+/// the same lock at the same moment it is taken and returned, so it is the answer that cannot drift.
+fn is_leased(leased: &[AtomicBool], index: usize) -> bool {
+    leased
+        .get(index)
+        .map(|leased| leased.load(Ordering::Acquire))
+        // No bookkeeping, so no evidence — treat it as leased and leave it alone.
+        .unwrap_or(true)
+}
+
+/// Fold per-slot capability observations into the pool-wide answer, recording what was observed.
+///
+/// `observed` is `None` for a slot the caller could not inspect — a busy sibling — and the rule for
+/// that case is the reason this is a function rather than a loop: **an unobserved slot contributes
+/// its last recorded value, never a guess.** Folding it in as `false` would publish a `false` the
+/// pool has never actually seen, and since the cache is only rewritten on a replacement, one busy
+/// sibling during one replacement would advertise "cannot stream" until the next replacement — on a
+/// quiet deployment, possibly never. Every upload in between would be buffered.
+///
+/// Factored out so that rule has one definition and a test can drive all three cases; see
+/// `an_unobserved_slot_keeps_its_last_answer_rather_than_guessing`.
+fn fold_stream_capability(
+    recorded: &[std::sync::atomic::AtomicBool],
+    observed: &[Option<bool>],
+) -> bool {
+    if observed.is_empty() {
+        // No slots is not a pool that can stream, and it is the one case `all` would answer `true`
+        // for on an empty iterator.
+        return false;
+    }
+    observed.iter().enumerate().all(|(index, seen)| match seen {
+        Some(seen) => {
+            if let Some(known) = recorded.get(index) {
+                known.store(*seen, Ordering::Relaxed);
+            }
+            *seen
+        }
+        None => recorded
+            .get(index)
+            .map(|known| known.load(Ordering::Relaxed))
+            .unwrap_or(false),
+    })
 }
 
 /// Start a pool and hand back a shared one, with its keepalive running if it asked for one.
@@ -820,6 +954,20 @@ impl WorkerPool {
                     .stream_request_body
             });
 
+        // Per slot, read from the same handshakes, because a later refresh that cannot lock a busy
+        // slot has to fall back to something: this slot's own last observation rather than a guess.
+        let stream_capable: Box<[AtomicBool]> = slots
+            .iter()
+            .map(|slot| {
+                AtomicBool::new(
+                    slot.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .hello
+                        .stream_request_body,
+                )
+            })
+            .collect();
+
         // **Every** slot, not any: a pool with one worker that cannot answer a `PING` must not ping
         // the others, because the failure mode of getting it wrong is a respawn loop rather than a
         // slower request. A replacement that fails to advertise the capability switches it off
@@ -872,6 +1020,11 @@ impl WorkerPool {
             // re-derived afterwards because there is no `&self` to derive it from until `pool`
             // exists.
             all_slots_stream_bodies: AtomicBool::new(all_slots_stream_bodies),
+            // Seeded from the same handshakes the pool-wide cache was computed from, so the two
+            // cannot start out disagreeing. One flag per slot, always: unlike the keepalive's
+            // bookkeeping this one is read by a refresh that may have been triggered by any slot, so
+            // it cannot be sized to "only when in use".
+            stream_capable,
             // **Only on when a worker actually advertised the capability**, not merely when the key
             // was set. A deployment that writes `idle_ping_ms` and attaches an SDK that cannot answer
             // a `PING` never sends one, because discovery-by-destruction is what pinging an
@@ -892,6 +1045,12 @@ impl WorkerPool {
             } else {
                 Box::new([])
             },
+            // Always sized: the free list is the request path's own bookkeeping, and this mirrors it
+            // rather than being derived from it. One relaxed load per lease is cheaper than the lock
+            // it stands in for.
+            leased: (0..count as usize)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
             keepalive_parker,
             keepalive_started: AtomicBool::new(false),
             pings_sent: AtomicU64::new(0),
@@ -1249,33 +1408,45 @@ impl WorkerPool {
     /// `slot` names the one guard the caller is known to hold, so it is read through that guard and
     /// never locked again. Every other slot is `try_lock`ed, for the reason
     /// [`Self::worker_status`] gives at length: this is reachable from an exchange thread whose own
-    /// worker is mid-request. A slot that cannot be locked is *assumed not to stream*, which is the
-    /// direction whose worst case is a buffered request — a false `true` would publish a yes for a
-    /// mixed-capability pool, open a body pump, and fail the request against the worker that cannot
-    /// take one.
+    /// worker is mid-request.
+    ///
+    /// # A slot that cannot be locked is *unknown*, not "no", and unknown is not cached
+    ///
+    /// A busy sibling is not evidence about the worker inside it, so folding it into the answer
+    /// would publish a `false` this pool has never observed — and because the cache is only written
+    /// here, one replacement during a busy period would advertise "cannot stream" until the *next*
+    /// replacement, which on a quiet deployment could be never. Every upload in between would be
+    /// buffered. So a `WouldBlock` **leaves the cached value alone** rather than storing the
+    /// conservative guess: the earlier `true` came from handshakes that were actually read, and it
+    /// stays true until something is actually observed to contradict it.
+    ///
+    /// That is also why the answer is kept **per slot** rather than as one boolean: the value a
+    /// replacement contributes is stored on the slot it belongs to, so a later refresh with the lock
+    /// in hand can fold it in without having to observe the busy one again.
     fn refresh_stream_capability(&self, slot: Option<(usize, &Slot)>) {
-        let all = !self.slots.is_empty()
-            && self.slots.iter().enumerate().all(|(index, candidate)| {
-                if let Some((held, held_slot)) = slot {
-                    if held == index {
-                        return held_slot.hello.stream_request_body;
-                    }
+        // The slot this caller holds is read through its own guard; every other slot is
+        // `try_lock`ed. `None` means "could not observe", which the fold treats as "last answer
+        // stands" rather than as a guess.
+        let observed: Vec<Option<bool>> = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| match slot {
+                Some((held, held_slot)) if held == index => {
+                    Some(held_slot.hello.stream_request_body)
                 }
-                match candidate.try_lock() {
-                    Ok(guard) => guard.hello.stream_request_body,
+                _ => match candidate.try_lock() {
+                    Ok(guard) => Some(guard.hello.stream_request_body),
                     Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                        poisoned.into_inner().hello.stream_request_body
+                        Some(poisoned.into_inner().hello.stream_request_body)
                     }
-                    // **A slot that cannot be locked is assumed *not* to stream.** The conservative
-                    // direction is the one that costs a buffered request, not the one that opens a
-                    // body pump for a worker which then refuses it: a `true` here publishes a
-                    // pool-wide yes for a mixed-capability pool, and the listener's consequence is a
-                    // failed request rather than a slower one. The cost of a false `false` is that a
-                    // streaming-capable pool falls back to buffering while one slot is busy, which is
-                    // what the pool did before the cache existed.
-                    Err(std::sync::TryLockError::WouldBlock) => false,
-                }
-            });
+                    // Busy: this slot's own cached answer stands, which is an answer that was read
+                    // from a handshake rather than a guess.
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                },
+            })
+            .collect();
+        let all = fold_stream_capability(&self.stream_capable, &observed);
         self.all_slots_stream_bodies.store(all, Ordering::Relaxed);
     }
 
@@ -1391,10 +1562,22 @@ impl WorkerPool {
             if !self.keepalive_on.load(Ordering::Relaxed) {
                 return;
             }
+
+            // **Leased first, and the order matters.** `try_lock` succeeding does not mean the
+            // worker is idle: an awaited request releases the slot's mutex before it awaits the
+            // exchange, so the mutex is unlocked for the whole time the worker is thinking. The free
+            // list is the pool's own answer to "may a request be given this slot", written under the
+            // same lock at the moment it is taken and returned.
+            if is_leased(&self.leased, index) {
+                continue;
+            }
+
             let mut guard = match slot.try_lock() {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                // Serving a request, which is the definition of "not idle".
+                // Reserved by another path between the check above and here — a rolling restart's
+                // `take_specific`, or a request that took it in that window. Serving a request,
+                // which is the definition of "not idle".
                 Err(std::sync::TryLockError::WouldBlock) => continue,
             };
 
@@ -1405,15 +1588,11 @@ impl WorkerPool {
             }
 
             // **A request has finished on this connection since the last sweep, so it is not idle.**
-            // The flag is set by `release` and cleared here, which makes one sweep act on every slot
+            // The flag is set by `release` and claimed here, which makes one sweep act on every slot
             // that has been quiet since the previous one — no timer arithmetic to jitter, and no way
-            // for "the sweep never ran" to look like "every ping succeeded".
-            let used = self
-                .used_since_sweep
-                .get(index)
-                .map(|used| used.swap(false, Ordering::Relaxed))
-                .unwrap_or(true);
-            if used {
+            // for "the sweep never ran" to look like "every ping succeeded". `claim_idle` is where
+            // the direction of the flag is stated.
+            if claim_idle(&self.used_since_sweep, index) {
                 continue;
             }
 
@@ -2058,29 +2237,55 @@ impl WorkerPool {
             }
         });
 
-        match connection
-            .post_streamed_async(head, &request.body, relay, callback)
-            .await
-        {
+        // The connection is poisoned if this future is dropped before the exchange has finished.
+        // See [`InvalidateOnDrop`]: the lease is released by `Drop`, so without this a cancelled
+        // request hands the next one a connection holding half of its own exchange.
+        let mut guard_connection = InvalidateOnDrop::new(Arc::clone(&connection));
+
+        // **The opening is awaited under the request deadline.** A connected worker that accepts the
+        // head and then never answers leaves this future pending for ever, and with it the lease —
+        // the slot is never released and the pool shrinks by one per silent worker. The threaded
+        // arm has always bounded this; `post_streamed_async` has no timer of its own, so the bound
+        // has to be here.
+        //
+        // A timeout is `Reading` and therefore *not* retryable for a non-idempotent verb, which is
+        // the same rule the threaded path's timeout follows: the bytes reached the worker, so a
+        // replay could run the application twice.
+        let opening = tokio::time::timeout(
+            self.spec.request_timeout,
+            connection.post_streamed_async(head, &request.body, relay, callback),
+        )
+        .await;
+        let opening = match opening {
+            Ok(opening) => opening,
+            Err(_) => {
+                // The worker is silent, which is exactly the condition `is_fatal` covers for a
+                // read: it must not serve again. The lease is still inside `ended` at this point —
+                // the callback has not run — so dropping `ended` here returns the slot as well.
+                self.repair_streamed_slot(index, &ended);
+                drop(ended);
+                return Err(FailedAttempt {
+                    retryable: may_retry(RequestStage::Reading, request),
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source: WorkerError::Timeout(self.spec.request_timeout),
+                    },
+                });
+            }
+        };
+
+        // The call returned, so the wire's position is known and the failure branch below repairs
+        // the worker on its own terms.
+        guard_connection.disarm();
+
+        match opening {
             Ok(crate::pool::Opened::Buffered(response)) => Ok(Delivery::Buffered(response)),
             Ok(crate::pool::Opened::Relayed(opening)) => {
                 Ok(crate::pool::Delivery::Relayed(opening.relayed))
             }
             Err((stage, source)) => {
                 if source.is_fatal() {
-                    let mut slot = self.slots[index]
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if slot.exchange.is_some() {
-                        replace(
-                            &self.name,
-                            &self.spec,
-                            &self.guard,
-                            self.call_handler.as_ref(),
-                            &mut slot,
-                        );
-                    }
-                    self.refresh_stream_capability(None);
+                    self.repair_streamed_slot(index, &ended);
                 }
                 Err(FailedAttempt {
                     retryable: may_retry(stage, request),
@@ -2093,6 +2298,55 @@ impl WorkerPool {
         }
     }
 
+    /// Replace the worker behind a streamed exchange that failed, **unless its ending already did**.
+    ///
+    /// A streamed response reports its own ending through `on_end`, which is
+    /// [`PoolEnding::finish`] — and `finish` replaces the worker whenever `complete` is `false`,
+    /// which is every fatal failure. So the caller that observes the failure must not replace it a
+    /// second time: the slot it would grab already holds the *replacement*, and killing that one
+    /// costs a healthy worker and a respawn for every streamed error.
+    ///
+    /// `ending` is the `Arc` the callback consumes, and taking the option is the ownership test. If
+    /// it is already `None` the ending ran and cleaned up; if it is still `Some` the ending has not
+    /// run — `post_streamed_async` returns before `on_end` on a connection that was already ended —
+    /// and this caller is the only owner left.
+    ///
+    /// # Why not "is the exchange still the one that failed"
+    ///
+    /// That is the obvious alternative and it is a race: `finish` holds the slot lock only while it
+    /// decides, so a comparison made here could see a replacement that `finish` installed and then
+    /// be pre-empted by *another* request leasing that slot. The `Option` is set exactly once, by
+    /// whoever reaches it first, so it cannot be misread.
+    fn repair_streamed_slot(&self, index: usize, ending: &std::sync::Mutex<Option<PoolEnding>>) {
+        // `None` is the proof that an ending ran: the callback `take`s the ending before calling
+        // `PoolEnding::finish`, and `finish` is what replaces the worker when the body did not
+        // complete. Replacing again here would kill the replacement it just installed.
+        let ending_ran = match ending.lock() {
+            Ok(held) => held.is_none(),
+            // A poisoned lock means the callback panicked inside `finish`, so whether it replaced
+            // anything is unknown. Replacing is the safe repair.
+            Err(_) => false,
+        };
+        if ending_ran {
+            return;
+        }
+
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.exchange.is_some() {
+            replace(
+                &self.name,
+                &self.spec,
+                &self.guard,
+                self.call_handler.as_ref(),
+                &mut slot,
+            );
+        }
+        drop(slot);
+        self.refresh_stream_capability(None);
+    }
+
     /// One try at an async relayed request on a spawned worker's exchange thread.
     async fn attempt_relayed_async_threaded(
         self: &Arc<Self>,
@@ -2100,10 +2354,18 @@ impl WorkerPool {
         relay: volucer_fcgi::Relay,
     ) -> std::result::Result<Delivery, FailedAttempt> {
         let queued_at = Instant::now();
-        let lease = self.acquire_owned().map_err(|source| FailedAttempt {
-            source,
-            retryable: false,
-        })?;
+        // The awaited acquisition, for the reason `attempt_async` gives: this is reached from
+        // `request_relayed_async`, which the front-end awaits, so the thread waiting here is a new
+        // runtime one. A pipe worker's *exchange* stays on its own thread — that is what this
+        // attempt is for — but the *wait for a slot* has nothing to do with which thread owns a
+        // pipe, and parking a runtime thread for it is the same stall either way.
+        let lease = self
+            .acquire_owned_async()
+            .await
+            .map_err(|source| FailedAttempt {
+                source,
+                retryable: false,
+            })?;
         let index = lease.index;
         let waited_us = queued_at.elapsed().as_micros() as u64;
         if let Some(counter) = self.wait_us.get(index) {
@@ -2286,18 +2548,24 @@ impl WorkerPool {
 
     /// One try at an async request. The counterpart of [`Self::attempt`].
     async fn attempt_async(
-        &self,
+        self: &Arc<Self>,
         request: &Request,
     ) -> std::result::Result<Response, FailedAttempt> {
         let queued_at = Instant::now();
-        // `acquire` parks on a `Condvar` when the pool is full, which is the same behaviour the
-        // synchronous path has and is deliberate: a request that must wait for a worker is waiting
-        // for *capacity*, not for this worker, and there is nothing else useful to do meanwhile.
-        let lease = self.acquire().map_err(|source| FailedAttempt {
-            source,
-            retryable: false,
-        })?;
-        let index = lease.index();
+        // **The awaited acquisition, not `acquire`.** `acquire` parks the calling thread on a
+        // `Condvar` when the pool is full, and the caller here is a task on the HTTP front-end's
+        // runtime: at `c=100` with twelve workers a hundred of these park every runtime thread and
+        // nothing is left to run the code that releases a slot. `acquire_owned_async` waits on a
+        // `tokio` notification instead and keeps the same fairness rule — see its own docs — and
+        // that is why it exists.
+        let lease = self
+            .acquire_owned_async()
+            .await
+            .map_err(|source| FailedAttempt {
+                source,
+                retryable: false,
+            })?;
+        let index = lease.index;
         let waited_us = queued_at.elapsed().as_micros() as u64;
         if let Some(counter) = self.wait_us.get(index) {
             counter.fetch_add(waited_us, Ordering::Relaxed);
@@ -2320,7 +2588,11 @@ impl WorkerPool {
         // Everything that needs the slot is done in one critical section, and the answer is awaited
         // *outside* it. The guard is a plain `MutexGuard`, so it must not cross an `await`; a block is
         // what enforces that, rather than a comment saying so.
-        let waiting = {
+        //
+        // The third element is the connection an awaited arm is about to use, when there is one, so
+        // the wait below can poison it if this future is dropped mid-exchange. See
+        // [`InvalidateOnDrop`].
+        let posted = {
             let mut slot = self.slots[index]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2356,8 +2628,11 @@ impl WorkerPool {
             match slot.exchange.as_ref() {
                 Some(SlotExchange::Threaded(exchange)) => {
                     match exchange.post_request_async(head, &request.body) {
-                        Ok(waiting) => Ok(Box::pin(waiting)
-                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>),
+                        Ok(waiting) => Ok((
+                            Box::pin(waiting)
+                                as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>,
+                            None,
+                        )),
                         Err((stage, source)) => Err((stage, source)),
                     }
                 }
@@ -2366,12 +2641,14 @@ impl WorkerPool {
                 // of the slot — which is what lets the caller release the lock before awaiting it.
                 Some(SlotExchange::Awaited(exchange)) => {
                     let connection = Arc::clone(exchange);
-                    Ok(Box::pin(
-                        async move { connection.post_request_async(head, &request.body).await },
-                    )
-                        as std::pin::Pin<
-                            Box<dyn std::future::Future<Output = _> + Send>,
-                        >)
+                    let awaited = Arc::clone(&connection);
+                    Ok((
+                        Box::pin(
+                            async move { awaited.post_request_async(head, &request.body).await },
+                        )
+                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>,
+                        Some(connection),
+                    ))
                 }
                 // A slot is only chosen while it has an exchange, so this cannot happen; reported
                 // rather than panicked, because a panic here would take the server down for one
@@ -2389,13 +2666,11 @@ impl WorkerPool {
             }
         };
 
-        let outcome = match waiting {
-            Ok(waiting) => match tokio::time::timeout(timeout, waiting).await {
-                Ok(outcome) => outcome,
-                // The exchange is still blocked in a read on this worker, so the caller kills it —
-                // the same contract `round_trip`'s timeout has, and `is_fatal` is what tells it to.
-                Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
-            },
+        // The third element is the connection an awaited arm is about to use, when there is one, so
+        // the wait below can poison it if this future is dropped mid-exchange. See
+        // [`InvalidateOnDrop`].
+        let (waiting, awaited_connection) = match posted {
+            Ok(posted) => posted,
             Err((stage, source)) => {
                 return Err(FailedAttempt {
                     source: ServerError::WorkerProtocol {
@@ -2406,6 +2681,25 @@ impl WorkerPool {
                 });
             }
         };
+
+        // Armed for an awaited connection only: a threaded exchange's cancellation is already
+        // handled by the exchange thread, which owns the pipe and reports through its own channel.
+        let mut invalidate = awaited_connection
+            .as_ref()
+            .map(|connection| InvalidateOnDrop::new(Arc::clone(connection)));
+
+        let outcome = match tokio::time::timeout(timeout, waiting).await {
+            Ok(outcome) => outcome,
+            // The exchange is still blocked in a read on this worker, so the caller kills it — the
+            // same contract `round_trip`'s timeout has, and `is_fatal` is what tells it to.
+            Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+        };
+
+        // The exchange has returned, so the connection's position is known, and the failure branch
+        // below is responsible for repairing the worker on its own terms.
+        if let Some(guard) = invalidate.as_mut() {
+            guard.disarm();
+        }
 
         // Its fate is decided exactly as `invoke` decides it.
         let mut slot = self.slots[index]
@@ -2544,17 +2838,34 @@ impl WorkerPool {
                 let ended = Arc::new(std::sync::Mutex::new(Some(ending)));
                 let finished = Arc::clone(&ended);
                 drop(slot);
-                let opened = connection.block_on(connection.post_streamed_async(
-                    head,
-                    &request.body,
-                    relay,
-                    Box::new(move |done| {
-                        if let Some(ending) = finished.lock().ok().and_then(|mut held| held.take())
-                        {
-                            ending.finish(done);
-                        }
-                    }),
-                ));
+                let opened = connection.block_on(async {
+                    // The same deadline the awaited arm applies, for the same reason: a worker that
+                    // accepts the head and then says nothing holds this slot for ever. Bridging
+                    // through `block_on` does not make the wait bounded on its own.
+                    match tokio::time::timeout(
+                        self.spec.request_timeout,
+                        connection.post_streamed_async(
+                            head,
+                            &request.body,
+                            relay,
+                            Box::new(move |done| {
+                                if let Some(ending) =
+                                    finished.lock().ok().and_then(|mut held| held.take())
+                                {
+                                    ending.finish(done);
+                                }
+                            }),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(opened) => opened,
+                        Err(_) => Err((
+                            RequestStage::Reading,
+                            WorkerError::Timeout(self.spec.request_timeout),
+                        )),
+                    }
+                });
                 return match opened {
                     Ok(crate::pool::Opened::Buffered(response)) => Ok(Delivery::Buffered(response)),
                     Ok(crate::pool::Opened::Relayed(opened)) => {
@@ -2562,18 +2873,7 @@ impl WorkerPool {
                     }
                     Err((stage, source)) => {
                         if source.is_fatal() {
-                            if let Ok(mut slot) = self.slots[index].lock() {
-                                if slot.exchange.is_some() {
-                                    replace(
-                                        &self.name,
-                                        &self.spec,
-                                        &self.guard,
-                                        self.call_handler.as_ref(),
-                                        &mut slot,
-                                    );
-                                }
-                            }
-                            self.refresh_stream_capability(None);
+                            self.repair_streamed_slot(index, &ended);
                         }
                         Err(FailedAttempt {
                             retryable: may_retry(stage, request),
@@ -3104,6 +3404,9 @@ impl WorkerPool {
             free.waiters += 1;
             if let Some(index) = free.take_woken() {
                 free.waiters -= 1;
+                // Under the lock, so the keepalive cannot see this slot as free in the window
+                // between the free list dropping it and the lease recording that it was taken.
+                self.mark_leased(index);
                 drop(free);
                 return Ok(OwnedLease {
                     pool: Arc::clone(self),
@@ -3146,6 +3449,9 @@ impl WorkerPool {
                     // for a slot that was handed back is the one outcome worth avoiding here.
                     let index = free.take_woken();
                     free.waiters -= 1;
+                    if let Some(index) = index {
+                        self.mark_leased(index);
+                    }
                     drop(free);
                     return match index {
                         Some(index) => Ok(OwnedLease {
@@ -3195,6 +3501,9 @@ impl WorkerPool {
         loop {
             if let Some(index) = free.take_woken() {
                 free.waiters -= 1;
+                // Under the lock: the keepalive must not see this slot as free between the free list
+                // dropping it and the lease recording the take.
+                self.mark_leased(index);
                 drop(free);
                 return Ok(index);
             }
@@ -3215,12 +3524,31 @@ impl WorkerPool {
         }
     }
 
+    /// Mark a slot leased, under the free list's lock so the two cannot be observed disagreeing.
+    fn mark_leased(&self, index: usize) {
+        if let Some(leased) = self.leased.get(index) {
+            leased.store(true, Ordering::Release);
+        }
+    }
+
+    /// Mark a slot free again, under the free list's lock.
+    fn mark_free(&self, index: usize) {
+        if let Some(leased) = self.leased.get(index) {
+            leased.store(false, Ordering::Release);
+        }
+    }
+
     /// Take a free slot, if one is free *and* not already owed to a parked request.
     fn take_free(&self) -> Option<usize> {
-        self.free
+        let mut free = self
+            .free
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take_available()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = free.take_available()?;
+        // Under the lock, so the keepalive cannot observe the slot as free in the window between
+        // removing it and recording that it was taken.
+        self.mark_leased(index);
+        Some(index)
     }
 
     /// Take `index` if it is free, for [`WorkerPool::restart`].
@@ -3230,7 +3558,9 @@ impl WorkerPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let at = free.ids.iter().position(|free| *free == index)?;
-        Some(free.ids.swap_remove(at))
+        let index = free.ids.swap_remove(at);
+        self.mark_leased(index);
+        Some(index)
     }
 
     /// How long a request may wait for a slot, or `None` for "refuse at once".
@@ -3290,13 +3620,11 @@ impl WorkerPool {
         // Marked here rather than at the lease sites: this is the one function every path returns a
         // slot through, so the keepalive's "this slot has been used" and the free list's "may be
         // taken" are written at the same moment. A slot released twice returned above, so a double
-        // release cannot be mistaken for a fresh use.
-        //
-        // `false`, i.e. *not* idle: the worker has just finished a request, so its read has only now
-        // returned to waiting. The next sweep is what decides whether it has been quiet since.
-        if let Some(used) = self.used_since_sweep.get(index) {
-            used.store(false, Ordering::Relaxed);
-        }
+        // release cannot be mistaken for a fresh use. `mark_used` states the direction and says why.
+        mark_used(&self.used_since_sweep, index);
+        // And the free-list mirror the keepalive reads instead of `try_lock`, for the reason
+        // `is_leased` gives: an awaited slot is unlocked for the whole time its worker thinks.
+        self.mark_free(index);
         self.released.notify_one();
         // And the awaited waiters, which are not parked on that `Condvar`. Both signals for one
         // release is deliberate: whichever kind of request is queued takes the slot, and the other
@@ -3390,7 +3718,7 @@ struct PoolEnding {
 }
 
 impl PoolEnding {
-    fn finish(self, done: crate::worker_pool::exchange::StreamDone) {
+    fn finish(self, mut done: crate::worker_pool::exchange::StreamDone) {
         let PoolEnding {
             pool,
             spec,
@@ -3399,6 +3727,14 @@ impl PoolEnding {
             started,
         } = self;
         let index = lease.index;
+
+        // **The records a rendered answer would otherwise lose.** A buffered answer that reaches this
+        // path — a relay the policy refused, or a body the worker measured — is rendered by the
+        // caller, and rendering drops `WorkerResponse::metrics`. Taken here, before the slot is
+        // handed back, so a refused relay is not silently metricless.
+        if !done.metrics.is_empty() {
+            pool.stash_metrics(std::mem::take(&mut done.metrics));
+        }
 
         // **`lock`, not `try_lock`, and the difference matters.** The stream can finish before the
         // caller has returned from `request_streamed` — a one-chunk body does — and the caller still
@@ -3572,9 +3908,21 @@ fn invoke(
             let waiting = Arc::clone(&connection);
             connection.block_on(async move {
                 let mut track = |_stage| {};
-                waiting
-                    .request_encoded_tracked(head, &request.body, &mut track)
-                    .await
+                // **The deadline the threaded arm has and this one did not.** `request_encoded_tracked`
+                // performs an unbounded read: a connected but silent worker would hold this slot for
+                // the life of the process, whereas `ChannelExchange::request` is given `timeout` and
+                // reports `WorkerError::Timeout` so the fatal-error handling above can replace it.
+                // Applied here rather than inside the transport because the transport is shared with
+                // the awaited request path, whose caller supplies its own bound.
+                match tokio::time::timeout(
+                    timeout,
+                    waiting.request_encoded_tracked(head, &request.body, &mut track),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+                }
             })
         }
         // A slot is only chosen while it has an exchange, so this cannot happen;
@@ -3644,7 +3992,15 @@ fn invoke_job(
             let connection = Arc::clone(exchange);
             connection.block_on(async {
                 let waiting = Arc::clone(&connection);
-                waiting.request_job(head, &payload).await
+                // **`JOB_TIMEOUT`, exactly as the threaded arm applies.** A consumer that accepts the
+                // payload and never acknowledges would otherwise hold this slot for ever, and the
+                // point of a job timeout is that an unacknowledged job is *requeued* rather than lost
+                // to a slot that will never come back. Without this the awaited variant was the one
+                // path a job could be lost on for good.
+                match tokio::time::timeout(JOB_TIMEOUT, waiting.request_job(head, &payload)).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(JOB_TIMEOUT))),
+                }
             })
         }
         // A slot is only chosen while it has an exchange, so this cannot happen; reported rather than
@@ -3849,14 +4205,41 @@ impl SlotExchange {
 /// decides whether this is cheap: a runtime sized to the slot count would rebuild, thread for
 /// thread, the population the exchange threads already were — the cost this change removes.
 pub struct AsyncRuntime {
-    runtime: tokio::runtime::Runtime,
+    /// `Option` so the destructor can take it and shut it down without blocking.
+    ///
+    /// **A bare `Runtime` cannot be dropped inside a runtime.** Its destructor performs a blocking
+    /// shutdown, and `tokio` panics on that: *"Cannot drop a runtime in a context where blocking is
+    /// not allowed"*. A socket or `attach` pool's last reference can be released by a connection task
+    /// on the listener's runtime — the ordinary case at shutdown, not an exotic one — so a bare field
+    /// would turn a clean shutdown into a panic in the front-end.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl std::fmt::Debug for AsyncRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AsyncRuntime")
-            .field("threads", &self.runtime.metrics().num_workers())
-            .finish_non_exhaustive()
+        match &self.runtime {
+            Some(runtime) => f
+                .debug_struct("AsyncRuntime")
+                .field("threads", &runtime.metrics().num_workers())
+                .finish_non_exhaustive(),
+            None => f
+                .debug_struct("AsyncRuntime")
+                .field("runtime", &"stopped")
+                .finish(),
+        }
+    }
+}
+
+impl Drop for AsyncRuntime {
+    fn drop(&mut self) {
+        // `shutdown_background` never blocks, so it is legal from inside a runtime and is the only
+        // teardown that is safe from both contexts. The consequence is that worker threads finish
+        // whatever they are doing rather than being joined — which is why the slots are stopped
+        // *before* the pool drops this: by then there is nothing left for a thread to be in the
+        // middle of.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -3873,12 +4256,20 @@ impl AsyncRuntime {
             .enable_all()
             .thread_name("volucer-attach")
             .build()?;
-        Ok(AsyncRuntime { runtime })
+        Ok(AsyncRuntime {
+            runtime: Some(runtime),
+        })
     }
 
-    /// The handle a synchronous caller bridges through.
+    /// The handle a synchronous caller bridges through, or `None` once the runtime is stopped.
     pub(crate) fn handle(&self) -> tokio::runtime::Handle {
-        self.runtime.handle().clone()
+        match &self.runtime {
+            Some(runtime) => runtime.handle().clone(),
+            // Unreachable while a pool exists: the `Option` is only emptied by `Drop`, which runs
+            // after every slot has been stopped. Reported as its own runtime rather than panicked,
+            // because a panic in a `Drop` chain aborts the process.
+            None => unreachable!("the pool runtime is only stopped when the pool is dropped"),
+        }
     }
 
     /// Adopt a handshaken connection, so a runtime may drive it.
@@ -3900,7 +4291,10 @@ impl AsyncRuntime {
         writer: &volucer_fcgi::Stream,
         fail: impl Fn(volucer_fcgi::FcgiError) -> ServerError,
     ) -> Result<(wire::AsyncStream, wire::AsyncStream)> {
-        let _inside = self.runtime.handle().enter();
+        let _inside = match &self.runtime {
+            Some(runtime) => runtime.handle().enter(),
+            None => unreachable!("the pool runtime is only stopped when the pool is dropped"),
+        };
         let to_async = |stream: &volucer_fcgi::Stream| -> Result<wire::AsyncStream> {
             wire::AsyncStream::from_std(stream)
                 .map_err(|source| fail(volucer_fcgi::FcgiError::Io(source)))
@@ -4135,6 +4529,151 @@ mod tests {
         assert!(every_slot_answers_ping(&[may_ping(&fixed_sdk)]));
         assert!(!every_slot_answers_ping(&[may_ping(&old_sdk)]));
     }
+    /// **A slot that was never inspected keeps its last answer, and a busy sibling is not a "no".**
+    ///
+    /// The cache is only rewritten on a replacement, so a wrong `false` is not a one-request cost:
+    /// it advertises "this pool cannot stream request bodies" until the *next* replacement, which on
+    /// a deployment that never recycles a worker may be never. Every upload in between would be
+    /// buffered — and buffering is a whole-`Vec` allocation of the client's upload, on a path that
+    /// was deliberately built to avoid it.
+    ///
+    /// The bug this test exists for: `refresh_stream_capability` folded `WouldBlock` in as `false`,
+    /// so one replacement that happened while a sibling was serving silently downgraded a fully
+    /// capable pool. The conservative *direction* was right; applying it to a slot nobody looked at
+    /// was not.
+    #[test]
+    fn an_unobserved_slot_keeps_its_last_answer_rather_than_guessing() {
+        let recorded = |values: &[bool]| -> Vec<AtomicBool> {
+            values.iter().map(|value| AtomicBool::new(*value)).collect()
+        };
+
+        // Two capable slots, nothing observed yet: the pool streams.
+        let known = recorded(&[true, true]);
+        assert!(fold_stream_capability(&known, &[None, None]));
+        assert!(known.iter().all(|flag| flag.load(Ordering::Relaxed)));
+
+        // The genuine "no": a replacement observed to lack the capability vetoes the pool, which is
+        // the direction the cache exists for.
+        assert!(!fold_stream_capability(&known, &[Some(false), None]));
+        assert!(!fold_stream_capability(&known, &[Some(false), Some(true)]));
+
+        // And it stays recorded, so the next refresh with both slots observable does not resurrect
+        // a `true` from nowhere.
+        assert!(!fold_stream_capability(&known, &[None, None]));
+
+        // A pool with no slots is not one that can stream, which is the case `all` would get wrong.
+        assert!(!fold_stream_capability(&[], &[]));
+
+        // A slot that was never recorded and cannot be observed contributes `false`: there is
+        // nothing to stand on, and the safe answer for an unknown is this one.
+        let empty: Vec<AtomicBool> = Vec::new();
+        assert!(!fold_stream_capability(&empty, &[None]));
+    }
+
+    /// **A released slot is marked used, and the sweep is what clears it.**
+    ///
+    /// `release` stored `false` and the sweep skipped on `if used`. The flag therefore *never*
+    /// became `true`, so "has this slot been quiet since I last looked" answered "yes" for a slot
+    /// that had just finished a request — and the sweep pinged a worker whose read had only now
+    /// returned to waiting. That is the exact case the flag was added for, inverted.
+    ///
+    /// The two halves are asserted together because either alone passes against the bug: a test that
+    /// only checked `release` writes `true` would pass with the sweep skipping on `false`, and vice
+    /// versa. What matters is that the pair composes into "one sweep, one ping per quiet slot".
+    #[test]
+    fn a_released_slot_is_used_until_a_sweep_clears_it() {
+        // A pool that never pings holds no flags at all, and every slot then answers "not idle" —
+        // there is nothing to decide.
+        assert!(
+            claim_idle(&[], 0),
+            "an untracked slot has no evidence of idleness"
+        );
+
+        let flags: Vec<AtomicBool> = (0..2).map(|_| AtomicBool::new(false)).collect();
+
+        // Seeded `false`, so a pool that has just booted is pinged by the first sweep — the case
+        // the keepalive most needs to cover, because a server started and then left quiet is how
+        // the pool lost every child in the measurement this feature came from.
+        assert!(
+            !claim_idle(&flags, 0),
+            "a freshly booted pool is pinged on the first sweep"
+        );
+
+        // A release marks it used, and the next sweep leaves it alone.
+        mark_used(&flags, 0);
+        assert!(
+            claim_idle(&flags, 0),
+            "a slot that served a request must not be pinged by the very next sweep"
+        );
+
+        // And it is now quiet, so the following sweep pings it — exactly once.
+        assert!(
+            !claim_idle(&flags, 0),
+            "a slot that has been quiet for a whole period is pinged exactly once"
+        );
+
+        // A slot used repeatedly is never pinged: the flag is set again before every sweep.
+        for _ in 0..3 {
+            mark_used(&flags, 0);
+            assert!(claim_idle(&flags, 0), "a busy slot is never pinged");
+        }
+
+        // The flags are per slot, so one slot's traffic does not shelter its neighbour — which is
+        // the whole reason this is a flag each rather than a counter on the pool.
+        mark_used(&flags, 0);
+        assert!(claim_idle(&flags, 0), "slot 0 is busy");
+        assert!(
+            !claim_idle(&flags, 1),
+            "slot 1 is quiet and must still be pinged"
+        );
+    }
+
+    /// **A lease, not a locked mutex, is what makes a slot busy.**
+    ///
+    /// `attempt_async` and the relayed paths post their exchange and then *release* the slot's
+    /// `MutexGuard` before awaiting it — deliberately, because a `MutexGuard` across an `await` is
+    /// `!Send` — so an awaited slot is unlocked for the entire time its worker is thinking. A sweep
+    /// that used `try_lock` as its busy test would find such a slot "idle", take the lock, and write
+    /// a `PING` into a connection whose request is still in flight, interleaving a health check with
+    /// an answer the front-end is reading.
+    ///
+    /// That is not a theory about ordering: it is the difference between the two sources of truth,
+    /// and this test pins it. `is_leased` is what the sweep now consults, and the mutex check stays
+    /// only as a narrower check for the window a reservation cannot cover.
+    #[test]
+    fn a_lease_rather_than_a_locked_mutex_is_what_makes_a_slot_busy() {
+        // A pool with no bookkeeping has no evidence, so the sweep leaves it alone. Answering "idle"
+        // there would be a guess in the direction that corrupts a connection.
+        assert!(
+            is_leased(&[], 0),
+            "an untracked slot must be treated as busy"
+        );
+
+        let leased: Vec<AtomicBool> = (0..2).map(|_| AtomicBool::new(false)).collect();
+
+        // Freshly free: a sweep may ping it.
+        assert!(!is_leased(&leased, 0));
+
+        // Taken: a request holds it, whether or not that request still holds the slot's mutex. This
+        // is the case `try_lock` got wrong — the guard is released across the await, so the mutex
+        // says "free" while this says "busy", and this is the one that is right.
+        leased[0].store(true, Ordering::Release);
+        assert!(
+            is_leased(&leased, 0),
+            "a leased slot is busy even though its mutex is unlocked: pinging it would put a PING \
+             into a connection whose answer is still being read"
+        );
+
+        // Returned: pingable again.
+        leased[0].store(false, Ordering::Release);
+        assert!(!is_leased(&leased, 0));
+
+        // Per slot, so one request does not shelter its neighbour.
+        leased[0].store(true, Ordering::Release);
+        assert!(is_leased(&leased, 0));
+        assert!(!is_leased(&leased, 1));
+    }
+
     /// A pool's queue keeps at most its bound, and counts what it refused.
     ///
     /// **The bug this test exists for was a leak, and it was described in the wrong direction.** The
@@ -4384,6 +4923,12 @@ mod tests {
             tokio::runtime::Handle::try_current().is_err(),
             "the test must adopt from outside a runtime, or it cannot reproduce the bug"
         );
+        // The runtime itself, borrowed once and used for both polls: `AsyncRuntime` gives out a
+        // `Handle` for callers that bridge, but this test has to drive a raw future.
+        let runtime = pool_runtime
+            .runtime
+            .as_ref()
+            .expect("the pool runtime is live until it is dropped");
         let fail = |source: volucer_fcgi::FcgiError| ServerError::WorkerProtocol {
             backend: "test".to_string(),
             source: volucer_worker::WorkerError::Io(match source {
@@ -4397,7 +4942,7 @@ mod tests {
         let (mut driver, _writer) = pool_runtime
             .adopt(&read_stream, &stream, fail)
             .expect("adoption");
-        let complaint = poll_once(&pool_runtime.runtime, &mut driver);
+        let complaint = poll_once(runtime, &mut driver);
         assert!(
             complaint.is_empty(),
             "a connection adopted by the pool must stay driven by it, but the wait failed: \
@@ -4418,7 +4963,7 @@ mod tests {
             )
         };
         drop(throwaway);
-        let verdict = poll_once(&pool_runtime.runtime, &mut driver2);
+        let verdict = poll_once(runtime, &mut driver2);
         assert!(
             verdict.contains("being shutdown"),
             "adopting under a runtime that is then dropped must be detectable, or this test \

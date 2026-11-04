@@ -489,7 +489,8 @@ impl Backend {
         matches!(self, Backend::Worker { .. })
     }
 
-    /// Whether this backend reads the path as a file to execute.    ///
+    /// Whether this backend reads the path as a file to execute.
+    ///
     /// The question the route table's `stat` turns on, and the reason it is not `!is_worker()`: an
     /// upstream does not interpret the path either, for a different reason — it is an HTTP peer
     /// that routes on the URL itself, so volucer stat-ing the path first would check a file the

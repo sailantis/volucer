@@ -213,18 +213,19 @@ where
                 // An empty piece carries no information, and a stream of them would spin here.
                 Some(bytes) if bytes.is_empty() => continue,
                 Some(bytes) => {
-                    let mut frames = bytes.chunks(BODY_CHUNK).peekable();
-                    while let Some(piece) = frames.next() {
-                        let last = frames.peek().is_none() && false;
-                        let mut header = Header::with_checksum(
+                    // Every piece of a chunk goes out **without** `LAST`, even the final piece of a
+                    // chunk: `LAST` is the only end-of-body signal for a streamed request, and
+                    // `chunks` returning `Some` says only that more arrived, never that there is no
+                    // more. The terminal `None` arm below writes the one frame that carries it —
+                    // unlike `send_body`, where the body is whole and its last piece genuinely is the
+                    // end.
+                    for piece in bytes.chunks(BODY_CHUNK) {
+                        let header = Header::with_checksum(
                             MessageType::Body,
                             request_id,
                             piece,
                             self.checksum,
                         )?;
-                        if last {
-                            header.flags |= flags::LAST;
-                        }
                         self.writer.write_all(&header.encode()).await?;
                         self.writer.write_all(piece).await?;
                         self.writer.flush().await?;
@@ -244,7 +245,8 @@ where
         self.collect_response(request_id).await
     }
 
-    /// Write one frame whose payload is already encoded.    ///
+    /// Write one frame whose payload is already encoded.
+    ///
     /// The flush is per frame rather than per request, and that is the protocol's requirement
     /// rather than a choice: the channel is half-duplex, so a frame left in the buffer would be
     /// a deadlock rather than a latency win.
@@ -1262,6 +1264,17 @@ impl AsyncExchange {
         self.ended.load(Ordering::Acquire)
     }
 
+    /// Mark the connection unusable, so the next request through this slot replaces the worker.
+    ///
+    /// Used by [`InvalidateOnDrop`] when a future is cancelled mid-exchange: a dropped future leaves
+    /// the wire somewhere between the request frame and the answer, and *nothing* knows how far. The
+    /// slot's lease is released on drop, so the next request would otherwise be handed this
+    /// connection and read the abandoned exchange's frames as its own — the frame-desynchronisation
+    /// failure the whole protocol is arranged to avoid.
+    pub(super) fn poison(&self) {
+        self.ended.store(true, Ordering::Release);
+    }
+
     /// Run one exchange and return its answer, from a **synchronous** caller.
     ///
     /// The bridge a blocking front-end needs. `block_in_place` when called from inside the
@@ -1520,6 +1533,7 @@ impl AsyncExchange {
                     end: None,
                     complete: false,
                     failure: Some(source.to_string()),
+                    metrics: Vec::new(),
                 });
                 return Err((stage, source));
             }
@@ -1532,11 +1546,14 @@ impl AsyncExchange {
             // will never run.
             volucer_worker::codec::Delivery::Buffered(response) => {
                 let end = response.end.clone();
+                // The records travel with the ending, because `rendered` below drops them.
+                let metrics = response.metrics.clone();
                 drop(wire);
                 on_end(super::exchange::StreamDone {
                     end: Some(end),
                     complete: true,
                     failure: None,
+                    metrics,
                 });
                 return Ok(crate::pool::Opened::Buffered(crate::pool::rendered(
                     response,
@@ -1579,11 +1596,15 @@ impl AsyncExchange {
             // The exchange is over whether or not the drain succeeded: a failed drain leaves the
             // connection unusable, which `complete: false` is how the pool is told.
             let end = wire.stream_end().cloned();
+            // Refused by the relay policy, so this is an ordinary answer — and its records would be
+            // dropped by `rendered` below. They are put in the response before it leaves.
+            let metrics = std::mem::take(&mut response.metrics);
             drop(wire);
             on_end(super::exchange::StreamDone {
                 complete: outcome.is_ok() && end.is_some(),
                 end,
                 failure: outcome.as_ref().err().map(|err| err.to_string()),
+                metrics,
             });
             return match outcome {
                 Ok(()) => Ok(crate::pool::Opened::Buffered(crate::pool::rendered(
@@ -1622,6 +1643,9 @@ impl AsyncExchange {
                 end,
                 complete,
                 failure: outcome.as_ref().err().map(|err| err.to_string()),
+                // A relayed body's records were already taken by `take_telemetry` above, and
+                // `pump_streamed`'s tail reports them the same way for the threaded path.
+                metrics: Vec::new(),
             });
         });
 

@@ -219,6 +219,14 @@ pub(super) struct StreamDone {
     pub(super) complete: bool,
     /// Why the body did not reach its end, when it did not.
     pub(super) failure: Option<String>,
+    /// The worker's own telemetry records, when the answer came back buffered.
+    ///
+    /// **Carried rather than read off the response**, because the response leaves this path as a
+    /// rendered `Response` and rendering is where the records would be lost. A streamed exchange that
+    /// the relay policy refused — an error page, a `X-Sendfile`, a measured body — is an ordinary
+    /// answer by the time anybody sees it, and it is exactly the kind of answer an application emits
+    /// metrics with, so dropping them made every refused relay silently metricless.
+    pub(super) metrics: Vec<volucer_worker::MetricRecord>,
 }
 /// What the exchange thread is to do with a finished exchange.
 ///
@@ -446,6 +454,8 @@ fn pump_streamed(
     // frame — `stream_end()` is `None` for it — so this is what lets the ending tell "measured" from
     // "truncated" without guessing.
     let mut saw_stream = false;
+    // A buffered answer's records, which the caller cannot read off the response it renders.
+    let mut buffered_metrics: Vec<volucer_worker::MetricRecord> = Vec::new();
 
     let outcome = match channel.request_streamed(head, body, &mut *on_stage) {
         Ok(volucer_worker::Delivery::Streamed(streamed)) => {
@@ -483,6 +493,7 @@ fn pump_streamed(
                         }
                         response.logs = channel.logs().to_vec();
                         response.metrics = channel.metrics().to_vec();
+                        buffered_metrics.clone_from(&response.metrics);
                         let _ = emit(StreamEvent::Buffered(response));
                         Ok(())
                     }
@@ -511,6 +522,7 @@ fn pump_streamed(
         // and the caller answers with it exactly as `request` would have.
         Ok(volucer_worker::Delivery::Buffered(response)) => {
             drop(sender);
+            buffered_metrics.clone_from(&response.metrics);
             let _ = emit(StreamEvent::Buffered(response));
             Ok(())
         }
@@ -541,6 +553,7 @@ fn pump_streamed(
         end: end.clone(),
         complete: body_ended && (end.is_some() || !saw_stream),
         failure: outcome.as_ref().err().map(|err| err.to_string()),
+        metrics: buffered_metrics,
     });
 }
 /// Forward every remaining body chunk into `sender`, and publish the verdict.
