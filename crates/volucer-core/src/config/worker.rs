@@ -46,6 +46,37 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
+    /// How often to ping an idle worker, in milliseconds. **`0` means never, and never is the
+    /// default.**
+    ///
+    /// # What this is for, and why it is opt-in
+    ///
+    /// A worker's read on its channel can carry a deadline — PHP's `default_socket_timeout` is
+    /// **60 seconds** and is captured when the stream is created, and any SDK may set its own. A
+    /// deadline that lands on an *idle* read cannot be told from the server closing the channel:
+    /// both return end-of-file. Measured, a PHP worker's `stream_get_contents` returns `''` for both
+    /// and only `stream_get_meta_data()['timed_out']` separates them, so an SDK that does not ask
+    /// ends the worker. A pool left quiet past that deadline therefore loses **every slot at once**,
+    /// on the first request after the gap: 96 children gone in 200 ms, 96 replacements, a handful of
+    /// 502s. A `PING` inside the window is what stops the read from ever being idle.
+    ///
+    /// # Why it is not on by default
+    ///
+    /// Because it is only correct for a worker that answers one. A worker that does not understand
+    /// `PING` does not ignore the frame — it treats an unknown type as a protocol error and exits,
+    /// because skipping a frame would misalign its reader. So the pool pings only a worker that
+    /// advertised [`HelloAck::answers_ping`], and turns the keepalive off **pool-wide** the first
+    /// time one fails. A default of "on" would therefore be a default that pings a third-party
+    /// worker into a respawn loop until it discovered the capability by destroying it.
+    ///
+    /// The PHP SDK advertises the capability, so a PHP deployment can turn this on and get the
+    /// protection. The SDK-side fix is the real fix — a worker should tell a deadline from a close —
+    /// and this is the defence for a worker that has not taken it.
+    ///
+    /// [`HelloAck::answers_ping`]: volucer_worker::HelloAck::answers_ping
+    #[serde(default)]
+    pub idle_ping_ms: Option<u64>,
+
     /// Extra environment variables for the worker process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,

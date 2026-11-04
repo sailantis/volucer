@@ -1919,6 +1919,7 @@ fn a_workers_streamed_response_is_re_framed_as_separate_records() {
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),

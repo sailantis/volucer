@@ -1314,6 +1314,9 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
         request_timeout: crate::worker_pool::REQUEST_TIMEOUT,
         // A spawned worker's pipes are blocking, so no runtime drives anything.
         runtime: None,
+        // No keepalive: these tests drive startup failures, and a thread pinging a worker that never
+        // booted would be a second moving part in a test about the first.
+        keepalive: None,
     }
 }
 

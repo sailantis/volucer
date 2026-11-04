@@ -592,6 +592,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             pid = ack.pid,
             no_checksum = ack.no_checksum,
             stream_request_body = ack.stream_request_body,
+            answers_ping = ack.answers_ping,
             "worker handshake complete"
         );
         Ok(ack)
@@ -830,6 +831,13 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     }
 
     /// Ask a worker for its health without serving a request.
+    ///
+    /// The keepalive the pool runs on an idle slot, and the reason it exists: a worker's read on
+    /// its channel can carry a deadline (`default_socket_timeout` in PHP, `settimeout` in Python),
+    /// and a deadline that lands on an *idle* read cannot be told from the server closing the
+    /// channel — both return end-of-file. An SDK that reads it that way ends the worker, so a pool
+    /// left quiet past the deadline loses every slot at once. A `PING` inside that window is what
+    /// keeps the read from ever being idle, and it costs one frame per period.
     ///
     /// Telemetry cannot reach the match below: `expect_any` absorbs log and
     /// metric frames before returning, so the only thing that arrives here is a
@@ -2757,6 +2765,7 @@ mod tests {
                 runtime: "php-cli".to_string(),
                 no_checksum: false,
                 stream_request_body: false,
+                answers_ping: false,
             },
         );
         let mut channel = script.channel();

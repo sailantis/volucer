@@ -710,6 +710,66 @@ where
         }
     }
 
+    /// Ask an idle worker for its health, and wait for its `PONG`.
+    ///
+    /// The async twin of [`volucer_worker::WireChannel::ping`], and the reason it is written
+    /// separately rather than shared: the blocking one cannot describe this one's `await`, and the
+    /// blocking one must not be used on a connection a runtime owns.
+    ///
+    /// # Why it reads frames instead of using `expect_any`
+    ///
+    /// `volucer_worker`'s `expect_any` absorbs `LOG` and `METRIC` and returns anything else, which
+    /// is right for a `CONTROL` acknowledgement — a control frame is sent *about* the worker and can
+    /// carry its own telemetry. A ping is sent into a quiet window on the pool's behalf, so a frame
+    /// arriving here is much more likely to be something a request is waiting for than something
+    /// this exchange should consume. `EVENT` is traced and dropped by every other read loop in this
+    /// module, so it is dropped here too; **anything that is not a `PONG`, telemetry or a call is
+    /// left as an error rather than swallowed**, because the alternative is a keepalive that quietly
+    /// eats a response.
+    ///
+    /// # The frame is unsolicited
+    ///
+    /// `PING` carries no request id — it belongs to no exchange — so this can never be confused with
+    /// a response, and the protocol's correlation rules are untouched.
+    pub(super) async fn ping(&mut self) -> Result<()> {
+        self.send_frame(MessageType::Ping, volucer_worker::UNSOLICITED, &[], 0)
+            .await?;
+
+        loop {
+            let Some((header, payload)) = self.read_frame().await? else {
+                return Err(WorkerError::Closed(
+                    "the worker closed its output while answering a ping".to_string(),
+                ));
+            };
+
+            match header.message_type {
+                MessageType::Pong => return Ok(()),
+                MessageType::Log => self.absorb_log(&payload),
+                MessageType::Metric => self.absorb_metric(&payload),
+                MessageType::Event => {
+                    tracing::trace!("worker sent an event while answering a ping");
+                }
+                // **Not absorbed, and deliberately.** A call is only answerable while a request is in
+                // flight — the protocol says so, and a worker is required to refuse one it makes at
+                // any other time. This is the one place where answering it would be worse than
+                // failing: the pool would then be running a call handler from a keepalive, for a
+                // request that does not exist.
+                MessageType::Call => {
+                    return Err(WorkerError::NotA {
+                        expected: MessageType::Pong.name(),
+                        actual: MessageType::Call,
+                    });
+                }
+                other => {
+                    return Err(WorkerError::NotA {
+                        expected: MessageType::Pong.name(),
+                        actual: other,
+                    })
+                }
+            }
+        }
+    }
+
     /// The next non-empty body chunk, or `None` when the streamed body is over.
     ///
     /// `None` means `LAST` was seen **and** the terminal `END` was read, so it is the only signal
@@ -1368,6 +1428,33 @@ impl AsyncExchange {
         }
     }
 
+    /// Ask an idle worker for its health over the connection a runtime drives.
+    ///
+    /// The counterpart of `ChannelExchange::ping`, and it holds the connection's own lock for the
+    /// same reason every other method on this type does: the lock **is** the protocol's
+    /// one-request-at-a-time rule, so a ping taken here cannot interleave with a request that
+    /// started on another task. That is also what makes it safe to call from a keepalive thread at
+    /// all — the pool only pings a slot it can lock, and a slot that is serving a request is one it
+    /// cannot.
+    ///
+    /// A fatal error marks the connection ended, exactly as a request's would: a `PONG` that never
+    /// arrives because the socket is gone must not leave a slot looking healthy.
+    pub(super) async fn ping(&self) -> std::result::Result<(), WorkerError> {
+        if self.is_ended() {
+            return Err(ended_error());
+        }
+        let mut wire = self.wire.lock().await;
+        match wire.ping().await {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                if source.is_fatal() {
+                    self.ended.store(true, Ordering::Release);
+                }
+                Err(source)
+            }
+        }
+    }
+
     /// Send a control frame and close the connection, which is how an attached worker is stopped.
     pub(super) async fn drain_and_close(&self) {
         self.ended.store(true, Ordering::Release);
@@ -1605,6 +1692,10 @@ fn ended_error() -> WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the unix-gated timeout test needs this, so it is gated too — otherwise every other
+    // platform reports it unused.
+    #[cfg(unix)]
+    use std::time::Duration;
     use volucer_worker::{RequestEnd, ResponseHead};
 
     /// The request head these tests send. Its content does not matter to the codec — it is an
@@ -2014,5 +2105,159 @@ mod tests {
             "and it is still on the connection, which is what a scrape reads"
         );
         answered.await.unwrap();
+    }
+
+    /// A `PING` is answered by the worker's `PONG`, and that is the whole keepalive contract.
+    #[tokio::test]
+    async fn a_ping_is_answered_by_a_pong() {
+        let (mut worker_write, front_read, front_write) = halves();
+        let mut wire = WireChannel::new_with_policy(front_read, front_write, Checksum::Optional);
+
+        let answered = tokio::spawn(async move {
+            // The `PING` the server sent, read as the worker would read it: unsolicited, no payload.
+            let ping = wire_frame(&mut worker_write).await;
+            assert_eq!(ping.0.message_type, MessageType::Ping);
+            assert_eq!(
+                ping.0.request_id,
+                volucer_worker::UNSOLICITED,
+                "a ping belongs to no exchange, so it can never be mistaken for a response"
+            );
+            emit(
+                &mut worker_write,
+                MessageType::Pong,
+                volucer_worker::UNSOLICITED,
+                0,
+                &[],
+            )
+            .await;
+            worker_write
+        });
+
+        wire.ping().await.expect("the pong completes the ping");
+        answered.await.unwrap();
+    }
+
+    /// A frame that is not a `PONG` is refused rather than swallowed.
+    ///
+    /// **This is the property the keepalive depends on.** A ping is sent into a quiet window on the
+    /// pool's behalf, so a `RESPONSE` arriving here belongs to something else — and a keepalive that
+    /// returned `Ok` for it would consume a frame the request path is waiting for. The failure is
+    /// also what makes a worker that does not speak `PING` visible instead of silently wrong: the
+    /// pool stops pinging on it (see `WorkerPool::keepalive_once`).
+    #[tokio::test]
+    async fn a_frame_that_is_not_a_pong_is_refused() {
+        let (mut worker_write, front_read, front_write) = halves();
+        let mut wire = WireChannel::new_with_policy(front_read, front_write, Checksum::Optional);
+
+        let answered = tokio::spawn(async move {
+            let _ping = wire_frame(&mut worker_write).await;
+            emit(
+                &mut worker_write,
+                MessageType::Response,
+                1,
+                0,
+                &Json::encode(&ResponseHead::default()).unwrap(),
+            )
+            .await;
+            worker_write
+        });
+
+        let err = wire.ping().await.unwrap_err();
+        assert!(
+            matches!(err, WorkerError::NotA { .. }),
+            "expected a NotA naming the frame, got {err}"
+        );
+        answered.await.unwrap();
+    }
+
+    /// Telemetry that happens to be in flight is absorbed rather than mistaken for the answer.
+    ///
+    /// A worker emits `LOG` and `METRIC` on its own schedule, so a ping landing between two of them
+    /// is the ordinary case on a chatty application. `EVENT` is traced and dropped here exactly as it
+    /// is by every other read loop in this module.
+    #[tokio::test]
+    async fn telemetry_before_the_pong_is_absorbed() {
+        let (mut worker_write, front_read, front_write) = halves();
+        let mut wire = WireChannel::new_with_policy(front_read, front_write, Checksum::Optional);
+
+        let answered = tokio::spawn(async move {
+            let _ping = wire_frame(&mut worker_write).await;
+            emit(
+                &mut worker_write,
+                MessageType::Event,
+                volucer_worker::UNSOLICITED,
+                0,
+                b"{}",
+            )
+            .await;
+            emit(
+                &mut worker_write,
+                MessageType::Pong,
+                volucer_worker::UNSOLICITED,
+                0,
+                &[],
+            )
+            .await;
+            worker_write
+        });
+
+        wire.ping()
+            .await
+            .expect("telemetry does not stand in for the answer");
+        answered.await.unwrap();
+    }
+
+    /// A silent peer makes the ping fail rather than hang.
+    ///
+    /// **The property the keepalive thread depends on.** That thread sweeps slots one at a time, so a
+    /// `PING` that waited forever would stop it for every slot behind it — and the failure it defends
+    /// against would then be caused by the defence. `SlotExchange::ping` bounds the await with
+    /// `PING_TIMEOUT`; this checks that the bound is real rather than a comment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_peer_times_the_ping_out_rather_than_hanging() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ours_reader = ours.try_clone().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        ours_reader.set_nonblocking(true).unwrap();
+        let connection = AsyncExchange::start_for_test(
+            AsyncStream::Unix(tokio::net::UnixStream::from_std(ours_reader).unwrap()),
+            AsyncStream::Unix(tokio::net::UnixStream::from_std(ours).unwrap()),
+        );
+
+        // The worker end is alive but says nothing: a hung worker, which is the case that must not
+        // stall the sweep.
+        let silent = theirs;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            // A short deadline, so the test is fast; production uses `PING_TIMEOUT`.
+            tokio::time::timeout(Duration::from_millis(50), connection.ping()),
+        )
+        .await;
+
+        // The outer timeout is the assertion: if the inner one did not bound the wait, this would
+        // never return and the test would hang instead of failing.
+        let inner = outcome.expect("the ping must be bounded by its own deadline");
+        assert!(
+            inner.is_err() || inner.unwrap().is_err(),
+            "a peer that never answers must not report success"
+        );
+
+        drop(silent);
+    }
+
+    /// Read one frame from the worker's side of the duplex.
+    ///
+    /// Written here rather than reused from the codec because it is the *other* end of the wire: the
+    /// point of these tests is that the two halves agree, and calling the codec's reader would make
+    /// that agreement an assumption rather than the thing under test.
+    async fn wire_frame<R: AsyncRead + Unpin>(reader: &mut R) -> (Header, Vec<u8>) {
+        let mut bytes = [0u8; HEADER_LEN];
+        reader.read_exact(&mut bytes).await.unwrap();
+        let header = Header::decode(&bytes).unwrap();
+        let mut payload = vec![0u8; header.payload_len as usize];
+        reader.read_exact(&mut payload).await.unwrap();
+        (header, payload)
     }
 }

@@ -362,6 +362,7 @@ fn the_handshake_helper_writes_what_the_channel_expects() {
         runtime: String::new(),
         no_checksum: false,
         stream_request_body: false,
+        answers_ping: false,
     };
 
     let mut bytes = Vec::new();

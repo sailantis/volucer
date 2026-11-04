@@ -88,6 +88,7 @@ fn config(workers: u32) -> WorkerConfig {
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -1074,6 +1075,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -1192,6 +1194,7 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -1381,6 +1384,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -1552,6 +1556,7 @@ fn slow_pool(tag: &str, workers: u32, micros: u64, max_wait: Option<Duration>) -
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -3134,6 +3139,7 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -3468,6 +3474,7 @@ fn booting_pool(tag: &str, workers: u32, marker_dir: &Path, micros: u64) -> Work
         max_requests: None,
         working_dir: None,
         request_timeout_ms: None,
+        idle_ping_ms: None,
         env: Default::default(),
         checksum: Default::default(),
         services: Vec::new(),
@@ -3653,6 +3660,7 @@ fn an_attached_pool_reports_that_it_cannot_be_swept() {
         max_requests: None,
         services: Vec::new(),
         checksum: Default::default(),
+        idle_ping_ms: None,
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
@@ -3688,4 +3696,183 @@ fn an_attached_pool_reports_that_it_cannot_be_swept() {
         "a pool nothing was replaced in must not read as a finished deploy: {report:?}"
     );
     assert!(report.is_noop());
+}
+
+/// A keepalive keeps a worker alive and answering across a gap longer than its own read deadline.
+///
+/// # What this does and does not prove, stated honestly
+///
+/// A worker's read on its channel can carry a deadline — PHP's `default_socket_timeout` is 60 s and
+/// is captured when the stream is created. A deadline that lands on an *idle* read is
+/// indistinguishable from the server closing the channel unless the SDK asks, and an SDK that does not
+/// ask ends the worker. Measured on an SDK that did not, a pool left quiet past that deadline lost
+/// **every** slot at the first request after the gap.
+///
+/// **The shipped SDK now asks**, so this test cannot demonstrate a rescue: with `idle_ping_ms` unset
+/// the workers survive the same gap, verified by disabling the keepalive here and watching the liveness
+/// assertion pass. What the test therefore proves is what is actually claimed by turning the key on —
+/// that the pings go out, are answered, do not disturb the pool, and leave it still serving — which is
+/// the set of facts that can be wrong in this change. The defence the keepalive *provides* is for a
+/// third-party worker that has not taken the SDK fix, and that case cannot be built out of the shipped
+/// SDK.
+///
+/// The assertions are on liveness *during* the idle window rather than on the exit path, because a
+/// worker that reads a deadline as end-of-file exits perfectly normally — an assertion on `run()`
+/// returning passes against the broken behaviour. That distinction is what made an earlier version of
+/// this test pass against a broken SDK.
+#[test]
+fn a_keepalive_keeps_idle_workers_alive_past_their_read_deadline() {
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+    volucer_testkit::require_example_routes(&[]);
+
+    let mut settings = config(2);
+    // The deadline the worker inherits, set on the interpreter the supervisor starts.
+    settings.command = format!(
+        "php -d default_socket_timeout=1 \"{}\"",
+        example_worker().display()
+    );
+    // 250 ms, i.e. four pings inside a one-second deadline. Fast enough that the test is short,
+    // slow enough that it is not pinging continuously.
+    settings.idle_ping_ms = Some(250);
+
+    let pool = match WorkerPool::start("keepalive", &settings) {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("skipping: the keepalive pool could not start: {err}");
+            return;
+        }
+    };
+
+    assert!(
+        pool.keepalive_running(),
+        "the pool must have started its keepalive: the PHP SDK advertises `answers_ping`"
+    );
+
+    pool.request(&get("/")).expect("the pool serves a request");
+
+    // Well past the one-second deadline: without a keepalive, both children have exited by now.
+    std::thread::sleep(Duration::from_millis(3000));
+
+    // **Liveness, counted during the idle window rather than inferred from the exit path.** A worker
+    // that read the deadline as end-of-file exits perfectly normally, so an assertion on `run()`
+    // returning would pass against the broken behaviour — which is exactly how an earlier version of
+    // this test failed to catch it.
+    let idle = pool
+        .worker_status()
+        .into_iter()
+        .filter(|worker| worker.idle)
+        .count();
+    assert_eq!(
+        idle, 2,
+        "both workers must still be alive and idle after idling past their read deadline"
+    );
+
+    // And the pool still serves, which is the property that actually matters: a worker that survived
+    // but cannot answer is no better than one that exited.
+    pool.request(&get("/"))
+        .expect("a worker kept alive by the keepalive still answers");
+
+    assert!(
+        pool.keepalive_running(),
+        "the keepalive must not have switched itself off: every slot answers a ping"
+    );
+}
+
+/// A pool that pings keeps its workers answering, and one sweep is safe to drive on demand.
+///
+/// The sweep is the behaviour worth testing — the thread around it is a parking loop — so this calls
+/// `keepalive_once` directly and checks the two properties that matter: an answering worker is pinged
+/// and survives, and repeated sweeps do not disturb the pool.
+///
+/// The *failure* direction (a worker that ignores a ping switches the keepalive off rather than being
+/// replaced) cannot be produced from the shipped SDK, which answers correctly. It is covered where it
+/// can be: `worker_pool::tests` exercises the capability gate, and the failure branch's decision —
+/// "stop pinging, kill nothing" — is the one line in `keepalive_once` that a real worker would have to
+/// be hung to reach.
+#[test]
+fn a_keepalive_sweep_pings_an_idle_worker_without_disturbing_it() {
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+    volucer_testkit::require_example_routes(&[]);
+
+    let mut settings = config(2);
+    settings.idle_ping_ms = Some(50);
+    let pool = match WorkerPool::start("ping-sweep", &settings) {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("skipping: the pool could not start: {err}");
+            return;
+        }
+    };
+    assert!(pool.keepalive_running(), "the PHP SDK answers a ping");
+
+    // Two sweeps back to back, each of which must ping both idle slots and survive.
+    let before = pool.pings_sent();
+    pool.keepalive_once();
+    pool.keepalive_once();
+    assert!(
+        pool.pings_sent() > before,
+        "the sweep must have actually pinged: a keepalive that sends nothing is indistinguishable \
+         from one whose pings all succeed, and it is the failure this defends against"
+    );
+    assert!(
+        pool.keepalive_running(),
+        "an answered ping leaves the keepalive running"
+    );
+    assert_eq!(
+        pool.free_slots(),
+        pool.len(),
+        "a ping must not take a slot: it is sent on a connection no request is using, and the slot \
+         stays on the free list throughout"
+    );
+
+    // The pings went out on the same connections requests use, so if they had interleaved a frame the
+    // next request would fail rather than succeed.
+    pool.request(&get("/"))
+        .expect("a worker that has been pinged still answers a request");
+}
+///
+/// # Why this is the safety property rather than a nicety
+///
+/// A worker that does not understand `PING` does not ignore the frame — it treats an unknown type as
+/// a protocol error and **exits**, because skipping a frame would misalign its reader. So a server
+/// that discovered the capability by sending one would kill every worker it asked, discover the
+/// answer by destroying the pool, and repeat it on every idle period for the process's life.
+///
+/// Driven through `Backend::new` rather than `WorkerPool::start` because the keepalive is started by
+/// the former: a pool built directly is never shared, so it can never have a thread — see
+/// `worker_pool::shared`.
+#[test]
+fn a_pool_that_must_not_ping_starts_no_keepalive() {
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+    volucer_testkit::require_example_routes(&[]);
+
+    // The shipped SDK advertises the capability, so the *positive* direction is the one a real
+    // worker can demonstrate. The negative direction is proven at the unit level instead, where the
+    // handshake can be forged: see `worker_pool::tests::a_keepalive_is_not_started_without_the_capability`.
+    let mut settings = config(1);
+    settings.idle_ping_ms = Some(100);
+    let Ok(backend) =
+        volucer_server::Backend::from_config("ping-capable", &BackendConfig::Worker(settings))
+    else {
+        eprintln!("skipping: the backend could not start");
+        return;
+    };
+    assert!(
+        backend.keepalive_running(),
+        "a worker that advertises `answers_ping` must have its keepalive running"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        backend.keepalive_running(),
+        "three periods later it is still running, which means the pings were answered"
+    );
 }

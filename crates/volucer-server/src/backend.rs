@@ -359,6 +359,20 @@ impl Backend {
     /// `registry` is ignored for the three kinds that have no channel to install a handler on, and is
     /// passed to the pool for the one that does — the pool installs it on every worker's channel before
     /// that worker's handshake, and again on every replacement.
+    /// Whether this backend's pool is keeping its idle workers alive.
+    ///
+    /// `false` for every backend that is not a worker pool, and for a pool with no `idle_ping_ms`,
+    /// one whose workers did not advertise the capability, or one whose keepalive switched itself
+    /// off after a failed probe. One answer for all of them, because the question an operator is
+    /// asking is "is anything pinging my workers", and the startup and failure log lines say which
+    /// case it is.
+    pub fn keepalive_running(&self) -> bool {
+        match self {
+            Backend::Worker { pool, .. } => pool.keepalive_running(),
+            _ => false,
+        }
+    }
+
     pub fn from_config_with(
         name: &str,
         config: &BackendConfig,
@@ -383,11 +397,13 @@ impl Backend {
             }),
             BackendConfig::Worker(worker) => Ok(Backend::Worker {
                 name: name.to_string(),
-                pool: Arc::new(WorkerPool::start_with(name, worker, registry)?),
+                pool: crate::worker_pool::shared(WorkerPool::start_with(name, worker, registry)?),
             }),
             BackendConfig::Attach(attach) => Ok(Backend::Worker {
                 name: name.to_string(),
-                pool: Arc::new(WorkerPool::start_attached(name, attach, registry)?),
+                pool: crate::worker_pool::shared(WorkerPool::start_attached(
+                    name, attach, registry,
+                )?),
             }),
             BackendConfig::Upstream(upstream) => {
                 // Validated rather than accepted on faith: `Config::validate` refuses a bad origin,
@@ -1045,6 +1061,7 @@ mod tests {
                 max_requests: None,
                 working_dir: None,
                 request_timeout_ms: None,
+                idle_ping_ms: None,
                 env: Default::default(),
                 checksum: Default::default(),
                 services: Vec::new(),

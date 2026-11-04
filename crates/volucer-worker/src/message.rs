@@ -72,6 +72,23 @@ pub struct HelloAck {
     /// that would have to cope with the new shape, exactly like [`Self::no_checksum`].
     #[serde(default)]
     pub stream_request_body: bool,
+    /// Whether this worker answers a `PING` with a `PONG`.
+    ///
+    /// **The server must never ping a worker that did not say this**, and the direction of the
+    /// rule is the same one [`Self::stream_request_body`] follows, for a sharper reason: a
+    /// worker that does not understand `PING` does not ignore it — it treats an unknown frame
+    /// type as a protocol error and **exits**, because skipping a frame would silently misalign
+    /// its reader. A server that probed for the capability by sending one would therefore kill
+    /// every worker it asked, discover the answer by destroying the pool, and repeat that every
+    /// idle period. So the party that has to cope is the party that advertises, exactly as with
+    /// `stream_request_body`.
+    ///
+    /// An SDK that predates this field decodes it as `false` and is simply never pinged, which is
+    /// the behaviour it had before the field existed. The PHP SDK has answered `PING` since its
+    /// first commit, so it advertises `true`; a third-party worker on another runtime is the case
+    /// this key exists for.
+    #[serde(default)]
+    pub answers_ping: bool,
 }
 
 /// What the server tells a worker when asking it to serve a request.

@@ -131,6 +131,26 @@ Two consequences worth knowing:
 A CGI backend cannot be streamed to: `php-cgi` reads `CONTENT_LENGTH` from its environment before
 it touches `STDIN`. Those backends keep the buffered path, unchanged.
 
+### A worker whose read has a deadline
+
+A worker reads its channel with whatever timeout its runtime gave it — PHP's
+`default_socket_timeout` is **60 seconds** and is captured when the stream is created — and a
+deadline that lands on an *idle* connection is indistinguishable from the peer closing it. A worker
+that reads it as a close ends itself, so a pool left quiet for longer than that deadline loses
+**every slot at once**, on the first request after the gap.
+
+`idle_ping_ms` makes Volucer ping an idle slot inside that window, and it is **off by default**
+because it is only correct for a worker that answers a `PING`. A worker that does not understand one
+does not ignore it — skipping an unknown frame would misalign its reader, so the correct behaviour is
+to exit — so the capability is advertised by the worker (`answers_ping` in its `HELLO_ACK`) rather
+than probed. `idle_ping_ms` therefore does nothing until a worker has claimed it, and a `PONG` that
+does not arrive switches the keepalive off for the whole pool and says so once, rather than replacing
+a worker on every idle period.
+
+The better fix is in the SDK — a worker should ask whether an empty read was a timeout
+(`feof()` answers it for free) — and the PHP SDK now does. This key is the defence for a worker that
+has not taken that fix, which is the case a third-party runtime presents.
+
 ### Recycling
 
 A worker is replaced when any of the following occurs:

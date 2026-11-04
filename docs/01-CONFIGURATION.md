@@ -1032,6 +1032,7 @@ command = "php worker.php"
 | `memory_limit_mb` | integer | absent | Recycle a worker whose peak RSS exceeds this. |
 | `max_requests` | integer | absent | Recycle a worker after this many requests. |
 | `request_timeout_ms` | integer | `30000` | How long one request may take before the slot is replaced. `0` is refused: a request with no deadline holds its slot for ever. |
+| `idle_ping_ms` | integer | absent | How often to `PING` an idle worker, or `0`/absent for never. Off by default because it is only correct for a worker that advertises `answers_ping`; nothing is sent until one does. See [a worker whose read has a deadline](02-BACKENDS.md#a-worker-whose-read-has-a-deadline). |
 | `working_dir` | path | absent | The working directory for the worker. |
 | `env` | table | empty | Extra environment variables for the worker, merged over `[server.env]`. |
 | `services` | array of strings | empty | What this backend's workers may call: a namespace (`"kv.cache"`, `"workers"`), a method (`"workers.list"`, `"kv.cache.get"`) or a verb across storages (`"kv.get"`). See [Services](08-SERVICES.md). |
@@ -1066,6 +1067,7 @@ instead of starting worker processes.
 | `relay` | string | absent | The relay address. Falls back to `VOLUCER_RELAY_SOCKET`. |
 | `max_requests` | integer | absent | Recycle a slot after this many requests. |
 | `request_timeout_ms` | integer | `30000` | How long one request may take before the slot's process is treated as gone. `0` is refused. |
+| `idle_ping_ms` | integer | absent | How often to `PING` an idle slot, or `0`/absent for never. The same key and the same gate as a `worker` backend's: nothing is sent to a worker that did not advertise `answers_ping`. An attached pool is the case that needs it most, because its children hold the connection for the life of a slot. See [a worker whose read has a deadline](02-BACKENDS.md#a-worker-whose-read-has-a-deadline). |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
 | `services` | array of strings | empty | What this backend's workers may call: a namespace (`"kv.cache"`, `"workers"`), a method (`"workers.list"`, `"kv.cache.get"`) or a verb across storages (`"kv.get"`). See [Services](08-SERVICES.md). |
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
