@@ -1245,8 +1245,9 @@ impl AsyncExchange {
     /// The production constructor is reached only through a handshake on a dialled relay. A test
     /// wants the same object without a supervisor, so this exists rather than duplicating the
     /// constructor's body — and it runs under the test's own runtime, which is the one that will
-    /// poll the connection.
-    #[cfg(all(test, unix))]
+    /// poll the connection. `AsyncStream` is platform-neutral, so this is too: the portability gate
+    /// belongs on the fixtures that need a unix socket, not on the type.
+    #[cfg(test)]
     pub(super) fn start_for_test(reader: AsyncStream, writer: AsyncStream) -> Self {
         AsyncExchange {
             wire: Arc::new(tokio::sync::Mutex::new(WireChannel::new_with_policy(
