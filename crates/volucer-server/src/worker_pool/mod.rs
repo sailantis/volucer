@@ -139,6 +139,19 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a worker has to exit after being told to, before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a keepalive `PING` waits for its `PONG` before the probe is abandoned.
+///
+/// Deliberately short, and deliberately **not** a worker timeout. The keepalive runs on a thread of
+/// its own, one slot at a time, so waiting as long as [`REQUEST_TIMEOUT`] would stall every slot
+/// behind it. Three seconds is longer than an answer on a connection that is already open should
+/// take, and the two numbers mean different things: this bounds *the probe*, whereas `REQUEST_TIMEOUT`
+/// bounds *a request* and kills the worker when it expires.
+///
+/// **Giving up here does not kill the worker.** It switches the keepalive off for the pool, because a
+/// worker that is hung and one that cannot speak `PING` are indistinguishable from the failure — see
+/// `WorkerPool::keepalive_once`. A keepalive must never be able to cost a worker.
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long a request may wait for a slot before it is refused.
 ///
 /// Not `None`. A bounded wait is what the tail measurement asked for, but *refusing* as soon
@@ -188,6 +201,51 @@ const MAX_PENDING_METRICS: usize = 4096;
 /// — the flood that makes an operator stop reading the log, which is worse than the silence this
 /// replaces. Every 1024th is rare enough to be read and frequent enough to be noticed.
 const DROP_WARNING_INTERVAL: u64 = 1024;
+
+/// The keepalive thread's parking place: a sleep that shutdown can cut short.
+///
+/// A plain `thread::sleep` would make `Drop` wait out a whole `idle_ping_ms` — at the periods this
+/// key is worth setting, that is tens of seconds a process would spend shutting down for a thread
+/// that is about to find no pool. A `Condvar` with a timeout is the smallest thing that sleeps
+/// without polling, and it is signalled exactly once, by `Drop`.
+///
+/// Not a `tokio::sync::Notify` because the pool is built before any runtime exists — see
+/// [`WorkerPool::start_keepalive`].
+#[derive(Debug, Default)]
+struct KeepaliveParker {
+    /// `false` until the pool is dropped; guarded by `wake`'s mutex because that is the condition
+    /// the `Condvar` is waiting on.
+    stopping: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl KeepaliveParker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Sleep for `period`, or until [`Self::stop`] — `true` only for the second.
+    fn wait_for(&self, period: Duration) -> bool {
+        let stopping = self
+            .stopping
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (stopping, _) = self
+            .wake
+            .wait_timeout_while(stopping, period, |stopping| !*stopping)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *stopping
+    }
+
+    /// Wake the thread and tell it to stop. Idempotent, and safe after the thread has gone.
+    fn stop(&self) {
+        *self
+            .stopping
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.wake.notify_all();
+    }
+}
 
 /// The bucket a wait of `micros` belongs in.
 ///
@@ -532,6 +590,95 @@ pub struct WorkerPool {
     /// capability — the conservative direction, which the comment on [`Self::streams_request_bodies`]
     /// already required.
     all_slots_stream_bodies: AtomicBool,
+
+    /// Whether the keepalive is still allowed to run, once it has been switched off.
+    ///
+    /// **Off is permanent, and that is the whole point.** The keepalive pings only a worker that
+    /// advertised [`HelloAck::answers_ping`], so a failed `PONG` should mean "this worker is in
+    /// trouble" rather than "this worker does not speak PING". But the two are indistinguishable
+    /// from the failure alone — a worker that does not understand the frame exits rather than
+    /// ignoring it — so a pool that kept trying would respawn every slot on every tick for the
+    /// process's life. One failure disables the keepalive for the pool and is logged; the pool then
+    /// behaves exactly as it did before the key existed, which is the safe direction.
+    ///
+    /// [`HelloAck::answers_ping`]: volucer_worker::HelloAck::answers_ping
+    keepalive_on: AtomicBool,
+
+    /// The keepalive thread's parking place, when it has one.
+    ///
+    /// `Some` only when a keepalive was actually started, and `None` for every pool that did not ask
+    /// for one — which is every pool by default. Held so `Drop` can wake the thread instead of
+    /// leaving a process to wait out a period for a thread that is about to do nothing.
+    keepalive_parker: Option<Arc<KeepaliveParker>>,
+
+    /// Whether each slot has served a request since the last sweep.
+    ///
+    /// **Stamped in [`Self::release`]**, the one function every path returns a slot through, so the
+    /// keepalive's notion of "idle" is derived from the same place as the free list's "may be taken"
+    /// and the two cannot drift apart.
+    ///
+    /// A flag rather than a timestamp, and that is a correction rather than a preference: the first
+    /// version compared `now - released_at` against the period, which is *unfalsifiable in the
+    /// direction that matters* — a pool whose sweep was never reached, or whose period never quite
+    /// elapsed, looks exactly like a pool whose pings all succeed. A flag makes "this slot has been
+    /// idle since I last looked" the question the sweep actually asks, so one sweep always acts on
+    /// every idle slot regardless of jitter, and a test can prove it did.
+    ///
+    /// Empty when no keepalive is configured, so a pool that never pings never writes to it.
+    used_since_sweep: Box<[AtomicBool]>,
+
+    /// Whether [`Self::start_keepalive`] has run, so a second call cannot start a second thread.
+    ///
+    /// The pool is built unshared and only becomes an `Arc` in `Backend`, which is where the
+    /// keepalive starts — there is no `Arc` to hold during construction, and a thread that held a
+    /// bare reference could not outlive the constructor. This makes the start idempotent rather than
+    /// assuming it is called exactly once.
+    keepalive_started: AtomicBool,
+
+    /// How many `PING`s this pool has sent and had answered.
+    ///
+    /// A counter rather than nothing, because the keepalive is the one feature here whose *absence*
+    /// is invisible: a pool that never pings looks exactly like a pool whose pings all succeed, and
+    /// the failure it defends against is silent. It is also what lets a test assert that a sweep
+    /// actually did something instead of passing on an empty slot list.
+    pings_sent: AtomicU64,
+}
+
+/// Whether **every** slot advertised `answers_ping`, which is the gate on the keepalive.
+///
+/// `all`, not `any`, and not a per-slot decision. A pool that pinged the workers that can answer and
+/// left the others alone would need a per-slot flag and would still be wrong in the direction that
+/// matters: the protocol has no way to ask a worker whether it understands `PING` without risking the
+/// frame that would kill it, so "all" is the only answer that is never a guess. One worker on an SDK
+/// without the field disables the keepalive for the pool, and the pool then behaves exactly as it did
+/// before the key existed.
+///
+/// Factored out of construction so the rule has one definition and a test can exercise it; see
+/// `a_keepalive_needs_the_capability_and_not_merely_the_key`.
+fn every_slot_answers_ping(advertised: &[bool]) -> bool {
+    !advertised.is_empty() && advertised.iter().all(|answers| *answers)
+}
+
+/// Start a pool and hand back a shared one, with its keepalive running if it asked for one.
+///
+/// The two steps are one function because they cannot be separated: the keepalive thread holds a
+/// `Weak`, so it can only be started once the pool is an `Arc`, and a `WorkerPool` is only an `Arc`
+/// after this. Doing it here means every backend that can have a keepalive gets one, and a caller
+/// cannot forget.
+pub(crate) fn shared(pool: WorkerPool) -> Arc<WorkerPool> {
+    let shared = Arc::new(pool);
+    if let Some(period) = shared.spec.keepalive {
+        if shared.keepalive_on.load(Ordering::Relaxed) {
+            shared.start_keepalive(period);
+        } else {
+            tracing::debug!(
+                backend = %shared.name,
+                "idle_ping_ms is set but no worker advertised `answers_ping`; \
+                 the keepalive will not send one"
+            );
+        }
+    }
+    shared
 }
 
 impl WorkerPool {
@@ -673,6 +820,28 @@ impl WorkerPool {
                     .stream_request_body
             });
 
+        // **Every** slot, not any: a pool with one worker that cannot answer a `PING` must not ping
+        // the others, because the failure mode of getting it wrong is a respawn loop rather than a
+        // slower request. A replacement that fails to advertise the capability switches it off
+        // again; see `refresh_stream_capability`'s sibling `keepalive_still_supported`.
+        let starts_keepalive = {
+            let advertised: Vec<bool> = slots
+                .iter()
+                .map(|slot| {
+                    slot.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .hello
+                        .answers_ping
+                })
+                .collect();
+            every_slot_answers_ping(&advertised)
+        };
+
+        // Created only when a keepalive will run, so a pool that never pings holds no parker and its
+        // `Drop` has nothing to wake.
+        let keepalive_parker =
+            (spec.keepalive.is_some() && starts_keepalive).then(KeepaliveParker::new);
+
         let pool = WorkerPool {
             name: name.to_string(),
             spec,
@@ -702,6 +871,29 @@ impl WorkerPool {
             // re-derived afterwards because there is no `&self` to derive it from until `pool`
             // exists.
             all_slots_stream_bodies: AtomicBool::new(all_slots_stream_bodies),
+            // **Only on when a worker actually advertised the capability**, not merely when the key
+            // was set. A deployment that writes `idle_ping_ms` and attaches an SDK that cannot answer
+            // a `PING` never sends one, because discovery-by-destruction is what pinging an
+            // unadvertised worker amounts to.
+            keepalive_on: AtomicBool::new(starts_keepalive),
+            // One flag per slot, but only when a keepalive exists: an empty slice keeps a pool that
+            // never pings from paying for the bookkeeping at all.
+            //
+            // **Seeded `false`, i.e. not used**, so the very first sweep pings a pool that has just
+            // booted. That is the case the keepalive most needs to cover: a server started, warmed
+            // once, and then left quiet is exactly how the pool lost every child in the measurement
+            // this feature came from. Seeding `true` would leave a booted-and-idle pool unprotected
+            // for one whole period, which is the only period that matters when nobody is calling.
+            used_since_sweep: if keepalive_parker.is_some() {
+                (0..count as usize)
+                    .map(|_| AtomicBool::new(false))
+                    .collect()
+            } else {
+                Box::new([])
+            },
+            keepalive_parker,
+            keepalive_started: AtomicBool::new(false),
+            pings_sent: AtomicU64::new(0),
         };
 
         tracing::info!(
@@ -1077,6 +1269,166 @@ impl WorkerPool {
                 }
             });
         self.all_slots_stream_bodies.store(all, Ordering::Relaxed);
+    }
+
+    /// Start the thread that keeps idle workers from timing themselves out.
+    ///
+    /// Called once the pool is shared, which is `Backend::new` — see [`Self::keepalive_started`] for
+    /// why the constructor cannot do it. Idempotent, so a caller that is unsure cannot start two
+    /// threads pinging the same workers.
+    ///
+    /// # Why a thread and not a `tokio` task
+    ///
+    /// The pool is built before any runtime exists — `Dispatcher::from_config` runs ahead of every
+    /// listener, so a misconfigured backend is reported before a port is occupied — and a
+    /// `spawn_blocking` thread is reachable from a `std` context where a runtime task is not. The
+    /// thread does one `PING` per period and is asleep the rest of the time, so its cost is a parked
+    /// thread and one wake per period per pool, not per slot and not per request.
+    ///
+    /// # Why it holds a `Weak`
+    ///
+    /// The thread outlives nothing: it upgrades to the pool for each sweep and drops the reference
+    /// before sleeping. A `Drop` that signalled `keepalive_stop` is therefore the only coordination
+    /// needed, and the thread cannot keep a pool alive — which matters, because a pool that leaked a
+    /// live thread would leak every PHP process it owns.
+    /// Whether this pool is currently keeping its idle workers alive.
+    ///
+    /// `false` for a pool with no `idle_ping_ms`, for one whose workers did not advertise
+    /// [`HelloAck::answers_ping`], and for one whose keepalive switched itself off after a failed
+    /// probe. The three are deliberately one answer: an operator asking "why is my pool still losing
+    /// workers when I set `idle_ping_ms`" needs to know the keepalive is not running, and the log
+    /// line at startup or at the failure says which of the three it was.
+    ///
+    /// [`HelloAck::answers_ping`]: volucer_worker::HelloAck::answers_ping
+    pub fn keepalive_running(&self) -> bool {
+        self.spec.keepalive.is_some() && self.keepalive_on.load(Ordering::Relaxed)
+    }
+
+    /// How many `PING`s this pool has sent and had answered.
+    ///
+    /// The number that distinguishes "the keepalive is working" from "the keepalive was configured
+    /// and did nothing". Both look identical from the outside, because the failure it defends against
+    /// is silent — so a sweep that finds no idle slot, or one whose capability gate never opened, is
+    /// otherwise indistinguishable from a healthy pool.
+    pub fn pings_sent(&self) -> u64 {
+        self.pings_sent.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn start_keepalive(self: &Arc<Self>, period: Duration) {
+        if self.keepalive_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pool = Arc::downgrade(self);
+        let name = self.name.clone();
+        let Some(parker) = self.keepalive_parker.as_ref().map(Arc::clone) else {
+            return;
+        };
+
+        let spawned = std::thread::Builder::new()
+            .name(format!("volucer-keepalive-{name}"))
+            .spawn(move || {
+                tracing::debug!(backend = %name, ?period, "worker keepalive started");
+                loop {
+                    // Parked until the period expires or the pool is dropped, whichever is first, so
+                    // shutdown is immediate rather than up to one period late.
+                    if parker.wait_for(period) {
+                        return;
+                    }
+                    let Some(upgraded) = pool.upgrade() else {
+                        return;
+                    };
+                    if !upgraded.keepalive_on.load(Ordering::Relaxed) {
+                        tracing::debug!(backend = %name, "worker keepalive is off; stopping");
+                        return;
+                    }
+                    upgraded.keepalive_once();
+                    drop(upgraded);
+                }
+            });
+
+        if let Err(err) = spawned {
+            tracing::warn!(
+                backend = %self.name,
+                %err,
+                "could not start the worker keepalive thread; workers will not be pinged"
+            );
+        }
+    }
+
+    /// Ping every slot that is idle, once.
+    ///
+    /// # Only idle slots, and the slot lock is what proves it
+    ///
+    /// A slot that a request holds cannot be locked, so `try_lock` failing *is* the "busy" answer —
+    /// no extra state, and no way for the two to disagree. That matters because the ping crosses the
+    /// same connection a request uses: pinging a slot mid-request would put a frame into a response
+    /// the front-end is reading.
+    ///
+    /// # A failure switches the keepalive off rather than killing the worker
+    ///
+    /// A worker that does not answer a `PING` is either broken or does not speak it, and the two look
+    /// identical from here. Killing it would be a respawn per period for the second case, so the pool
+    /// stops pinging instead and says so once. The worker is left exactly as it would have been had
+    /// the key never been set.
+    /// `pub` rather than private so a test can drive one sweep on demand instead of waiting out the
+    /// thread's period. The sweep is the whole of the behaviour and the thread around it is only a
+    /// parking loop, so this is the surface worth testing — but it is not part of the deployment
+    /// surface, and nothing calls it except that thread.
+    pub fn keepalive_once(&self) {
+        if self.spec.keepalive.is_none() {
+            return;
+        }
+
+        for (index, slot) in self.slots.iter().enumerate() {
+            if !self.keepalive_on.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut guard = match slot.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                // Serving a request, which is the definition of "not idle".
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+            };
+
+            // A slot whose worker is gone has nothing to ping; the ordinary request path replaces it
+            // on the next lease, and doing it here would race that path for the same slot.
+            if guard.exchange.is_none() || !guard.link.is_alive() {
+                continue;
+            }
+
+            // **A request has finished on this connection since the last sweep, so it is not idle.**
+            // The flag is set by `release` and cleared here, which makes one sweep act on every slot
+            // that has been quiet since the previous one — no timer arithmetic to jitter, and no way
+            // for "the sweep never ran" to look like "every ping succeeded".
+            let used = self
+                .used_since_sweep
+                .get(index)
+                .map(|used| used.swap(false, Ordering::Relaxed))
+                .unwrap_or(true);
+            if used {
+                continue;
+            }
+
+            match guard.exchange.as_mut().map(|e| e.ping(PING_TIMEOUT)) {
+                Some(Ok(())) => {
+                    self.pings_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Err((_, source))) => {
+                    // Off for the whole pool, once, because the next slot will fail identically.
+                    self.keepalive_on.store(false, Ordering::Relaxed);
+                    tracing::warn!(
+                        backend = %self.name,
+                        slot = index,
+                        %source,
+                        "a worker did not answer a keepalive ping; the keepalive is now off for \
+                         this backend, and workers are reached exactly as they were before \
+                         `idle_ping_ms` was set"
+                    );
+                    return;
+                }
+                None => {}
+            }
+        }
     }
 
     /// This pool's workers, one entry each, for `workers.list`.
@@ -2905,6 +3257,16 @@ impl WorkerPool {
             }
             free.ids.push(index);
         }
+        // Marked here rather than at the lease sites: this is the one function every path returns a
+        // slot through, so the keepalive's "this slot has been used" and the free list's "may be
+        // taken" are written at the same moment. A slot released twice returned above, so a double
+        // release cannot be mistaken for a fresh use.
+        //
+        // `false`, i.e. *not* idle: the worker has just finished a request, so its read has only now
+        // returned to waiting. The next sweep is what decides whether it has been quiet since.
+        if let Some(used) = self.used_since_sweep.get(index) {
+            used.store(false, Ordering::Relaxed);
+        }
         self.released.notify_one();
         // And the awaited waiters, which are not parked on that `Condvar`. Both signals for one
         // release is deliberate: whichever kind of request is queued takes the slot, and the other
@@ -2966,6 +3328,12 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
+        // Woken before the slots are stopped, so the keepalive thread cannot be mid-sweep while the
+        // workers it would ping are being torn down. The thread holds a `Weak`, so even an
+        // unsignalled one could not reach this pool — this is about not making shutdown wait.
+        if let Some(parker) = &self.keepalive_parker {
+            parker.stop();
+        }
         self.shutdown();
     }
 }
@@ -3387,6 +3755,42 @@ impl SlotExchange {
             SlotExchange::Threaded(_) => None,
         }
     }
+
+    /// Ask this slot's worker for a `PONG`, whatever thread or runtime owns the connection.
+    ///
+    /// The one operation the pool performs on a slot it does not intend to serve a request with,
+    /// so it is the one place the two variants are dispatched rather than chosen between. Both
+    /// paths end in the same protocol exchange; only who is allowed to touch the connection
+    /// differs, which is the whole content of [`SlotExchange`].
+    ///
+    /// `&mut self` for the threaded arm, which posts through a `&mut self` sender, and borrowed
+    /// rather than taken so the caller keeps the slot it holds the lock for — moving the exchange
+    /// out would make the slot look dead to [`Slot::is_available`].
+    fn ping(&mut self, timeout: Duration) -> std::result::Result<(), (RequestStage, WorkerError)> {
+        match self {
+            SlotExchange::Threaded(exchange) => exchange.ping(timeout),
+            // Bridged on the pool's own runtime, which is the runtime that owns the connection's
+            // waker and therefore the only one that may poll it. Called from the keepalive thread,
+            // which is not inside a runtime, so this takes `block_on`'s out-of-runtime path and
+            // parks only itself for the length of one round trip.
+            SlotExchange::Awaited(exchange) => {
+                let connection = Arc::clone(exchange);
+                exchange.block_on(async move {
+                    match tokio::time::timeout(timeout, connection.ping()).await {
+                        // A `PONG` that does not arrive is reported as a timeout and nothing more:
+                        // whether it means "busy", "slow" or "gone" is the caller's decision, and the
+                        // pool makes it from the worker's own advertised capability.
+                        Err(_) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+                        // Nothing was sent that could fail in the send phase, so every failure here
+                        // belongs to the read — the same attribution `Exchange::Ping` makes on the
+                        // threaded path.
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(source)) => Err((RequestStage::Reading, source)),
+                    }
+                })
+            }
+        }
+    }
 }
 
 /// The runtime that drives an attached pool's connections.
@@ -3623,6 +4027,46 @@ pub(super) fn params(pairs: &[(&str, &str)]) -> NameValuePairs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A keepalive is not started for a pool whose workers did not advertise the capability.
+    ///
+    /// # Why the negative direction needs a test of its own
+    ///
+    /// A worker that does not understand `PING` does not ignore the frame — it treats an unknown type
+    /// as a protocol error and exits, because skipping a frame would misalign its reader. So the cost
+    /// of getting this wrong is not a slower request; it is a pool that loses a worker on every idle
+    /// period, forever, and discovers the capability by destroying it.
+    ///
+    /// The gate is therefore the *handshake*, not the key: `idle_ping_ms` asks for a keepalive, and a
+    /// worker that does not advertise `answers_ping` means none is started. The predicate is exercised
+    /// directly because the shipped SDK advertises the capability, so the case that matters cannot be
+    /// produced by running one.
+    #[test]
+    fn a_keepalive_needs_the_capability_and_not_merely_the_key() {
+        let advertised: Vec<bool> = vec![true, true];
+        let mixed: Vec<bool> = vec![true, false];
+        let absent: Vec<bool> = vec![false, false];
+
+        assert!(every_slot_answers_ping(&advertised));
+        assert!(
+            !every_slot_answers_ping(&mixed),
+            "one worker that cannot answer must veto the pool: pinging the others would leave the \
+             pool pinging a worker that will never answer"
+        );
+        assert!(!every_slot_answers_ping(&absent));
+
+        // A pool with no slots is not a pool to ping.
+        assert!(!every_slot_answers_ping(&[]));
+
+        // **And the default has to be the safe answer.** `HelloAck::default()` is what an SDK that
+        // predates the field decodes to, so a default of `true` would turn every older worker into a
+        // worker that gets pinged and exits.
+        assert!(
+            !HelloAck::default().answers_ping,
+            "an absent `answers_ping` must decode as `false`, which is the whole reason the \
+             capability is advertised rather than probed"
+        );
+    }
 
     /// A pool's queue keeps at most its bound, and counts what it refused.
     ///

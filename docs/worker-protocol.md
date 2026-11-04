@@ -120,7 +120,7 @@ The numbering is part of the protocol. These values must never be reordered or r
 | # | Name | Direction | Correlated | Carries |
 | --- | --- | --- | --- | --- |
 | 1 | `HELLO` | server → worker | no | Protocol version, for the handshake |
-| 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime`, `no_checksum`, `stream_request_body` (see below) |
+| 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime`, `no_checksum`, `stream_request_body`, `answers_ping` (see below) |
 | 3 | `REQUEST` | server → worker | yes | Request metadata (JSON). The body follows in `BODY` frames. `body_len` is absent when the frame carries `STREAMED`, which is only sent to a worker that set `stream_request_body` in its `HELLO_ACK` |
 | 4 | `RESPONSE` | worker → server | yes | Response head: `status`, `headers`, `body_len`. `body_len` is authoritative unless the frame carries `STREAMED`, which declares no length |
 | 5 | `BODY` | either direction | yes | Raw bytes of the request or response body |
@@ -472,6 +472,17 @@ A pool answers "yes" only when **every** slot agreed, because a body can only be
 caller that fell back to buffering after half the body had gone to a worker that turned out not to
 understand it would have nothing left to send.
 
+### `answers_ping`, and the one field a server must not test by trying
+
+A worker that can answer a `PING` says so in its `HELLO_ACK`. The server pings only then, and
+`idle_ping_ms` does nothing until some worker has claimed it — see *Health* below for the whole
+argument.
+
+This is the one capability where a probe is not merely wasteful but destructive: an unknown frame
+type is a protocol error, not something a worker may skip, so a server that sent a `PING` to find out
+would kill the worker it asked. An SDK that predates the field decodes it as `false` and is simply
+never pinged, which is exactly what it did before the field existed.
+
 ### Serving a request
 
 ```
@@ -583,6 +594,36 @@ server  ──CONTROL (drain|shutdown|reload|report)─►  worker
 either  ──PING──►  other
         ◄─PONG───
 ```
+
+`PING` is unsolicited — it carries no request id — so it can never be confused with a response, and
+it is legal in a quiet window on an otherwise idle connection.
+
+**Only a worker that advertises `answers_ping` in its `HELLO_ACK` is ever pinged.** The rule and its
+direction are the same as `stream_request_body`'s, and the reason is sharper: a worker that does not
+understand `PING` does not ignore it. Skipping an unknown frame would silently misalign its reader,
+so the correct behaviour — and the one every SDK here implements — is to treat it as a protocol
+error and exit. A server that discovered the capability by sending one would therefore kill every
+worker it asked, learn the answer by destroying the pool, and repeat that on every idle period. The
+party that has to cope is the party that advertises.
+
+#### Why the server pings at all
+
+A worker's read can carry a deadline — PHP's `default_socket_timeout` is 60 s and is captured when
+the stream is created, and any runtime may set its own. A deadline that lands on an **idle** read
+returns the same thing as the peer closing the channel, and an SDK that does not ask which it was
+ends the worker. Measured on one that did not: a pool left quiet past the deadline lost every slot
+at the first request after the gap.
+
+`idle_ping_ms` on a backend is the server-side defence, and it is **off by default** (`0` means
+never) because it is only correct for a worker that answers. The fix belongs in the SDK — a worker
+should ask whether an empty read was a timeout — and is the better answer; this is what protects a
+deployment whose worker has not taken it.
+
+A sweep pings only slots a request is not holding, and only ones that have been idle since the
+previous sweep. A `PONG` that does not arrive switches the keepalive **off for the whole pool** and
+logs it once: from the failure alone a worker that is hung and one that cannot speak `PING` are
+indistinguishable, so the safe response is to stop pinging and leave the workers exactly as they
+were rather than to replace them every period.
 
 ### A call, while a request is in flight
 

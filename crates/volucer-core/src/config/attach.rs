@@ -134,6 +134,24 @@ pub struct AttachConfig {
     #[serde(default)]
     pub checksum: ChecksumMode,
 
+    /// How often to ping an idle connection, in milliseconds. **`0` means never, and never is the
+    /// default.**
+    ///
+    /// The same key with the same meaning as [`WorkerConfig::idle_ping_ms`], and it matters more
+    /// here: an attached worker holds its connection for the life of a slot, and the supervisor's
+    /// child may be reading it with a deadline it set for itself. A pool that went quiet used to
+    /// lose every attached slot at the first request after the gap — measured as 96 children gone
+    /// and 96 replacements — because the child read the deadline as end-of-file. A `PING` keeps the
+    /// read from being idle.
+    ///
+    /// The capability gate applies unchanged: a worker that did not advertise
+    /// [`HelloAck::answers_ping`] is never pinged, because one that does not understand `PING`
+    /// exits rather than ignoring it.
+    ///
+    /// [`HelloAck::answers_ping`]: volucer_worker::HelloAck::answers_ping
+    #[serde(default)]
+    pub idle_ping_ms: Option<u64>,
+
     /// Which control namespaces the attached workers may call.
     ///
     /// The same allow-list and the same reasoning as [`WorkerConfig::services`]: a connection is

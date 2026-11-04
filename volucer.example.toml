@@ -781,6 +781,20 @@ max_requests = 1000       # and after this many requests
 #   with no deadline holds its slot for ever, and the pool cannot tell that from
 #   a slow one until it runs out of slots.
 working_dir = "."
+# idle_ping_ms = 20000
+#   How often to PING an idle worker, or 0/absent for never. OFF BY DEFAULT, and it is not
+#   a tuning knob: a worker reads its channel with whatever deadline its runtime gave it
+#   (PHP's default_socket_timeout is 60 s), and a deadline that lands on an IDLE read is
+#   indistinguishable from the server closing the channel. A worker that reads it as a
+#   close ends itself, so a pool left quiet past that deadline loses every slot at once on
+#   the next request -- measured as 96 children gone and 96 replacements. A PING inside the
+#   window is what prevents it.
+#
+#   Nothing is sent to a worker that did not advertise `answers_ping` in its handshake,
+#   because a worker that does not understand a PING EXITS rather than ignoring it (an
+#   unknown frame type would misalign its reader). So a default of "on" would ping a
+#   third-party worker into a respawn loop. The fix belongs in the SDK -- a worker should
+#   ask feof() -- and the PHP SDK has it; this key is the defence for one that has not.
 # services = ["config"]   # What this backend's workers may CALL, mid-request. Absent means
                           # none, which is the safe default: the worker channel is a
                           # remote-execution surface and this key is the only thing limiting

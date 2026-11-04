@@ -146,7 +146,12 @@ impl Consumers {
     /// it. Dropping the `Consumers` drops the pool, and `Drop for WorkerPool` is what reaps the processes.
     pub fn new(plane: &JobsPlane, pool: WorkerPool, lease: Duration, prefetch: usize) -> Self {
         Consumers {
-            pool: Arc::new(pool),
+            // Through `worker_pool::shared` rather than a bare `Arc::new`, so a consumer pool gets its
+            // keepalive exactly as a backend's does. `[jobs.pool]` has no `idle_ping_ms` today — see
+            // `Spec::from_jobs_config`, which passes `None` — so this starts no thread, but the two
+            // construction sites must not differ in whether they *would*, or the next key added to a
+            // consumer table would silently do nothing here and work everywhere else.
+            pool: crate::worker_pool::shared(pool),
             pipelines: plane
                 .consumed()
                 .into_iter()

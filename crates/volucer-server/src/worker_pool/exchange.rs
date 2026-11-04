@@ -148,6 +148,16 @@ pub(super) enum Exchange {
         opening: tokio::sync::oneshot::Sender<StreamEvent>,
         on_end: Box<dyn FnOnce(StreamDone) + Send>,
     },
+    /// Ask an idle worker for its health.
+    ///
+    /// An exchange rather than a lock on the channel, and that is the whole reason this variant
+    /// exists: [`ChannelExchange`]'s thread owns the channel exclusively and its loop is
+    /// `while let Ok(exchange) = work_rx.recv()`, so the only safe way to reach the channel from
+    /// anywhere else is to ask that thread to do it. A timer that reached in with `try_recv`, or
+    /// that waited with `blocking_recv`, would either race the thread or panic inside a blocking
+    /// region — the second of those is the exact defect CI caught in the async hand-off, and it
+    /// presented as a `502` on every request rather than as a crash.
+    Ping,
 }
 
 /// What a streamed exchange tells its caller, in order.
@@ -333,6 +343,13 @@ impl Exchange {
             } => {
                 on_stage(RequestStage::Reading);
                 channel.send_frame(message_type, request_id, &payload, extra_flags)?;
+                Ok(None)
+            }
+            Exchange::Ping => {
+                // The stage is `Reading` because there is nothing to send that could fail
+                // meaningfully: the only outcome the pool acts on is whether a `PONG` came back.
+                on_stage(RequestStage::Reading);
+                channel.ping()?;
                 Ok(None)
             }
             Exchange::Streamed {
@@ -842,6 +859,29 @@ impl ChannelExchange {
                 self.ended = true;
                 Err((failure.stage, WorkerError::Closed(failure.message)))
             }
+        }
+    }
+
+    /// Ask an idle worker for its health, giving up after `timeout`.
+    ///
+    /// Posted as an [`Exchange::Ping`] rather than taking the channel, because the thread that owns
+    /// the channel is the only thing permitted to touch it. `round_trip` is reused for the wait so
+    /// the timeout, the `ended` bookkeeping and the "thread is gone" reporting are the same code as
+    /// every other exchange's, which is the reason a keepalive cannot drift away from the rest.
+    pub fn ping(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<(), (RequestStage, WorkerError)> {
+        match self.round_trip(Exchange::Ping, timeout) {
+            // `Ping` never produces a completion: the answer is the absence of an error.
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err((
+                RequestStage::Reading,
+                WorkerError::Closed(
+                    "the exchange thread answered a ping with a completion".to_string(),
+                ),
+            )),
+            Err(failure) => Err(failure),
         }
     }
 

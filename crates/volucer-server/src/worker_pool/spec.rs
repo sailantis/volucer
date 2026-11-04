@@ -88,6 +88,13 @@ pub(super) struct Spec {
     /// `Option` on the one spec type rather than a second spec type, because everything else about
     /// reaching a worker is identical and two specs would be two sets of rules that must agree.
     pub(super) runtime: Option<Arc<crate::worker_pool::AsyncRuntime>>,
+    /// How often to ping an idle worker, or `None` to never ping.
+    ///
+    /// On the spec rather than passed to each `boot` for the reason `checksum` and `runtime` are: a
+    /// *replacement* worker joins the same keepalive as the one it replaces, and a period that had to
+    /// be handed in at every replacement site is one that would eventually be forgotten at one — with
+    /// the symptom being one slot that quietly stops being kept alive while its siblings are not.
+    pub(super) keepalive: Option<Duration>,
 }
 
 impl Spec {
@@ -156,6 +163,7 @@ impl Spec {
                 )),
                 WorkerTransport::Pipe => None,
             },
+            keepalive: keepalive_of(config.idle_ping_ms, name)?,
         })
     }
 
@@ -176,6 +184,7 @@ impl Spec {
                 max_requests: config.max_jobs,
                 working_dir: config.working_dir.clone(),
                 request_timeout_ms: None,
+                idle_ping_ms: None,
                 env: config.env.clone(),
                 services: Vec::new(),
                 grpc_services: Vec::new(),
@@ -231,6 +240,7 @@ impl Spec {
                     },
                 )?,
             )),
+            keepalive: keepalive_of(config.idle_ping_ms, name)?,
         })
     }
 
@@ -337,6 +347,19 @@ fn request_timeout_of(configured: Option<u64>, backend: &str) -> Result<Duration
     }
 }
 
+/// A configured `idle_ping_ms`, resolved.
+///
+/// `None` and `Some(0)` both mean "never", which is what every configuration written before this key
+/// existed means. Unlike `request_timeout_ms`, `0` is **not** refused: there, zero invited a
+/// permanent hang, whereas here zero is the safe and correct pre-existing behaviour — a pool that
+/// never pings is exactly what the server did until this key existed.
+fn keepalive_of(configured: Option<u64>, _backend: &str) -> Result<Option<Duration>> {
+    Ok(match configured {
+        None | Some(0) => None,
+        Some(millis) => Some(Duration::from_millis(millis)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +372,7 @@ mod tests {
             max_requests: None,
             working_dir: None,
             request_timeout_ms: None,
+            idle_ping_ms: None,
             env: Default::default(),
             checksum: Default::default(),
             services: Vec::new(),
@@ -367,6 +391,7 @@ mod tests {
             workers,
             max_requests: None,
             checksum: Default::default(),
+            idle_ping_ms: None,
             services: Vec::new(),
             grpc_services: Vec::new(),
             grpc_serve_any: false,

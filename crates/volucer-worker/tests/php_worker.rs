@@ -493,6 +493,7 @@ fn a_frame_the_php_side_did_not_write_is_not_accepted() {
         runtime: String::new(),
         no_checksum: false,
         stream_request_body: false,
+        answers_ping: false,
     };
     let encoded = Json::encode(&ack).expect("encode a HELLO_ACK");
     let mut wire = Vec::new();

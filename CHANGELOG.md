@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`idle_ping_ms`: the server can keep an idle worker's read from timing out.** A worker's read can carry a deadline — PHP's `default_socket_timeout` is 60 s and is captured when the stream is created — and a deadline that lands on an *idle* read returns the same thing as the server closing the channel. An SDK that does not ask which it was ends the worker, so a pool left quiet past the deadline lost **every slot at once**, on the first request after the gap: measured as 96 children gone and 96 replacements, with a handful of `502`s while they came back. A `PING` inside the window is what keeps the read from being idle.
+
+  Off by default (`0` means never), because it is only correct for a worker that answers one — and a worker that does not understand `PING` does not ignore it, it exits, so a default of "on" would ping a third-party worker into a respawn loop. The capability is therefore **advertised** by the worker in its `HELLO_ACK` (`answers_ping`) rather than probed, exactly as `stream_request_body` is, and `idle_ping_ms` does nothing until a worker has claimed it. The PHP SDK advertises `PING` support, so a PHP deployment can turn this on; the better fix is in the SDK and this is the defence for a worker that has not taken it.
+
+  A sweep pings only slots no request holds, and only ones idle since the previous sweep. A `PONG` that does not arrive switches the keepalive off for the whole pool and says so once, because from the failure alone a hung worker and one that cannot speak `PING` are indistinguishable — so the safe answer is to stop pinging rather than to replace the worker every period. Verified end to end against a worker that reads a deadline as a close: **8 children → 0** without the key, **8 → 8** with it, in both arm orders (`scripts/verify-keepalive-rescue.sh`).
+
 ### Fixed
 
 - **A worker's calls reach the server on an awaited connection.** A worker may send a `CALL` at any point in its life — `kv`, `lock` and `jobs` all reach the server from inside a request, and a framework asks during boot — and the blocking channel had a handler installed for that. The awaited channel was a different type and never got one, so on an awaited slot every call was answered `"no call handler is installed"` and the application saw a failure unrelated to what it asked for. Only a worker on the socket transport was awaited before this release, which is why this showed up as seven `kv`/`lock`/`jobs` tests failing on Windows and nowhere else. Both paths now build the handler from one function, so they cannot drift again.
