@@ -3430,6 +3430,13 @@ impl WorkerPool {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(index) = free.take_woken() {
                     free.waiters -= 1;
+                    // Under the lock, like every other take site: the keepalive must not be able to
+                    // observe this slot as free between the free list dropping it and the lease
+                    // recording the take. This is the path *every* queued awaited request takes when
+                    // a release wakes it, so omitting it here left the flag false for the whole
+                    // request — including the await on the worker, when the slot mutex is unlocked
+                    // and the keepalive's only other test cannot see the request at all.
+                    self.mark_leased(index);
                     drop(free);
                     return Ok(OwnedLease {
                         pool: Arc::clone(self),
@@ -4325,8 +4332,27 @@ impl Slot {
     /// An attached slot has no `try_wait`: see [`Link::is_alive`] for why the honest answer
     /// there is "the connection is still open", and why that is the same window a spawned
     /// worker has.
+    ///
+    /// **A connection whose exchange has ended is not available either**, and that is a third
+    /// condition rather than a refinement of the first. [`wire::AsyncExchange::poison`] marks a
+    /// connection whose position on the wire is unknown — an abandoned exchange — and `is_ended` is
+    /// also set once a fatal read failure closes it. Both mean the *next* request cannot be served
+    /// here, so treating the slot as available would answer that request with a protocol error and
+    /// only then replace the worker: a client's failed `POST` in exchange for cleanup this could do
+    /// first. Asked here so every caller — `attempt`, `attempt_async`, both relayed paths — repairs
+    /// the slot before handing it out.
     fn is_available(&mut self) -> bool {
-        self.exchange.is_some() && self.link.is_alive()
+        self.exchange.is_some() && self.link.is_alive() && !self.connection_ended()
+    }
+
+    /// Whether this slot's awaited connection has been closed or abandoned.
+    fn connection_ended(&self) -> bool {
+        match &self.exchange {
+            Some(SlotExchange::Awaited(exchange)) => exchange.is_ended(),
+            // A threaded exchange has no such flag: its thread reports through the channel, and a
+            // dead worker is what `link.is_alive` already covers.
+            Some(SlotExchange::Threaded(_)) | None => false,
+        }
     }
     /// Kill the worker and drop its pipes.
     fn terminate(&mut self) {
@@ -4672,6 +4698,51 @@ mod tests {
         leased[0].store(true, Ordering::Release);
         assert!(is_leased(&leased, 0));
         assert!(!is_leased(&leased, 1));
+    }
+
+    /// **An abandoned connection must not be handed to the next request.**
+    ///
+    /// `poison` marks a connection whose position on the wire is unknown — the request that owned it
+    /// was cancelled between the request frame and the answer. The exchange is still `Some`, so
+    /// without a third condition in `is_available` the slot would go to the next request, which would
+    /// fail with a `Closed` protocol error and only *then* trigger the replacement: a client's failed
+    /// `POST` in exchange for cleanup the pool could have done first. A `GET` would be retried and
+    /// hide it; a `POST` would not.
+    #[tokio::test]
+    async fn an_abandoned_connection_reports_itself_ended() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let address = listener.local_addr().expect("an address");
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("a connection");
+            let _ = stream.write_all(b"hello").await;
+            stream
+        });
+        let client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("a connection to the listener");
+        let server = accepted.await.expect("the accepted half");
+
+        let exchange = std::sync::Arc::new(wire::AsyncExchange::start_for_test(
+            wire::AsyncStream::Tcp(client),
+            wire::AsyncStream::Tcp(server),
+        ));
+        assert!(
+            !exchange.is_ended(),
+            "a fresh connection has not ended, so its slot is available"
+        );
+
+        // What a cancelled request does to its connection.
+        exchange.poison();
+        assert!(
+            exchange.is_ended(),
+            "an abandoned exchange must report itself ended, because that is what makes \
+             `is_available` refuse the slot and the pool replace the worker *before* the next \
+             request is answered with a protocol error"
+        );
     }
 
     /// A pool's queue keeps at most its bound, and counts what it refused.
