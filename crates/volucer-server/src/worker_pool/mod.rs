@@ -823,7 +823,8 @@ impl WorkerPool {
         // **Every** slot, not any: a pool with one worker that cannot answer a `PING` must not ping
         // the others, because the failure mode of getting it wrong is a respawn loop rather than a
         // slower request. A replacement that fails to advertise the capability switches it off
-        // again; see `refresh_stream_capability`'s sibling `keepalive_still_supported`.
+        // again — checked per slot in `keepalive_once`, because that is the only place a replaced
+        // worker's handshake is read before a ping is sent to it.
         let starts_keepalive = {
             let advertised: Vec<bool> = slots
                 .iter()
@@ -1248,10 +1249,10 @@ impl WorkerPool {
     /// `slot` names the one guard the caller is known to hold, so it is read through that guard and
     /// never locked again. Every other slot is `try_lock`ed, for the reason
     /// [`Self::worker_status`] gives at length: this is reachable from an exchange thread whose own
-    /// worker is mid-request. A slot that cannot be locked is *assumed* to stream, which keeps the
-    /// answer conservative — a false `true` only means a caller takes the streaming path and is refused
-    /// by [`Self::attempt_streaming`]'s own per-slot check, which is the same refusal an unadvertised
-    /// pool gets anyway.
+    /// worker is mid-request. A slot that cannot be locked is *assumed not to stream*, which is the
+    /// direction whose worst case is a buffered request — a false `true` would publish a yes for a
+    /// mixed-capability pool, open a body pump, and fail the request against the worker that cannot
+    /// take one.
     fn refresh_stream_capability(&self, slot: Option<(usize, &Slot)>) {
         let all = !self.slots.is_empty()
             && self.slots.iter().enumerate().all(|(index, candidate)| {
@@ -1265,7 +1266,14 @@ impl WorkerPool {
                     Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                         poisoned.into_inner().hello.stream_request_body
                     }
-                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    // **A slot that cannot be locked is assumed *not* to stream.** The conservative
+                    // direction is the one that costs a buffered request, not the one that opens a
+                    // body pump for a worker which then refuses it: a `true` here publishes a
+                    // pool-wide yes for a mixed-capability pool, and the listener's consequence is a
+                    // failed request rather than a slower one. The cost of a false `false` is that a
+                    // streaming-capable pool falls back to buffering while one slot is busy, which is
+                    // what the pool did before the cache existed.
+                    Err(std::sync::TryLockError::WouldBlock) => false,
                 }
             });
         self.all_slots_stream_bodies.store(all, Ordering::Relaxed);
@@ -1407,6 +1415,28 @@ impl WorkerPool {
                 .unwrap_or(true);
             if used {
                 continue;
+            }
+
+            // **A slot whose worker did not advertise `answers_ping` is never pinged**, and it is
+            // checked here rather than only at construction because a slot can be *replaced*.
+            // `keepalive_on` was computed once from the booted pool and a replacement never touched
+            // it, so a worker swapped for an older SDK — or for a third-party one, which is the case
+            // this whole feature exists for — would have been sent a `PING` it treats as an unknown
+            // frame type. That worker exits rather than ignoring it, so the pool would lose a
+            // healthy slot every period: exactly the failure the keepalive was added to prevent,
+            // reached from the other direction.
+            //
+            // Checked on the slot's own handshake instead of recomputing a pool-wide flag, because
+            // the answer is per worker and the sweep already holds the lock that makes it readable.
+            if !guard.hello.answers_ping {
+                tracing::debug!(
+                    backend = %self.name,
+                    slot = index,
+                    "a replacement worker does not advertise `answers_ping`; the keepalive is off \
+                     for this backend"
+                );
+                self.keepalive_on.store(false, Ordering::Relaxed);
+                return;
             }
 
             match guard.exchange.as_mut().map(|e| e.ping(PING_TIMEOUT)) {
@@ -4068,6 +4098,43 @@ mod tests {
         );
     }
 
+    /// **A worker that is replaced must be asked the same question as one that booted.**
+    ///
+    /// `keepalive_on` was computed once, from the pool that existed at construction, and a
+    /// replacement never touched it. So a slot swapped for a worker on an older SDK — or a
+    /// third-party one, which is the case this whole feature exists for — would be sent a `PING` it
+    /// treats as an unknown frame type. A worker exits on that rather than ignoring it, so the pool
+    /// would lose a healthy slot every period: the failure the keepalive was added to prevent,
+    /// reached from the other direction.
+    ///
+    /// The gate is now read from the slot's own handshake inside the sweep, so the assertion is that
+    /// the two helpers agree — `every_slot_answers_ping` is what construction uses and the sweep uses
+    /// `hello.answers_ping` directly. A test that only exercised construction would pass with the
+    /// replacement hole open, which is exactly what happened.
+    #[test]
+    fn a_replacement_worker_is_asked_whether_it_answers_ping() {
+        // What a replacement on a fixed SDK advertises, and what one on an older SDK advertises.
+        let fixed_sdk = HelloAck {
+            answers_ping: true,
+            ..HelloAck::default()
+        };
+        let old_sdk = HelloAck::default();
+
+        // The sweep's own check, written the way the sweep writes it.
+        let may_ping = |hello: &HelloAck| hello.answers_ping;
+
+        assert!(may_ping(&fixed_sdk));
+        assert!(
+            !may_ping(&old_sdk),
+            "a replaced worker that does not advertise `answers_ping` must not be pinged, because \
+             it exits on a frame it does not understand"
+        );
+
+        // And construction's rule agrees with the sweep's, so a pool cannot be started under one
+        // answer and continue under another.
+        assert!(every_slot_answers_ping(&[may_ping(&fixed_sdk)]));
+        assert!(!every_slot_answers_ping(&[may_ping(&old_sdk)]));
+    }
     /// A pool's queue keeps at most its bound, and counts what it refused.
     ///
     /// **The bug this test exists for was a leak, and it was described in the wrong direction.** The
