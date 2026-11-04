@@ -2871,11 +2871,25 @@ async fn prepare(
     //
     // The memory is the point: without this a 1 GB upload is 1 GB of server heap before the
     // application sees a byte.
+    //
+    // **The capability is not the question.** `streams_request_bodies` answers "can this backend be
+    // handed a body of unknown length", which is a property of the pool, not of this request. Every
+    // request starts as `Payload::Streamed` (see `Payload`'s own note: the HTTP transport has no
+    // other body type), so asking it alone opened a pump — and therefore took the blocking path
+    // below — for a `GET /` with no body at all.
+    //
+    // Measured on a hello-world `attach` arm at c=100: the blocking pool grew from 20 threads idle
+    // to 132 under load, at 8.4 futex and 4.25 `sched_switch` per request, and stopped gaining
+    // throughput at ~62k where the same front-end serving `upstream` reached ~99k. A body that has
+    // already ended cannot be streamed, so it is read here — `drain` returns an empty `Vec` without
+    // awaiting a frame — and the request takes the hop-less path.
     let limit = front_end.limits.max_body_bytes;
     let streaming = front_end.dispatcher.streams_request_bodies(&backend);
-    let (body, pump) = match (body, streaming) {
-        (Payload::Streamed(body), true) => (None, Some(BodyPump::start(body, limit))),
-        (body, _) => (Some(read_body(body, limit).await?), None),
+    let (body, pump) = match body {
+        Payload::Streamed(inner) if pumps_this_body(&inner, streaming) => {
+            (None, Some(BodyPump::start(inner, limit)))
+        }
+        body => (Some(read_body(body, limit).await?), None),
     };
 
     // A route that proves its pattern names a script may skip the router's own `stat`:
@@ -3675,6 +3689,24 @@ where
     }
 
     Ok(out)
+}
+
+/// Whether this request's body should be pumped rather than read.
+///
+/// Two independent questions, and conflating them was a measured regression:
+///
+/// - **Can** this backend take a body of unknown length? That is
+///   [`Dispatcher::streams_request_bodies`], a property of the pool, not of this request.
+/// - **Does** this request have a body still to arrive? Every request starts as a streamed payload
+///   because the HTTP transport has no other body type, so `GET /` is streamed too — with a body
+///   that has already ended.
+///
+/// A body that has ended cannot be streamed, and opening a pump for it forced the blocking path for
+/// an otherwise bodyless request. Kept as a named predicate rather than a match guard so the rule is
+/// testable against `Full<Bytes>`, which is the only body a test can construct — [`Incoming`] needs a
+/// live connection.
+fn pumps_this_body<B: Body>(body: &B, can_stream: bool) -> bool {
+    can_stream && !body.is_end_stream()
 }
 
 /// Build the CGI request and decide which backend serves it.
@@ -4555,6 +4587,55 @@ mod tests {
     use super::*;
     use hyper::header::HOST;
     use std::path::PathBuf;
+
+    /// A request with no body must not open a pump, even when the backend can stream.
+    ///
+    /// This is the regression that cost the `attach` arm its throughput: every request starts as a
+    /// streamed payload, so asking only "can this backend stream" opened a pump for `GET /` and
+    /// pushed a bodyless request onto the blocking path. The pool then grew a thread per concurrent
+    /// request — 20 threads idle against 132 at c=100 — because the hop is `spawn_blocking`.
+    ///
+    /// `Full<Bytes>` is what a test can build; it reports `is_end_stream()` for an empty body, which
+    /// is the same answer `Incoming` gives for a request that sent none. That equivalence is the
+    /// assumption this test rests on, and it is the reason the production call site passes the real
+    /// `Incoming` rather than re-deriving the answer from headers.
+    #[test]
+    fn an_empty_body_is_never_pumped_even_when_the_backend_can_stream() {
+        let empty = Full::new(Bytes::new());
+        assert!(
+            !pumps_this_body(&empty, true),
+            "a body that has already ended cannot be streamed, so a backend's streaming \
+             capability must not turn `GET /` into a pumped request"
+        );
+    }
+
+    /// A request that does have a body must still be pumped — the fix must not trade the regression
+    /// for buffering every upload in heap.
+    ///
+    /// `Full` over non-empty bytes reports `!is_end_stream()` on the first call, which is the shape
+    /// an upload has before its frames are read.
+    #[test]
+    fn a_body_that_is_still_arriving_is_pumped_when_the_backend_can_stream() {
+        let upload = Full::new(Bytes::from_static(b"0123456789"));
+        assert!(
+            pumps_this_body(&upload, true),
+            "a backend that advertised streaming must still be handed an upload as it arrives"
+        );
+    }
+
+    /// And a backend that cannot stream never gets a pump, whatever the body looks like.
+    ///
+    /// The capability half of the predicate: `spawn_cgi` and `external` cannot accept a body of
+    /// unknown length, so they keep the buffered path exactly as before.
+    #[test]
+    fn a_backend_that_cannot_stream_is_never_pumped() {
+        let upload = Full::new(Bytes::from_static(b"0123456789"));
+        assert!(
+            !pumps_this_body(&upload, false),
+            "a CGI backend needs CONTENT_LENGTH before it reads STDIN, so it must never be \
+             handed a streamed body"
+        );
+    }
 
     fn routing() -> Routing {
         Routing {
