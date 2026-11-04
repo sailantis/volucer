@@ -195,11 +195,25 @@ where
     ///
     /// The worker must have advertised [`volucer_worker::HelloAck::stream_request_body`] before this
     /// is called; the pool gates that, because the capability lives on its side.
+    ///
+    /// # The deadline covers the worker, not the client
+    ///
+    /// `timeout` is applied **only after the terminating `LAST` frame has gone out**, which is the
+    /// split `ChannelExchange::round_trip_streaming` documents and for the same reason: while the
+    /// body is still arriving the worker has not been asked anything, so a deadline there would fail
+    /// an upload that is merely slow. A 256 MiB `POST` over a phone link takes longer than the thirty
+    /// seconds this pool allows a worker to think, and the client's own connection is the only thing
+    /// that can bound that phase.
+    ///
+    /// Without this the awaited arm had no deadline at all: a worker that accepted the head and then
+    /// said nothing held its slot for ever, and the pool shrank by one per silent worker while the
+    /// threaded arm was answering `504` for the same worker.
     pub(super) async fn request_encoded_streaming(
         &mut self,
         head: Vec<u8>,
         chunks: &mut dyn FnMut() -> Result<Option<Vec<u8>>>,
         on_stage: &mut (dyn FnMut(RequestStage) + Send),
+        timeout: std::time::Duration,
     ) -> Result<WorkerResponse> {
         let request_id = self.take_request_id();
 
@@ -241,8 +255,14 @@ where
             }
         }
 
+        // Phase one ends here, so the worker's own deadline starts here. The head and every body
+        // frame are on the wire, the worker owes an answer, and from this point the clock is the
+        // pool's `request_timeout` rather than the client's upload speed.
         on_stage(RequestStage::Reading);
-        self.collect_response(request_id).await
+        match tokio::time::timeout(timeout, self.collect_response(request_id)).await {
+            Ok(response) => response,
+            Err(_) => Err(WorkerError::Timeout(timeout)),
+        }
     }
 
     /// Write one frame whose payload is already encoded.
@@ -1333,20 +1353,22 @@ impl AsyncExchange {
     /// blocks the runtime thread, which is why this path is used only for an upload — one thread per
     /// upload is the upload's own cost, not the request path's.
     ///
-    /// The terminating `None` raises `body_done`, which is what starts the caller's deadline: until
-    /// then it is waiting on the client, not on the worker.
+    /// `timeout` is the deadline on the **worker**, and it starts only once the body has been sent —
+    /// see [`WireChannel::request_encoded_streaming`]. Until then this is waiting on the client, and
+    /// how long a client takes to upload is not something the pool's `request_timeout` may decide.
     pub(super) async fn request_streaming(
         &self,
         head: Vec<u8>,
         mut chunks: Box<dyn FnMut() -> std::result::Result<Option<Vec<u8>>, WorkerError> + Send>,
         on_stage: &mut (dyn FnMut(RequestStage) + Send),
+        timeout: std::time::Duration,
     ) -> std::result::Result<WorkerResponse, WorkerError> {
         if self.is_ended() {
             return Err(ended_error());
         }
         let mut wire = self.wire.lock().await;
         match wire
-            .request_encoded_streaming(head, &mut chunks, on_stage)
+            .request_encoded_streaming(head, &mut chunks, on_stage, timeout)
             .await
         {
             Ok(response) => Ok(response),
@@ -2284,5 +2306,161 @@ mod tests {
         let mut payload = vec![0u8; header.payload_len as usize];
         reader.read_exact(&mut payload).await.unwrap();
         (header, payload)
+    }
+
+    /// **A worker that accepts a streamed body and then says nothing is timed out.**
+    ///
+    /// The awaited arm had no deadline at all before this: `collect_response` is an unbounded read,
+    /// and the threaded arm's `round_trip_streaming` is what supplied the bound. So a silent worker
+    /// held its slot for ever and the pool shrank by one per silent worker — the same failure the
+    /// threaded arm answers with a `504`, arrived at by a different door.
+    ///
+    /// The `timeout` here is deliberately short and the assertion is on the *outcome*, not on a wall
+    /// clock: a test that slept for a deadline would be slow and would still pass if the deadline
+    /// were applied to the wrong phase.
+    #[tokio::test]
+    async fn a_silent_worker_times_a_streamed_body_out() {
+        let (mut worker_write, front_read, front_write) = halves();
+        let mut wire = WireChannel::new_with_policy(front_read, front_write, Checksum::Optional);
+
+        // The worker reads the head and the terminal `LAST`, then says nothing at all. Draining
+        // rather than ignoring is what a real worker does, so the front-end's writes do not block
+        // on a full duplex buffer and the timeout is the only thing that can end this.
+        let answered = tokio::spawn(async move {
+            loop {
+                let (header, _) = wire_frame(&mut worker_write).await;
+                if header.flags & flags::LAST != 0 {
+                    break;
+                }
+            }
+            // Then nothing. Holding the writer is what keeps the connection open.
+            worker_write
+        });
+
+        let mut stage = RequestStage::Sending;
+        let mut track = |reported: RequestStage| stage = reported;
+        // One piece, then end of input — so `LAST` goes out and the worker's deadline starts. The
+        // worker has been written to say nothing afterwards, which is the case under test.
+        let mut sent = false;
+        let mut chunks = || {
+            if sent {
+                return Ok(None);
+            }
+            sent = true;
+            Ok(Some(b"hello".to_vec()))
+        };
+
+        let err = wire
+            .request_encoded_streaming(
+                REQUEST_HEAD.as_bytes().to_vec(),
+                &mut chunks,
+                &mut track,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a worker that never answers must not be waited on for ever");
+
+        assert!(
+            matches!(err, WorkerError::Timeout(_)),
+            "expected the deadline to report a timeout, got {err}"
+        );
+        // The body was sent and the answer was not, so the stage is what decides whether a replay is
+        // sound — and it must say `Reading`, or a `POST` would be replayed against a worker that may
+        // have run it.
+        assert!(
+            matches!(stage, RequestStage::Reading),
+            "the deadline covers the answer, so the failure is attributed to reading; got {stage:?}"
+        );
+
+        // Aborted rather than awaited: this worker's job is to stay silent, so it would never
+        // finish on its own.
+        answered.abort();
+        let _ = answered.await;
+    }
+
+    /// **The deadline does not cover the client's upload.**
+    ///
+    /// The other half of the same rule, and the reason the timeout is applied after `LAST` rather
+    /// than around the whole exchange. A body still arriving is the client's business: a 256 MiB
+    /// `POST` over a phone link takes longer than the thirty seconds this pool allows a *worker* to
+    /// think, and failing it would refuse a slow upload for being slow.
+    ///
+    /// Written as "an upload slower than the timeout still succeeds", because that is the property.
+    /// An implementation that wrapped the whole call would pass the previous test and fail this one.
+    ///
+    /// Multi-threaded, deliberately: `chunks` blocks the thread it is called on, which is exactly
+    /// what it does in production (the front-end's pump blocks on the client's socket), so a
+    /// single-threaded runtime would starve the worker task rather than exercise the phase boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_upload_outlives_the_worker_deadline() {
+        let (mut worker_write, front_read, front_write) = halves();
+        let mut wire = WireChannel::new_with_policy(front_read, front_write, Checksum::Optional);
+
+        let answered = tokio::spawn(async move {
+            // Read the whole exchange, then answer it properly.
+            loop {
+                let (header, _) = wire_frame(&mut worker_write).await;
+                if header.flags & flags::LAST != 0 {
+                    break;
+                }
+            }
+            let head = ResponseHead {
+                status: 200,
+                headers: Vec::new(),
+                body_len: 2,
+            };
+            emit(
+                &mut worker_write,
+                MessageType::Response,
+                1,
+                0,
+                &Json::encode(&head).unwrap(),
+            )
+            .await;
+            emit(&mut worker_write, MessageType::Body, 1, flags::LAST, b"ok").await;
+            emit(
+                &mut worker_write,
+                MessageType::End,
+                1,
+                0,
+                &Json::encode(&RequestEnd::default()).unwrap(),
+            )
+            .await;
+            worker_write
+        });
+
+        // Three pieces, each delayed by more than the whole deadline: 300 ms of uploading against a
+        // 200 ms worker deadline. If the deadline covered this phase the request would fail.
+        //
+        // The margin after `LAST` is deliberately generous — the worker's answer is microseconds of
+        // work, so a 200 ms budget cannot be lost to scheduling. A tight deadline here would race the
+        // scheduler instead of testing the phase boundary, which is what the first version of this
+        // test did: it blocked a worker thread for the whole upload and then demanded the answer
+        // inside the same 50 ms.
+        let mut sent = 0;
+        let mut chunks = || {
+            if sent == 3 {
+                return Ok(None);
+            }
+            sent += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(Some(b"piece".to_vec()))
+        };
+
+        let mut stage = RequestStage::Sending;
+        let mut track = |reported: RequestStage| stage = reported;
+        let response = wire
+            .request_encoded_streaming(
+                REQUEST_HEAD.as_bytes().to_vec(),
+                &mut chunks,
+                &mut track,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect("a slow upload is the client's business, not the worker's deadline");
+
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.body, b"ok");
+        drop(answered.await);
     }
 }
