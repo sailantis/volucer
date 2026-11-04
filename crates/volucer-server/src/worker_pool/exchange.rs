@@ -220,6 +220,23 @@ pub(super) struct StreamDone {
     /// Why the body did not reach its end, when it did not.
     pub(super) failure: Option<String>,
 }
+/// What the exchange thread is to do with a finished exchange.
+///
+/// The distinction is load-bearing rather than bookkeeping. `answers` is read by `round_trip`,
+/// which takes the *next* message on it as its own, so an exchange whose outcome travels on a
+/// channel it owns must not also leave one here. Leaving one behind makes the next round trip — an
+/// ordinary request, an unsolicited frame write, or a keepalive's `PING` — read a stranger's answer
+/// and act on it, and for a ping that means reporting a health check that was never sent.
+///
+/// This is why the choice is a return value and not a comment: a variant added without deciding
+/// will not compile.
+enum Outcome {
+    /// One answer, for whoever is waiting in `round_trip`.
+    Publish(std::result::Result<Option<Completed>, WorkerError>),
+    /// The outcome already left through a sender this exchange was built with.
+    Private,
+}
+
 impl Exchange {
     /// Run this exchange on a live channel.
     ///
@@ -228,23 +245,21 @@ impl Exchange {
     /// [`Exchange::Request`] and [`Exchange::Job`] have two phases; every other exchange reports
     /// `Reading` once, because a control or a frame write has nothing to read and its result
     /// is not retried.
-    fn run(
-        self,
-        channel: &mut Channel,
-        on_stage: &mut dyn FnMut(RequestStage),
-    ) -> std::result::Result<Option<Completed>, WorkerError> {
+    fn run(self, channel: &mut Channel, on_stage: &mut dyn FnMut(RequestStage)) -> Outcome {
         match self {
             Exchange::Request { head, body } => {
                 // The stage is reported by the channel as it moves from writing to reading, which
                 // is the only place that can know where a failure happened.
                 let result = channel.request_encoded(head, &body, &mut *on_stage);
-                result.map(|response| Some(Completed::Response(response)))
+                Outcome::Publish(result.map(|response| Some(Completed::Response(response))))
             }
             Exchange::RequestAsync { head, body, answer } => {
                 // The whole exchange, run here and nowhere else: this thread still owns the pipes,
                 // and the only thing that changed is that the *caller* is not parked while it runs.
-                // Always `Ok(None)`: the outcome travels on `answer`, because `run`'s return value
-                // is queued on the shared `answers` channel that no caller of this variant reads.
+                // `Private`: the outcome travels on `answer`, and `answers` has no reader for this
+                // variant — publishing it would leave a stale reply for the next round trip, which
+                // is a real defect rather than a tidiness issue (a `PING` would consume it and
+                // report health it never checked).
                 //
                 // The stage is tracked here rather than by `start`'s closure, because this arm is the
                 // one that has to hand it *beside* the error: the caller decides whether a replay is
@@ -264,7 +279,7 @@ impl Exchange {
                 // connection). The response is simply dropped, exactly as a timed-out
                 // `round_trip` drops it.
                 let _ = answer.send(outcome);
-                Ok(None)
+                Outcome::Private
             }
             Exchange::RequestStreamedAsync {
                 head,
@@ -273,9 +288,9 @@ impl Exchange {
                 opening,
                 on_end,
             } => {
-                // The same rule as `Exchange::Streamed`: always `Ok(None)`, because every outcome
-                // leaves through `opening` and `on_end`, and `run`'s return value would sit on the
-                // shared `answers` channel until the next request read it as its own.
+                // `Private`: every outcome leaves through `opening` and `on_end`, so `answers` must
+                // be left alone. Publishing here would put a reply on it that the next round trip
+                // reads as its own.
                 //
                 // `opening` is consumed by the first emission, so the remaining events after a
                 // `Head` have nowhere to go — which is correct: after the head the caller reads the
@@ -296,7 +311,7 @@ impl Exchange {
                     on_end,
                     &mut *on_stage,
                 );
-                Ok(None)
+                Outcome::Private
             }
             Exchange::RequestStreaming {
                 head,
@@ -324,7 +339,7 @@ impl Exchange {
                 // Raised on every exit, including a failed send: the caller must not go on waiting
                 // forever for a body that will never be completed.
                 body_done.store(true, std::sync::atomic::Ordering::Release);
-                result.map(|response| Some(Completed::Response(response)))
+                Outcome::Publish(result.map(|response| Some(Completed::Response(response))))
             }
             Exchange::Job { head, body } => {
                 let result = channel.job(head, &body, &mut *on_stage);
@@ -333,7 +348,9 @@ impl Exchange {
                 // the response object; a job has no response object, so without this they would sit
                 // in the channel until the consumer was recycled — which is exactly when a scrape can
                 // no longer see them.
-                result.map(|ack| Some(Completed::Job(ack, channel.take_metrics())))
+                Outcome::Publish(
+                    result.map(|ack| Some(Completed::Job(ack, channel.take_metrics()))),
+                )
             }
             Exchange::Send {
                 message_type,
@@ -342,15 +359,17 @@ impl Exchange {
                 extra_flags,
             } => {
                 on_stage(RequestStage::Reading);
-                channel.send_frame(message_type, request_id, &payload, extra_flags)?;
-                Ok(None)
+                Outcome::Publish(
+                    channel
+                        .send_frame(message_type, request_id, &payload, extra_flags)
+                        .map(|()| None),
+                )
             }
             Exchange::Ping => {
                 // The stage is `Reading` because there is nothing to send that could fail
                 // meaningfully: the only outcome the pool acts on is whether a `PONG` came back.
                 on_stage(RequestStage::Reading);
-                channel.ping()?;
-                Ok(None)
+                Outcome::Publish(channel.ping().map(|()| None))
             }
             Exchange::Streamed {
                 head,
@@ -359,12 +378,12 @@ impl Exchange {
                 events,
                 on_end,
             } => {
-                // **Always `Ok(None)`, whatever happened.** `run`'s return value is queued on the
-                // answer channel that `round_trip` reads, and this caller stops reading after one
-                // message — so an `Err` here would sit on that channel until the *next* request's
-                // `round_trip` consumed it and failed for a reason that had nothing to do with it.
-                // Every outcome therefore leaves through `events` (for the opening) and `on_end`
-                // (for the ending), which are this exchange's own channels and nobody else's.
+                // `Private`: `run`'s return value would otherwise be queued on the answer channel
+                // that `round_trip` reads, and this caller stops reading after one message — so it
+                // would sit there until the *next* request's `round_trip` consumed it and failed
+                // for a reason that had nothing to do with it. Every outcome therefore leaves
+                // through `events` (for the opening) and `on_end` (for the ending), which are this
+                // exchange's own channels and nobody else's.
                 pump_streamed(
                     channel,
                     head,
@@ -374,7 +393,7 @@ impl Exchange {
                     on_end,
                     &mut *on_stage,
                 );
-                Ok(None)
+                Outcome::Private
             }
         }
     }
@@ -643,15 +662,22 @@ impl ChannelExchange {
                 // The default is the send phase, so a failure before the callback
                 // fires is still attributed to the write.
                 let mut stage = RequestStage::Sending;
-                let result = exchange.run(&mut channel, &mut |reported| stage = reported);
-                // The receiver is gone only if the caller dropped this exchange,
-                // which happens on a timeout. Then the answer is dropped with the
-                // thread — the caller has already decided not to wait.
-                if answer_tx
-                    .send(result.map_err(|source| (stage, source)))
-                    .is_err()
-                {
-                    break;
+                match exchange.run(&mut channel, &mut |reported| stage = reported) {
+                    // The exchange published its own answer, or it answers on a channel of its
+                    // own; either way nothing is owed to `answers`.
+                    Outcome::Private => {}
+                    // Exactly one answer per exchange, and this is the only place one is queued.
+                    // A receiver that has gone means the caller dropped the exchange, which happens
+                    // on a timeout: the answer goes with the thread, and the caller has already
+                    // decided not to wait.
+                    Outcome::Publish(result) => {
+                        if answer_tx
+                            .send(result.map_err(|source| (stage, source)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -1190,6 +1216,201 @@ impl ChannelExchange {
                     RequestStage::Reading,
                     WorkerError::Closed("the exchange thread ended without answering".to_string()),
                 ))
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use volucer_worker::message::{Json, RequestEnd, ResponseHead};
+    use volucer_worker::{write_frame, Checksum, Codec, Header, MessageType, RequestHeader};
+
+    /// A worker on the far end of a **loopback** pair, driven by the test instead of by a process.
+    ///
+    /// Written against the wire format on purpose. The defect under test is bookkeeping on *this*
+    /// side of the connection, so the far end should be as dumb as possible: it serves `REQUEST`,
+    /// answers `PING`, and panics on a frame the test did not mean to send.
+    ///
+    /// Loopback rather than a unix socket so the test runs on every platform. The defect is in the
+    /// exchange thread, which does not know what it is reading from, and this is the one transport
+    /// available everywhere — the pipes Linux uses by default have no such fixture.
+    fn scripted_worker(incoming: TcpListener, requests: usize) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || {
+            let (their_side, _) = incoming.accept().unwrap();
+            let mut reader = std::io::BufReader::new(their_side.try_clone().unwrap());
+            let mut writer = std::io::BufWriter::new(their_side);
+            let mut served = 0usize;
+            let mut pings = 0usize;
+            while let Ok(Some((header, _))) =
+                Header::read_frame_with(&mut reader, Checksum::Required)
+            {
+                let id = header.request_id;
+                match header.message_type {
+                    MessageType::Request => {
+                        served += 1;
+                        let payload = Json::encode(&ResponseHead {
+                            status: 200,
+                            headers: Vec::new(),
+                            body_len: 0,
+                        })
+                        .unwrap();
+                        write_frame(
+                            &mut writer,
+                            &Header::new(MessageType::Response, id, &payload).unwrap(),
+                            &payload,
+                        )
+                        .unwrap();
+                        let payload = Json::encode(&RequestEnd::default()).unwrap();
+                        write_frame(
+                            &mut writer,
+                            &Header::new(MessageType::End, id, &payload).unwrap(),
+                            &payload,
+                        )
+                        .unwrap();
+                    }
+                    MessageType::Ping => {
+                        pings += 1;
+                        write_frame(
+                            &mut writer,
+                            &Header::new(MessageType::Pong, id, b"").unwrap(),
+                            b"",
+                        )
+                        .unwrap();
+                    }
+                    other => {
+                        panic!("the scripted worker was sent {other:?}, which it does not serve")
+                    }
+                }
+                if served >= requests && pings > 0 {
+                    break;
+                }
+            }
+            pings
+        })
+    }
+
+    /// A connected [`ChannelExchange`] over a loopback connection.
+    ///
+    /// `ChannelExchange::start` is the only constructor and it takes the channel the handshake would
+    /// have produced, so the test builds exactly that rather than a parallel path.
+    fn connected(requests: usize) -> (ChannelExchange, std::thread::JoinHandle<usize>) {
+        let incoming = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = incoming.local_addr().unwrap();
+        let peer = scripted_worker(incoming, requests);
+        let ours = TcpStream::connect(address).unwrap();
+        let channel = BoundedChannel::new(ours.try_clone().unwrap(), ours);
+        (ChannelExchange::start(channel), peer)
+    }
+
+    fn a_request(uri: &str) -> Vec<u8> {
+        Json::encode(&RequestHeader {
+            method: "GET".to_string(),
+            uri: uri.to_string(),
+            ..RequestHeader::default()
+        })
+        .unwrap()
+    }
+
+    /// **An async request must not answer the exchange that follows it.**
+    ///
+    /// `post_request_async` hands its outcome to the caller on a private channel, and the exchange
+    /// thread's loop *also* queues `run`'s return value on the shared `answers` channel. Both async
+    /// arms were written as returning `Ok(None)` on the theory that nobody reads it — but
+    /// `round_trip` reads exactly that channel and takes the next message as its own, so the leftover
+    /// is consumed by whatever runs next.
+    ///
+    /// The assertion is on the **following** exchange rather than on the request itself, because the
+    /// request reports its own answer correctly. The harm is one exchange later, which is why a test
+    /// written against the request alone passes against the leak.
+    #[test]
+    fn an_async_request_does_not_answer_the_next_exchange() {
+        let (mut exchange, peer) = connected(2);
+
+        let waiting = exchange.post_request_async(a_request("/"), b"").unwrap();
+        let response = block_on(waiting).expect("the worker answers");
+        assert_eq!(response.head.status, 200);
+
+        let response = exchange
+            .request(a_request("/next"), b"", Duration::from_secs(2))
+            .expect("the next exchange must be answered by the worker, not by a leftover");
+        assert_eq!(response.head.status, 200);
+
+        exchange.close();
+        peer.join().expect("the scripted worker stayed in step");
+    }
+
+    /// The keepalive's own consequence of the same leak, stated separately because it is why this
+    /// matters: a keepalive that silently reports health is worse than none.
+    ///
+    /// `ping` accepts `Ok(None)` as "the worker answered", so a leftover makes the health check
+    /// report success and leaves the *real* `PONG` on `answers` for the next exchange to trip over.
+    #[test]
+    fn a_ping_cannot_break_the_exchange_after_it() {
+        let (mut exchange, peer) = connected(2);
+
+        let waiting = exchange.post_request_async(a_request("/"), b"").unwrap();
+        block_on(waiting).expect("the worker answers");
+
+        exchange
+            .ping(Duration::from_secs(2))
+            .expect("the worker is alive and answers pings");
+
+        let response = exchange
+            .request(a_request("/after-the-ping"), b"", Duration::from_secs(2))
+            .expect("a ping must not desynchronise the connection");
+        assert_eq!(response.head.status, 200);
+
+        exchange.close();
+        peer.join().expect("the scripted worker stayed in step");
+    }
+
+    /// The control: a synchronous exchange and a ping both reach the wire in order, so the two tests
+    /// above are measuring the leftover rather than a peer that never answers.
+    #[test]
+    fn a_ping_after_a_synchronous_exchange_reaches_the_worker() {
+        let (mut exchange, peer) = connected(1);
+
+        exchange
+            .send(MessageType::Ping, 0, b"", 0)
+            .expect("the worker answers a frame");
+
+        exchange
+            .ping(Duration::from_secs(2))
+            .expect("the worker is alive and answers pings");
+
+        exchange.close();
+        let pings = peer.join().expect("the scripted worker stayed in step");
+        assert_eq!(pings, 2, "both frames must reach the worker");
+    }
+
+    /// Poll one future to completion on this thread.
+    ///
+    /// The exchange's async future is driven by the caller's runtime in production, and this test
+    /// only needs one `poll` loop — so a trivial executor is more honest than `#[tokio::test]`, which
+    /// would also change the runtime the future runs under.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
             }
         }
     }
