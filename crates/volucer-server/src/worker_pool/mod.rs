@@ -1325,10 +1325,14 @@ impl WorkerPool {
             Some(SlotExchange::Awaited(exchange)) => {
                 let connection = Arc::clone(exchange);
                 let waiting = Arc::clone(&connection);
+                let timeout = self.spec.request_timeout;
                 connection.block_on(async move {
                     let mut stage = RequestStage::Sending;
                     let mut track = |reported: RequestStage| stage = reported;
-                    match waiting.request_streaming(head, chunks, &mut track).await {
+                    match waiting
+                        .request_streaming(head, chunks, &mut track, timeout)
+                        .await
+                    {
                         Ok(response) => Ok(response),
                         Err(source) => Err((stage, source)),
                     }
