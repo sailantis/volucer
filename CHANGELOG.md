@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-04
+
 ### Added
 
 - **`idle_ping_ms`: the server can keep an idle worker's read from timing out.** A worker's read can carry a deadline — PHP's `default_socket_timeout` is 60 s and is captured when the stream is created — and a deadline that lands on an *idle* read returns the same thing as the server closing the channel. An SDK that does not ask which it was ends the worker, so a pool left quiet past the deadline lost **every slot at once**, on the first request after the gap: measured as 96 children gone and 96 replacements, with a handful of `502`s while they came back. A `PING` inside the window is what keeps the read from being idle.
@@ -315,7 +317,8 @@ The first release: one binary that serves PHP without embedding it.
 - **`volucer check`** reports listeners, backends, PHP binaries and selection reasons.
 - **Release archives for six targets**, platform installers and a systemd unit.
 
-[Unreleased]: https://github.com/sailantis/volucer/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/sailantis/volucer/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sailantis/volucer/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sailantis/volucer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sailantis/volucer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sailantis/volucer/compare/v0.1.0...v0.2.0
