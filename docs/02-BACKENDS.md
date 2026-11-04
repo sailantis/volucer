@@ -520,35 +520,22 @@ Volucer rebuild.
 
 ### Virtual hosts behind an HTTP/2 origin
 
-An origin that selects a virtual host by name (nginx's `server_name`, or a multi-tenant
-application) routes on the name the client requested, not on the address Volucer dialed. The two
-are often the same string, but they are distinct values.
-
-On an **HTTP/1.1** hop, the client's `Host` header is forwarded unchanged, so the origin receives
-the requested name. On an **HTTP/2** hop, the same name is carried in the `:authority`
-pseudo-header, and by default that field contains the origin's own address. An origin reached
-over `https://` (ALPN negotiates h2) or with `protocol = "h2c"` therefore receives the dialed
-address:
+HTTP/2 origins select virtual hosts using the `:authority` pseudo-header. By default, Volucer
+sets it to the origin address, not the hostname requested by the client. This affects `https://`
+origins (where ALPN negotiates HTTP/2) and backends configured with `protocol = "h2c"`.
 
 ```toml
 [backends.shop]
 kind = "upstream"
 origin = "https://backend.internal:8443"
-# The client requests shop.example.com; without this setting, the origin receives backend.internal.
+# Preserve the client's hostname (for example, shop.example.com) in :authority.
 preserve_host = true
 ```
 
-`preserve_host = true` places the client's name in `:authority` on an HTTP/2 hop. It has no
-effect on an HTTP/1.1 hop, where the `Host` header is already forwarded.
-
-The setting is **opt-in** because the two deployment types need opposite behavior, and a request
-alone does not reveal which one applies. An origin that validates its own name responds to a
-foreign name with `421 Misdirected Request`. Sending the client's name to every origin would
-break configurations that work today. Enable it only for backends that serve as virtual-host
-targets.
-
-The forwarded `Host` header and `X-Forwarded-Host` are set in both cases, so an origin that
-routes on `X-Forwarded-Host` requires no change.
+Set `preserve_host = true` only for origins that route by the client's hostname. It changes
+`:authority` on HTTP/2 hops and has no effect on HTTP/1.1, where `Host` is already forwarded.
+Keep it off for origins that validate their own hostname; they may reject a foreign name with
+`421 Misdirected Request`. The `Host` and `X-Forwarded-Host` headers are forwarded in either case.
 
 ### Supervising the origin
 
