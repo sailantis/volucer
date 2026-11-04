@@ -555,6 +555,42 @@ fn a_streamed_body_reaches_an_awaited_worker() {
     );
 }
 
+/// A large response from a *worker* arrives whole.
+///
+/// This is the counterpart to `a_streamed_body_reaches_an_awaited_worker`, and it exists because the
+/// fix for a bodyless request changed which dispatch function a `GET` takes: the hop-less path uses
+/// `dispatch_to_relayed_async`, which relays a response past `max_stream_bytes`, where the blocking
+/// path it used to take returned a buffered one. A regression there would truncate or fail a large
+/// download rather than slow anything down, so it is asserted end to end against a real worker.
+///
+/// `/big` is 800 KB of repeated text — well past any plausible chunk size, so a length/flag
+/// disagreement anywhere in the relay would show up as a short or malformed body rather than as a
+/// silent pass.
+#[test]
+fn a_large_response_from_a_worker_arrives_whole() {
+    let server = server!(2);
+
+    let response = get(&server.address, "/big");
+
+    assert_eq!(response.status, 200, "{response:?}");
+    assert_eq!(
+        response.body.len(),
+        800_000,
+        "the relayed response was not the size the application sent"
+    );
+    assert!(
+        response.body.iter().all(|byte| *byte == b'a'
+            || *byte == b'b'
+            || *byte == b'c'
+            || *byte == b'd'
+            || *byte == b'e'
+            || *byte == b'f'
+            || *byte == b'g'
+            || *byte == b'h'),
+        "the relayed response contains bytes the application never wrote"
+    );
+}
+
 #[test]
 fn request_headers_become_the_cgi_environment() {
     let server = server!(2);
