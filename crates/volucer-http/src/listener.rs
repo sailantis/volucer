@@ -2972,7 +2972,11 @@ async fn prepare(
             let prepare_routing = routing.clone();
             let prepare_routes = routes.clone();
             let prepare_parts = parts.clone();
-            let prepare_body = body.clone();
+            // **Moved, not cloned.** The `else` arm is the only one that runs here, and `body` is not
+            // read afterwards in it — the original stayed alive for nothing, costing a full
+            // upload-sized allocation and copy on every POST that reaches the blocking preparation
+            // path.
+            let prepare_body = body;
             let prepare_remote = remote_addr.clone();
             let prepare_traceparent = outbound_traceparent.clone();
             tokio::task::spawn_blocking(move || {
@@ -4368,19 +4372,30 @@ fn with_error_page(
 ///
 /// Protocol first, then component, and the order is the point: for a gRPC call the failure is a
 /// status in the trailers rather than a `502`, so the protocol decides before the component does.
-///
-/// **A client that sent too much gets `413`, not `502`.** Every other worker failure is a gateway
-/// error, but this one is not the backend's fault: the client exceeded `max_body_bytes` and is the
-/// only party who can act on it. Reporting it as a gateway error would blame the application for a
-/// decision this server made — which is why this is one function rather than the rule written at
-/// each of the two dispatch paths.
+/// The one exception is a client that overran `max_body_bytes`, which is checked first and mapped
+/// per protocol — see the note in the body.
 fn map_backend_failure(err: ServerError, is_grpc: bool) -> HttpError {
+    // **A client that sent too much is told so, on either protocol, and before the protocol's own
+    // mapping.** It is not the origin's failure and not a gateway's: the client exceeded
+    // `max_body_bytes` and is the only party who can act on it. For gRPC that makes
+    // `RESOURCE_EXHAUSTED` the right code — the specification's *retryable* "come back with less",
+    // which is the same instruction the HTTP side's `413` carries, and the same code the rate
+    // limiter already answers with. Mapping it through `grpc_failure` would produce `INTERNAL`,
+    // which tells a gRPC client its own oversized upload was the server's fault and that retrying
+    // unchanged is futile.
     if let ServerError::WorkerProtocol {
         source: volucer_worker::WorkerError::BodyTooLarge { limit },
         ..
     } = &err
     {
-        return HttpError::BodyTooLarge { limit: *limit };
+        let limit = *limit;
+        if is_grpc {
+            return HttpError::Grpc {
+                status: volucer_upstream::GrpcStatus::ResourceExhausted,
+                reason: format!("the request body exceeded max_body_bytes ({limit})"),
+            };
+        }
+        return HttpError::BodyTooLarge { limit };
     }
     if is_grpc {
         return grpc_failure(err);
@@ -5227,6 +5242,49 @@ mod tests {
         assert_eq!(protocol_name(hyper::Version::HTTP_10), "HTTP/1.0");
         assert_eq!(protocol_name(hyper::Version::HTTP_11), "HTTP/1.1");
         assert_eq!(protocol_name(hyper::Version::HTTP_2), "HTTP/2.0");
+    }
+
+    /// **A gRPC call that overran the body cap is `RESOURCE_EXHAUSTED`, not `INTERNAL`.**
+    ///
+    /// The body-cap branch sits above the gRPC mapping in `map_backend_failure`, and it has to: a client
+    /// that sent too much is the only party who can act on it, and the gRPC spelling of "come back with
+    /// less" is `RESOURCE_EXHAUSTED` — the specification's *retryable* code, and the same one the rate
+    /// limiter already answers with.
+    ///
+    /// Reading the cap through `grpc_failure` instead would produce `INTERNAL`, which tells a gRPC
+    /// client that the server failed and that retrying unchanged is futile. That is the wrong
+    /// instruction twice over: the fault is the client's and the remedy is a smaller body.
+    ///
+    /// Asserted on the status, not on the presence of a `grpc-status` trailer, because both paths write
+    /// trailers — the difference is entirely the code inside.
+    #[test]
+    fn an_oversized_grpc_body_is_resource_exhausted_rather_than_internal() {
+        let body_too_large = || ServerError::WorkerProtocol {
+            backend: "app".to_string(),
+            source: volucer_worker::WorkerError::BodyTooLarge { limit: 1024 },
+        };
+
+        let mapped = map_backend_failure(body_too_large(), true);
+        match &mapped {
+            HttpError::Grpc { status, .. } => assert_eq!(
+                *status,
+                volucer_upstream::GrpcStatus::ResourceExhausted,
+                "a gRPC body over the cap must be RESOURCE_EXHAUSTED (retryable), not INTERNAL: \
+                 {mapped}"
+            ),
+            other => {
+                panic!("a gRPC failure must travel in trailers, not as an HTTP status: {other}")
+            }
+        }
+        assert_eq!(
+            mapped.status(),
+            200,
+            "gRPC failures are HTTP 200 with a status in the trailers: {mapped}"
+        );
+
+        // The HTTP half on the same failure: still a `413`, which is what a plain client can read.
+        let http = map_backend_failure(body_too_large(), false);
+        assert_eq!(http.status(), 413, "{http}");
     }
 
     /// A body the transport already read is passed on, and counted against the same limit.

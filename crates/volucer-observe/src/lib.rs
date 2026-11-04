@@ -1004,11 +1004,17 @@ thread_local! {
 
 /// Fill `dest` with unpredictable bytes, drawing at most one syscall per [`IDS_PER_RESEED`] ids.
 ///
-/// This replaces a `getrandom` call per id with a SplitMix64 stream seeded from `getrandom`. The
-/// values are used for **log correlation only** — the crate docs say so and nothing is authorised
-/// by them — so the requirement is that they are not guessable *and* never repeat, not that they
-/// are from a CSPRNG. A SplitMix64 stream meets that: it has a full 2^64 period, so within a
-/// reseed window it cannot repeat, and the window is 64 ids wide.
+/// A request id is not a token: nothing is authorised by it and guessing one reveals nothing, so
+/// the requirement here is that the ids **do not repeat** within a thread's window and are not
+/// trivially guessable, not that they come from a CSPRNG.
+///
+/// **SplitMix64 is a bijective mixer, so this doc does not claim unpredictability from it.** It has
+/// a full 2^64 period, which is what makes a reseed window of 64 ids collision-free — and only the
+/// top byte of each step is exposed, so a single id says almost nothing about the state. But the
+/// mixer is invertible: consecutive ids constrain the 64-bit state, and enough of them would let a
+/// reader solve for it and predict the rest of the window. That is an acceptable trade because the
+/// threat model is *log correlation*, where an attacker who can read this many ids already reads the
+/// logs; it would not be acceptable for anything that authorised a request.
 ///
 /// If the system source is unavailable the seed comes from [`fallback_fill`], exactly as before,
 /// and the same warning is emitted once.
