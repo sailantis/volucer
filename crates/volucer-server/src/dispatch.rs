@@ -23,6 +23,35 @@ use crate::calls::{
 use crate::error::{Result, ServerError};
 use crate::rpc::RpcGrants;
 
+/// Whether this backend kind can answer **without parking a thread**.
+///
+/// Today that is a worker pool and nothing else, and the reason is the client rather than the kind:
+/// a worker's connection is driven by a runtime (`attach` and `socket` alike), where `external` and
+/// `spawn_cgi` reach `volucer-fcgi`, whose transport is a blocking socket with a read timeout and
+/// whose crate contains no `async fn` at all. Calling one of those from a runtime thread puts a
+/// socket read where unrelated connections and timers are scheduled — a stall rather than a failure,
+/// which is why this must be a decision rather than a default.
+pub fn answers_asynchronously(backend: &Backend) -> bool {
+    matches!(backend, Backend::Worker { .. })
+}
+
+/// [`answers_asynchronously`], from a backend's configured *name* — which is the question the tests
+/// and the front-end actually ask, and the one that stays answerable without building the pools a
+/// [`Backend`] needs.
+///
+/// The names are the four `kind` values of `[backends.*]`, and the list is kept here rather than
+/// derived from `BackendConfig` so that adding a kind is a compile error in one place instead of a
+/// silent `false` in the gate.
+pub fn answers_asynchronously_kind(kind: &str) -> bool {
+    matches!(kind, "worker" | "attach")
+}
+
+/// [`Dispatcher::is_upstream`], from a backend's configured *name*. See
+/// [`answers_asynchronously_kind`] for why this exists as a free function.
+pub fn is_upstream_kind(kind: &str) -> bool {
+    matches!(kind, "upstream")
+}
+
 /// Routes requests to backends.
 #[derive(Debug)]
 pub struct Dispatcher {
@@ -1104,6 +1133,18 @@ impl Dispatcher {
         matches!(self.backends.get(backend), Some(Backend::Upstream { .. }))
     }
 
+    /// Whether this backend can answer **without parking a thread**, so the front-end may await it
+    /// on a runtime thread. See [`answers_asynchronously`] for which kinds can and why.
+    ///
+    /// An unknown name answers `false` for the same reason [`Self::is_upstream`] does: a name that
+    /// selects nothing keeps the blocking behaviour rather than guessing.
+    pub fn answers_asynchronously(&self, backend: &str) -> bool {
+        self.backends
+            .get(backend)
+            .map(answers_asynchronously)
+            .unwrap_or(false)
+    }
+
     /// The client for a named upstream backend.
     ///
     /// `None` for the three CGI kinds, so a caller that asks for the wrong one cannot accidentally
@@ -1630,6 +1671,51 @@ mod tests {
         assert!(err.to_string().contains("app"), "{err}");
     }
 
+    /// **The two questions about a backend must not be the same question.**
+    ///
+    /// `is_upstream` decides which path streams a body to an origin. `answers_asynchronously`
+    /// decides whether the front-end may await the backend on a runtime thread — and `external` and
+    /// `spawn_cgi` may not, because their client is a blocking socket. When the second question was
+    /// not asked, both of those performed a socket read inline on a runtime thread, which stalls
+    /// unrelated connections and timers instead of failing, so nothing else caught it.
+    ///
+    /// Asserted on the predicates themselves rather than through a dispatcher, because building one
+    /// starts a real pool: the answer is a property of the backend's *kind*, and a test that had to
+    /// launch a worker to ask it would be measuring the launcher.
+    ///
+    /// The two lists are written out rather than derived from one another, because that is the point:
+    /// `is_upstream` is exactly one variant, and `answers_asynchronously` is exactly one *different*
+    /// variant. A single predicate returning one answer for both is the defect.
+    #[test]
+    fn the_async_gate_names_only_the_kind_that_can_take_it() {
+        // What `Backend::` can be, as far as either question is concerned.
+        const KINDS: [&str; 4] = ["external", "spawn_cgi", "worker", "upstream"];
+
+        // `upstream` is the only kind whose body is streamed to an origin instead of a CGI process.
+        assert_eq!(
+            KINDS
+                .iter()
+                .filter(|kind| is_upstream_kind(kind))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["upstream"]
+        );
+
+        // And the one that can be awaited is `worker` alone — `attach` is a worker reached
+        // differently, so it answers the same question the same way.
+        assert_eq!(
+            KINDS
+                .iter()
+                .filter(|kind| answers_asynchronously_kind(kind))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["worker"]
+        );
+
+        // A name that selects nothing keeps the blocking behaviour, for both questions.
+        assert!(!answers_asynchronously_kind("no-such-backend"));
+        assert!(!is_upstream_kind("no-such-backend"));
+    }
     #[test]
     fn dispatch_to_an_unknown_backend_reports_it_by_name() {
         let config = config_with(&[("app", unreachable_backend())], "app");

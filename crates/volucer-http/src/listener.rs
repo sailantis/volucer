@@ -2798,6 +2798,16 @@ async fn prepare(
         .await;
     }
 
+    // **A backend that cannot answer asynchronously keeps the blocking path, and it is decided
+    // here rather than inside the dispatcher.** `external` and `spawn_cgi` reach `volucer-fcgi`,
+    // which has no `async fn` in it: its transport is a blocking socket with a read timeout. The
+    // async path below would therefore perform that socket read on a runtime thread, where enough
+    // concurrent requests of either kind stall unrelated connections and timers.
+    //
+    // So the async path is for the one kind that can take it. Everything else falls through to the
+    // `spawn_blocking` below, which is exactly what it did before the async path existed.
+    let awaits_its_backend = front_end.dispatcher.answers_asynchronously(&backend);
+
     // **A gRPC call this backend was not granted is refused here**, and every part of that sentence
     // is load-bearing.
     //
@@ -2918,8 +2928,9 @@ async fn prepare(
     //
     // A request whose body is still arriving (`pump`) keeps the old path below: its body crosses to
     // the exchange thread a frame at a time by construction, so what it costs is the client's upload
-    // rather than the server's throughput.
-    if !streaming_dispatch {
+    // rather than the server's throughput. So does a backend that cannot be awaited at all — see
+    // `awaits_its_backend`, which is the gate the blocking path was always implicitly assuming.
+    if !streaming_dispatch && awaits_its_backend {
         // **A request whose path cannot name a script is prepared and dispatched without leaving
         // the runtime thread.**
         //
