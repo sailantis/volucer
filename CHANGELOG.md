@@ -16,6 +16,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A refused connection no longer spends the slot it was refused.** The accept loop compared the live connection count against `max_connections` and, on refusing, left the count incremented. Every turned-away connection therefore leaked one slot permanently, so a single burst above the ceiling retired the listener for the life of the process: it kept refusing connections that its own refusals had freed room for. Observed as `active=1276805` against a ceiling of 512 on a server that had served normally a minute earlier, answering nothing thereafter. Recovery required a restart.
 - **`max_connections = 0` now means no ceiling.** The key documented `0` as unlimited and `--startup` prints "(no ceiling)" for it, but the listener compared against `0` and refused every connection, so the one setting that promises to admit everybody admitted nobody.
 
+### Documentation
+
+- **Sizing the runtime.** Tokio's default of one worker thread per core is tuned for a CPU-bound server, and this one waits on backend processes instead. On the 12-core reference host, four runtime threads are worth +8.7% throughput at concurrency 12 and about a tenth less front-end CPU per request at every concurrency measured, with no regression at 100 or 400. `TOKIO_WORKER_THREADS` already controls it; [operations](docs/11-OPERATIONS.md#sizing-the-runtime) now says so, with the numbers.
+
 ## [0.5.0] - 2026-11-04
 
 ### Added

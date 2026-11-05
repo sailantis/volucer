@@ -751,6 +751,45 @@ volucer-0.1.0-x86_64-pc-windows-msvc.zip
 
 Each archive contains the binary, README, license, and systemd unit.
 
+## Sizing the runtime
+
+Volucer runs one multi-threaded Tokio runtime, and by default Tokio starts **one worker thread
+per core**. That default is tuned for a CPU-bound server and this one is not: a request spends
+its time waiting for a backend process, not computing. On a machine with many cores the extra
+threads mostly contend with each other, and the measurement is unambiguous.
+
+On a 12-core host with an `external` backend in front of 96 `php-fpm` children, same binary and
+same configuration, varying only `TOKIO_WORKER_THREADS`:
+
+| concurrency | 12 threads (default) | 4 threads | throughput | front-end CPU |
+|---:|---:|---:|---:|---:|
+| 12 | 28,168 rps | **30,625 rps** | **+8.7%** | −8.7% |
+| 100 | 54,229 rps | **55,740 rps** | +2.8% | −10.0% |
+| 400 | 62,920 rps | **64,103 rps** | +1.9% | −10.5% |
+
+Four threads is better or equal everywhere and costs about a tenth less CPU per request. Below
+that it falls off a cliff — two threads on the same host drop to 38,280 rps at concurrency 100,
+because there is no longer enough parallelism to keep the backend busy.
+
+The setting is Tokio's own environment variable, so it needs no key in the configuration:
+
+```bash
+TOKIO_WORKER_THREADS=4 volucer serve --config volucer.toml
+```
+
+Under `systemd`, put it in the unit:
+
+```ini
+[Service]
+Environment=TOKIO_WORKER_THREADS=4
+ExecStart=/usr/local/bin/volucer serve --config /etc/volucer/volucer.toml
+```
+
+Pick the number from your concurrency rather than your core count. The useful range in the
+measurements above is 4–8 on 12 cores; the ceiling is where per-request CPU starts rising again,
+which means the runtime threads are the queue. If you are unsure, leave the default — it is
+correct, just not optimal — and measure with `volucer status` before and after.
+
 ## Running as a different user
 
 Volucer needs read access to the document root and write access to the ACME cache. It does
