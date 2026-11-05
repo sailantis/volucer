@@ -25,12 +25,16 @@ use crate::rpc::RpcGrants;
 
 /// Whether this backend kind can answer **without parking a thread**.
 ///
-/// Today that is a worker pool and nothing else, and the reason is the client rather than the kind:
-/// a worker's connection is driven by a runtime (`attach` and `socket` alike), where `external` and
-/// `spawn_cgi` reach `volucer-fcgi`, whose transport is a blocking socket with a read timeout and
-/// whose crate contains no `async fn` at all. Calling one of those from a runtime thread puts a
-/// socket read where unrelated connections and timers are scheduled — a stall rather than a failure,
-/// which is why this must be a decision rather than a default.
+/// Two things decide it, and neither is the protocol. A worker's connection is driven by a runtime
+/// (`attach` and `socket` alike). An `external` backend is a socket this server owns, and
+/// `volucer_fcgi::AsyncClient` drives it from a runtime too — it was written for exactly this, after
+/// a blocking-pool thread per in-flight request was measured at 185 threads and 78.9 µs of front-end
+/// CPU per request against the awaited worker path's 46.3.
+///
+/// `spawn_cgi` is the one that looks like it belongs and does not. It speaks the same FastCGI, but
+/// its exchange is owned by a supervised slot — the permit that bounds it is released by whatever
+/// finishes the request — so making it awaited is a change to the slot lifecycle rather than to a
+/// socket. Until that is done it keeps the blocking path, deliberately.
 pub fn answers_asynchronously(backend: &Backend) -> bool {
     matches!(backend, Backend::Worker { .. } | Backend::External { .. })
 }

@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`external` backends are awaited instead of parking a thread.** A `php-fpm` (or any FastCGI) exchange no longer holds a blocking-pool thread for its duration. On the 12-core reference host with one 96-child pool at concurrency 100 this took front-end threads from 185 to 15, front-end CPU from 78.9 to 54.6 µs per request, and throughput from 44.4k to 51.6k rps. Streaming responses from an external backend relay on a task rather than a reader thread. `spawn_cgi` is unchanged and still uses the blocking path.
+
 ## [0.5.0] - 2026-11-04
 
 ### Added
