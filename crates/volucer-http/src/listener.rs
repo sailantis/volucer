@@ -2799,13 +2799,15 @@ async fn prepare(
     }
 
     // **A backend that cannot answer asynchronously keeps the blocking path, and it is decided
-    // here rather than inside the dispatcher.** `external` and `spawn_cgi` reach `volucer-fcgi`,
-    // which has no `async fn` in it: its transport is a blocking socket with a read timeout. The
-    // async path below would therefore perform that socket read on a runtime thread, where enough
-    // concurrent requests of either kind stall unrelated connections and timers.
+    // here rather than inside the dispatcher.** `spawn_cgi` reaches `volucer-fcgi`'s blocking
+    // client, and its exchange is owned by a supervised slot rather than by a socket the caller
+    // holds, so answering it here would park a runtime thread on a pipe read.
     //
-    // So the async path is for the one kind that can take it. Everything else falls through to the
-    // `spawn_blocking` below, which is exactly what it did before the async path existed.
+    // `external` used to be in that group too, on the grounds that `volucer-fcgi` had no `async fn`.
+    // It does now (`volucer_fcgi::AsyncClient`), and the reason it was worth writing is measured: a
+    // FastCGI backend answered through `spawn_blocking` held one thread per in-flight request —
+    // 185 threads against nginx's 5 at concurrency 100 — and cost 78.9 us of front-end CPU per
+    // request against 46.3 for the awaited worker path, for 44.4k rps against 95.7k.
     let awaits_its_backend = front_end.dispatcher.answers_asynchronously(&backend);
 
     // **A gRPC call this backend was not granted is refused here**, and every part of that sentence

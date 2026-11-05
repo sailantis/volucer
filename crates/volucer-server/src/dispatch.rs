@@ -32,7 +32,7 @@ use crate::rpc::RpcGrants;
 /// socket read where unrelated connections and timers are scheduled — a stall rather than a failure,
 /// which is why this must be a decision rather than a default.
 pub fn answers_asynchronously(backend: &Backend) -> bool {
-    matches!(backend, Backend::Worker { .. })
+    matches!(backend, Backend::Worker { .. } | Backend::External { .. })
 }
 
 /// [`answers_asynchronously`], from a backend's configured *name* — which is the question the tests
@@ -43,7 +43,7 @@ pub fn answers_asynchronously(backend: &Backend) -> bool {
 /// derived from `BackendConfig` so that adding a kind is a compile error in one place instead of a
 /// silent `false` in the gate.
 pub fn answers_asynchronously_kind(kind: &str) -> bool {
-    matches!(kind, "worker" | "attach")
+    matches!(kind, "worker" | "attach" | "external")
 }
 
 /// [`Dispatcher::is_upstream`], from a backend's configured *name*. See
@@ -1684,10 +1684,15 @@ mod tests {
     /// launch a worker to ask it would be measuring the launcher.
     ///
     /// The two lists are written out rather than derived from one another, because that is the point:
-    /// `is_upstream` is exactly one variant, and `answers_asynchronously` is exactly one *different*
-    /// variant. A single predicate returning one answer for both is the defect.
+    /// `is_upstream` is exactly one variant, and `answers_asynchronously` is a different set. A single
+    /// predicate returning one answer for both is the defect.
+    ///
+    /// `external` joined the awaited set when `volucer_fcgi::AsyncClient` was written. It is not a
+    /// property of the protocol — `spawn_cgi` speaks the same FastCGI and stays blocking, because its
+    /// exchange is owned by a supervised slot rather than by a socket the caller holds — so the
+    /// distinction is stated per kind and asserted per kind.
     #[test]
-    fn the_async_gate_names_only_the_kind_that_can_take_it() {
+    fn the_async_gate_names_only_the_kinds_that_can_take_it() {
         // What `Backend::` can be, as far as either question is concerned.
         const KINDS: [&str; 4] = ["external", "spawn_cgi", "worker", "upstream"];
 
@@ -1701,16 +1706,18 @@ mod tests {
             vec!["upstream"]
         );
 
-        // And the one that can be awaited is `worker` alone — `attach` is a worker reached
-        // differently, so it answers the same question the same way.
+        // `worker` and `external` can be awaited — `attach` is a worker reached differently, so it
+        // answers the same question the same way. `spawn_cgi` deliberately does not: a FastCGI
+        // conversation is not enough, and its slot lifecycle is what blocks.
         assert_eq!(
             KINDS
                 .iter()
                 .filter(|kind| answers_asynchronously_kind(kind))
                 .copied()
                 .collect::<Vec<_>>(),
-            vec!["worker"]
+            vec!["external", "worker"]
         );
+        assert!(answers_asynchronously_kind("attach"));
 
         // A name that selects nothing keeps the blocking behaviour, for both questions.
         assert!(!answers_asynchronously_kind("no-such-backend"));

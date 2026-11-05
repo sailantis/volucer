@@ -311,7 +311,7 @@ fn header_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
 /// guard becomes `starts_with`'s own, and comparing the same way everywhere is what
 /// lets the comparison go through the slice `PartialEq` (a `memcmp` for a fixed
 /// length) instead of three separate byte checks.
-fn find_header_end(bytes: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_header_end(bytes: &[u8]) -> Option<(usize, usize)> {
     let len = bytes.len();
     let mut index = 0;
     // Both terminators are at least two bytes long, so the last offset one can start
@@ -541,23 +541,27 @@ impl Delivery {
 #[derive(Debug)]
 pub struct ResponseStream {
     /// The header block, `\r\n\r\n` included, so [`parse_response`] works on it unchanged.
-    head: Vec<u8>,
+    pub(crate) head: Vec<u8>,
     /// One already-read record, when the switch happened part-way through the buffer.
-    pending: Option<Vec<u8>>,
+    ///
+    /// Crate-visible rather than private: the awaited client in `async_client` drains a stream the
+    /// same way and must see what was already read past the head. Two readers of one wire format
+    /// disagreeing about where the body starts is the bug this avoids having.
+    pub(crate) pending: Option<Vec<u8>>,
     /// Whether every byte has been relayed and `END_REQUEST` was seen.
-    finished: bool,
+    pub(crate) finished: bool,
     /// `STDERR` seen so far. Grows as the body is drained, because a backend writes both.
-    stderr: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
     /// The `END_REQUEST` body, once it arrives.
-    end: Option<EndRequest>,
+    pub(crate) end: Option<EndRequest>,
     /// How long the backend had taken when the head came back.
     ///
     /// Recorded there rather than at the end because it is the figure that matters for a stream:
     /// time-to-first-byte. A total is not knowable until the client stops reading.
-    started: Instant,
-    head_duration: Duration,
+    pub(crate) started: Instant,
+    pub(crate) head_duration: Duration,
     /// Whether the backend agreed to keep the connection.
-    keep_conn_requested: bool,
+    pub(crate) keep_conn_requested: bool,
 }
 
 impl ResponseStream {
@@ -647,7 +651,7 @@ pub struct Client<T = Stream> {
     /// encoding writes here, then `append_records` copies it into `out`.
     params: Vec<u8>,
     /// Whether the last request asked for keep-alive.
-    keep_conn_requested: bool,
+    pub(crate) keep_conn_requested: bool,
     /// Set once reuse is known to be unsafe.
     closed_by_backend: bool,
     /// Set while a [`ResponseStream`] taken from this client has not been drained.

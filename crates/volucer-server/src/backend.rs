@@ -60,6 +60,12 @@ pub struct ClientPool {
     endpoint: Endpoint,
     /// Warm connections, checked out by `acquire` and returned by `release`.
     idle: Mutex<Vec<volucer_fcgi::Client>>,
+    /// Warm connections driven by a runtime, checked out by `acquire_async`.
+    ///
+    /// Separate from `idle` because the two are in different modes at the *file description* level:
+    /// the awaited path needs `O_NONBLOCK` and no `SO_RCVTIMEO`, and neither can be undone for a
+    /// socket a blocking read might touch. See [`ClientPool::acquire_async`].
+    async_idle: Mutex<Vec<volucer_fcgi::AsyncClient>>,
     /// Requests in flight, when the operator asked for a ceiling.
     ///
     /// A counter with a condvar rather than an async semaphore, because the request path is
@@ -73,6 +79,7 @@ impl ClientPool {
         ClientPool {
             endpoint,
             idle: Mutex::new(Vec::new()),
+            async_idle: Mutex::new(Vec::new()),
             limit: max_connections.map(Limit::new),
         }
     }
@@ -140,6 +147,62 @@ impl ClientPool {
         }
     }
 
+    /// Take a connection for an awaited request.
+    ///
+    /// **A separate list from `idle`, and it has to be.** Driving a socket from a runtime requires
+    /// `O_NONBLOCK` and no `SO_RCVTIMEO`, and both are properties of the *file description* rather
+    /// than of the handle — so a blocking `Client` adopted by the runtime could never be handed back
+    /// to the blocking path. Keeping two pools is what makes each connection's mode a property of
+    /// the list it lives in, instead of something a caller has to remember.
+    ///
+    /// The retention cap is the same constant, for the same measured reason.
+    async fn acquire_async(
+        &self,
+        backend: &str,
+    ) -> Result<(volucer_fcgi::AsyncClient, Option<BackendPermit>)> {
+        let permit = match &self.limit {
+            None => None,
+            Some(limit) => Some(
+                limit
+                    .enter()
+                    .map(|permit| BackendPermit { _permit: permit })?,
+            ),
+        };
+
+        let pooled = {
+            let mut idle = self
+                .async_idle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            idle.pop()
+        };
+        if let Some(client) = pooled {
+            return Ok((client, permit));
+        }
+
+        volucer_fcgi::AsyncClient::connect(&self.endpoint, None)
+            .await
+            .map(|client| (client, permit))
+            .map_err(|source| ServerError::Worker {
+                backend: backend.to_string(),
+                source,
+            })
+    }
+
+    /// Give an awaited request's connection back, or drop it.
+    fn release_async(&self, client: volucer_fcgi::AsyncClient) {
+        if !client.is_reusable() {
+            return;
+        }
+        let mut idle = self
+            .async_idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if idle.len() < MAX_IDLE_CONNECTIONS {
+            idle.push(client);
+        }
+    }
+
     /// Close every idle connection.
     fn clear(&mut self) {
         let idle = self
@@ -147,6 +210,13 @@ impl ClientPool {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         idle.clear();
+        // The awaited pool too. A connection driven by a runtime holds the same backend's child, so
+        // closing only the blocking half would leave a request's worth of children parked.
+        let async_idle = self
+            .async_idle
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        async_idle.clear();
     }
 }
 
@@ -273,7 +343,11 @@ pub enum Backend {
         name: String,
         /// Shared behind its own lock: one backend serves both front-ends, so a
         /// `&mut` here would make the whole dispatcher exclusive again.
-        pool: ClientPool,
+        ///
+        /// An `Arc` because a relayed response outlives the request that opened it: the task
+        /// pumping its body returns the connection to the pool after the last byte, so it needs a
+        /// handle rather than a borrow.
+        pool: Arc<ClientPool>,
     },
     /// A pool of FastCGI processes that volucer starts and supervises: `php-cgi`, or any
     /// command that serves FastCGI on the address it is given.
@@ -388,7 +462,7 @@ impl Backend {
                 })?;
                 Ok(Backend::External {
                     name: name.to_string(),
-                    pool: ClientPool::new(endpoint, external.max_connections),
+                    pool: Arc::new(ClientPool::new(endpoint, external.max_connections)),
                 })
             }
             BackendConfig::SpawnCgi(cgi) => Ok(Backend::SpawnCgi {
@@ -541,8 +615,64 @@ impl Backend {
     pub async fn request_async(&self, request: &Request) -> Result<Response> {
         match self {
             Backend::Worker { pool, .. } => pool.request_async(request).await,
+            // `external` is awaited too. It used to fall through to `request` on the grounds that
+            // `volucer-fcgi` had no `async fn` — which was true, and cost a blocking-pool thread
+            // per in-flight request: measured at 185 threads against nginx's 5 at concurrency 100,
+            // and 78.9 us of front-end CPU per request against 46.3 for the awaited worker path.
+            // `volucer_fcgi::AsyncClient` is that `async fn`.
+            Backend::External { name, pool } => Self::external_async(name, pool, request).await,
+            // `spawn_cgi` keeps the blocking path: its exchange is also a FastCGI conversation, but
+            // the slot that owns the connection is a process this crate supervises, and the permit
+            // is released by the thread that finishes the request. Making that awaited is a change
+            // to the slot lifecycle rather than to a socket, and it is measurable on its own.
             other => other.request(request),
         }
+    }
+
+    /// Ask an `external` backend for a response, across an `await`.
+    ///
+    /// The same sequence as [`Backend::request_external`] — take a connection, send, retry once on a
+    /// reused connection the backend closed, give it back — with the socket driven by the runtime
+    /// instead of a parked thread. The retry rule is identical because it is a property of the
+    /// backend (php-fpm closes idle connections), not of the transport.
+    async fn external_async(name: &str, pool: &ClientPool, request: &Request) -> Result<Response> {
+        let (mut client, _permit) = pool.acquire_async(name).await?;
+        let reused = client.is_reusable();
+
+        for attempt in 0..2 {
+            match client.request(request).await {
+                Ok(response) => {
+                    pool.release_async(client);
+                    return Ok(response);
+                }
+                Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+                    tracing::debug!(
+                        backend = %name,
+                        "the backend closed a reused connection; reconnecting"
+                    );
+                    client = volucer_fcgi::AsyncClient::connect(pool.endpoint(), None)
+                        .await
+                        .map_err(|source| ServerError::Worker {
+                            backend: name.to_string(),
+                            source,
+                        })?;
+                }
+                Err(source) => {
+                    return Err(ServerError::Worker {
+                        backend: name.to_string(),
+                        source,
+                    })
+                }
+            }
+        }
+
+        Err(ServerError::Worker {
+            backend: name.to_string(),
+            source: volucer_fcgi::FcgiError::IncompleteResponse {
+                request_id: volucer_fcgi::REQUEST_ID,
+                complete: false,
+            },
+        })
     }
 
     /// [`Backend::request_relayed`], without parking the calling thread while the worker thinks.
@@ -558,6 +688,9 @@ impl Backend {
     ) -> Result<crate::pool::Delivery> {
         match self {
             Backend::Worker { pool, .. } => pool.request_relayed_async(request, relay).await,
+            Backend::External { name, pool } => {
+                Self::external_relayed_async(name, pool, request, buffer, relay).await
+            }
             other => other.request_relayed(request, buffer, relay),
         }
     }
@@ -895,6 +1028,111 @@ impl Backend {
         }
     }
 
+    /// Ask an `external` backend for a response, relaying the body when it does not fit in `buffer`.
+    ///
+    /// The awaited twin of [`Backend::external_relayed`]. The *rules* are identical — the connection
+    /// is taken out of the pool, never returned mid-response, the permit is held until the body has
+    /// been drained, and a reused connection the backend closed is retried once. What differs is what
+    /// pumps the body: a `tokio` task that `await`s each chunk, instead of a thread that blocks on it.
+    ///
+    /// This is the case that made the async work necessary rather than optional. Before it existed,
+    /// `request_relayed_async` fell through to the synchronous relayed path for `external`, so the
+    /// blocking FastCGI read ran *on a runtime worker* — the exact stall the original comment on
+    /// `awaits_its_backend` warned about. It showed up as throughput going **down** (44.4k to 39.0k)
+    /// while front-end CPU went down too (78.9 to 54.4 us), which is what a serialised runtime looks
+    /// like from the outside.
+    async fn external_relayed_async(
+        name: &str,
+        pool: &Arc<ClientPool>,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<crate::pool::Delivery> {
+        let (mut client, permit) = pool.acquire_async(name).await?;
+        let reused = client.is_reusable();
+
+        let mut attempt = 0;
+        let delivery = loop {
+            match client.request_streaming(request, buffer, relay).await {
+                Ok(delivery) => break delivery,
+                Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+                    attempt += 1;
+                    tracing::debug!(
+                        backend = %name,
+                        "the backend closed a reused connection; reconnecting"
+                    );
+                    client = volucer_fcgi::AsyncClient::connect(pool.endpoint(), None)
+                        .await
+                        .map_err(|source| ServerError::Worker {
+                            backend: name.to_string(),
+                            source,
+                        })?;
+                }
+                Err(source) => {
+                    return Err(ServerError::Worker {
+                        backend: name.to_string(),
+                        source,
+                    })
+                }
+            }
+        };
+
+        match delivery {
+            volucer_fcgi::Delivery::Buffered(response) => {
+                pool.release_async(client);
+                drop(permit);
+                Ok(crate::pool::Delivery::Buffered(response))
+            }
+            volucer_fcgi::Delivery::Streamed(stream) => {
+                let head = stream.head().to_vec();
+                let head_duration = stream.head_duration();
+                let verdict = crate::relay::Verdict::new();
+                // The pump publishes through its own clone of the handles. `Verdict` clones the two
+                // `Arc`s and never the answer, so there is one verdict either way.
+                let published = verdict.clone();
+                let (sender, receiver) = crate::relay::channel();
+                let backend = name.to_string();
+                let pool = Arc::clone(pool);
+
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut failed = false;
+                    loop {
+                        match client.next_chunk(&mut stream).await {
+                            Ok(Some(chunk)) => {
+                                if sender.send(bytes::Bytes::from(chunk)).await.is_err() {
+                                    // The client went away: drain rather than abandon, so the slot's
+                                    // pipe is not left half-read.
+                                    while let Ok(Some(_)) = client.next_chunk(&mut stream).await {}
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                tracing::warn!(backend = %backend, %err, "a streamed response failed part way through");
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    let complete = stream.is_finished() && !failed;
+                    published.publish(stream.stderr(), complete);
+                    // The permit is what `max_connections` actually bounds, so it is given back
+                    // exactly here — after the body, never before.
+                    drop(permit);
+                    pool.release_async(client);
+                });
+
+                Ok(crate::pool::Delivery::Relayed(crate::relay::Relayed::new(
+                    head,
+                    receiver,
+                    head_duration,
+                    verdict,
+                )))
+            }
+        }
+    }
+
     /// Whether this backend is a worker pool whose slot contention should be
     /// reported when the server stops. `None` for every other shape.
     pub fn worker_contention(&self) -> Option<Contention> {
@@ -950,11 +1188,16 @@ impl Backend {
                 }
             }
             Backend::External { pool, .. } => {
-                // Nothing was started, so there is nothing to stop; closing the
-                // connections is the whole cleanup. `get_mut` because the pool is
-                // already exclusively borrowed here — taking the lock would be
-                // pointless.
-                pool.clear();
+                // Nothing was started, so there is nothing to stop; closing the connections is the
+                // whole cleanup. `get_mut` because the pool is behind an `Arc` now — same rule as
+                // the worker pool above, and the same warning if something outlived the dispatcher.
+                match Arc::get_mut(pool) {
+                    Some(pool) => pool.clear(),
+                    None => tracing::warn!(
+                        "an external pool could not be drained because a connection is still \
+                         shared; its sockets will be closed when the last request finishes"
+                    ),
+                }
             }
         }
     }

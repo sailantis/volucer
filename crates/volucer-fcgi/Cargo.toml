@@ -12,6 +12,15 @@ volucer-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# The awaited client. Optional so a consumer that only needs the codec does not link a runtime;
+# `volucer-server` enables it, because the HTTP front-end is where the blocking hand-off was
+# measured and where the async path is used.
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+async = ["dep:tokio"]
+
 # `TCP_QUICKACK` has no wrapper in std, and it is a Linux-only option: it is the
 # receiver-side half of the Nagle/delayed-ACK interaction documented on
 # `Stream::arm_immediate_ack`. Nothing else here needs libc.

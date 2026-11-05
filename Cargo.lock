@@ -2197,6 +2197,7 @@ version = "0.5.0"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "volucer-core",
  "volucer-testkit",

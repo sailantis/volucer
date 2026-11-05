@@ -18,6 +18,11 @@ pub mod protocol;
 pub mod record;
 pub mod transport;
 
+#[cfg(feature = "async")]
+pub mod async_client;
+
+#[cfg(feature = "async")]
+pub use async_client::{adopt, AsyncClient, AsyncStream};
 pub use cgi::{
     build_params, build_params_for, percent_decode_cow, route, RequestInfo, Route, Routing,
 };
