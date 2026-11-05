@@ -799,23 +799,34 @@ correct, just not optimal — and measure with `volucer status` before and after
 
 ## Scaling a single process
 
-Throughput is **linear in cores**, and a single process uses all of them. Measured on the
-12-core reference host with an `attach` backend and 96 children, pinning the front-end and the
-supervisor to N cores, at concurrency 400:
+Throughput is **linear in cores up to the point where the cores run out**, and a single process
+uses all of them. Measured on the 12-core reference host with an `attach` backend and 96
+children, pinning the front-end and the supervisor to N cores, at concurrency 400:
 
-| cores | throughput | front-end CPU per request |
-|---:|---:|---:|
-| 12 | 101,022 rps | 46.9 µs |
-| 8 | 80,154 rps | 47.3 µs |
-| 6 | 59,212 rps | 47.5 µs |
-| 4 | 39,114 rps | 48.0 µs |
-| 2 | 19,250 rps | 49.6 µs |
+| cores | throughput | rps per core | front-end CPU per request |
+|---:|---:|---:|---:|
+| 12 | 101,022 rps | 8,418 | 46.9 µs |
+| 8 | 80,154 rps | 10,019 | 47.3 µs |
+| 6 | 59,212 rps | 9,869 | 47.5 µs |
+| 4 | 39,114 rps | 9,778 | 48.0 µs |
+| 2 | 19,250 rps | 9,625 | 49.6 µs |
 
-That is ~10,000 rps per core from 2 to 12, with the per-request cost flat to within 6%. There is
-no per-process serialisation to work around, so **one process on a bigger host is the right
-answer before several processes on the same host** — and running two front-ends against one pool
-was measured *slower* than one (91–95k against 97k) because the same work is then done less
-efficiently.
+Per-request cost is flat to within 6% across the whole range, and from 2 to 8 cores throughput
+tracks the core count at ~10,000 rps per core. **The last row is not linear and is not a
+ceiling:** 8 → 12 cores is 1.26× throughput for 1.50× cores, because at 12 the box is full —
+front-end 4.67 + PHP 4.90 + load generator 1.93 = 11.50 of 12 cores, 96% busy. The cell measures
+how much of the machine the whole arrangement needs, not how far the front-end can scale, and
+the generator is on the same cores it is measuring. Read the table as "one process consumes
+~0.8 cores per 10,000 rps", not as a per-core rate that holds at every count.
+
+That the 12-core point is CPU-bound rather than serialised is confirmed from the other side: at
+a fixed 96 children, concurrency 100 → 200 → 400 gives 101.5k → 102.1k → 102.2k with the box at
+98–100% busy. Throughput stops because the CPU is gone; nothing is waiting on a lock.
+
+So there is no per-process serialisation to work around, and **one process on a bigger host is
+the right answer before several processes on the same host** — running two front-ends against
+one pool was measured *slower* than one (91–95k against 97k) because the same work is then done
+less efficiently.
 
 Two things cap a single process long before the cores do, and both are configuration:
 
