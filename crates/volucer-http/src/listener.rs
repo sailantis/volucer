@@ -1593,7 +1593,23 @@ impl HttpListener {
             match tokio::time::timeout(ACCEPT_POLL, listener.accept()).await {
                 Ok(Ok(stream)) => {
                     let active = front_end.stats.connections.fetch_add(1, Ordering::Relaxed) + 1;
-                    if active > front_end.limits.max_connections {
+                    // `0` means no ceiling, which is what `--max-connections 0` and
+                    // `[server] max_connections = 0` both document. Without this test the
+                    // comparison below refuses *every* connection, so "no ceiling" would be the
+                    // one setting that admits nobody.
+                    let over = front_end.limits.max_connections != 0
+                        && active > front_end.limits.max_connections;
+                    if over {
+                        // **This must undo the increment above.** It used to only `continue`, so
+                        // every rejected connection leaked a slot and the listener could never
+                        // recover: once `active` passed the limit by the number of connections ever
+                        // refused, every subsequent accept was refused too, including the ones the
+                        // refusals had freed room for. A single burst retired the listener for the
+                        // life of the process — measured at `active=1276805` against a limit of 512,
+                        // serving zero requests, on a deployment that had been healthy a minute
+                        // earlier. The decrement lives here rather than being deferred to the task
+                        // below because this connection never becomes a task.
+                        front_end.stats.connections.fetch_sub(1, Ordering::Relaxed);
                         front_end.stats.rejected.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(active, "refusing an HTTP connection: at the limit");
                         drop(stream);

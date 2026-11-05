@@ -11,6 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`external` backends are awaited instead of parking a thread.** A `php-fpm` (or any FastCGI) exchange no longer holds a blocking-pool thread for its duration. On the 12-core reference host with one 96-child pool at concurrency 100 this took front-end threads from 185 to 15, front-end CPU from 78.9 to 54.6 µs per request, and throughput from 44.4k to 51.6k rps. Streaming responses from an external backend relay on a task rather than a reader thread. `spawn_cgi` is unchanged and still uses the blocking path.
 
+### Fixed
+
+- **A refused connection no longer spends the slot it was refused.** The accept loop compared the live connection count against `max_connections` and, on refusing, left the count incremented. Every turned-away connection therefore leaked one slot permanently, so a single burst above the ceiling retired the listener for the life of the process: it kept refusing connections that its own refusals had freed room for. Observed as `active=1276805` against a ceiling of 512 on a server that had served normally a minute earlier, answering nothing thereafter. Recovery required a restart.
+- **`max_connections = 0` now means no ceiling.** The key documented `0` as unlimited and `--startup` prints "(no ceiling)" for it, but the listener compared against `0` and refused every connection, so the one setting that promises to admit everybody admitted nobody.
+
 ## [0.5.0] - 2026-11-04
 
 ### Added

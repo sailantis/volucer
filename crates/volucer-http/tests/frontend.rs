@@ -653,6 +653,123 @@ fn a_missing_script_is_a_404_without_troubling_the_backend() {
     assert!(response.text().contains("not found"), "{}", response.text());
 }
 
+/// **A refused connection must not spend the slot it was refused.**
+///
+/// The accept loop increments the connection counter and then compares it against the ceiling. The
+/// refusal path used to `continue` without undoing that increment, so every connection turned away
+/// leaked one slot for the life of the process and the listener could never recover: once `active`
+/// had passed the ceiling by the number of connections ever refused, *every* subsequent accept was
+/// refused too, including the ones the refusals had themselves freed room for.
+///
+/// Measured on a deployment under a concurrency sweep: `active=1276805` against a ceiling of 512,
+/// serving zero requests, on a server that had been healthy a minute earlier. One burst retired the
+/// listener permanently, and nothing about it was recoverable at runtime.
+///
+/// The assertion is on the listener *recovering*, not on the counter, because recovery is the
+/// contract an operator cares about — and because a counter could be made to read correctly while
+/// the accept loop still refused.
+///
+/// **The burst has to be concurrent**, and this test was wrong the first time because it was not: a
+/// serial sequence never has more than one connection open, so it never reaches the ceiling and
+/// never takes the refusal path at all. It passed against the leaking code for that reason alone.
+/// Here `BURST` sockets are held open together against a ceiling of 2, so `BURST - 2` of them are
+/// genuinely refused.
+#[test]
+fn a_refused_connection_gives_its_slot_back() {
+    const CEILING: usize = 2;
+    const BURST: usize = 24;
+
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let limits = HttpLimits {
+        max_connections: CEILING,
+        ..HttpLimits::default()
+    };
+
+    let Some(server) = Server::start(dispatcher, routing, limits, Default::default()) else {
+        return;
+    };
+
+    // Every socket is opened and *held*, with no request written. An admitted connection waits on
+    // its first request, so the admitted ones stay open and the ceiling is genuinely reached — which
+    // is what makes the rest take the refusal path.
+    let held: Vec<TcpStream> = (0..BURST)
+        .filter_map(|_| TcpStream::connect(&server.address).ok())
+        .collect();
+    assert_eq!(
+        held.len(),
+        BURST,
+        "the listener must be reachable to test its ceiling"
+    );
+
+    // Long enough for the accept loop to have handled all of them: it takes one per `accept`, and a
+    // refusal is immediate, so this only has to cover scheduling.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(held);
+
+    // The last admitted connection's task must finish before the slots are free again. A connection
+    // that is dropped by the client is noticed at the next read, so give the listener a moment
+    // rather than racing it.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The bug's signature: a request that should be admitted is refused instead. With the leak this
+    // is a connect that is accepted and then dropped with no response at all, which `exchange`
+    // reports as a panic on "no header terminator".
+    let response = get(&server.address, "/");
+
+    // The backend is unreachable on purpose, so the only acceptable outcome is the front-end's own
+    // 502. A 502 proves the connection was admitted, dispatched and answered; the status itself is
+    // the unreachable backend's, not the listener's.
+    assert!(
+        response.status == 502,
+        "the listener did not recover after its refusals: {} {}",
+        response.status,
+        response.reason
+    );
+}
+
+/// **`max_connections = 0` means no ceiling, and the listener has to agree.**
+///
+/// `[server] max_connections` documents `0` as unlimited, `--startup` prints "(no ceiling)" for it,
+/// and `config/tests/endpoints.rs` asserts the value reads through as `0`. The accept loop then
+/// compared `active > 0`, which is true for every connection, so the one setting that promises to
+/// admit everybody admitted nobody — the exact opposite, and only on the deployments that had turned
+/// the limit off.
+///
+/// Asserted through the listener rather than on the parsed value, because the parsed value was
+/// already right; it was the comparison that disagreed with it.
+#[test]
+fn a_zero_ceiling_admits_connections() {
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let limits = HttpLimits {
+        max_connections: 0,
+        ..HttpLimits::default()
+    };
+
+    let Some(server) = Server::start(dispatcher, routing, limits, Default::default()) else {
+        return;
+    };
+
+    // More connections than the *default* ceiling would allow would also be a fine test, but a
+    // handful is enough: with the broken comparison the very first one is refused.
+    let held: Vec<TcpStream> = (0..8)
+        .filter_map(|_| TcpStream::connect(&server.address).ok())
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held);
+
+    let response = get(&server.address, "/");
+    assert!(
+        response.status == 502,
+        "a zero ceiling refused a connection: {} {}",
+        response.status,
+        response.reason
+    );
+}
+
 /// A configuration whose backend starts no process, for tests that must not need
 /// `php`. An `external` backend pointing at a loopback port nothing listens on.
 fn unreachable_config() -> Config {
