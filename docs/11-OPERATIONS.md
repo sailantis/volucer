@@ -294,6 +294,13 @@ Group=volucer
 StateDirectory=volucer
 WorkingDirectory=/var/lib/volucer
 
+# Two file descriptors per client connection are needed as soon as TLS or the backend pool
+# is in play, and systemd's default of 1024 is the same wall a shell's `ulimit -n` is: past
+# it, connections fail to accept and the log says "Too many open files". This has to exceed
+# `[server] max_connections` — see [Scaling a single process](#scaling-a-single-process) for
+# why that key, not the core count, is usually what limits a large host.
+LimitNOFILE=65536
+
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -818,6 +825,8 @@ Two things cap a single process long before the cores do, and both are configura
   concurrency 600 the default ceiling served 78.5k rps where the same configuration uncapped
   served 101.0k. Raise it to at least the number of connections your clients hold open, and raise
   the file-descriptor limit to match: the default `ulimit -n` of 1024 is the next wall after 512.
+  Under `systemd` that is `LimitNOFILE=65536` in the unit (the [unit above](#systemd) has it);
+  in a container it is the runtime's `--ulimit nofile=` or the orchestrator's equivalent.
 - **The child count.** Children are what the pool draws from; past the knee they are memory and
   context switches for no requests. On this host throughput went 61.1k → 84.1k → 96.5k → 101.7k
   for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
