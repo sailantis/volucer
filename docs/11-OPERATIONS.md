@@ -294,6 +294,13 @@ Group=volucer
 StateDirectory=volucer
 WorkingDirectory=/var/lib/volucer
 
+# Two file descriptors per client connection are needed as soon as TLS or the backend pool
+# is in play, and systemd's default of 1024 is the same wall a shell's `ulimit -n` is: past
+# it, connections fail to accept and the log says "Too many open files". This has to exceed
+# `[server] max_connections` — see [Scaling a single process](#scaling-a-single-process) for
+# why that key, not the core count, is usually what limits a large host.
+LimitNOFILE=65536
+
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -750,6 +757,89 @@ volucer-0.1.0-x86_64-pc-windows-msvc.zip
 ```
 
 Each archive contains the binary, README, license, and systemd unit.
+
+## Sizing the runtime
+
+Volucer runs one multi-threaded Tokio runtime, and by default Tokio starts **one worker thread
+per core**. That default is tuned for a CPU-bound server and this one is not: a request spends
+its time waiting for a backend process, not computing. On a machine with many cores the extra
+threads mostly contend with each other, and the measurement is unambiguous.
+
+On a 12-core host with an `external` backend in front of 96 `php-fpm` children, same binary and
+same configuration, varying only `TOKIO_WORKER_THREADS`:
+
+| concurrency | 12 threads (default) | 4 threads | throughput | front-end CPU |
+|---:|---:|---:|---:|---:|
+| 12 | 28,168 rps | **30,625 rps** | **+8.7%** | −8.7% |
+| 100 | 54,229 rps | **55,740 rps** | +2.8% | −10.0% |
+| 400 | 62,920 rps | **64,103 rps** | +1.9% | −10.5% |
+
+Four threads is better or equal everywhere and costs about a tenth less CPU per request. Below
+that it falls off a cliff — two threads on the same host drop to 38,280 rps at concurrency 100,
+because there is no longer enough parallelism to keep the backend busy.
+
+The setting is Tokio's own environment variable, so it needs no key in the configuration:
+
+```bash
+TOKIO_WORKER_THREADS=4 volucer serve --config volucer.toml
+```
+
+Under `systemd`, put it in the unit:
+
+```ini
+[Service]
+Environment=TOKIO_WORKER_THREADS=4
+ExecStart=/usr/local/bin/volucer serve --config /etc/volucer/volucer.toml
+```
+
+Pick the number from your concurrency rather than your core count. The useful range in the
+measurements above is 4–8 on 12 cores; the ceiling is where per-request CPU starts rising again,
+which means the runtime threads are the queue. If you are unsure, leave the default — it is
+correct, just not optimal — and measure with `volucer status` before and after.
+
+## Scaling a single process
+
+Throughput is **linear in cores**, and a single process uses all of them. Measured on the
+12-core reference host with an `attach` backend and 96 children, pinning the front-end and the
+supervisor to N cores, at concurrency 400:
+
+| cores | throughput | front-end CPU per request |
+|---:|---:|---:|
+| 12 | 101,022 rps | 46.9 µs |
+| 8 | 80,154 rps | 47.3 µs |
+| 6 | 59,212 rps | 47.5 µs |
+| 4 | 39,114 rps | 48.0 µs |
+| 2 | 19,250 rps | 49.6 µs |
+
+That is ~10,000 rps per core from 2 to 12, with the per-request cost flat to within 6%. There is
+no per-process serialisation to work around, so **one process on a bigger host is the right
+answer before several processes on the same host** — and running two front-ends against one pool
+was measured *slower* than one (91–95k against 97k) because the same work is then done less
+efficiently.
+
+Two things cap a single process long before the cores do, and both are configuration:
+
+- **`[server] max_connections`, default 512.** It refuses a connection beyond the ceiling by
+  closing it: no status code, no `Retry-After`, nothing but a reset at the TCP layer — so a client
+  pool that keeps more connections open than this sees errors rather than backpressure. At
+  concurrency 600 the default ceiling served 78.5k rps where the same configuration uncapped
+  served 101.0k. Raise it to at least the number of connections your clients hold open, and raise
+  the file-descriptor limit to match: the default `ulimit -n` of 1024 is the next wall after 512.
+  Under `systemd` that is `LimitNOFILE=65536` in the unit (the [unit above](#systemd) has it);
+  in a container it is the runtime's `--ulimit nofile=` or the orchestrator's equivalent.
+- **The child count.** Children are what the pool draws from; past the knee they are memory and
+  context switches for no requests. On this host throughput went 61.1k → 84.1k → 96.5k → 101.7k
+  for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
+  gets most of it; the last few percent needs two or three per core.
+
+If a single process on the largest host available is still short, run more *hosts*. Multiple
+processes on one host is the one arrangement measured to lose throughput.
+
+One host-level note, since it is free: check `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`.
+Under a hypervisor it is often `xen`, which is not vDSO-eligible, so every `clock_gettime` is a
+real syscall — about 16 per request on the reference host. Switching to `tsc` (available there
+with `constant_tsc`) removed 2.7 µs of front-end CPU per request, worth +2.8% throughput. This
+is a host setting, not a volucer one, and it is worth checking before buying capacity.
 
 ## Running as a different user
 

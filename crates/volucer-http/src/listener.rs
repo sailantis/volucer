@@ -182,6 +182,20 @@ pub struct HttpStats {
     /// Only possible with `[server.tls].plain`, which is off by default and logged at startup.
     /// Counted so a deployment can see it happening rather than inferring it.
     pub plaintext_on_tls_port: AtomicUsize,
+    /// The last `rejected` value that was announced in the log.
+    ///
+    /// **Not a counter, and deliberately separate from [`Self::rejected`].** `rejected` is the
+    /// exact number and has to stay exact — it is exported as a metric and printed at shutdown.
+    /// This is only "how far the log has caught up", so a refusal *storm* is written as a
+    /// handful of lines with a running total instead of one line per refused connection.
+    ///
+    /// The flood was measured, not imagined: a single listener held at its 512-connection
+    /// ceiling by 600 clients wrote **1,722,771 warning lines and 143 MB** in twelve seconds,
+    /// against 902 bytes for the same cell under the ceiling. On a deployment with a
+    /// conservative `max_connections` and a keep-alive-heavy client pool that is a disk-fill
+    /// vector reachable by anyone who can open sockets, and it is exactly backwards — the
+    /// server logs loudest at the moment it can least afford the work.
+    pub rejections_reported: AtomicUsize,
     /// QUIC handshakes that completed. Zero unless `[server.http3]` is configured.
     ///
     /// Separate from [`Self::handshakes`] because the two are different protocols over different
@@ -206,6 +220,59 @@ pub struct HttpStats {
 }
 
 impl HttpStats {
+    /// Should this refusal be written to the log?
+    ///
+    /// True for the first refusal, then once per doubling of the running total. A storm is
+    /// therefore narrated in ~20 lines whether it refuses a hundred connections or a million,
+    /// and the line always carries the true total, so nothing is lost by dropping the rest.
+    /// The exact per-connection record is [`Self::rejected`], which is unaffected.
+    pub fn should_report_rejection(&self) -> bool {
+        let refused = self.rejected.load(Ordering::Relaxed);
+        let reported = self.rejections_reported.load(Ordering::Relaxed);
+        if reported == 0 {
+            // First one ever, or the first of a new storm.
+            return self
+                .rejections_reported
+                .compare_exchange(0, refused, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        }
+        // Powers of two: 2, 4, 8, ... Each compare_exchange is a claim on that exact point in
+        // the sequence, so concurrent refusals across runtime threads cannot all log the same
+        // milestone.
+        let next = reported.saturating_mul(2).max(reported + 1);
+        if refused < next {
+            return false;
+        }
+        self.rejections_reported
+            .compare_exchange(reported, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// End a storm, if one is in progress, by resetting the report watermark.
+    ///
+    /// **Hysteresis is the whole point.** A listener held at its ceiling admits and refuses
+    /// alternately: a client finishes, a slot frees, the next accept is admitted, the one after
+    /// is refused. Resetting the watermark on every admitted connection would re-enable
+    /// per-connection logging on every refusal and reproduce the flood this exists to prevent —
+    /// so the storm is only declared over once the listener is at or below *half* its ceiling.
+    pub fn close_rejection_storm(&self, active: usize, limit: usize) {
+        // One relaxed load on the ordinary path, which the ceiling check above already pays.
+        if self.rejections_reported.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if limit != 0 && active.saturating_mul(2) > limit {
+            return;
+        }
+        if self.rejections_reported.swap(0, Ordering::Relaxed) != 0 {
+            let refused = self.rejected.load(Ordering::Relaxed);
+            tracing::info!(
+                active,
+                refused,
+                "back under the connection ceiling; refusals stopped"
+            );
+        }
+    }
+
     /// The counters as a tuple, for logging at shutdown.
     pub fn snapshot(&self) -> (usize, usize, usize, usize) {
         (
@@ -1593,12 +1660,50 @@ impl HttpListener {
             match tokio::time::timeout(ACCEPT_POLL, listener.accept()).await {
                 Ok(Ok(stream)) => {
                     let active = front_end.stats.connections.fetch_add(1, Ordering::Relaxed) + 1;
-                    if active > front_end.limits.max_connections {
+                    // `0` means no ceiling, which is what `--max-connections 0` and
+                    // `[server] max_connections = 0` both document. Without this test the
+                    // comparison below refuses *every* connection, so "no ceiling" would be the
+                    // one setting that admits nobody.
+                    let over = front_end.limits.max_connections != 0
+                        && active > front_end.limits.max_connections;
+                    if over {
+                        // **This must undo the increment above.** It used to only `continue`, so
+                        // every rejected connection leaked a slot and the listener could never
+                        // recover: once `active` passed the limit by the number of connections ever
+                        // refused, every subsequent accept was refused too, including the ones the
+                        // refusals had freed room for. A single burst retired the listener for the
+                        // life of the process — measured at `active=1276805` against a limit of 512,
+                        // serving zero requests, on a deployment that had been healthy a minute
+                        // earlier. The decrement lives here rather than being deferred to the task
+                        // below because this connection never becomes a task.
+                        front_end.stats.connections.fetch_sub(1, Ordering::Relaxed);
                         front_end.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(active, "refusing an HTTP connection: at the limit");
+                        // **A refusal storm is a few lines, not one line per connection.**
+                        // The exact count is `rejected`, which is a counter and an exported
+                        // metric; this only decides how often that count is *narrated*. First
+                        // refusal, then powers of two, so ~20 lines cover a million refusals,
+                        // plus one line the moment the storm ends so a reader is never left
+                        // believing the server is still saturated.
+                        //
+                        // Without this, 600 keep-alive clients against a default 512-connection
+                        // ceiling wrote 1,722,771 lines / 143 MB in twelve seconds while serving
+                        // the connections it had admitted — measured on this box.
+                        if front_end.stats.should_report_rejection() {
+                            let seen = front_end.stats.rejected.load(Ordering::Relaxed);
+                            tracing::warn!(
+                                active,
+                                refused = seen,
+                                "refusing an HTTP connection: at the limit"
+                            );
+                        }
                         drop(stream);
                         continue;
                     }
+                    // Back under the ceiling: close the storm's accounting with one line, so
+                    // the log says when the pressure ended rather than stopping mid-count.
+                    front_end
+                        .stats
+                        .close_rejection_storm(active, front_end.limits.max_connections);
 
                     // **The local address, read from the accepted socket.** This is the address the
                     // client actually reached, which is what a site's `addresses` binding compares

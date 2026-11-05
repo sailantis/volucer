@@ -194,9 +194,8 @@ where
     R: AsyncRead + Unpin,
 {
     let mut head = [0u8; HEADER_LEN];
-    match read_exact_or_eof(reader, &mut head).await? {
-        false => return Ok(None),
-        true => {}
+    if !read_exact_or_eof(reader, &mut head).await? {
+        return Ok(None);
     }
     let header = Header::decode(head)?;
 

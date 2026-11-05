@@ -26,7 +26,7 @@ use std::time::Duration;
 use volucer_core::config::{BackendConfig, Config, ServerConfig, WorkerConfig};
 use volucer_core::sites::Sites;
 use volucer_fcgi::Routing;
-use volucer_http::{HttpLimits, HttpListener};
+use volucer_http::{HttpLimits, HttpListener, HttpStats};
 use volucer_server::Dispatcher;
 
 /// Find `php` on `PATH`.
@@ -651,6 +651,216 @@ fn a_missing_script_is_a_404_without_troubling_the_backend() {
     assert_eq!(response.status, 404, "{response:?}");
     assert_eq!(response.reason, "Not Found");
     assert!(response.text().contains("not found"), "{}", response.text());
+}
+
+/// **A refused connection must not spend the slot it was refused.**
+///
+/// The accept loop increments the connection counter and then compares it against the ceiling. The
+/// refusal path used to `continue` without undoing that increment, so every connection turned away
+/// leaked one slot for the life of the process and the listener could never recover: once `active`
+/// had passed the ceiling by the number of connections ever refused, *every* subsequent accept was
+/// refused too, including the ones the refusals had themselves freed room for.
+///
+/// Measured on a deployment under a concurrency sweep: `active=1276805` against a ceiling of 512,
+/// serving zero requests, on a server that had been healthy a minute earlier. One burst retired the
+/// listener permanently, and nothing about it was recoverable at runtime.
+///
+/// The assertion is on the listener *recovering*, not on the counter, because recovery is the
+/// contract an operator cares about — and because a counter could be made to read correctly while
+/// the accept loop still refused.
+///
+/// **The burst has to be concurrent**, and this test was wrong the first time because it was not: a
+/// serial sequence never has more than one connection open, so it never reaches the ceiling and
+/// never takes the refusal path at all. It passed against the leaking code for that reason alone.
+/// Here `BURST` sockets are held open together against a ceiling of 2, so `BURST - 2` of them are
+/// genuinely refused.
+#[test]
+fn a_refused_connection_gives_its_slot_back() {
+    const CEILING: usize = 2;
+    const BURST: usize = 24;
+
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let limits = HttpLimits {
+        max_connections: CEILING,
+        ..HttpLimits::default()
+    };
+
+    let Some(server) = Server::start(dispatcher, routing, limits, Default::default()) else {
+        return;
+    };
+
+    // Every socket is opened and *held*, with no request written. An admitted connection waits on
+    // its first request, so the admitted ones stay open and the ceiling is genuinely reached — which
+    // is what makes the rest take the refusal path.
+    let held: Vec<TcpStream> = (0..BURST)
+        .filter_map(|_| TcpStream::connect(&server.address).ok())
+        .collect();
+    assert_eq!(
+        held.len(),
+        BURST,
+        "the listener must be reachable to test its ceiling"
+    );
+
+    // Long enough for the accept loop to have handled all of them: it takes one per `accept`, and a
+    // refusal is immediate, so this only has to cover scheduling.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(held);
+
+    // The last admitted connection's task must finish before the slots are free again. A connection
+    // that is dropped by the client is noticed at the next read, so give the listener a moment
+    // rather than racing it.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The bug's signature: a request that should be admitted is refused instead. With the leak this
+    // is a connect that is accepted and then dropped with no response at all, which `exchange`
+    // reports as a panic on "no header terminator".
+    let response = get(&server.address, "/");
+
+    // The backend is unreachable on purpose, so the only acceptable outcome is the front-end's own
+    // 502. A 502 proves the connection was admitted, dispatched and answered; the status itself is
+    // the unreachable backend's, not the listener's.
+    assert!(
+        response.status == 502,
+        "the listener did not recover after its refusals: {} {}",
+        response.status,
+        response.reason
+    );
+}
+
+/// **`max_connections = 0` means no ceiling, and the listener has to agree.**
+///
+/// `[server] max_connections` documents `0` as unlimited, `--startup` prints "(no ceiling)" for it,
+/// and `config/tests/endpoints.rs` asserts the value reads through as `0`. The accept loop then
+/// compared `active > 0`, which is true for every connection, so the one setting that promises to
+/// admit everybody admitted nobody — the exact opposite, and only on the deployments that had turned
+/// the limit off.
+///
+/// Asserted through the listener rather than on the parsed value, because the parsed value was
+/// already right; it was the comparison that disagreed with it.
+#[test]
+fn a_zero_ceiling_admits_connections() {
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let limits = HttpLimits {
+        max_connections: 0,
+        ..HttpLimits::default()
+    };
+
+    let Some(server) = Server::start(dispatcher, routing, limits, Default::default()) else {
+        return;
+    };
+
+    // More connections than the *default* ceiling would allow would also be a fine test, but a
+    // handful is enough: with the broken comparison the very first one is refused.
+    let held: Vec<TcpStream> = (0..8)
+        .filter_map(|_| TcpStream::connect(&server.address).ok())
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held);
+
+    let response = get(&server.address, "/");
+    assert!(
+        response.status == 502,
+        "a zero ceiling refused a connection: {} {}",
+        response.status,
+        response.reason
+    );
+}
+
+/// **A refusal storm is a few log lines, not one per refused connection.**
+///
+/// A listener held at its `max_connections` ceiling by a client pool that keeps every connection
+/// open refuses continuously, and logging each refusal is both a disk-fill vector and the moment
+/// the process can least afford the work. Measured on this box: 600 keep-alive clients against the
+/// default 512 ceiling wrote **1,722,771 warning lines / 143 MB in twelve seconds**, while the same
+/// cell under the ceiling wrote 902 bytes.
+///
+/// Asserted on the *decision*, not on captured log output, because the property that matters is how
+/// often the accept loop chooses to narrate — and because a million simulated refusals are
+/// deterministic while a million real ones are a slow test.
+///
+/// Both halves are pinned: the count has to stay small, and the per-connection record
+/// ([`HttpStats::rejected`]) has to stay exact, because that is what the metric and the shutdown
+/// line read.
+#[test]
+fn a_refusal_storm_is_reported_in_a_handful_of_lines() {
+    use std::sync::atomic::Ordering;
+
+    let stats = HttpStats::default();
+    let mut logged = 0usize;
+
+    // A million refusals, which is roughly half a second at the rate this was measured at.
+    for _ in 0..1_000_000u64 {
+        stats.rejected.fetch_add(1, Ordering::Relaxed);
+        if stats.should_report_rejection() {
+            logged += 1;
+        }
+    }
+
+    assert!(
+        logged <= 32,
+        "a million refusals produced {logged} log lines; this is the flood the watermark exists to stop"
+    );
+    assert!(
+        logged >= 2,
+        "the storm has to be reported as it grows, not only once — got {logged}"
+    );
+    assert_eq!(
+        stats.rejected.load(Ordering::Relaxed),
+        1_000_000,
+        "the exact count must survive the log rate limiting; it is the exported metric"
+    );
+}
+
+/// **A storm that has ended is reported again the next time one starts.**
+///
+/// The hysteresis has to be one-sided: a listener sitting *at* its ceiling admits and refuses
+/// alternately (a slot frees, the next accept is admitted, the one after is refused), so clearing
+/// the watermark on any admission would re-enable per-connection logging and reproduce the flood.
+/// It clears only once the listener is comfortably under the ceiling.
+#[test]
+fn a_second_storm_is_reported_and_one_at_the_ceiling_is_not_closed() {
+    use std::sync::atomic::Ordering;
+
+    const LIMIT: usize = 512;
+    let stats = HttpStats::default();
+
+    // First storm: one refusal, reported, and the watermark is set.
+    stats.rejected.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        stats.should_report_rejection(),
+        "the first refusal is always logged"
+    );
+    assert_eq!(stats.rejections_reported.load(Ordering::Relaxed), 1);
+
+    // Sitting at the ceiling: an admission at 512 against a limit of 512 must NOT clear it.
+    // Asserted on the watermark rather than on the next decision, because the *next* refusal is
+    // legitimately logged anyway — 1 -> 2 is a doubling of the running total — so a
+    // decision-based assertion passes whether or not the storm was closed, and proves nothing.
+    stats.close_rejection_storm(LIMIT, LIMIT);
+    assert_eq!(
+        stats.rejections_reported.load(Ordering::Relaxed),
+        1,
+        "a listener at its ceiling must not treat an alternating admit/refuse as the storm ending"
+    );
+
+    // Comfortably under it: the storm is over and the watermark is released.
+    stats.close_rejection_storm(LIMIT / 2, LIMIT);
+    assert_eq!(
+        stats.rejections_reported.load(Ordering::Relaxed),
+        0,
+        "half the ceiling is where the storm counts as over"
+    );
+
+    // …so the next refusal is reported at once rather than waiting for a doubling.
+    stats.rejected.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        stats.should_report_rejection(),
+        "the first refusal after a storm ended has to be logged immediately"
+    );
 }
 
 /// A configuration whose backend starts no process, for tests that must not need
