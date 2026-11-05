@@ -872,8 +872,17 @@ Two things cap a single process long before the cores do, and both are configura
   for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
   gets most of it; the last few percent needs two or three per core.
 
-If a single process on the largest host available is still short, run more *hosts*. Multiple
-processes on one host is the one arrangement measured to lose throughput.
+If a single process on the largest host available is still short, run more *hosts*. Several
+processes on one host only help in the shape described above — each confined to a few cores — and
+unpinned they are no better than one process, which is the measurement the earlier version of this
+section mistook for a statement about process count.
+
+Whatever the layout, **do not count the same address twice.** `max_connections` is per listener, so
+N processes on N ports give N times the ceiling, and the same is true of the connection registry,
+the counters, the rate limit and the access log — every one of those is per process because volucer
+has nothing shared between processes. Three processes are three independent servers that happen to
+run the same configuration, and everything an operator reads from one of them is a third of the
+truth.
 
 One host-level note, since it is free: check `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`.
 Under a hypervisor it is often `xen`, which is not vDSO-eligible, so every `clock_gettime` is a
