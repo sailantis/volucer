@@ -812,12 +812,12 @@ efficiently.
 
 Two things cap a single process long before the cores do, and both are configuration:
 
-- **`[server] max_connections`, default 512.** It refuses a connection beyond the ceiling with a
-  bare close — no status code, no `Retry-After` — so a client pool that keeps more connections
-  open than this sees errors rather than backpressure. At concurrency 600 the default ceiling
-  served 78.5k rps where the same configuration uncapped served 101.0k. Raise it to at least the
-  number of connections your clients hold open, and raise the file-descriptor limit to match:
-  the default `ulimit -n` of 1024 is the next wall after 512.
+- **`[server] max_connections`, default 512.** It refuses a connection beyond the ceiling by
+  closing it: no status code, no `Retry-After`, nothing but a reset at the TCP layer — so a client
+  pool that keeps more connections open than this sees errors rather than backpressure. At
+  concurrency 600 the default ceiling served 78.5k rps where the same configuration uncapped
+  served 101.0k. Raise it to at least the number of connections your clients hold open, and raise
+  the file-descriptor limit to match: the default `ulimit -n` of 1024 is the next wall after 512.
 - **The child count.** Children are what the pool draws from; past the knee they are memory and
   context switches for no requests. On this host throughput went 61.1k → 84.1k → 96.5k → 101.7k
   for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
