@@ -790,6 +790,48 @@ measurements above is 4–8 on 12 cores; the ceiling is where per-request CPU st
 which means the runtime threads are the queue. If you are unsure, leave the default — it is
 correct, just not optimal — and measure with `volucer status` before and after.
 
+## Scaling a single process
+
+Throughput is **linear in cores**, and a single process uses all of them. Measured on the
+12-core reference host with an `attach` backend and 96 children, pinning the front-end and the
+supervisor to N cores, at concurrency 400:
+
+| cores | throughput | front-end CPU per request |
+|---:|---:|---:|
+| 12 | 101,022 rps | 46.9 µs |
+| 8 | 80,154 rps | 47.3 µs |
+| 6 | 59,212 rps | 47.5 µs |
+| 4 | 39,114 rps | 48.0 µs |
+| 2 | 19,250 rps | 49.6 µs |
+
+That is ~10,000 rps per core from 2 to 12, with the per-request cost flat to within 6%. There is
+no per-process serialisation to work around, so **one process on a bigger host is the right
+answer before several processes on the same host** — and running two front-ends against one pool
+was measured *slower* than one (91–95k against 97k) because the same work is then done less
+efficiently.
+
+Two things cap a single process long before the cores do, and both are configuration:
+
+- **`[server] max_connections`, default 512.** It refuses a connection beyond the ceiling with a
+  bare close — no status code, no `Retry-After` — so a client pool that keeps more connections
+  open than this sees errors rather than backpressure. At concurrency 600 the default ceiling
+  served 78.5k rps where the same configuration uncapped served 101.0k. Raise it to at least the
+  number of connections your clients hold open, and raise the file-descriptor limit to match:
+  the default `ulimit -n` of 1024 is the next wall after 512.
+- **The child count.** Children are what the pool draws from; past the knee they are memory and
+  context switches for no requests. On this host throughput went 61.1k → 84.1k → 96.5k → 101.7k
+  for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
+  gets most of it; the last few percent needs two or three per core.
+
+If a single process on the largest host available is still short, run more *hosts*. Multiple
+processes on one host is the one arrangement measured to lose throughput.
+
+One host-level note, since it is free: check `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`.
+Under a hypervisor it is often `xen`, which is not vDSO-eligible, so every `clock_gettime` is a
+real syscall — about 16 per request on the reference host. Switching to `tsc` (available there
+with `constant_tsc`) removed 2.7 µs of front-end CPU per request, worth +2.8% throughput. This
+is a host setting, not a volucer one, and it is worth checking before buying capacity.
+
 ## Running as a different user
 
 Volucer needs read access to the document root and write access to the ACME cache. It does

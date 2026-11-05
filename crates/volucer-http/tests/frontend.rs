@@ -26,7 +26,7 @@ use std::time::Duration;
 use volucer_core::config::{BackendConfig, Config, ServerConfig, WorkerConfig};
 use volucer_core::sites::Sites;
 use volucer_fcgi::Routing;
-use volucer_http::{HttpLimits, HttpListener};
+use volucer_http::{HttpLimits, HttpListener, HttpStats};
 use volucer_server::Dispatcher;
 
 /// Find `php` on `PATH`.
@@ -767,6 +767,99 @@ fn a_zero_ceiling_admits_connections() {
         "a zero ceiling refused a connection: {} {}",
         response.status,
         response.reason
+    );
+}
+
+/// **A refusal storm is a few log lines, not one per refused connection.**
+///
+/// A listener held at its `max_connections` ceiling by a client pool that keeps every connection
+/// open refuses continuously, and logging each refusal is both a disk-fill vector and the moment
+/// the process can least afford the work. Measured on this box: 600 keep-alive clients against the
+/// default 512 ceiling wrote **1,722,771 warning lines / 143 MB in twelve seconds**, while the same
+/// cell under the ceiling wrote 902 bytes.
+///
+/// Asserted on the *decision*, not on captured log output, because the property that matters is how
+/// often the accept loop chooses to narrate — and because a million simulated refusals are
+/// deterministic while a million real ones are a slow test.
+///
+/// Both halves are pinned: the count has to stay small, and the per-connection record
+/// ([`HttpStats::rejected`]) has to stay exact, because that is what the metric and the shutdown
+/// line read.
+#[test]
+fn a_refusal_storm_is_reported_in_a_handful_of_lines() {
+    use std::sync::atomic::Ordering;
+
+    let stats = HttpStats::default();
+    let mut logged = 0usize;
+
+    // A million refusals, which is roughly half a second at the rate this was measured at.
+    for _ in 0..1_000_000u64 {
+        stats.rejected.fetch_add(1, Ordering::Relaxed);
+        if stats.should_report_rejection() {
+            logged += 1;
+        }
+    }
+
+    assert!(
+        logged <= 32,
+        "a million refusals produced {logged} log lines; this is the flood the watermark exists to stop"
+    );
+    assert!(
+        logged >= 2,
+        "the storm has to be reported as it grows, not only once — got {logged}"
+    );
+    assert_eq!(
+        stats.rejected.load(Ordering::Relaxed),
+        1_000_000,
+        "the exact count must survive the log rate limiting; it is the exported metric"
+    );
+}
+
+/// **A storm that has ended is reported again the next time one starts.**
+///
+/// The hysteresis has to be one-sided: a listener sitting *at* its ceiling admits and refuses
+/// alternately (a slot frees, the next accept is admitted, the one after is refused), so clearing
+/// the watermark on any admission would re-enable per-connection logging and reproduce the flood.
+/// It clears only once the listener is comfortably under the ceiling.
+#[test]
+fn a_second_storm_is_reported_and_one_at_the_ceiling_is_not_closed() {
+    use std::sync::atomic::Ordering;
+
+    const LIMIT: usize = 512;
+    let stats = HttpStats::default();
+
+    // First storm: one refusal, reported, and the watermark is set.
+    stats.rejected.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        stats.should_report_rejection(),
+        "the first refusal is always logged"
+    );
+    assert_eq!(stats.rejections_reported.load(Ordering::Relaxed), 1);
+
+    // Sitting at the ceiling: an admission at 512 against a limit of 512 must NOT clear it.
+    // Asserted on the watermark rather than on the next decision, because the *next* refusal is
+    // legitimately logged anyway — 1 -> 2 is a doubling of the running total — so a
+    // decision-based assertion passes whether or not the storm was closed, and proves nothing.
+    stats.close_rejection_storm(LIMIT, LIMIT);
+    assert_eq!(
+        stats.rejections_reported.load(Ordering::Relaxed),
+        1,
+        "a listener at its ceiling must not treat an alternating admit/refuse as the storm ending"
+    );
+
+    // Comfortably under it: the storm is over and the watermark is released.
+    stats.close_rejection_storm(LIMIT / 2, LIMIT);
+    assert_eq!(
+        stats.rejections_reported.load(Ordering::Relaxed),
+        0,
+        "half the ceiling is where the storm counts as over"
+    );
+
+    // …so the next refusal is reported at once rather than waiting for a doubling.
+    stats.rejected.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        stats.should_report_rejection(),
+        "the first refusal after a storm ended has to be logged immediately"
     );
 }
 
