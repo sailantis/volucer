@@ -828,6 +828,35 @@ the right answer before several processes on the same host** — running two fro
 one pool was measured *slower* than one (91–95k against 97k) because the same work is then done
 less efficiently.
 
+**Correction (measured later, on the same host): that conclusion was about thread
+oversubscription, not about process count.** The test behind it ran two processes with twelve
+runtime threads *each* — 24 threads on 12 cores, neither pinned — which is measurably no better
+than one process (54.7k against 53.9k). What actually matters is **how many cores the front-end's
+threads are spread over**, and a single process is spread across all of them:
+
+| layout (one pool, 96 children, c=100) | rps | p50 | front-end CPU/req |
+|---|---:|---:|---:|
+| 1 process × 12 threads | 53,446 | 1.67 ms | 53.9 µs |
+| 4 processes × 12 threads, **pinned to 4 cores** | **67,807** | **1.24 ms** | **42.2 µs** |
+| 4 processes × 12 threads, **unpinned** (12 cores) | 54,692 | — | 58.6 µs |
+
+Pinning is the whole effect: the same four processes on four cores gain 27%, and released onto
+twelve lose all of it. A single process on fewer cores shows the same thing (54.1 µs of
+front-end CPU per request on twelve cores, 47.4 µs on two, at concurrency 100). The per-request
+cost is a cache-locality property — a request's data polled by threads on more cores is fetched
+from more places — so **the more cores a front-end's threads span, the more each request costs**,
+even though more cores raise the ceiling. `nginx` and Node's `cluster` get this for free by
+running one event loop per process.
+
+There is no configuration key for this yet: it needs several processes behind one address
+(`SO_REUSEPORT`, not implemented) or an external load balancer, with each front-end confined
+(`CPUAffinity=` under systemd) to a couple of cores. Measured against nginx in front of the same
+pool, that layout is **68,796 rps against nginx's 63,763** at concurrency 100 (four rotated
+rounds) and **76,545 against 70,829** at concurrency 200.
+
+If a single process on the largest host available is still short, prefer **more processes confined
+to few cores each** over one process spread across all of them, and more *hosts* after that.
+
 Two things cap a single process long before the cores do, and both are configuration:
 
 - **`[server] max_connections`, default 512.** It refuses a connection beyond the ceiling by
