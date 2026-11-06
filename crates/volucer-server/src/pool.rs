@@ -46,6 +46,8 @@ use volucer_core::config::{
     FCGI_CONCURRENCY_PLACEHOLDER,
 };
 use volucer_core::program::{resolve_program, split_command};
+#[cfg(unix)]
+use volucer_fcgi::AsyncClient;
 use volucer_fcgi::{Client, Endpoint, Request, Response};
 
 use crate::error::{Hint, Result, ServerError};
@@ -175,10 +177,49 @@ struct Slot {
     served: Arc<AtomicU64>,
     /// Live connections, up to the slot's concurrency.
     ///
-    /// A `Vec` rather than one `Option` because a preforked master can answer several
-    /// requests at once, and one connection carries one request: `FCGI_MPXS_CONNS` is `0` and
-    /// the accept loop is one request at a time. An idle connection here is one warm child.
-    clients: Vec<Client>,
+    /// The slot's warm connections, in whichever mode the requests that left them put them.
+    ///
+    /// **One list, one connection per child, and a mode — not one list per mode.** `php-cgi` serves
+    /// one *connection* at a time per child (`FCGI_MPXS_CONNS` is 0), so a slot that kept a warm
+    /// connection in each mode would hold two sockets against one child and the second request would
+    /// wait for the first child to finish — measured as an 8-second stall, with `connect` succeeding
+    /// and the write never being read. A slot therefore owns at most `concurrency` connections, and
+    /// each is tagged with the runtime mode it is currently in.
+    clients: Vec<WarmClient>,
+}
+
+/// A connection a slot is holding warm, and how it is currently driven.
+///
+/// `O_NONBLOCK` and the cleared `SO_RCVTIMEO` are properties of the *file description*, not of the
+/// handle, so a socket's mode is a property of the connection and cannot be inferred from anything
+/// else. Tagging it is what lets a slot reuse one child's connection from either request path
+/// without ever holding two, which is the difference between a pool that works on `php-cgi` and one
+/// that stalls.
+#[derive(Debug)]
+enum WarmClient {
+    Blocking(Client),
+    #[cfg(unix)]
+    Awaited(AsyncClient),
+}
+
+impl WarmClient {
+    /// Whether the connection can serve another request, in whatever mode it is in.
+    fn is_reusable(&self) -> bool {
+        match self {
+            WarmClient::Blocking(client) => client.is_reusable(),
+            #[cfg(unix)]
+            WarmClient::Awaited(client) => client.is_reusable(),
+        }
+    }
+
+    /// Which client drives it. See [`Mode`].
+    fn mode(&self) -> Mode {
+        match self {
+            WarmClient::Blocking(_) => Mode::Blocking,
+            #[cfg(unix)]
+            WarmClient::Awaited(_) => Mode::Awaited,
+        }
+    }
 }
 
 impl Slot {
@@ -195,13 +236,39 @@ impl Slot {
         slot_address_of(&self.endpoint)
     }
 
-    /// Drop every connection that the backend refused to keep.
+    /// Take this slot's warm connection, if it is one this mode can drive.
     ///
-    /// Separate from [`exchange`] because it has to run before a connection is taken,
-    /// and doing it in one pass is cheaper than testing each one twice.
-    fn prune_dead_clients(&mut self) {
-        self.clients.retain(|client| client.is_reusable());
+    /// **A connection in the other mode is closed, not converted**, and that is what keeps a slot to
+    /// one connection at a time — which `php-cgi` requires. A single `php-cgi -b` serves one
+    /// *connection* and loops on it: it never accepts a second until the first closes, so holding a
+    /// warm blocking connection while the awaited path opens its own leaves the second request
+    /// unserved until the first child is done with. Measured three ways: one slot with one child
+    /// hangs; the same slot with `children = 4` passes; `strace` shows the child serving the first
+    /// connection and never accepting the second.
+    ///
+    /// Closing costs a reconnect on the request that changes mode. That is the right trade — a
+    /// deployment's traffic does not alternate paths per request (one front-end uses one), and a
+    /// reconnect is a round trip where a second connection is a stall.
+    fn take_warm(&mut self, mode: Mode) -> Option<WarmClient> {
+        self.clients.retain(WarmClient::is_reusable);
+        match self.clients.pop() {
+            Some(warm) if warm.mode() == mode => Some(warm),
+            // The other mode's connection, or one that is past its keep-alive. Dropping it closes the
+            // socket, which is what hands the child back.
+            _ => None,
+        }
     }
+}
+
+/// Which client drives a connection, and therefore which of the two can use it.
+///
+/// A connection's mode is a property of its *file description* — `O_NONBLOCK` and the cleared
+/// `SO_RCVTIMEO` — so it cannot be inferred from anything else and has to be recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Blocking,
+    #[cfg(unix)]
+    Awaited,
 }
 
 /// Send one request over a slot's address, returning the connection it used.
@@ -291,6 +358,113 @@ fn exchange(
 
 fn is_connection_error(err: &volucer_fcgi::FcgiError) -> bool {
     crate::backend::is_transport_error(err)
+}
+
+/// Open a connection that a runtime — `runtime`, specifically — owns.
+///
+/// **Synchronous on purpose, and the two calls it makes are the reason.** A `tokio` connection
+/// resolves its driver from the *current* runtime context at the moment it is constructed
+/// (`from_std`), and that runtime must outlive the connection. `AsyncClient::connect` is a future,
+/// so which runtime it registers under depends on who polls it — the *caller's* — and a slot's warm
+/// connection is later polled by whoever asks next. Registering it on the caller's runtime and
+/// storing it in the slot is therefore the same bug `AsyncRuntime` documents: a socket whose driver
+/// is gone fails its next poll with *"a Tokio 1.x context was found, but it is being shutdown"*.
+///
+/// So the transport is opened with the blocking `Endpoint::connect` (a loopback connect or a unix
+/// socket: no name server, no park worth avoiding) and handed to `adopt`, which runs
+/// `prepare_for_async` and `from_std`. Both happen inside `enter`, and **neither is across an
+/// `await`** — an `EnterGuard` is thread-local state, so holding one across a yield point would
+/// leave the pool's runtime "entered" for whatever unrelated task the thread ran next.
+///
+/// A `?` here cannot leak the guard: it is a plain binding dropped at the end of the function.
+#[cfg(unix)]
+fn connect_awaited(
+    runtime: &crate::worker_pool::AsyncRuntime,
+    endpoint: &Endpoint,
+    backend: &str,
+    timeout: Duration,
+) -> Result<AsyncClient> {
+    let _entered = runtime.enter();
+    let stream = endpoint
+        .connect(Some(timeout))
+        .map_err(|source| deadline_or_worker(backend, timeout, source))?;
+    let adopted = volucer_fcgi::adopt(&stream).map_err(|source| ServerError::Worker {
+        backend: backend.to_string(),
+        source,
+    })?;
+    Ok(AsyncClient::from_stream(adopted))
+}
+
+/// [`exchange`], across an `await`.
+///
+/// The same sequence and the same two decisions: reuse the connection only when the previous request
+/// said it may be reused, and retry once on a transport error — but not when the deadline expired,
+/// because a timed-out request has already been waited for once.
+///
+/// Returns the connection so the caller can put it back, exactly as [`exchange`] does: a slot's warm
+/// connection is what makes the next request to it cheap, and on this path it is also what keeps the
+/// connection on the runtime that owns its waker.
+#[cfg(unix)]
+async fn exchange_async(
+    runtime: &crate::worker_pool::AsyncRuntime,
+    endpoint: &Endpoint,
+    request: &Request,
+    take: Option<AsyncClient>,
+    backend: &str,
+    timeout: Duration,
+) -> Result<(Response, AsyncClient)> {
+    let mut client = match take {
+        Some(client) if client.is_reusable() => client,
+        _ => connect_awaited(runtime, endpoint, backend, timeout)?,
+    };
+
+    let mut attempt = 0;
+    loop {
+        match client.request(request).await {
+            Ok(response) => return Ok((response, client)),
+            Err(err)
+                if attempt == 0
+                    && retryable(&err)
+                    && !crate::backend::is_deadline_expired(&err) =>
+            {
+                attempt += 1;
+                client = connect_awaited(runtime, endpoint, backend, timeout)?;
+            }
+            Err(source) => return Err(deadline_or_worker(backend, timeout, source)),
+        }
+    }
+}
+
+/// Report a failed awaited exchange the way the blocking one reports it.
+///
+/// **A deadline is named as a deadline.** `os error 10060` and "a connection attempt failed" are what
+/// the OS says when a read times out; the operator configured `request_timeout_ms`, and a message
+/// that does not say so sends them looking for a network problem that does not exist. The blocking
+/// path builds this same sentence inline; it is a function here because the awaited path reaches it
+/// from two places (the buffered exchange and the relayed one).
+#[cfg(unix)]
+fn deadline_or_worker(
+    backend: &str,
+    timeout: Duration,
+    source: volucer_fcgi::FcgiError,
+) -> ServerError {
+    if crate::backend::is_deadline_expired(&source) {
+        return ServerError::Worker {
+            backend: backend.to_string(),
+            source: volucer_fcgi::FcgiError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the backend did not answer within {} ms — that is the deadline \
+                     `request_timeout_ms` sets for this backend, not a network timeout",
+                    timeout.as_millis()
+                ),
+            )),
+        };
+    }
+    ServerError::Worker {
+        backend: backend.to_string(),
+        source,
+    }
 }
 
 /// Gives a slot's place back on drop, on every path out of a request.
@@ -723,16 +897,40 @@ pub struct CgiPool {
     /// not change it — `restart_only` says so, and reading the configuration per request would let
     /// the two disagree.
     request_timeout: Duration,
+    /// The runtime that drives a slot's connections, when this pool can use one at all.
+    ///
+    /// `None` on Windows (a slot's address may be a named pipe, which no runtime can drive) and
+    /// `Some` everywhere else. Its presence is exactly what [`Self::drives_connections`] answers,
+    /// which is the question the front-end's gate asks.
+    ///
+    /// **Owned by the pool rather than borrowed from the front-end**, and that is a rule rather than
+    /// a preference: a connection's waker belongs to whichever runtime first polls it, and that
+    /// runtime must outlive the connection. `CgiPool::start` runs long before any listener exists,
+    /// so there is no front-end runtime to borrow. `worker_pool::AsyncRuntime` states the same rule
+    /// from the other side, for the same measured reason — a socket whose runtime was shut down
+    /// fails its next poll with *"a Tokio 1.x context was found, but it is being shutdown"*.
+    #[cfg(unix)]
+    runtime: Option<crate::worker_pool::AsyncRuntime>,
     /// Held for the life of the pool; dropping it reaps every slot.
     _guard: LifecycleGuard,
 }
 
 /// How many requests one slot may serve at once.
 ///
-/// A counter and a condvar, mirroring `backend::Limit` for an `external` backend's
-/// `max_connections`: the request path is synchronous, so a request over the slot's concurrency
-/// has to *block*, and blocking is the feature — the alternative is opening a connection no child
-/// is there to accept, which queues in the listen backlog where nothing counts it.
+/// A counter with **two ways to wait on it**, because the same count has two kinds of caller.
+/// A synchronous request (the FastCGI front-end, the control plane, a test) has to *block* —
+/// blocking is the feature, since the alternative is opening a connection no child is there to
+/// accept, which queues in the listen backlog where nothing counts it. An awaited request on the
+/// HTTP front-end must **not** park its thread: at `c=100` with twelve slots, a hundred requests
+/// park twelve runtime threads and nothing is left running to release one. So there is one number
+/// and two wake-ups, and which one a request uses is a property of the path it took — never of the
+/// limit, which would be a second limit.
+///
+/// **One counter rather than one per kind, and that is a correctness requirement.** With two, a slot
+/// whose concurrency is 1 would admit a blocking request and an awaited one simultaneously — two
+/// requests inside an address `php-cgi` serves strictly one at a time. Worse, [`CgiPool::respawn_idle`]
+/// reads this count to decide whether a slot is serving, so a request counted in a list it did not
+/// read would be replaced mid-response.
 ///
 /// The concurrency is `children.max(1)` for `binary` and `concurrency.max(1)` for `command`.
 /// With `children = 0` it is 1, so the observable behaviour of an existing configuration is
@@ -740,7 +938,12 @@ pub struct CgiPool {
 #[derive(Debug)]
 struct SlotPermits {
     state: Mutex<usize>,
+    /// Blocking waiters. Signalled on every release, whether or not one is waiting.
     released: Condvar,
+    /// Awaited waiters. Signalled on every release for the same reason, and the cost of a signal
+    /// nobody is waiting for is a lock-free no-op — the same trade
+    /// [`WorkerPool::release`](crate::WorkerPool) makes for its two kinds.
+    released_async: tokio::sync::Notify,
     concurrency: usize,
 }
 
@@ -749,6 +952,7 @@ impl SlotPermits {
         SlotPermits {
             state: Mutex::new(0),
             released: Condvar::new(),
+            released_async: tokio::sync::Notify::new(),
             concurrency,
         }
     }
@@ -771,14 +975,53 @@ impl SlotPermits {
         *in_flight += 1;
     }
 
-    /// Give the place back, which is what wakes a waiting request.
+    /// [`Self::enter`], without parking the calling thread.
+    ///
+    /// The notification is registered **before** the check, so a `leave` that lands between the two
+    /// cannot be lost: `enable()` arms it and the loop re-tests after every wake. That ordering is
+    /// load-bearing rather than stylistic — a request that missed the wake would wait for a release
+    /// that has already happened, for the rest of the slot's life.
+    ///
+    /// `#[cfg(unix)]` because its only callers are, and not as a convenience: a Windows slot address
+    /// may be a named pipe, which no runtime can drive, so on that platform every request takes
+    /// [`Self::enter`] and this would be dead code rather than a second path.
+    #[cfg(unix)]
+    async fn enter_async(&self) {
+        loop {
+            let released = self.released_async.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+
+            {
+                let mut in_flight = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *in_flight < self.concurrency {
+                    *in_flight += 1;
+                    return;
+                }
+            }
+
+            released.await;
+        }
+    }
+
+    /// Give the place back, which is what wakes a waiting request — of either kind.
     fn leave(&self) {
-        let mut in_flight = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *in_flight = in_flight.saturating_sub(1);
+        {
+            let mut in_flight = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *in_flight = in_flight.saturating_sub(1);
+        }
+        // Both signals for one release, and that is how a pool with two kinds of waiter works:
+        // whichever kind is queued takes the place, and the other kind's signal finds nobody
+        // waiting. Signalled outside the lock so the woken request does not immediately contend
+        // with the releaser for the value it was just told had changed.
         self.released.notify_one();
+        self.released_async.notify_one();
     }
 
     /// How many requests the slot is serving right now, or `None` if even reading that would
@@ -787,6 +1030,9 @@ impl SlotPermits {
     /// `try_lock`, because the answer is only wanted by a rolling restart, and a sweep that
     /// waited here would be waiting for the requests it is supposed to leave alone. `None` means
     /// "not knowable from here", which the caller treats as busy — the conservative direction.
+    ///
+    /// Counts both kinds of request, because there is one count: see the type's own note on why a
+    /// second counter would be a second limit.
     fn in_flight(&self) -> Option<usize> {
         self.state.try_lock().ok().map(|in_flight| *in_flight)
     }
@@ -822,6 +1068,18 @@ impl CgiPool {
             socket_paths: Vec::new(),
             max_requests: config.max_requests,
             request_timeout: request_timeout_of(config.request_timeout_ms, name)?,
+            #[cfg(unix)]
+            runtime: Some(
+                crate::worker_pool::AsyncRuntime::start(name, count as usize).map_err(
+                    |source| ServerError::Misconfigured {
+                        backend: name.to_string(),
+                        reason: format!(
+                        "could not start the runtime that would drive this pool's connections: \
+                         {source}"
+                    ),
+                    },
+                )?,
+            ),
             _guard: guard,
         };
 
@@ -1092,6 +1350,29 @@ impl CgiPool {
         self.slots.is_empty()
     }
 
+    /// Whether this pool's connections are ones a runtime drives, rather than ones a thread holds.
+    /// Asked by the front-end before it decides to `await` a request, and answered from the pool
+    /// rather than from the configuration: on Unix every address a slot can have — a loopback port or
+    /// a unix socket — is one [`volucer_fcgi::adopt`] can hand to a runtime, so the runtime's own
+    /// presence is the whole answer. On Windows it is `false` whenever an address may be a named
+    /// pipe, which no runtime can drive; see [`volucer_fcgi::AsyncClient::connect`], which refuses
+    /// the same case from the other side.
+    ///
+    /// A property of the pool, so constant for its life, which is why it can be asked per request
+    /// without touching a slot.
+    pub fn drives_connections(&self) -> bool {
+        #[cfg(unix)]
+        {
+            // A pool cannot outlive its runtime: the `Option` is emptied only by `Drop`, which runs
+            // after every slot has been stopped.
+            self.runtime.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// Send a request through the pool.
     ///
     /// Takes `&self`. Admission is per slot and *outside* the slot's lock: a request first
@@ -1129,8 +1410,11 @@ impl CgiPool {
             let mut slot = self.slots[index]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            slot.prune_dead_clients();
-            (slot.endpoint.clone(), slot.clients.pop())
+            let taken = match slot.take_warm(Mode::Blocking) {
+                Some(WarmClient::Blocking(client)) => Some(client),
+                _ => None,
+            };
+            (slot.endpoint.clone(), taken)
         };
 
         let (response, client) =
@@ -1143,7 +1427,93 @@ impl CgiPool {
             // The connection goes back so the next request to this slot is warm. Retention is
             // per slot and bounded by concurrency, which *is* the number of processes behind the
             // address — so a warm connection is one warm child and cannot starve a sibling.
-            slot.clients.push(client);
+            slot.clients.push(WarmClient::Blocking(client));
+            slot.served.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        self.recycle_if_needed(index, served)?;
+        Ok(response)
+    }
+
+    /// [`Self::request`], without parking the calling thread while the slot's process thinks.
+    ///
+    /// The awaited twin, and it exists for the reason the front-end's gate exists: on a runtime
+    /// thread, `permits.enter()` parks a thread the runtime needs to keep serving. Twelve parked
+    /// threads out of twelve is the stall `WorkerPool::acquire_owned_async` documents — measured
+    /// there as 35–50 rps with `too many connections`, which is what a self-inflicted deadlock
+    /// looks like from outside.
+    ///
+    /// Every *rule* is the same as the blocking path's, deliberately, because a difference between
+    /// them would be a correctness bug on one:
+    ///
+    /// - admission is per slot and outside the slot's lock, so `children = n` still serves `n` at
+    ///   once from one address;
+    /// - the lock covers bookkeeping only and is released before any I/O;
+    /// - the connection goes back to the slot it came from, so the next request to that slot is warm;
+    /// - the permit is given back on every path out, including the `?`s below.
+    ///
+    /// What differs is only *which* connection and *how the place is waited for*: both paths take from
+    /// the same one list, and a connection is only reused by the mode that can drive it — a mode
+    /// mismatch closes it rather than opening a second, because `php-cgi` serves one *connection* at a
+    /// time per child and a second would wait for the first child to finish (see [`Slot::take_warm`]).
+    /// The place is taken with [`SlotPermits::enter_async`] rather than on the `Condvar` the blocking
+    /// path uses.
+    ///
+    /// Returns `WrongProtocol` rather than falling back when the address is one this path cannot
+    /// drive, because a caller that asked for an awaited exchange has already told its front-end it
+    /// may `await`; answering it synchronously anyway would be the silent stall
+    /// `Backend::request_async` was written to remove.
+    #[cfg(unix)]
+    pub async fn request_async(&self, request: &Request) -> Result<Response> {
+        if self.slots.is_empty() {
+            return Err(ServerError::NoWorker {
+                backend: self.name.clone(),
+            });
+        }
+        let Some(runtime) = &self.runtime else {
+            return Err(ServerError::WrongProtocol {
+                backend: self.name.clone(),
+            });
+        };
+
+        let index = self.next_slot_index();
+        let permits = Arc::clone(&self.permits[index]);
+        // Awaited rather than entered: the wait yields the runtime thread instead of consuming it,
+        // on the *same* count the blocking path uses.
+        permits.enter_async().await;
+        let _permit = PermitGuard(permits);
+
+        // Bookkeeping only, and released before any I/O — the same critical section the blocking
+        // path takes.
+        let (endpoint, taken) = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let taken = match slot.take_warm(Mode::Awaited) {
+                Some(WarmClient::Awaited(client)) => Some(client),
+                _ => None,
+            };
+            (slot.endpoint.clone(), taken)
+        };
+
+        // **Every socket on this path is opened by `exchange_async`, inside the pool's runtime, and
+        // never across an `await`.** See `connect_awaited`: a connection's driver is resolved when it
+        // is constructed and must outlive it, so it cannot be registered on whichever runtime happens
+        // to poll the future.
+        let (response, client) = exchange_async(
+            runtime,
+            &endpoint,
+            request,
+            taken,
+            &self.name,
+            self.request_timeout,
+        )
+        .await?;
+
+        let served = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.clients.push(WarmClient::Awaited(client));
             slot.served.fetch_add(1, Ordering::Relaxed) + 1
         };
         self.recycle_if_needed(index, served)?;
@@ -1254,8 +1624,11 @@ impl CgiPool {
             let mut slot = self.slots[index]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            slot.prune_dead_clients();
-            (slot.endpoint.clone(), slot.clients.pop())
+            let taken = match slot.take_warm(Mode::Blocking) {
+                Some(WarmClient::Blocking(client)) => Some(client),
+                _ => None,
+            };
+            (slot.endpoint.clone(), taken)
         };
 
         let mut client = match taken {
@@ -1284,7 +1657,7 @@ impl CgiPool {
                     let mut slot = self.slots[index]
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    slot.clients.push(client);
+                    slot.clients.push(WarmClient::Blocking(client));
                     slot.served.fetch_add(1, Ordering::Relaxed) + 1
                 };
                 self.recycle_if_needed(index, served)?;
@@ -1315,6 +1688,160 @@ impl CgiPool {
                     source,
                 })?;
                 Ok(Delivery::Relayed(report))
+            }
+        }
+    }
+
+    /// [`Self::request_relayed`], without parking the calling thread while the slot's process thinks.
+    ///
+    /// The awaited twin, and the rules are the blocking one's unchanged: the permit is held until
+    /// `END_REQUEST` because the slot is still serving the request while its body is being relayed,
+    /// the permit and the served count are released by whatever finishes the body, and the
+    /// connection is not returned to the slot mid-response.
+    ///
+    /// What differs is what pumps the body and where the endpoint comes from — see
+    /// [`Self::request_async`] for both, and [`crate::backend`]'s `external_relayed_async` for the
+    /// same shape on the `external` backend.
+    #[cfg(unix)]
+    pub async fn request_relayed_async(
+        &self,
+        request: &Request,
+        buffer: usize,
+        relay: volucer_fcgi::Relay,
+    ) -> Result<Delivery> {
+        if self.slots.is_empty() {
+            return Err(ServerError::NoWorker {
+                backend: self.name.clone(),
+            });
+        }
+        let Some(runtime) = &self.runtime else {
+            return Err(ServerError::WrongProtocol {
+                backend: self.name.clone(),
+            });
+        };
+
+        let index = self.next_slot_index();
+        let permits = Arc::clone(&self.permits[index]);
+        permits.enter_async().await;
+        // Moved into the pump task when the response is streamed, and dropped here otherwise.
+        // Either way it is released exactly once, which is why it is a guard rather than a call.
+        let permit = PermitGuard(permits);
+
+        let (endpoint, taken) = {
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let taken = match slot.take_warm(Mode::Awaited) {
+                Some(WarmClient::Awaited(client)) => Some(client),
+                _ => None,
+            };
+            (slot.endpoint.clone(), taken)
+        };
+
+        // One retry on a transport error, on the same terms as the blocking path: a slot may have
+        // recycled between requests without the address changing, and `php-cgi` closes the
+        // connection even when keep-alive was requested. Never on a deadline — see
+        // `backend::is_deadline_expired`, which is the same predicate the blocking path consults.
+        //
+        // The connection is opened by `connect_awaited`, on the pool's runtime — see there for why it
+        // cannot be an `await` on this path.
+        let mut client = match taken {
+            Some(client) if client.is_reusable() => client,
+            _ => connect_awaited(runtime, &endpoint, &self.name, self.request_timeout)?,
+        };
+        let mut attempt = 0;
+        let delivery = loop {
+            match client.request_streaming(request, buffer, relay).await {
+                Ok(delivery) => break delivery,
+                Err(err)
+                    if attempt == 0
+                        && retryable(&err)
+                        && !crate::backend::is_deadline_expired(&err) =>
+                {
+                    attempt += 1;
+                    client = connect_awaited(runtime, &endpoint, &self.name, self.request_timeout)?;
+                }
+                Err(source) => {
+                    // **Named as the deadline it is**, exactly as the blocking path does: the
+                    // operator configured `request_timeout_ms`, and a message that says "socket
+                    // timeout" sends them looking for a network problem that does not exist.
+                    return Err(deadline_or_worker(&self.name, self.request_timeout, source));
+                }
+            }
+        };
+
+        match delivery {
+            volucer_fcgi::Delivery::Buffered(response) => {
+                let served = {
+                    let mut slot = self.slots[index]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    slot.clients.push(WarmClient::Awaited(client));
+                    slot.served.fetch_add(1, Ordering::Relaxed) + 1
+                };
+                self.recycle_if_needed(index, served)?;
+                Ok(Delivery::Buffered(response))
+            }
+            volucer_fcgi::Delivery::Streamed(stream) => {
+                let served = Arc::clone(
+                    &self.slots[index]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .served,
+                );
+                let head = stream.head().to_vec();
+                let head_duration = stream.head_duration();
+                let verdict = crate::relay::Verdict::new();
+                // The pump publishes through its own clone of the handles. `Verdict` clones the two
+                // `Arc`s and never the answer, so there is one verdict either way.
+                let published = verdict.clone();
+                let (sender, receiver) = crate::relay::channel();
+                let backend = self.name.clone();
+
+                // **A task, not a thread** — the difference between this and
+                // `crate::relay::spawn_reader`. The blocking client must be pumped by a thread
+                // because `blocking_send` on a runtime worker would consume the thread the receiver
+                // needs to drain the channel; an awaited client has no such problem, because
+                // `send` is a future. That is the whole of what this path buys on a large response.
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut failed = false;
+                    loop {
+                        match client.next_chunk(&mut stream).await {
+                            Ok(Some(chunk)) => {
+                                if sender.send(bytes::Bytes::from(chunk)).await.is_err() {
+                                    // The client went away: drain rather than abandon, so the
+                                    // slot's connection is not left half-read.
+                                    while let Ok(Some(_)) = client.next_chunk(&mut stream).await {}
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                tracing::warn!(
+                                    backend = %backend,
+                                    %err,
+                                    "a streamed response failed part way through"
+                                );
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    let complete = stream.is_finished() && !failed;
+                    published.publish(stream.stderr(), complete);
+                    // The slot serves this request until its last byte, so both the permit and the
+                    // count are released here and nowhere earlier.
+                    drop(permit);
+                    served.fetch_add(1, Ordering::Relaxed);
+                });
+
+                Ok(Delivery::Relayed(crate::relay::Relayed::new(
+                    head,
+                    receiver,
+                    head_duration,
+                    verdict,
+                )))
             }
         }
     }

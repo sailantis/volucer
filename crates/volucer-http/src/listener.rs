@@ -2904,15 +2904,25 @@ async fn prepare(
     }
 
     // **A backend that cannot answer asynchronously keeps the blocking path, and it is decided
-    // here rather than inside the dispatcher.** `spawn_cgi` reaches `volucer-fcgi`'s blocking
-    // client, and its exchange is owned by a supervised slot rather than by a socket the caller
-    // holds, so answering it here would park a runtime thread on a pipe read.
+    // here rather than inside the dispatcher.** `answers_asynchronously` is the gate, and today the
+    // only kind that can fail it is a `spawn_cgi` slot whose address is a Windows named pipe — a
+    // transport no runtime can register.
     //
-    // `external` used to be in that group too, on the grounds that `volucer-fcgi` had no `async fn`.
-    // It does now (`volucer_fcgi::AsyncClient`), and the reason it was worth writing is measured: a
-    // FastCGI backend answered through `spawn_blocking` held one thread per in-flight request —
-    // 185 threads against nginx's 5 at concurrency 100 — and cost 78.9 us of front-end CPU per
-    // request against 46.3 for the awaited worker path, for 44.4k rps against 95.7k.
+    // The other three kinds that used to fail it have each been moved across, and the reason was
+    // always the same one: a blocking exchange parks a thread, and on this front-end that thread is
+    // a runtime thread.
+    //
+    // `external` was the first. It used to be blocking on the grounds that `volucer-fcgi` had no
+    // `async fn`. It does now (`volucer_fcgi::AsyncClient`), and the reason it was worth writing is
+    // measured: a FastCGI backend answered through `spawn_blocking` held one thread per in-flight
+    // request — 185 threads against nginx's 5 at concurrency 100 — and cost 78.9 us of front-end CPU
+    // per request against 46.3 for the awaited worker path, for 44.4k rps against 95.7k.
+    //
+    // `spawn_cgi` was the last, and it needed a change to the slot lifecycle rather than to a socket:
+    // its permit was taken with a `Condvar`, which parks whichever thread asks, so twelve concurrent
+    // requests would have parked all twelve runtime threads and left nothing running to release one.
+    // `CgiPool` now waits on that same count with `tokio::sync::Notify` when the request is awaited,
+    // and drives the connections it already owned from a runtime of its own.
     let awaits_its_backend = front_end.dispatcher.answers_asynchronously(&backend);
 
     // **A gRPC call this backend was not granted is refused here**, and every part of that sentence

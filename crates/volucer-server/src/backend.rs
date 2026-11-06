@@ -621,10 +621,22 @@ impl Backend {
             // and 78.9 us of front-end CPU per request against 46.3 for the awaited worker path.
             // `volucer_fcgi::AsyncClient` is that `async fn`.
             Backend::External { name, pool } => Self::external_async(name, pool, request).await,
-            // `spawn_cgi` keeps the blocking path: its exchange is also a FastCGI conversation, but
-            // the slot that owns the connection is a process this crate supervises, and the permit
-            // is released by the thread that finishes the request. Making that awaited is a change
-            // to the slot lifecycle rather than to a socket, and it is measurable on its own.
+            // **`spawn_cgi` is awaited too, and it took a change to the slot lifecycle rather than to
+            // a socket.** Its permit used to be taken with a `Condvar`, which parks whichever thread
+            // asked — a runtime thread, on this path, twelve of which is the whole runtime. That one
+            // count now has a second way to wait on it (`tokio::sync::Notify`) used when the request
+            // is awaited, and the pool drives the connections it already owned from a runtime of its
+            // own, so the same request is answered without parking anything. See
+            // `CgiPool::request_async` and `CgiPool::drives_connections`.
+            //
+            // The guard is not enough on its own: `request_async` is unix-only, because a Windows slot
+            // address may be a named pipe, which no runtime can drive. On that platform the `other`
+            // arm answers it and `drives_connections` is `false`, so both statements are true and the
+            // blocking path is the one that runs.
+            #[cfg(unix)]
+            Backend::SpawnCgi { pool, .. } if pool.drives_connections() => {
+                pool.request_async(request).await
+            }
             other => other.request(request),
         }
     }
@@ -690,6 +702,17 @@ impl Backend {
             Backend::Worker { pool, .. } => pool.request_relayed_async(request, relay).await,
             Backend::External { name, pool } => {
                 Self::external_relayed_async(name, pool, request, buffer, relay).await
+            }
+            // **A `spawn_cgi` slot is awaited too, when its own address is one a runtime can drive.**
+            // It is a change to the slot lifecycle rather than to a socket — the permit used to be
+            // taken with a `Condvar` that parks whichever thread asked — so one admission count now
+            // has a `Notify` for awaited requests as well; see `CgiPool::request_relayed_async`.
+            //
+            // The `false` arm is a Windows named-pipe slot, which no runtime can register. It keeps
+            // the blocking path, and that is a correctness fallback rather than a performance one.
+            #[cfg(unix)]
+            Backend::SpawnCgi { pool, .. } if pool.drives_connections() => {
+                pool.request_relayed_async(request, buffer, relay).await
             }
             other => other.request_relayed(request, buffer, relay),
         }

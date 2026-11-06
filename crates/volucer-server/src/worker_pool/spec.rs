@@ -154,12 +154,11 @@ impl Spec {
             // readiness-driven, so a handful of threads holds the whole pool.
             runtime: match config.transport {
                 WorkerTransport::Socket => Some(Arc::new(
-                    crate::worker_pool::AsyncRuntime::start(config.workers as usize).map_err(
-                        |source| ServerError::Misconfigured {
+                    crate::worker_pool::AsyncRuntime::start(name, config.workers as usize)
+                        .map_err(|source| ServerError::Misconfigured {
                             backend: name.to_string(),
                             reason: format!("could not start the worker runtime: {source}"),
-                        },
-                    )?,
+                        })?,
                 )),
                 WorkerTransport::Pipe => None,
             },
@@ -233,7 +232,7 @@ impl Spec {
             // worker's transport is a socket, which the front-end's runtime drives instead of a
             // thread. The count is the pool's concurrency, which is what the runtime is sized from.
             runtime: Some(Arc::new(
-                crate::worker_pool::AsyncRuntime::start(config.workers as usize).map_err(
+                crate::worker_pool::AsyncRuntime::start(name, config.workers as usize).map_err(
                     |source| ServerError::Misconfigured {
                         backend: name.to_string(),
                         reason: format!("could not start the attach runtime: {source}"),

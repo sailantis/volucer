@@ -1217,3 +1217,151 @@ fn a_deadline_is_distinguished_from_a_dropped_connection() {
         "removing this from the transport set would change the error a caller sees"
     );
 }
+
+/// The waited-on pool serves the same request as the blocking one, byte for byte.
+///
+/// The first thing an awaited exchange has to be is *correct*: the same request must produce the
+/// same response through `AsyncClient` as through `Client`. Everything below this test is about what
+/// it costs and what it shares; this one is about whether it works at all, and it is deliberately
+/// asserted on the body rather than on a status, because a 200 with an empty body would pass a
+/// weaker test.
+#[cfg(unix)]
+#[test]
+fn a_pool_answers_the_same_request_through_the_awaited_path() {
+    use std::sync::Arc;
+
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        volucer_testkit::skip("no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        volucer_testkit::skip_transient("no free port");
+        return;
+    };
+
+    let (root, script) = fixture("awaited");
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let pool =
+        Arc::new(CgiPool::start("awaited", &config_for(&binary, 1, base)).expect("pool starts"));
+    assert!(
+        pool.drives_connections(),
+        "a loopback port is an address a runtime can drive"
+    );
+
+    let request = request_for(&root, &script, "AWAITED");
+
+    // The blocking path first, as the reference.
+    let blocking = pool.request(&request).expect("the blocking path answers");
+    blocking.check_protocol().expect("completed");
+    let expected = String::from_utf8_lossy(&blocking.stdout).into_owned();
+    assert!(expected.contains("MARK=AWAITED"), "{expected:?}");
+
+    // And the awaited one, on a **multi-threaded** runtime, because that is the shape the HTTP
+    // front-end uses and the shape this has to work in: the future is polled on the caller's runtime
+    // while the socket's driver lives on the pool's. A current-thread runtime is not equivalent — it
+    // only ever polls the tasks on its own thread, inside its own `block_on`, so a readiness event
+    // registered on the pool's runtime would never be delivered while this thread waits. Verified
+    // rather than assumed: the current-thread version of this test hangs, which is exactly the
+    // distinction `AsyncRuntime`'s docs describe from the other side.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a caller runtime");
+    let awaited = runtime
+        .block_on(pool.request_async(&request))
+        .expect("the awaited path answers");
+    awaited.check_protocol().expect("completed");
+
+    assert_eq!(
+        String::from_utf8_lossy(&awaited.stdout),
+        expected,
+        "the two clients must produce one answer for one request"
+    );
+
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **The awaited path and the blocking path share one admission count.**
+///
+/// This is the property that makes the change safe rather than merely faster, and it is the one a
+/// second counter would have broken silently. `php-cgi` serves one request at a time per child, so a
+/// slot whose concurrency is 1 must admit exactly one request — whichever path it arrived on. With
+/// two counters a blocking request and an awaited one would both be admitted, and the second would
+/// queue invisibly inside the backend.
+///
+/// Held by a busy slot and asserted from the *other* path, in both directions, because a test that
+/// only proved one direction would pass against a pair of counters that happened to be sized 1.
+#[cfg(unix)]
+#[test]
+fn the_two_paths_share_one_admission_count() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        volucer_testkit::skip("no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        volucer_testkit::skip_transient("no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-pool-admission-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    let script = write_script(&root, "index.php", "<?php usleep(700000); echo 'SLOW';");
+    let script = script
+        .file_name()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
+
+    let pool =
+        Arc::new(CgiPool::start("admission", &config_for(&binary, 1, base)).expect("pool starts"));
+    let request = request_for(&root, &script, "");
+
+    // An awaited request takes the slot's only place...
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a caller runtime");
+
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let awaited = scope.spawn(|| {
+            runtime
+                .block_on(pool.request_async(&request))
+                .expect("the awaited request is served")
+        });
+
+        // ...and a blocking request must now wait for it, rather than being admitted beside it.
+        while started.elapsed() < Duration::from_millis(250) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let blocking = pool
+            .request(&request)
+            .expect("the blocking request is served");
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(700),
+            "the blocking request was admitted beside the awaited one after {:?}; the two paths \
+             are counting separately, which lets a one-child slot serve two requests at once",
+            started.elapsed()
+        );
+
+        blocking.check_protocol().expect("completed");
+        let awaited = awaited.join().expect("no thread panics");
+        awaited.check_protocol().expect("completed");
+    });
+
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&root);
+}

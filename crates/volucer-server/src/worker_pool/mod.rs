@@ -4260,12 +4260,17 @@ impl AsyncRuntime {
     /// Two to four threads, not `slots`. The connections are readiness-driven rather than blocking,
     /// so one thread holds many; a pool that gave each connection a thread would be the design this
     /// replaces.
-    fn start(slots: usize) -> std::io::Result<Self> {
+    ///
+    /// `backend` only names the threads, and it is a parameter because more than one pool can own a
+    /// runtime in one process — a `spawn_cgi` pool and a `worker` pool on the socket transport are
+    /// both this type — so `volucer-attach` on all of them would make a profile or a `ps` unable to
+    /// say which pool a thread belonged to.
+    pub(crate) fn start(backend: &str, slots: usize) -> std::io::Result<Self> {
         let threads = slots.clamp(2, 4);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(threads)
             .enable_all()
-            .thread_name("volucer-attach")
+            .thread_name(format!("volucer-b{backend}"))
             .build()?;
         Ok(AsyncRuntime {
             runtime: Some(runtime),
@@ -4279,6 +4284,23 @@ impl AsyncRuntime {
             // Unreachable while a pool exists: the `Option` is only emptied by `Drop`, which runs
             // after every slot has been stopped. Reported as its own runtime rather than panicked,
             // because a panic in a `Drop` chain aborts the process.
+            None => unreachable!("the pool runtime is only stopped when the pool is dropped"),
+        }
+    }
+
+    /// Run `self`'s context for the lifetime of the returned guard.
+    ///
+    /// For the one thing that needs a runtime *context* rather than a future: constructing a
+    /// `tokio` connection, whose driver is resolved from the current handle at that moment and must
+    /// outlive it. A `spawn_cgi` slot uses this to adopt a connection onto this runtime before
+    /// storing it, because the socket will later be polled by whichever runtime asks next.
+    ///
+    /// **The guard must not be held across an `await`.** It is thread-local state, so a yield point
+    /// inside it would leave this runtime entered for whatever unrelated task the thread ran next.
+    #[cfg(unix)]
+    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
+        match &self.runtime {
+            Some(runtime) => runtime.enter(),
             None => unreachable!("the pool runtime is only stopped when the pool is dropped"),
         }
     }
@@ -4993,7 +5015,7 @@ mod tests {
             }
         }
 
-        let pool_runtime = AsyncRuntime::start(2).expect("the pool runtime");
+        let pool_runtime = AsyncRuntime::start("test", 2).expect("the pool runtime");
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "the test must adopt from outside a runtime, or it cannot reproduce the bug"
