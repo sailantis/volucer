@@ -882,6 +882,7 @@ fn unreachable_config() -> Config {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket,
                 max_connections: None,
+                request_timeout_ms: None,
                 services: Vec::new(),
             }),
         )]
@@ -3769,6 +3770,7 @@ fn sendfile_server(response: &'static str, roots: Option<Vec<PathBuf>>) -> Optio
         BackendConfig::External(volucer_core::config::ExternalConfig {
             socket,
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         }),
     );
@@ -4944,6 +4946,7 @@ fn streaming_server(
         BackendConfig::External(volucer_core::config::ExternalConfig {
             socket,
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         }),
     );

@@ -4815,6 +4815,21 @@ fn check(
                     None => "none (one connection per request in flight)".to_string(),
                 }
             );
+            // The deadline, and it is worth a line here more than on the pools volucer starts: a
+            // wrong `request_timeout_ms` on this backend is the only thing that ends a request
+            // php-fpm accepted and never answered, and there is no killed process to notice it by.
+            // Resolved through the same method `serve` uses, so `check` cannot print a default that
+            // the running server does not apply.
+            println!(
+                "      request timeout:   {}",
+                match external.request_timeout(name) {
+                    Ok(timeout) => format!("{} ms", timeout.as_millis()),
+                    // Unreachable in practice — `validate` refuses a zero and this runs after it —
+                    // but printed as the refusal rather than as a plausible number, because a
+                    // `check` that guessed would be wrong in the one case somebody reads it.
+                    Err(reason) => format!("<refused: {reason}>"),
+                }
+            );
             // What the far side says about itself, when it says anything. This is the only
             // place volucer asks: a human is waiting, a round trip to a socket the operator
             // just named is what they asked for, and the answer is printed rather than acted

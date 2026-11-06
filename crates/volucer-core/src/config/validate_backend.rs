@@ -18,17 +18,22 @@ impl Config {
         let timeout = match backend {
             BackendConfig::Worker(w) => w.request_timeout_ms,
             BackendConfig::SpawnCgi(c) => c.request_timeout_ms,
-            BackendConfig::Attach(_) | BackendConfig::External(_) | BackendConfig::Upstream(_) => {
-                None
-            }
+            BackendConfig::External(e) => e.request_timeout_ms,
+            BackendConfig::Attach(_) | BackendConfig::Upstream(_) => None,
         };
         if timeout == Some(0) {
-            return bad(
+            // The noun names what is actually held, because it is the difference an operator needs:
+            // a pool slot is a process of ours that stays busy, an `external` connection is one of
+            // somebody else's children that stays busy and that volucer can never reclaim.
+            let held = match backend {
+                BackendConfig::External(_) => "connection",
+                _ => "slot",
+            };
+            return bad(format!(
                 "request_timeout_ms = 0 would give a request no deadline at all, so one hung \
-                 request could hold a slot for ever; write the number of milliseconds you mean \
+                 request could hold a {held} for ever; write the number of milliseconds you mean \
                  instead"
-                    .to_string(),
-            );
+            ));
         }
         match backend {
             BackendConfig::Worker(w) => {

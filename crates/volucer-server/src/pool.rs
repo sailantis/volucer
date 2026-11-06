@@ -186,6 +186,13 @@ struct Slot {
     /// and the write never being read. A slot therefore owns at most `concurrency` connections, and
     /// each is tagged with the runtime mode it is currently in.
     clients: Vec<WarmClient>,
+    /// Set when this slot has served `max_requests` and must be replaced before it serves again.
+    ///
+    /// **A flag rather than a replacement, because the request that crosses the limit can be a
+    /// *streamed* one.** Its last byte arrives on a reader thread or a pump task — neither of which
+    /// may stop and respawn a process tree while it is unwinding a response — so the reader records
+    /// the fact and [`CgiPool::next_slot_index`] acts on it, before the slot is handed out again.
+    recycle_due: bool,
 }
 
 /// A connection a slot is holding warm, and how it is currently driven.
@@ -238,25 +245,71 @@ impl Slot {
 
     /// Take this slot's warm connection, if it is one this mode can drive.
     ///
-    /// **A connection in the other mode is closed, not converted**, and that is what keeps a slot to
-    /// one connection at a time — which `php-cgi` requires. A single `php-cgi -b` serves one
-    /// *connection* and loops on it: it never accepts a second until the first closes, so holding a
-    /// warm blocking connection while the awaited path opens its own leaves the second request
-    /// unserved until the first child is done with. Measured three ways: one slot with one child
-    /// hangs; the same slot with `children = 4` passes; `strace` shows the child serving the first
-    /// connection and never accepting the second.
+    /// **The entry is *found*, not popped.** A slot can legitimately hold several connections in
+    /// several modes: `children = n` is `n` children behind one address, `concurrency` is equally
+    /// many permits, so a concurrent blocking request and an awaited one each leave a warm
+    /// connection of their own. Popping the last entry would then drop a live connection whenever
+    /// that entry happened to be the other mode — and forfeit the matching one that sat earlier in
+    /// the list, which is the worst of both: a reconnect *and* a closed child.
+    ///
+    /// **A connection in the other mode is closed, not converted, and not kept.** A single
+    /// `php-cgi -b` serves one *connection* and loops on it: it never accepts a second until the
+    /// first closes, so an idle warm connection holds its child away from any new one. Measured three
+    /// ways: one slot with one child hangs; the same slot with `children = 4` passes; `strace` shows
+    /// the child serving the first connection and never accepting the second. So when there is no
+    /// connection in `mode`, the ones in the other mode go before a new one is opened — which is also
+    /// what keeps the slot at `concurrency` connections rather than one more.
     ///
     /// Closing costs a reconnect on the request that changes mode. That is the right trade — a
     /// deployment's traffic does not alternate paths per request (one front-end uses one), and a
     /// reconnect is a round trip where a second connection is a stall.
     fn take_warm(&mut self, mode: Mode) -> Option<WarmClient> {
         self.clients.retain(WarmClient::is_reusable);
-        match self.clients.pop() {
-            Some(warm) if warm.mode() == mode => Some(warm),
-            // The other mode's connection, or one that is past its keep-alive. Dropping it closes the
-            // socket, which is what hands the child back.
-            _ => None,
+        match self.clients.iter().position(|warm| warm.mode() == mode) {
+            Some(at) => Some(self.clients.swap_remove(at)),
+            None => {
+                // Nothing this mode can drive. Dropping them closes the sockets, which is what
+                // hands the children back for the connection about to be opened.
+                self.clients.clear();
+                None
+            }
         }
+    }
+
+    /// Put a streamed response's connection back and count the request that owned it.
+    ///
+    /// **Called from the reader thread or the pump task, after the last byte** — the one place that
+    /// knows how the response ended and the only place that may count it. Both are the same two
+    /// steps the buffered path takes inline, so a streamed response no longer costs a reconnect and
+    /// is no longer invisible to `max_requests`.
+    ///
+    /// `served` is the counter handle the relay captured when the response started. If it is no
+    /// longer this slot's, the slot was replaced while the body was being relayed and `warm` belongs
+    /// to a process that is gone: it is dropped rather than handed to the replacement, and the
+    /// request is not counted against a slot that did not serve it.
+    ///
+    /// **`recycle_due` rather than a replacement**, because this runs mid-unwind of a response:
+    /// stopping a process tree here would block the thread that is still handing bytes to the
+    /// front-end, and a pump task may not respawn anything at all. [`CgiPool::next_slot_index`]
+    /// honours the flag before the slot is lent out again, which is the earliest moment a
+    /// replacement is safe.
+    fn returned(
+        &mut self,
+        served: &Arc<AtomicU64>,
+        max_requests: Option<u64>,
+        warm: Option<WarmClient>,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.served, served) {
+            return false;
+        }
+        if let Some(warm) = warm {
+            self.clients.push(warm);
+        }
+        let total = self.served.fetch_add(1, Ordering::Relaxed) + 1;
+        if max_requests.is_some_and(|max| max > 0 && total >= max) {
+            self.recycle_due = true;
+        }
+        true
     }
 }
 
@@ -387,7 +440,7 @@ fn connect_awaited(
     let _entered = runtime.enter();
     let stream = endpoint
         .connect(Some(timeout))
-        .map_err(|source| deadline_or_worker(backend, timeout, source))?;
+        .map_err(|source| crate::backend::deadline_or_worker(backend, timeout, source))?;
     let adopted = volucer_fcgi::adopt(&stream).map_err(|source| ServerError::Worker {
         backend: backend.to_string(),
         source,
@@ -404,6 +457,20 @@ fn connect_awaited(
 /// Returns the connection so the caller can put it back, exactly as [`exchange`] does: a slot's warm
 /// connection is what makes the next request to it cheap, and on this path it is also what keeps the
 /// connection on the runtime that owns its waker.
+///
+/// # The deadline is enforced here, by `tokio::time::timeout`
+///
+/// **It has to be, because this path has no socket timeout at all.** The blocking client's deadline
+/// is its `SO_RCVTIMEO`, set by `Endpoint::connect`; `prepare_for_async` *clears* it, since a pending
+/// `epoll` operation against a receive timeout is documented to panic. `timeout` therefore reaches
+/// this function as a connect budget and a number to quote in the error message, and without a
+/// wrapper a backend that accepts the request and never answers would hold this future — and the
+/// slot's [`PermitGuard`] — for ever, shrinking the pool one request at a time until nothing is
+/// admitted. The wrapper is what makes `request_timeout_ms` mean the same thing on both paths.
+///
+/// Nothing is retried after an expiry: a timed-out request has already been waited for once, and
+/// spending a second budget on a process that is plainly not answering is what
+/// [`crate::backend::is_deadline_expired`] exists to prevent.
 #[cfg(unix)]
 async fn exchange_async(
     runtime: &crate::worker_pool::AsyncRuntime,
@@ -420,9 +487,12 @@ async fn exchange_async(
 
     let mut attempt = 0;
     loop {
-        match client.request(request).await {
-            Ok(response) => return Ok((response, client)),
-            Err(err)
+        match tokio::time::timeout(timeout, client.request(request)).await {
+            Ok(Ok(response)) => return Ok((response, client)),
+            // **The connection is not returned after an expiry.** It is mid-exchange with a
+            // process that did not answer, so the next request must not find it in the slot: it is
+            // dropped with `client`, which closes the socket and hands the child back.
+            Ok(Err(err))
                 if attempt == 0
                     && retryable(&err)
                     && !crate::backend::is_deadline_expired(&err) =>
@@ -430,40 +500,11 @@ async fn exchange_async(
                 attempt += 1;
                 client = connect_awaited(runtime, endpoint, backend, timeout)?;
             }
-            Err(source) => return Err(deadline_or_worker(backend, timeout, source)),
+            Ok(Err(source)) => {
+                return Err(crate::backend::deadline_or_worker(backend, timeout, source))
+            }
+            Err(_) => return Err(crate::backend::deadline_expired(backend, timeout)),
         }
-    }
-}
-
-/// Report a failed awaited exchange the way the blocking one reports it.
-///
-/// **A deadline is named as a deadline.** `os error 10060` and "a connection attempt failed" are what
-/// the OS says when a read times out; the operator configured `request_timeout_ms`, and a message
-/// that does not say so sends them looking for a network problem that does not exist. The blocking
-/// path builds this same sentence inline; it is a function here because the awaited path reaches it
-/// from two places (the buffered exchange and the relayed one).
-#[cfg(unix)]
-fn deadline_or_worker(
-    backend: &str,
-    timeout: Duration,
-    source: volucer_fcgi::FcgiError,
-) -> ServerError {
-    if crate::backend::is_deadline_expired(&source) {
-        return ServerError::Worker {
-            backend: backend.to_string(),
-            source: volucer_fcgi::FcgiError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "the backend did not answer within {} ms — that is the deadline \
-                     `request_timeout_ms` sets for this backend, not a network timeout",
-                    timeout.as_millis()
-                ),
-            )),
-        };
-    }
-    ServerError::Worker {
-        backend: backend.to_string(),
-        source,
     }
 }
 
@@ -865,7 +906,12 @@ pub struct CgiPool {
     /// requests to that address. The lock is only held while a connection is taken or
     /// returned, never across a request — which is the difference between "one request per
     /// slot" and "`children` or `concurrency` requests per slot".
-    slots: Vec<Mutex<Slot>>,
+    ///
+    /// **An `Arc`, because a streamed response outlives its request.** The reader thread or the pump
+    /// task that finishes a body has to give the connection back and count the request, and it runs
+    /// after the caller has returned — see [`Self::shared`] and [`Slot::returned`]. The pool still
+    /// owns the slots: dropping it stops them, and the relay's handle then finds nothing to return to.
+    slots: Arc<Vec<Mutex<Slot>>>,
     /// Admission per slot, so a slot's concurrency is enforced without holding its lock.
     ///
     /// Sized to the slot count and created from `config.slot_concurrency()`, so a slot's permit
@@ -1057,7 +1103,7 @@ impl CgiPool {
         let concurrency = config.slot_concurrency();
         let mut pool = CgiPool {
             name: name.to_string(),
-            slots: Vec::with_capacity(count as usize),
+            slots: Arc::new(Vec::with_capacity(count as usize)),
             permits: (0..count)
                 .map(|_| Arc::new(SlotPermits::new(concurrency)))
                 .collect(),
@@ -1194,13 +1240,17 @@ impl CgiPool {
 
         // Index order, so the error names the slot it came from rather than whichever thread
         // happened to finish first.
+        let mut slots = Vec::with_capacity(addresses.len());
         for (index, result) in spawned.drain(..).enumerate() {
             let slot = result?;
             if let SlotAddress::Socket(path) = &addresses[index] {
                 self.socket_paths.push(path.clone());
             }
-            self.slots.push(Mutex::new(slot));
+            slots.push(Mutex::new(slot));
         }
+        // Published in one step, and shared from the start: a relayed response takes its own handle
+        // to this list before the pool is ever returned to a caller (see `Self::shared`).
+        self.slots = Arc::new(slots);
         Ok(())
     }
 
@@ -1336,6 +1386,7 @@ impl CgiPool {
             endpoint: address.endpoint(&self.bind_host, &self.name)?,
             served: Arc::new(AtomicU64::new(0)),
             clients: Vec::new(),
+            recycle_due: false,
         };
         wait_until_listening(&mut slot, self.launch.binary(), STARTUP_TIMEOUT)?;
         Ok(slot)
@@ -1344,6 +1395,22 @@ impl CgiPool {
     /// Number of live slots.
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// The slots as a shared, `'static` handle for work that outlives a borrowed request.
+    ///
+    /// **A streamed response ends after the request that opened it has returned**, on a reader
+    /// thread or a pump task, and that ending has to reach the slot its connection belongs to. The
+    /// alternatives are both wrong: capturing `&self` is impossible (the relay may outlive any borrow
+    /// the caller has), and cloning a `LifecycleGuard` is exactly what its own doc comment forbids —
+    /// a second handle to a Windows job object can be closed while the first is still adopting
+    /// children. A shared `Arc` around the slot list is the smallest thing that is neither.
+    ///
+    /// `Arc` rather than the pool itself, so the handle cannot be mistaken for ownership of the
+    /// processes: dropping the pool still stops every slot, and a relay that ends afterwards finds a
+    /// replaced (or emptied) list and simply does not return its connection.
+    fn shared(&self) -> Arc<Vec<Mutex<Slot>>> {
+        Arc::clone(&self.slots)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1533,6 +1600,12 @@ impl CgiPool {
     /// `served` is the value the caller observed *before* this check, so a concurrent request that
     /// also crossed the threshold does not replace a slot the first one has already replaced — that
     /// would kill a group that has served nothing.
+    ///
+    /// **The buffered paths call this directly; a streamed response cannot, and does not need to.**
+    /// It ends on a reader thread or a pump task, which may not stop a process tree mid-response, so
+    /// [`Slot::returned`] sets `recycle_due` instead and [`Self::next_slot_index`] replaces the slot
+    /// before lending it out again. Both routes read the same `max_requests` and the same counter, so
+    /// a deployment cannot get one behaviour for small responses and another for large ones.
     fn recycle_if_needed(&self, index: usize, served: u64) -> Result<()> {
         let Some(max) = self.max_requests.filter(|max| *max > 0) else {
             return Ok(());
@@ -1553,6 +1626,12 @@ impl CgiPool {
     ///
     /// A slot that died is restarted in place so the pool keeps its size; the
     /// alternative is a pool that silently shrinks under repeated crashes.
+    ///
+    /// **A slot whose `max_requests` was crossed while a streamed response was ending is replaced
+    /// here**, before it is lent out again. That is the earliest safe moment: the flag is set by the
+    /// reader thread or the pump task (see [`Slot::returned`]), which cannot stop a process tree
+    /// while it is still unwinding a response. The permit for that request has already been released,
+    /// so the replacement is not racing the body it was serving.
     fn next_slot_index(&self) -> usize {
         let count = self.slots.len();
         let base = self.cursor.fetch_add(1, Ordering::Relaxed);
@@ -1561,6 +1640,19 @@ impl CgiPool {
             let mut slot = self.slots[index]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.recycle_due {
+                slot.recycle_due = false;
+                tracing::debug!(
+                    backend = %self.name,
+                    slot = index,
+                    "a slot reached max_requests while relaying; replacing it before it serves again"
+                );
+                if let Err(err) = self.replace_locked(&mut slot) {
+                    tracing::warn!(backend = %self.name, %err, "could not recycle a slot");
+                    continue;
+                }
+                return index;
+            }
             if slot.is_alive() {
                 return index;
             }
@@ -1595,12 +1687,15 @@ impl CgiPool {
     /// happens on the reader thread. Releasing it at return time would let the pool admit `children`
     /// more requests than there are processes and queue them invisibly inside the backend.
     ///
-    /// # The client is not returned to the slot here
+    /// # The connection goes back, and the request is counted, on that same thread
     ///
-    /// It cannot be: it is owned by the reader thread until the response ends. A slot therefore has
-    /// one fewer warm connection for the duration of a streamed response, which is correct — the
-    /// connection genuinely is busy — and it costs one reconnect afterwards, on a path that only a
-    /// large response takes.
+    /// A streamed response used to drop both: the client was owned by the reader thread until the
+    /// response ended and simply died there, so the next request paid for a reconnect, and `served`
+    /// was incremented without anything acting on it, so `max_requests` never recycled a slot that
+    /// only served large responses. Both are the buffered arm's two steps, moved to where they
+    /// belong — see [`Slot::returned`]. Because a replacement cannot be made from a reader thread,
+    /// crossing `max_requests` there only *marks* the slot, and [`Self::next_slot_index`] replaces it
+    /// before it is lent out again.
     pub fn request_relayed(
         &self,
         request: &Request,
@@ -1670,17 +1765,28 @@ impl CgiPool {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .served,
                 );
-                // **Both the permit and the count are released on the reader thread.** The slot
-                // serves this request until its last byte, so releasing either at return time would
-                // let the pool admit more requests than there are processes — and would stop
-                // `max_requests` from ever recycling a slot that only serves large responses.
+                let slots = self.shared();
+                let max_requests = self.max_requests;
+                // **Both the permit and the count are released on the reader thread**, and the
+                // connection goes back to the slot: a streamed response ends on that thread, so it
+                // is the only place that knows the slot is free again. See [`Slot::returned`].
                 let report = crate::relay::spawn_reader(
                     self.name.clone(),
                     client,
                     stream,
-                    move |_client, _stream| {
+                    move |client, stream| {
+                        // Only a stream that reached `END_REQUEST` leaves a connection worth
+                        // keeping; a truncated or failed one is dropped here, which closes it and
+                        // hands the child back.
+                        let warm = (stream.is_finished() && client.is_reusable())
+                            .then(|| WarmClient::Blocking(client));
+                        {
+                            let mut slot = slots[index]
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            slot.returned(&served, max_requests, warm);
+                        }
                         drop(permit);
-                        served.fetch_add(1, Ordering::Relaxed);
                     },
                 )
                 .map_err(|source| ServerError::Spawn {
@@ -1696,8 +1802,9 @@ impl CgiPool {
     ///
     /// The awaited twin, and the rules are the blocking one's unchanged: the permit is held until
     /// `END_REQUEST` because the slot is still serving the request while its body is being relayed,
-    /// the permit and the served count are released by whatever finishes the body, and the
-    /// connection is not returned to the slot mid-response.
+    /// and the connection, the served count and `max_requests` are settled by whatever finishes the
+    /// body — see [`Slot::returned`]. The head read and every body chunk are bounded by
+    /// `request_timeout_ms`, exactly as the buffered path is.
     ///
     /// What differs is what pumps the body and where the endpoint comes from — see
     /// [`Self::request_async`] for both, and [`crate::backend`]'s `external_relayed_async` for the
@@ -1750,10 +1857,19 @@ impl CgiPool {
             _ => connect_awaited(runtime, &endpoint, &self.name, self.request_timeout)?,
         };
         let mut attempt = 0;
+        // **Bounded, like the buffered exchange.** The head read is where a backend that accepts the
+        // request and then says nothing would park this future — and the slot's permit with it — for
+        // ever, because the awaited socket has no `SO_RCVTIMEO` to stop it (`prepare_for_async`
+        // clears it). The body is bounded per chunk below, for the same reason.
         let delivery = loop {
-            match client.request_streaming(request, buffer, relay).await {
-                Ok(delivery) => break delivery,
-                Err(err)
+            match tokio::time::timeout(
+                self.request_timeout,
+                client.request_streaming(request, buffer, relay),
+            )
+            .await
+            {
+                Ok(Ok(delivery)) => break delivery,
+                Ok(Err(err))
                     if attempt == 0
                         && retryable(&err)
                         && !crate::backend::is_deadline_expired(&err) =>
@@ -1761,11 +1877,21 @@ impl CgiPool {
                     attempt += 1;
                     client = connect_awaited(runtime, &endpoint, &self.name, self.request_timeout)?;
                 }
-                Err(source) => {
+                Ok(Err(source)) => {
                     // **Named as the deadline it is**, exactly as the blocking path does: the
                     // operator configured `request_timeout_ms`, and a message that says "socket
                     // timeout" sends them looking for a network problem that does not exist.
-                    return Err(deadline_or_worker(&self.name, self.request_timeout, source));
+                    return Err(crate::backend::deadline_or_worker(
+                        &self.name,
+                        self.request_timeout,
+                        source,
+                    ));
+                }
+                Err(_) => {
+                    return Err(crate::backend::deadline_expired(
+                        &self.name,
+                        self.request_timeout,
+                    ));
                 }
             }
         };
@@ -1789,6 +1915,9 @@ impl CgiPool {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .served,
                 );
+                let slots = self.shared();
+                let max_requests = self.max_requests;
+                let timeout = self.request_timeout;
                 let head = stream.head().to_vec();
                 let head_duration = stream.head_duration();
                 let verdict = crate::relay::Verdict::new();
@@ -1807,17 +1936,29 @@ impl CgiPool {
                     let mut stream = stream;
                     let mut failed = false;
                     loop {
-                        match client.next_chunk(&mut stream).await {
-                            Ok(Some(chunk)) => {
+                        // **Every chunk is bounded by the same deadline as the head.**
+                        // `SO_RCVTIMEO` is cleared on an adopted socket, so without this a backend
+                        // that stalls half way through a body would park this task — and the slot's
+                        // permit — for ever. A per-chunk budget rather than a whole-body one,
+                        // because a large response legitimately takes longer than
+                        // `request_timeout_ms`; what the deadline means here is "the backend stopped
+                        // answering", which is exactly one read.
+                        match tokio::time::timeout(timeout, client.next_chunk(&mut stream)).await {
+                            Ok(Ok(Some(chunk))) => {
                                 if sender.send(bytes::Bytes::from(chunk)).await.is_err() {
                                     // The client went away: drain rather than abandon, so the
                                     // slot's connection is not left half-read.
-                                    while let Ok(Some(_)) = client.next_chunk(&mut stream).await {}
+                                    while let Ok(Ok(Some(_))) = tokio::time::timeout(
+                                        timeout,
+                                        client.next_chunk(&mut stream),
+                                    )
+                                    .await
+                                    {}
                                     break;
                                 }
                             }
-                            Ok(None) => break,
-                            Err(err) => {
+                            Ok(Ok(None)) => break,
+                            Ok(Err(err)) => {
                                 tracing::warn!(
                                     backend = %backend,
                                     %err,
@@ -1826,14 +1967,37 @@ impl CgiPool {
                                 failed = true;
                                 break;
                             }
+                            Err(_) => {
+                                tracing::warn!(
+                                    backend = %backend,
+                                    timeout_ms = timeout.as_millis() as u64,
+                                    "a streamed response stalled past `request_timeout_ms`; \
+                                     abandoning the connection"
+                                );
+                                failed = true;
+                                break;
+                            }
                         }
                     }
                     let complete = stream.is_finished() && !failed;
                     published.publish(stream.stderr(), complete);
-                    // The slot serves this request until its last byte, so both the permit and the
-                    // count are released here and nowhere earlier.
+                    // **The connection goes back to the slot it came from**, exactly as the
+                    // buffered arm above does, so a streamed response does not force the next
+                    // request to reconnect. Only when it is genuinely reusable: a truncated or
+                    // stalled stream leaves a connection mid-response, and `take_warm`'s `retain`
+                    // would drop it there anyway — dropping it here closes the child sooner.
+                    let warm = client.is_reusable().then_some(WarmClient::Awaited(client));
+                    // The slot serves this request until its last byte, so the count — and
+                    // `max_requests`, which the flag defers to the next slot hand-out — are
+                    // recorded here and nowhere earlier. The permit follows, last, so a request
+                    // admitted in this window cannot see a slot that has not been counted.
+                    {
+                        let mut slot = slots[index]
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        slot.returned(&served, max_requests, warm);
+                    }
                     drop(permit);
-                    served.fetch_add(1, Ordering::Relaxed);
                 });
 
                 Ok(Delivery::Relayed(crate::relay::Relayed::new(
@@ -1940,28 +2104,29 @@ impl CgiPool {
         let _ = crate::lifecycle::kill(&mut slot.child);
         let _ = slot.child.wait();
 
-        let mut replacement = self.spawn_slot(&address)?;
-        replacement.served = Arc::new(AtomicU64::new(0));
+        let replacement = self.spawn_slot(&address)?;
         *slot = replacement;
         Ok(())
     }
 
     /// Stop every slot, waiting for it to exit.
     ///
-    /// `&mut self` because stopping means emptying the pool, and only the owner
+    /// `&mut self` because stopping means retiring the slot list, and only the owner
     /// may do that. Nothing on the request path needs it: the server drops the
     /// pool, and `Drop` calls this.
+    ///
+    /// **A relay still pumping a body keeps its handle to the old list**, and that is deliberate:
+    /// waiting for a body to finish would hang a shutdown on a slow client. The processes are killed
+    /// here either way, and the pool then publishes an empty list — so a relay that ends afterwards
+    /// puts its connection back into a list nobody serves from, and a request against a stopped pool
+    /// is refused as `NoWorker` rather than by a slot whose process is gone.
     pub fn shutdown(&mut self) {
-        for slot in &mut self.slots {
-            // `get_mut`: the pool is exclusively borrowed, so there is nothing to
-            // synchronise against.
-            let slot = slot
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for slot in self.slots.iter() {
+            let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let _ = crate::lifecycle::kill(&mut slot.child);
             let _ = slot.child.wait();
         }
-        self.slots.clear();
+        self.slots = Arc::new(Vec::new());
         // `php-cgi` unlinks a stale path before binding, so a leftover socket is
         // not fatal — but a stopped pool should not leave litter behind, and on
         // Linux an unlinked file is what releases the name for the next run.
@@ -1977,6 +2142,22 @@ impl CgiPool {
                 }
             }
         }
+    }
+
+    /// How many requests each slot is serving right now, in slot order.
+    ///
+    /// The count is the one admission uses — both paths, one number — so a test can assert that a
+    /// request was *admitted* rather than infer it from how long something took. `None` for a slot
+    /// whose bookkeeping lock is held at this instant, which is the same answer
+    /// [`SlotPermits::in_flight`] gives to a rolling restart.
+    ///
+    /// **The permit count, not the number of sockets.** A request that is waiting to be admitted is
+    /// absent from it, which is the whole distinction a "the two paths share one limit" test needs.
+    pub fn in_flight(&self) -> Vec<Option<usize>> {
+        self.permits
+            .iter()
+            .map(|permits| permits.in_flight())
+            .collect()
     }
 
     /// The ports in use, for diagnostics. Unix-socket and pipe slots are not
@@ -2450,6 +2631,7 @@ mod tests {
             endpoint: Endpoint::Tcp(format!("127.0.0.1:{port}")),
             served: Arc::new(AtomicU64::new(0)),
             clients: Vec::new(),
+            recycle_due: false,
         };
 
         // The settle waits for the child to be gone, so the test does not depend on how long
@@ -2470,6 +2652,271 @@ mod tests {
              on a fresh port: {err:?}"
         );
         drop(squatter);
+    }
+
+    /// Take the connection the requested mode can drive, **wherever it is in the list**.
+    ///
+    /// A slot with `children = n` holds up to `n` connections and each is tagged with the mode of
+    /// the request that left it, so a mixed list is the ordinary case rather than a curiosity: one
+    /// blocking request and one awaited request leave `[Blocking, Awaited]`. Popping the last entry
+    /// and checking its mode would discard a live connection — closing its child — and report
+    /// nothing available even though a usable one sat in front of it, which is a reconnect *and* a
+    /// closed child on every alternation.
+    ///
+    /// **Both orders are asserted**, because "search" and "pop" agree on the order where the wanted
+    /// connection happens to be last. Only the other order distinguishes them, so it is the one that
+    /// fails against the old `pop()`.
+    ///
+    /// The connections are real: a scripted FastCGI server on loopback answers one request each, so
+    /// both entries are `is_reusable()` — which is a precondition of the list surviving
+    /// `take_warm`'s `retain`, and therefore part of what is being tested rather than scaffolding.
+    #[cfg(unix)]
+    #[test]
+    fn take_warm_finds_a_matching_connection_anywhere_in_the_list() {
+        use volucer_fcgi::{read_record, write_records, EndRequest, RecordType, REQUEST_ID};
+
+        /// One connection's worth of server: read a request, answer it, keep the connection open.
+        ///
+        /// Reads until the `PARAMS` and `STDIN` terminators rather than a fixed number of records:
+        /// the count depends on how the parameters happen to be split, and an empty body means the
+        /// `STDIN` terminator follows `PARAMS` immediately. Counting a fixed number is how this
+        /// fixture hung the first time it ran — see `append_records` for the shape it must match.
+        fn serve_one(mut stream: volucer_fcgi::Stream) {
+            let (mut params_done, mut stdin_done) = (false, false);
+            while !(params_done && stdin_done) {
+                match read_record(&mut stream) {
+                    Ok(Some(record)) => {
+                        // A terminator is an empty record of a stream type; there is no LAST flag
+                        // in this protocol, so emptiness *is* the signal.
+                        let terminator = record.content.is_empty();
+                        match record.header.record_type {
+                            RecordType::Params => params_done |= terminator,
+                            RecordType::Stdin => stdin_done |= terminator,
+                            _ => {}
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            let body = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nWARM";
+            if write_records(&mut stream, RecordType::Stdout, REQUEST_ID, body, true).is_err() {
+                return;
+            }
+            let end = EndRequest::complete();
+            let _ = write_records(
+                &mut stream,
+                RecordType::EndRequest,
+                REQUEST_ID,
+                &end.encode(),
+                false,
+            );
+            // Held open so the client's view of the connection stays valid.
+            std::thread::sleep(Duration::from_secs(5));
+        }
+
+        /// A listener that answers exactly `count` connections, one thread each.
+        ///
+        /// A thread per connection rather than a loop, because a warm connection is *held open*:
+        /// a serial accept loop would make the second connection wait for the first to be dropped,
+        /// and building a two-connection fixture would then deadlock against itself.
+        fn scripted_server(count: usize) -> (Endpoint, Vec<std::thread::JoinHandle<()>>) {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind a scripted FastCGI server");
+            let address = listener.local_addr().expect("address");
+            let mut handles = Vec::with_capacity(count);
+            for _ in 0..count {
+                let listener = listener
+                    .try_clone()
+                    .expect("clone the scripted server's listener");
+                handles.push(std::thread::spawn(move || {
+                    if let Ok((stream, _)) = listener.accept() {
+                        serve_one(volucer_fcgi::Stream::Tcp(stream));
+                    }
+                }));
+            }
+            (Endpoint::Tcp(address.to_string()), handles)
+        }
+
+        fn a_request() -> Request {
+            Request {
+                params: vec![(b"REQUEST_METHOD".to_vec(), b"GET".to_vec())],
+                body: Vec::new(),
+                keep_conn: true,
+            }
+        }
+
+        /// A warm blocking client: one request answered with keep-alive, which is what makes
+        /// `is_reusable()` true.
+        fn warm_blocking(endpoint: &Endpoint) -> WarmClient {
+            let mut client = Client::connect(endpoint, Some(Duration::from_secs(5)))
+                .expect("connect a blocking client");
+            client
+                .request(&a_request())
+                .expect("the scripted server answers");
+            assert!(client.is_reusable(), "the connection must be warm");
+            WarmClient::Blocking(client)
+        }
+
+        /// The same, on the runtime's client.
+        fn warm_awaited(runtime: &tokio::runtime::Runtime, endpoint: &Endpoint) -> WarmClient {
+            let mut client = {
+                let _inside = runtime.enter();
+                let stream = endpoint
+                    .connect(Some(Duration::from_secs(5)))
+                    .expect("connect a blocking socket");
+                let adopted = volucer_fcgi::adopt(&stream).expect("adopt the socket");
+                AsyncClient::from_stream(adopted)
+            };
+            runtime
+                .block_on(client.request(&a_request()))
+                .expect("the scripted server answers");
+            assert!(client.is_reusable(), "the connection must be warm");
+            WarmClient::Awaited(client)
+        }
+
+        fn slot_with(clients: Vec<WarmClient>) -> Slot {
+            Slot {
+                child: Command::new("true").spawn().expect("a harmless child"),
+                endpoint: Endpoint::Tcp("127.0.0.1:1".to_string()),
+                served: Arc::new(AtomicU64::new(0)),
+                clients,
+                recycle_due: false,
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a throwaway runtime");
+
+        // The wanted entry is **not** last. A `pop()` would look at the awaited one, refuse it, and
+        // drop it — closing a live child's connection — while leaving the blocking one unused.
+        let (endpoint, server) = scripted_server(2);
+        let awaited = warm_awaited(&runtime, &endpoint);
+        let blocking = warm_blocking(&endpoint);
+        let mut mixed = slot_with(vec![blocking, awaited]);
+        let taken = mixed.take_warm(Mode::Blocking);
+        assert!(
+            taken.is_some(),
+            "a blocking connection earlier in the list must be found"
+        );
+        assert!(matches!(taken, Some(WarmClient::Blocking(_))));
+        assert_eq!(mixed.clients.len(), 1, "only the taken entry is removed");
+        assert_eq!(
+            mixed.clients[0].mode(),
+            Mode::Awaited,
+            "the unrelated connection is left alone, not closed"
+        );
+
+        // And the same shape asked for the other mode takes the other entry, so each mode gets its
+        // own connection — which is exactly what a slot with two children is entitled to keep.
+        let (endpoint, server2) = scripted_server(2);
+        let awaited = warm_awaited(&runtime, &endpoint);
+        let blocking = warm_blocking(&endpoint);
+        let mut mixed = slot_with(vec![blocking, awaited]);
+        let taken = mixed.take_warm(Mode::Awaited);
+        assert!(matches!(taken, Some(WarmClient::Awaited(_))));
+        assert_eq!(mixed.clients.len(), 1);
+        assert_eq!(mixed.clients[0].mode(), Mode::Blocking);
+
+        // Nothing in the wanted mode: every connection goes, which is what clears the way for the
+        // one about to be opened. Leaving them would hold their children away from it.
+        let (endpoint, server3) = scripted_server(1);
+        let mut only_blocking = slot_with(vec![warm_blocking(&endpoint)]);
+        assert!(
+            only_blocking.take_warm(Mode::Awaited).is_none(),
+            "a blocking connection cannot serve an awaited request"
+        );
+        assert!(
+            only_blocking.clients.is_empty(),
+            "the other mode's connections must be closed, or they hold their children away from \
+             the connection about to be opened"
+        );
+
+        // The scripted servers exit when their client side is dropped; the handles are not joined
+        // because each one deliberately holds its connection open for longer than the test runs.
+        drop((mixed, only_blocking));
+        let _ = (server, server2, server3);
+    }
+
+    /// **An awaited exchange against a backend that never answers is bounded by its deadline.**
+    ///
+    /// The blocking path's deadline is the socket's `SO_RCVTIMEO`, set by `Endpoint::connect`;
+    /// `prepare_for_async` **clears** it, because a pending operation against a receive timeout is
+    /// documented to panic. So on this path the configured deadline used to bound the *connect* and
+    /// nothing else, and a backend that accepted a connection and then said nothing held the exchange
+    /// future — and the slot's [`PermitGuard`] with it — for as long as it liked. With one slot that
+    /// shrinks the pool to nothing, one request at a time.
+    ///
+    /// **Measured as "it returns at all".** A future that is not bounded never completes, so the
+    /// assertion is only that the call ends within a generous ceiling and reports a deadline, which
+    /// no amount of runner slowness can turn into a false pass or a false failure.
+    #[cfg(unix)]
+    #[test]
+    fn an_awaited_exchange_is_bounded_by_the_deadline() {
+        use std::time::Instant;
+
+        const TIMEOUT: Duration = Duration::from_millis(400);
+        /// Well above the deadline and far below "never", which is what an unbounded future does.
+        const CEILING: Duration = Duration::from_secs(10);
+
+        // A backend that reads whatever arrives and never answers: the shape of a worker stuck in a
+        // loop, which is what a deadline exists for.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a stalled backend");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let Ok(clone) = stream.try_clone() else {
+                    return;
+                };
+                held.push(clone);
+                let _ = std::io::copy(&mut stream, &mut std::io::sink());
+            }
+        });
+
+        let runtime =
+            crate::worker_pool::AsyncRuntime::start("deadline-test", 1).expect("a pool runtime");
+        let endpoint = Endpoint::Tcp(address.to_string());
+        let request = Request {
+            params: vec![(b"REQUEST_METHOD".to_vec(), b"GET".to_vec())],
+            body: Vec::new(),
+            keep_conn: true,
+        };
+
+        let started = Instant::now();
+        let outcome = runtime.handle().block_on(exchange_async(
+            &runtime, &endpoint, &request, None, "stalled", TIMEOUT,
+        ));
+        let elapsed = started.elapsed();
+
+        let err = outcome.expect_err("a backend that never answers must fail");
+        assert!(
+            elapsed < CEILING,
+            "the exchange returned after {elapsed:?}, far past the {TIMEOUT:?} deadline it was \
+             given: `client.request(...).await` is not bounded, so a backend that accepts a request \
+             and never answers holds this future and the slot's permit indefinitely"
+        );
+        assert!(
+            elapsed >= TIMEOUT,
+            "the exchange must not give up early: {elapsed:?}"
+        );
+        // Named as the deadline it is, with the configured number in it: that sentence is what an
+        // operator acts on.
+        let message = err.to_string();
+        assert!(
+            message.contains("did not answer within")
+                && message.contains(&TIMEOUT.as_millis().to_string()),
+            "a deadline has to be reported as one, with the configured number in it: {message}"
+        );
+        assert!(
+            match &err {
+                ServerError::Worker { source, .. } => crate::backend::is_deadline_expired(source),
+                other => panic!("expected a worker error, got {other:?}"),
+            },
+            "the error must be classified as a deadline so nothing retries it: {message}"
+        );
     }
 
     #[test]

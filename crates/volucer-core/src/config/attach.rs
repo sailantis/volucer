@@ -3,6 +3,13 @@
 
 use super::*;
 
+/// How long a request to an `external` backend may take, when configuration says nothing.
+///
+/// Thirty seconds, which is the constant the two pools have used since a deadline existed at all —
+/// one number so that an operator moving a backend from `spawn_cgi` to `external` does not silently
+/// acquire a different one.
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
 /// An already-running FastCGI server — php-fpm, or a preforking `php-cgi`.
 ///
 /// **There is no pool size to discover and none to enforce**, which is what this type's shape
@@ -59,6 +66,26 @@ pub struct ExternalConfig {
     #[serde(default)]
     pub max_connections: Option<usize>,
 
+    /// How long one request to this backend may take before volucer gives up on it, in milliseconds.
+    ///
+    /// **The key `worker` and `spawn_cgi` already have, and it was missing here for the wrong
+    /// reason.** Those two kinds own the process, so a deadline is enforced by killing it; an
+    /// `external` backend's children belong to `php-fpm`, so there is nothing to kill — which is
+    /// precisely why the deadline has to exist here. Without one, an `external` request whose
+    /// child accepts the request and never answers holds a connection, a `max_connections` permit
+    /// and (on the awaited path) a runtime task for ever, and volucer has no supervisor to notice.
+    ///
+    /// Thirty seconds, the same default and for the same reason: it is what the hard-coded value
+    /// used to be before it became a key. `0` is refused rather than read as "no limit", because a
+    /// request with no deadline is indistinguishable from a hung one until the pool has lost every
+    /// connection it had.
+    ///
+    /// **It bounds the exchange, not the whole relayed body.** A streamed response legitimately
+    /// takes longer than any per-request figure, so what this measures on that path is "the
+    /// backend stopped producing", one read at a time — the same rule the other two kinds follow.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+
     /// Which control namespaces this backend's application may call over `[rpc]`.
     ///
     /// **The same allow-list a worker's channel gets**, and deliberately the same key with the same
@@ -77,6 +104,29 @@ pub struct ExternalConfig {
     /// before this key existed reaches exactly what it reached before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
+}
+
+impl ExternalConfig {
+    /// The deadline for one request, resolved or refused.
+    ///
+    /// **Refused rather than read as "no limit"**, the same rule the other two pools apply to the
+    /// same key: a request with no deadline holds a connection and a permit for ever, and on this
+    /// backend nothing will ever take them back — `php-fpm` recycles a child after `pm.max_requests`
+    /// requests, and a child stuck in a read is not finishing one.
+    pub fn request_timeout(
+        &self,
+        backend: &str,
+    ) -> std::result::Result<std::time::Duration, String> {
+        match self.request_timeout_ms {
+            None => Ok(std::time::Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)),
+            Some(0) => Err(format!(
+                "backends.{backend}: request_timeout_ms = 0 would give a request no deadline at \
+                 all, so one hung request could hold a connection for ever; write the number of \
+                 milliseconds you mean instead"
+            )),
+            Some(millis) => Ok(std::time::Duration::from_millis(millis)),
+        }
+    }
 }
 
 /// A worker pool volucer connects to rather than starts.

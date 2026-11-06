@@ -1082,7 +1082,16 @@ Connect to an already-running FastCGI server, such as `php-fpm`.
 |---|---|---|---|
 | `socket` | string | **required** | The FastCGI address, e.g. `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`. |
 | `max_connections` | integer | absent | How many connections to keep open to the pool. |
+| `request_timeout_ms` | integer | `30000` | How long one request may take before Volucer abandons it. `0` is refused. |
 | `services` | array of strings | empty | What this backend's application may reach over `[rpc]`, by namespace or by method. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
+
+`request_timeout_ms` matters more here than on the kinds Volucer starts itself. A `worker`
+or `spawn_cgi` backend that stops answering is eventually killed by the pool that owns it;
+an `external` backend's children belong to `php-fpm`, so Volucer can only abandon the
+request. Without a deadline, one that is accepted and never answered would hold its
+connection, its `max_connections` place and, on the HTTP front-end, a runtime task for the
+life of the server. It bounds a single exchange, not a whole relayed body: for a streamed
+response it means "the backend stopped producing", one read at a time.
 
 There is no `workers` setting for `external`: the pool is managed separately. Configure
 its size where that server is configured, for example with `pm.max_children` or

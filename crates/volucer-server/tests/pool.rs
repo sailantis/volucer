@@ -12,7 +12,7 @@ use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
 use volucer_server::CgiPool;
 
 mod common;
-use common::{find_php_cgi, free_port_run, serial, write_script};
+use common::{find_php_cgi, free_port_run, peak_overlap, serial, write_script};
 
 fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
     SpawnCgiConfig {
@@ -417,42 +417,6 @@ fn children_lets_one_slot_serve_several_requests_at_once() {
     );
     assert!(script.is_file(), "the fixture script exists");
 
-    // The largest number of the recorded spans that were running at the same instant.
-    //
-    // A sweep over start/end events, with **ends ordered before starts at equal timestamps** so
-    // two spans that merely touch are not counted as overlapping: a serialised slot ends one
-    // request before the next begins, and calling that a two-way overlap would let the broken
-    // implementation satisfy the preforked half.
-    fn peak_overlap(trace: &Path) -> (usize, usize) {
-        let text = std::fs::read_to_string(trace).unwrap_or_default();
-        let spans: Vec<(f64, f64, String)> = text
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split_whitespace();
-                let start: f64 = parts.next()?.parse().ok()?;
-                let end: f64 = parts.next()?.parse().ok()?;
-                let pid = parts.next().unwrap_or("?").to_string();
-                Some((start, end, pid))
-            })
-            .collect();
-        let pids: std::collections::BTreeSet<&str> =
-            spans.iter().map(|(_, _, pid)| pid.as_str()).collect();
-        let mut events: Vec<(f64, i32)> = Vec::with_capacity(spans.len() * 2);
-        for (start, end, _) in &spans {
-            events.push((*start, 1));
-            events.push((*end, -1));
-        }
-        // `-1` sorts before `+1` at the same instant, which is the ordering described above.
-        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
-        let mut live = 0i32;
-        let mut peak = 0i32;
-        for (_, delta) in events {
-            live += delta;
-            peak = peak.max(live);
-        }
-        (peak as usize, pids.len())
-    }
-
     // Serve `rounds` rounds of `AT_ONCE` concurrent requests and report the best overlap seen.
     //
     // **Several rounds for the preforked half and one for the control**, which is the only
@@ -707,6 +671,118 @@ fn recycling_replaces_the_process_after_max_requests() {
         !is_running(original),
         "the replaced worker {original} is still running; the replacement did not take the \
          address over cleanly"
+    );
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A streamed response counts towards `max_requests` and gives its slot back.**
+///
+/// Both are the buffered arm's steps, and both were missing from the streamed one: the reader
+/// incremented the slot's count and nothing ever acted on it, so a slot that only served large
+/// responses was never recycled; and it dropped the client instead of returning it, so every
+/// streamed response forced a reconnect.
+///
+/// **Why the assertion is on the process id.** `max_requests` is observable only through the slot's
+/// process being replaced — there is no counter on the public surface, and adding one would let the
+/// test agree with itself rather than with the property. A slot configured with `max_requests = 2`
+/// must therefore have a different pid once it has served two *streamed* responses, which is what an
+/// operator relying on recycling for leak containment depends on.
+///
+/// **Every request here is streamed, and that is load-bearing.** A buffered request would call
+/// `recycle_if_needed` itself and mask the defect, because it reads the same counter. With only
+/// streamed requests the counter is the *only* thing that can trigger a replacement.
+///
+/// The connection going back is asserted as the slot's permit returning to zero after each body,
+/// which is the same `Slot::returned` call that returns the client — and the warm path itself is
+/// covered by the buffered tests, which share the mechanism.
+#[cfg(unix)]
+#[test]
+fn a_streamed_response_is_counted_and_recycles_the_slot() {
+    use volucer_server::Delivery;
+
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        volucer_testkit::skip("no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        volucer_testkit::skip_transient("no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-pool-stream-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    // 128 KiB with no `Content-Length`, so `Relay::unknown_length` relays it rather than buffering.
+    // Echoed in one `str_repeat` so the body arrives in several FastCGI records. **Double quotes**,
+    // because PHP single-quoted strings do not interpret `\r\n` and would send the escape literally.
+    let script = write_script(
+        &root,
+        "index.php",
+        "<?php echo \"Content-Type: text/plain\\r\\n\\r\\n\"; echo str_repeat('s', 131072);",
+    );
+    let script = script
+        .file_name()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
+
+    let mut config = config_for(&binary, 1, base);
+    config.max_requests = Some(2);
+    let mut pool = CgiPool::start("stream", &config).expect("pool starts");
+    let original = pool.pids()[0];
+    let request = request_for(&root, &script, "");
+
+    // **Every request is streamed**, and that is load-bearing: a buffered request would call
+    // `recycle_if_needed` itself and mask the defect, because it reads the same counter. With only
+    // streamed requests the counter is the *only* thing that can trigger a replacement.
+    for round in 0..3 {
+        let mut relayed = match pool
+            .request_relayed(&request, 4096, volucer_fcgi::Relay::unknown_length())
+            .expect("the slot answered")
+        {
+            Delivery::Relayed(relayed) => relayed,
+            Delivery::Buffered(_) => {
+                panic!("round {round}: a 128 KiB response with no length must be relayed")
+            }
+        };
+        // The body includes the head block (nothing was split off, because the header block and the
+        // first body bytes arrived in the same record), so the assertion is on the total rather
+        // than on the body alone: every byte the backend wrote must reach the client.
+        let mut received = 0usize;
+        while let Some(chunk) = relayed.body.blocking_recv() {
+            received += chunk.len();
+        }
+        assert_eq!(
+            received,
+            "Content-Type: text/plain\r\n\r\n".len() + 131_072,
+            "round {round}: every byte arrived"
+        );
+        // The permit came back with the connection: `Slot::returned` is one call that does both, so
+        // a slot left holding a permit after its body ended would be the same defect in the other
+        // direction — the pool would shrink by one per streamed response.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pool.in_flight()[0] != Some(0) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            pool.in_flight(),
+            vec![Some(0)],
+            "round {round}: the permit was not released when the body ended"
+        );
+    }
+
+    // Three streamed requests against a limit of two: the second records the count, the slot is
+    // replaced before it is handed out again, and the third is served by the replacement. So the
+    // pid is the observable, and the third response's bytes are the proof the replacement works.
+    let recycled = pool.pids()[0];
+    assert_ne!(
+        recycled, original,
+        "a slot that served `max_requests` streamed responses was not recycled; `served` is \
+         incremented but nothing acts on it, so `max_requests` never bounds a slot that only \
+         serves large responses"
     );
 
     pool.shutdown();
@@ -1291,17 +1367,34 @@ fn a_pool_answers_the_same_request_through_the_awaited_path() {
 ///
 /// This is the property that makes the change safe rather than merely faster, and it is the one a
 /// second counter would have broken silently. `php-cgi` serves one request at a time per child, so a
-/// slot whose concurrency is 1 must admit exactly one request — whichever path it arrived on. With
-/// two counters a blocking request and an awaited one would both be admitted, and the second would
-/// queue invisibly inside the backend.
+/// slot whose concurrency is `n` must admit exactly `n` requests — whichever path they arrived on.
+/// With two counters a blocking request and an awaited one would each be admitted against their own
+/// limit, and the surplus would queue invisibly inside the backend.
 ///
-/// Held by a busy slot and asserted from the *other* path, in both directions, because a test that
-/// only proved one direction would pass against a pair of counters that happened to be sized 1.
+/// **Measured on the counter itself, not on elapsed time.** An earlier version asserted that a
+/// blocking request took at least as long as an awaited one it should have been queued behind, and
+/// that assertion cannot fail: with separate counters the blocking request is admitted at once,
+/// opens its own connection, and then waits for the single child to finish the awaited request
+/// anyway — so the end-to-end duration is the same either way. Two things are needed to observe the
+/// difference, and this test has both:
+///
+/// - **A slot that can really serve two at once** (`children = 2`), so a wrongly admitted request is
+///   answered rather than queued behind the first child. That is the only backend shape in which
+///   "admitted" and "served" are the same fact.
+/// - **An observation of the count while both are running**: with one counter it reads 2, and with a
+///   counter per path the shared one the pool reports reads 1. Nothing here depends on how long
+///   either request takes, so a loaded runner cannot change the answer.
 #[cfg(unix)]
 #[test]
 fn the_two_paths_share_one_admission_count() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Instant;
+
+    /// How long the fixture holds a request inside PHP. Wide enough that both requests are in
+    /// flight together for far longer than the polling interval below.
+    const SLEEP_US: u64 = 900_000;
+    /// How long to wait for the count to reach the value under test before concluding it will not.
+    const PATIENCE: Duration = Duration::from_secs(5);
 
     let _serial = serial();
     let Some(binary) = find_php_cgi() else {
@@ -1316,51 +1409,124 @@ fn the_two_paths_share_one_admission_count() {
     let root = std::env::temp_dir().join(format!("volucer-pool-admission-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
-    let script = write_script(&root, "index.php", "<?php usleep(700000); echo 'SLOW';");
+    let script = write_script(
+        &root,
+        "index.php",
+        &format!("<?php usleep({SLEEP_US}); echo 'SLOW';"),
+    );
     let script = script
         .file_name()
         .expect("a file name")
         .to_string_lossy()
         .into_owned();
 
-    let pool =
-        Arc::new(CgiPool::start("admission", &config_for(&binary, 1, base)).expect("pool starts"));
+    // Two children, so the slot's concurrency is 2 and `php-cgi` genuinely answers two connections
+    // at the same time. With one child, a second request that *was* wrongly admitted would still
+    // wait for the first — the measurement below would then be unable to see the mistake.
+    let mut config = config_for(&binary, 1, base);
+    config.children = 2;
+    let pool = Arc::new(CgiPool::start("admission", &config).expect("pool starts"));
+    assert_eq!(
+        pool.in_flight(),
+        vec![Some(0)],
+        "a fresh slot is serving nothing"
+    );
     let request = request_for(&root, &script, "");
 
-    // An awaited request takes the slot's only place...
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("a caller runtime");
 
-    let started = Instant::now();
+    // Poll until the slot's count reaches `want`, or give up after `PATIENCE` or as soon as neither
+    // request can still be running. `try_lock` inside `in_flight` yields `None` at the instant
+    // another thread holds the bookkeeping lock, which is why this is a poll rather than a sample.
+    let settled = |want: usize, running: &dyn Fn() -> bool| -> Option<usize> {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            if let Some(count) = pool.in_flight()[0] {
+                if count == want {
+                    return Some(count);
+                }
+            }
+            if !running() || std::time::Instant::now() >= deadline {
+                return pool.in_flight()[0];
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    let awaited_done = Arc::new(AtomicBool::new(false));
+    let blocking_done = Arc::new(AtomicBool::new(false));
+
     std::thread::scope(|scope| {
-        let awaited = scope.spawn(|| {
-            runtime
-                .block_on(pool.request_async(&request))
-                .expect("the awaited request is served")
+        let awaited_flag = Arc::clone(&awaited_done);
+        let awaited_pool = Arc::clone(&pool);
+        let awaited_request = &request;
+        let awaited = scope.spawn(move || {
+            let response = runtime
+                .block_on(awaited_pool.request_async(awaited_request))
+                .expect("the awaited request is served");
+            awaited_flag.store(true, Ordering::Release);
+            response
         });
 
-        // ...and a blocking request must now wait for it, rather than being admitted beside it.
-        while started.elapsed() < Duration::from_millis(250) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let blocking = pool
-            .request(&request)
-            .expect("the blocking request is served");
-
-        assert!(
-            started.elapsed() >= Duration::from_millis(700),
-            "the blocking request was admitted beside the awaited one after {:?}; the two paths \
-             are counting separately, which lets a one-child slot serve two requests at once",
-            started.elapsed()
+        // One request is in flight, and it is one *place* whichever path took it.
+        let first = settled(1, &|| !awaited_done.load(Ordering::Acquire));
+        assert_eq!(
+            first,
+            Some(1),
+            "the awaited request must hold exactly one place while it is running"
         );
 
-        blocking.check_protocol().expect("completed");
-        let awaited = awaited.join().expect("no thread panics");
-        awaited.check_protocol().expect("completed");
+        let blocking_flag = Arc::clone(&blocking_done);
+        let blocking_pool = Arc::clone(&pool);
+        let blocking_request = &request;
+        let blocking = scope.spawn(move || {
+            let response = blocking_pool
+                .request(blocking_request)
+                .expect("the blocking request is served");
+            blocking_flag.store(true, Ordering::Release);
+            response
+        });
+
+        // **The assertion.** Both requests are being served at once, so one admission count reads
+        // 2. A counter per path would leave this one at 1 while the blocking request ran against
+        // its own — which is exactly the defect, and it is visible here without any timing.
+        let both = settled(2, &|| {
+            !awaited_done.load(Ordering::Acquire) || !blocking_done.load(Ordering::Acquire)
+        });
+        assert_eq!(
+            both,
+            Some(2),
+            "the awaited and blocking requests are counted by separate limits: the slot admits \
+             `children` requests in total, and a second counter lets it admit that many again, \
+             so a one-child slot would serve two at once"
+        );
+
+        blocking
+            .join()
+            .expect("no thread panics")
+            .check_protocol()
+            .expect("completed");
+        awaited
+            .join()
+            .expect("no thread panics")
+            .check_protocol()
+            .expect("completed");
     });
+
+    // And every place comes back, whatever happened above.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while pool.in_flight()[0] != Some(0) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        pool.in_flight(),
+        vec![Some(0)],
+        "both places must be released once the requests are answered"
+    );
 
     drop(pool);
     let _ = std::fs::remove_dir_all(&root);

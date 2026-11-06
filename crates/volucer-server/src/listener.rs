@@ -1236,6 +1236,7 @@ mod tests {
                     volucer_core::config::ExternalConfig {
                         socket: "127.0.0.1:1".to_string(),
                         max_connections: None,
+                        request_timeout_ms: None,
                         services: Vec::new(),
                     },
                 ),

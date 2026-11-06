@@ -1335,7 +1335,7 @@ impl Dispatcher {
         backend.request_async(request).await
     }
 
-    /// [`Self::dispatch_to_relayed`], without parking the calling thread while a worker answers.
+    /// [`Dispatcher::dispatch_to_relayed`], without parking the calling thread while a worker answers.
     ///
     /// Same lookup, same errors, same relay policy. See [`Backend::request_relayed_async`].
     pub async fn dispatch_to_relayed_async(
@@ -1487,6 +1487,25 @@ impl Dispatcher {
         }
     }
 
+    /// Requests the named backend is admitting right now, or `None` when it has no such counter.
+    ///
+    /// One line of passthrough to [`Backend::in_flight`], which see for why the number is exposed at
+    /// all: a test proves that a blocking and an awaited request share one `max_connections` budget
+    /// by watching the count reach the cap, and there is no other observable that distinguishes
+    /// "shared" from "one each".
+    pub fn in_flight(&self, backend: &str) -> Option<usize> {
+        self.backends.get(backend).and_then(Backend::in_flight)
+    }
+
+    /// Warm connections the named backend is holding open, or `None` when it holds none.
+    ///
+    /// The other half of the pair above, and for a different property: `MAX_IDLE_CONNECTIONS` is a
+    /// total across both paths, so a deployment serving both front-ends from one backend must park
+    /// one child rather than one per mode. See [`Backend::retained`].
+    pub fn retained(&self, backend: &str) -> Option<usize> {
+        self.backends.get(backend).and_then(Backend::retained)
+    }
+
     /// Stop every backend.
     ///
     /// `&mut self`, and only reachable by the owner: `Drop` is what reaps the
@@ -1635,6 +1654,7 @@ mod tests {
         BackendConfig::External(ExternalConfig {
             socket,
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         })
     }
@@ -2314,6 +2334,7 @@ url = "redis://127.0.0.1:6379"
                 BackendConfig::External(volucer_core::config::ExternalConfig {
                     socket: socket.to_string(),
                     max_connections: None,
+                    request_timeout_ms: None,
                     services: Vec::new(),
                 }),
             )],

@@ -85,3 +85,44 @@ pub fn write_script(root: &Path, name: &str, body: &str) -> PathBuf {
     std::fs::write(&path, body).expect("write the script");
     path
 }
+
+/// The largest number of recorded `start end` spans that were running at the same instant, and how
+/// many distinct processes recorded any.
+///
+/// **A property, not a duration.** Two requests that overlap *inside PHP* were served at the same
+/// time; one that merely finished quickly may not have been. A serialised backend can only ever
+/// reach an overlap of 1 however fast the machine is, and a genuinely concurrent one reaches 2
+/// however slow it is, so nothing here can flake on how loaded the runner is.
+///
+/// Ends are ordered before starts at equal timestamps, so two spans that merely touch are not
+/// counted as overlapping: a serialised slot ends one request before the next begins, and calling
+/// that a two-way overlap would let a broken implementation satisfy a test that asserts overlap.
+pub fn peak_overlap(trace: &Path) -> (usize, usize) {
+    let text = std::fs::read_to_string(trace).unwrap_or_default();
+    let spans: Vec<(f64, f64, String)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let start: f64 = parts.next()?.parse().ok()?;
+            let end: f64 = parts.next()?.parse().ok()?;
+            let pid = parts.next().unwrap_or("?").to_string();
+            Some((start, end, pid))
+        })
+        .collect();
+    let pids: std::collections::BTreeSet<&str> =
+        spans.iter().map(|(_, _, pid)| pid.as_str()).collect();
+    let mut events: Vec<(f64, i32)> = Vec::with_capacity(spans.len() * 2);
+    for (start, end, _) in &spans {
+        events.push((*start, 1));
+        events.push((*end, -1));
+    }
+    // `-1` sorts before `+1` at the same instant, which is the ordering described above.
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+    let mut live = 0i32;
+    let mut peak = 0i32;
+    for (_, delta) in events {
+        live += delta;
+        peak = peak.max(live);
+    }
+    (peak as usize, pids.len())
+}
