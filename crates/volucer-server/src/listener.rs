@@ -892,8 +892,8 @@ fn serve_connection(
         // per-connection id would give two requests the same id, which is worse than no id at all
         // because it looks like correlation and is not.
         let context = observe.begin(
-            param(request.params.as_slice(), b"HTTP_X_REQUEST_ID"),
-            param(request.params.as_slice(), b"HTTP_TRACEPARENT"),
+            || param(request.params.as_slice(), b"HTTP_X_REQUEST_ID"),
+            || param(request.params.as_slice(), b"HTTP_TRACEPARENT"),
         );
         let started = Instant::now();
 

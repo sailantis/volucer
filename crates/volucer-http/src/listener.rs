@@ -2296,24 +2296,44 @@ async fn handle(
     // Identity first, before anything can fail. A request that is rejected, redirected or 404s
     // still needs an id — those are precisely the requests an operator correlates against a
     // client's report — so this is taken before `prepare`, not inside it.
-    let context = front_end.observe.begin(
-        header_str(request.headers(), volucer_observe::REQUEST_ID_HEADER),
-        header_str(request.headers(), volucer_observe::TRACEPARENT_HEADER),
-    );
+    //
+    // Gated, because minting an identity is 40 random bytes and two `Instant::now()` calls, and the
+    // ordinary deployment consumes none of it: an access log is opt-in, spans are opt-in, and an id
+    // header is opt-in. `begin` itself stays unconditional in its contract — its tests pin that it
+    // always resolves a caller's id and trace — so the decision to skip it lives here, where the
+    // consumers are known.
+    let identity = front_end.observe.needs_request_identity();
+    let context = if identity {
+        front_end.observe.begin(
+            || header_str(request.headers(), volucer_observe::REQUEST_ID_HEADER),
+            || header_str(request.headers(), volucer_observe::TRACEPARENT_HEADER),
+        )
+    } else {
+        front_end.observe.anonymous_context()
+    };
     let started = Instant::now();
     // The request parts are needed for the record afterwards, so they are taken now rather than
     // inside `prepare`: consuming the request there would leave nothing to log.
-    let method = request.method().as_str().to_owned();
-    let target = request
-        .uri()
-        .path_and_query()
-        .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
-    let protocol = format!("{:?}", request.version());
+    //
+    // All six are behind `is_active`, because they are read by nothing else. `prepare` takes only
+    // the `context`, and the `context` reaches the CGI environment through
+    // `outbound_traceparent`, never through these. They used to be six unconditional `String`
+    // allocations per request — 2% of the front-end's CPU at 17 bytes, and in `perf` as `_rjem_malloc`,
+    // `memset` and `memmove`, for a record that a deployment without an access log never writes.
+    let active = front_end.observe.is_active();
+    let method = active.then(|| request.method().as_str().to_owned());
+    let target = active.then(|| {
+        request
+            .uri()
+            .path_and_query()
+            .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string())
+    });
+    let protocol = active.then(|| format!("{:?}", request.version()));
     // Taken from the headers *or* the URI, because an HTTP/2 or HTTP/3 request carries the name
     // in `:authority` and has no `Host` at all — see [`request_host`].
-    let host = request_host(request.headers(), request.uri()).map(str::to_owned);
-    let user_agent = header_str(request.headers(), "user-agent").map(str::to_owned);
-    let referer = header_str(request.headers(), "referer").map(str::to_owned);
+    let host = active.then(|| request_host(request.headers(), request.uri()).map(str::to_owned));
+    let user_agent = active.then(|| header_str(request.headers(), "user-agent").map(str::to_owned));
+    let referer = active.then(|| header_str(request.headers(), "referer").map(str::to_owned));
 
     let mut hsts: Option<volucer_core::config::HstsPolicy> = None;
     let mut response = match prepare(
@@ -2348,14 +2368,18 @@ async fn handle(
     // cannot find it on the response has no way to quote it, and an error is the case where they
     // most need to. Written after the handler so it cannot be overwritten by a backend that
     // happened to send its own.
+    //
+    // Gated on the same condition `begin` used to skip minting: a deployment with no id header gets
+    // an all-zero placeholder id from `begin`, and rendering 32 hex characters per request to echo
+    // a header nobody configured is the kind of cost that only shows up in a benchmark.
     if let Some(name) = front_end.observe.id_header() {
         if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
-            if let Ok(value) = HeaderValue::from_str(&context.id.as_str()) {
+            let rendered = context.id.as_str();
+            if let Ok(value) = HeaderValue::from_str(rendered.as_ref()) {
                 response.headers_mut().insert(name, value);
             }
         }
     }
-
     // **`Strict-Transport-Security`, on every answer over TLS.** Here rather than in `prepare`
     // because this is the one point every response passes through — including the ones
     // `error_response` built from an `Err`, which matters: a policy belongs to the *name*, so a 404
@@ -2396,23 +2420,29 @@ async fn handle(
     // access log**, so the exported span's status is the one the client sees — the same value the
     // log records — rather than the status a backend returned before the front-end rewrote it.
     //
+    // Gated on the span recorder rather than on `is_active()`: `record_server_span` is a no-op
+    // without one, but `target` and `method` are only built when a record is being written, and
+    // `is_active()` is true for an access-log-only deployment that exports no spans.
+    //
     // The path is logged, not the query: a query string is unbounded and often a secret, and this is
     // a *trace* attribute that a backend indexes.
-    if let Some(path) = target.split('?').next() {
-        front_end.observe.record_server_span(
-            &context,
-            context.started_at,
-            std::time::SystemTime::now(),
-            volucer_observe::ServerSpanAttributes {
-                method: &method,
-                path,
-                host: host.as_deref(),
-                status: response.status().as_u16(),
-                name: "http.request",
-                status_message: None,
-                extra: &[],
-            },
-        );
+    if front_end.observe.has_spans() {
+        if let Some(path) = target.as_deref().and_then(|t| t.split('?').next()) {
+            front_end.observe.record_server_span(
+                &context,
+                context.started_at,
+                std::time::SystemTime::now(),
+                volucer_observe::ServerSpanAttributes {
+                    method: method.as_deref().unwrap_or_default(),
+                    path,
+                    host: host.as_ref().and_then(|h| h.as_deref()),
+                    status: response.status().as_u16(),
+                    name: "http.request",
+                    status_message: None,
+                    extra: &[],
+                },
+            );
+        }
     }
 
     // `is_active` and not `is_enabled`: the two sinks are separately configured, and a deployment
@@ -2425,23 +2455,23 @@ async fn handle(
         // get the real figure would put a task on the hot path for one log field, so this reports
         // what is known and the README says which bodies report zero.
         let bytes_sent = response.body().size_hint().exact().unwrap_or(0);
-        let id = context.id.as_str();
         if front_end.observe.is_enabled() {
             // Rendered inside the guard: the hex form is an allocation, and a deployment with
             // tracing but no access log must not pay for one it discards.
+            let id = context.id.as_str();
             let trace_id = context.trace.trace_id_hex();
             front_end
                 .observe
                 .access_log()
                 .record(&volucer_observe::access_log::Record {
-                    id: &id,
-                    method: &method,
-                    target: &target,
-                    protocol: &protocol,
+                    id: id.as_ref(),
+                    method: method.as_deref().unwrap_or_default(),
+                    target: target.as_deref().unwrap_or("/"),
+                    protocol: protocol.as_deref().unwrap_or_default(),
                     peer: resolved_peer,
-                    host: host.as_deref(),
-                    user_agent: user_agent.as_deref(),
-                    referer: referer.as_deref(),
+                    host: host.as_ref().and_then(|h| h.as_deref()),
+                    user_agent: user_agent.as_ref().and_then(|u| u.as_deref()),
+                    referer: referer.as_ref().and_then(|r| r.as_deref()),
                     status: response.status().as_u16(),
                     total_seconds: started.elapsed().as_secs_f64(),
                     origin_seconds: None,

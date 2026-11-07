@@ -149,7 +149,7 @@ fn a_recorded_request_reaches_a_collector_with_the_ids_the_request_carried() {
     // An inbound `traceparent`, exactly as the HTTP front-end reads it: the trace is the caller's,
     // the span is ours, and the caller's span id becomes our parent.
     let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-    let context = observe.begin(Some("abc-123"), Some(caller));
+    let context = observe.begin(|| Some("abc-123"), || Some(caller));
     observe.record_server_span(
         &context,
         context.started_at,
@@ -252,7 +252,7 @@ fn a_configured_header_is_sent_with_the_export() {
     let exporter = Arc::new(Exporter::start(&settings).expect("an exporter"));
     let observe = Observability::disabled().with_spans(exporter.recorder());
 
-    let context = observe.begin(None, None);
+    let context = observe.begin(|| None, || None);
     observe.record_server_span(
         &context,
         context.started_at,
@@ -313,7 +313,7 @@ fn an_unreachable_collector_loses_spans_and_never_fails_a_request() {
     // Every one of these must return promptly, with no panic and no block.
     let started = std::time::Instant::now();
     for _ in 0..200 {
-        let context = observe.begin(None, None);
+        let context = observe.begin(|| None, || None);
         observe.record_server_span(
             &context,
             context.started_at,
@@ -368,7 +368,7 @@ fn a_request_the_caller_marked_unsampled_produces_no_export_at_all() {
     // The caller's flag is clear: "do not record this". nginx filters on `$otel_parent_sampled`
     // for exactly this case.
     let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
-    let context = observe.begin(Some("abc-123"), Some(caller));
+    let context = observe.begin(|| Some("abc-123"), || Some(caller));
     assert!(
         !context.trace.sampled(),
         "the caller's flag must be honoured"
@@ -390,7 +390,7 @@ fn a_request_the_caller_marked_unsampled_produces_no_export_at_all() {
 
     // And a root — no inbound `traceparent` — *is* exported, which is the other half of the
     // default: without it, a standalone deployment would export nothing while believing otherwise.
-    let root = observe.begin(None, None);
+    let root = observe.begin(|| None, || None);
     assert!(root.trace.sampled(), "a root must be recorded");
     observe.record_server_span(
         &root,

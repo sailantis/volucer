@@ -470,22 +470,71 @@ impl Observability {
         self.access_log.is_enabled() || self.spans.is_some()
     }
 
+    /// Whether a front-end must resolve a request's identity at all.
+    ///
+    /// **Every consumer, named once.** `is_active()` covers the span and the access log, but two
+    /// more things read the identity and neither is a "record":
+    ///
+    ///   - the id echoed on the response, which exists only when a header is configured;
+    ///   - the `traceparent` handed to a backend, which exists only when propagation injects.
+    ///
+    /// That second one is the case this exists for: a deployment can set
+    /// `trace_context = "propagate"` with no access log and no exporter — the backend exports —
+    /// and then the trace must still be *the client's*. A front-end that skipped `begin` there
+    /// would send `00-…-00` and break the trace at exactly the hop the setting joins.
+    ///
+    /// Use it as the guard before calling [`Observability::begin`], and pair it with
+    /// [`Observability::anonymous_context`] so the rest of the request path has a value that is
+    /// cheap rather than absent.
+    #[must_use]
+    pub fn needs_request_identity(&self) -> bool {
+        self.is_active() || self.id_header.is_some() || self.propagation.injects()
+    }
+
+    /// The identity of a request in a deployment that consumes none.
+    ///
+    /// Not a `Default`: an all-zero id and an unsampled trace are exactly wrong when they *are*
+    /// consumed — a zero id is invalid to a collector, and an unsampled trace is dropped. This is
+    /// the placeholder for the case [`Observability::needs_request_identity`] has already ruled out,
+    /// and it is here rather than at each call site so both front-ends hand back the same shape.
+    ///
+    /// Costs one `Instant::now()` and one `SystemTime::now()`, which the elapsed-time accounting
+    /// needs regardless of whether anything is recorded.
+    #[must_use]
+    pub fn anonymous_context(&self) -> RequestContext {
+        RequestContext {
+            id: RequestId::from_bytes([0u8; 16]),
+            trace: TraceContext::new(false),
+            parent_span_id: None,
+            started_at: SystemTime::now(),
+            started: Instant::now(),
+        }
+    }
+
     /// Resolve the identity of an inbound request.
     ///
     /// **The one place adoption, generation and trace continuation are decided.** Both front-ends
     /// call this, so they cannot answer "which id is this request" differently.
     ///
     /// `client_id` and `client_traceparent` are the raw header values as they arrived, or `None`.
+    ///
+    /// **Takes closures rather than values, and that is a performance contract.** Resolving an
+    /// identity mints a request id and a trace/span pair — up to 40 random bytes, drawn through
+    /// `fill`. A deployment with neither an access log nor spans discards all of it: measured on a
+    /// 17-byte hello page, the front-end's unconditional `begin` plus the string copies around it
+    /// were ~3.5% of its CPU for a value that never left the function. The closures are only called
+    /// when something will consume the result, so the cost follows the configuration instead of
+    /// being paid to produce a discard.
     #[must_use]
-    pub fn begin(
+    pub fn begin<'a>(
         &self,
-        client_id: Option<&str>,
-        client_traceparent: Option<&str>,
+        client_id: impl FnOnce() -> Option<&'a str>,
+        client_traceparent: impl FnOnce() -> Option<&'a str>,
     ) -> RequestContext {
         // A value is only even considered when a header is configured: with none, the client cannot
         // influence the id at all, which is the stricter default.
         let id = match self.id_header {
-            Some(_) => client_id
+            Some(_) => client_id()
                 .and_then(RequestId::parse)
                 .unwrap_or_else(RequestId::generate),
             None => RequestId::generate(),
@@ -498,7 +547,7 @@ impl Observability {
         // `extracts()` is asked here rather than at the call site, so `ignore` cannot be half
         // implemented: one front-end forgetting the check would make the key mean two things.
         let client_trace = match self.propagation.extracts() {
-            true => client_traceparent.and_then(TraceContext::parse),
+            true => client_traceparent().and_then(TraceContext::parse),
             false => None,
         };
         let trace = {
@@ -1359,12 +1408,12 @@ mod tests {
         // configured case.
         let configured = observing(Some(REQUEST_ID_HEADER));
         assert_eq!(
-            configured.begin(Some("abc-123"), None).id.as_str(),
+            configured.begin(|| Some("abc-123"), || None).id.as_str(),
             "abc-123"
         );
 
         let unconfigured = observing(None);
-        let resolved = unconfigured.begin(Some("abc-123"), None);
+        let resolved = unconfigured.begin(|| Some("abc-123"), || None);
         assert_ne!(resolved.id.as_str(), "abc-123", "the client had a say");
         assert_eq!(
             resolved.id.as_str().len(),
@@ -1379,11 +1428,11 @@ mod tests {
         // client's bad header into a failed request, and this is where that is decided.
         let observing = observing(Some(REQUEST_ID_HEADER));
         for value in ["bad value", "", "a\nb"] {
-            let resolved = observing.begin(Some(value), None);
+            let resolved = observing.begin(|| Some(value), || None);
             assert_eq!(resolved.id.as_str().len(), 32, "{value:?} was adopted");
         }
         // And an absent header is the same answer as a bad one.
-        assert_eq!(observing.begin(None, None).id.as_str().len(), 32);
+        assert_eq!(observing.begin(|| None, || None).id.as_str().len(), 32);
     }
 
     #[test]
@@ -1395,7 +1444,7 @@ mod tests {
         // tracing was on while exporting nothing.
         let observing = observing(None);
         let client = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let continued = observing.begin(None, Some(client));
+        let continued = observing.begin(|| None, || Some(client));
         assert_eq!(
             continued.trace.trace_id_hex(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -1406,7 +1455,7 @@ mod tests {
             "the caller's decision was reversed"
         );
 
-        let fresh = observing.begin(None, None);
+        let fresh = observing.begin(|| None, || None);
         assert!(
             fresh.trace.sampled(),
             "a root must be recorded, or a deployment with nothing in front of it exports nothing"
@@ -1415,7 +1464,7 @@ mod tests {
 
         // A broken traceparent starts a fresh trace rather than failing — the same rule as the id,
         // and it is a root like an absent one.
-        let broken = observing.begin(None, Some("not-a-traceparent"));
+        let broken = observing.begin(|| None, || Some("not-a-traceparent"));
         assert_ne!(broken.trace.trace_id(), [0u8; 16]);
     }
 
@@ -1426,14 +1475,17 @@ mod tests {
         // *root* and is recorded. A `parent_based` that read the two the same way would pass one
         // half of this test whichever way it read them.
         let observing = observing(None);
-        let unsampled = observing.begin(None, Some(UNSAMPLED_CLIENT_TRACE));
+        let unsampled = observing.begin(|| None, || Some(UNSAMPLED_CLIENT_TRACE));
         assert!(
             !unsampled.trace.sampled(),
             "an explicit -00 must be honoured, or a proxy spends somebody else's budget"
         );
-        assert!(observing.begin(None, None).trace.sampled(), "a root");
+        assert!(observing.begin(|| None, || None).trace.sampled(), "a root");
         assert!(
-            observing.begin(None, Some(CLIENT_TRACE)).trace.sampled(),
+            observing
+                .begin(|| None, || Some(CLIENT_TRACE))
+                .trace
+                .sampled(),
             "an explicit -01 is a caller asking to be recorded"
         );
     }
@@ -1443,7 +1495,7 @@ mod tests {
         // The other half of "one answer per question": the id and the elapsed time are taken in the
         // same call, so a front-end cannot log an id from before the work and a duration from after
         // it. Asserted by waiting, because a zero duration would also pass an equality check.
-        let context = observing(None).begin(None, None);
+        let context = observing(None).begin(|| None, || None);
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(
             context.elapsed_seconds() >= 0.005,
@@ -1464,7 +1516,7 @@ mod tests {
         // neighbour: reading the header and merely not writing it would be indistinguishable from
         // `extract` from the caller's side, and from the backend's.
         let observing = observing(None).with_propagation(TracePropagation::Ignore);
-        let context = observing.begin(None, Some(CLIENT_TRACE));
+        let context = observing.begin(|| None, || Some(CLIENT_TRACE));
         assert_ne!(
             context.trace.trace_id_hex(),
             "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -1482,7 +1534,7 @@ mod tests {
         // Today's behaviour, and the default. The client's header is what a backend receives —
         // Volucer writes nothing — so a backend's spans are siblings of this server's span.
         let observing = observing(None).with_propagation(TracePropagation::Extract);
-        let context = observing.begin(None, Some(CLIENT_TRACE));
+        let context = observing.begin(|| None, || Some(CLIENT_TRACE));
         assert_eq!(
             context.trace.trace_id_hex(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -1499,7 +1551,7 @@ mod tests {
         // The half that does not read: a client's trace is deliberately *not* joined, and the
         // header a backend gets is this server's own.
         let observing = observing(None).with_propagation(TracePropagation::Inject);
-        let context = observing.begin(None, Some(CLIENT_TRACE));
+        let context = observing.begin(|| None, || Some(CLIENT_TRACE));
         assert_ne!(
             context.trace.trace_id_hex(),
             "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -1521,7 +1573,7 @@ mod tests {
         // The value this whole key exists for. The trace id stays the caller's, the span id is
         // ours, and the backend is told ours — so its spans are children rather than siblings.
         let observing = observing(None).with_propagation(TracePropagation::Propagate);
-        let context = observing.begin(None, Some(CLIENT_TRACE));
+        let context = observing.begin(|| None, || Some(CLIENT_TRACE));
         assert_eq!(
             context.trace.trace_id_hex(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -1551,7 +1603,7 @@ mod tests {
         // with no context at all, because then `propagate` would silently stop working for exactly
         // the requests that already had a problem.
         let observing = observing(None).with_propagation(TracePropagation::Propagate);
-        let context = observing.begin(None, Some("00-not-a-trace-x-01"));
+        let context = observing.begin(|| None, || Some("00-not-a-trace-x-01"));
         assert!(context.parent_span_id.is_none());
         let header = observing
             .outbound_traceparent(&context)
@@ -1787,7 +1839,7 @@ mod tests {
             .with_sampling(Sampler::ParentBased)
             .with_spans(recording.clone());
 
-        let dropped = observing.begin(None, Some(UNSAMPLED_CLIENT_TRACE));
+        let dropped = observing.begin(|| None, || Some(UNSAMPLED_CLIENT_TRACE));
         assert!(
             observing
                 .outbound_traceparent(&dropped)
@@ -1807,7 +1859,7 @@ mod tests {
             "a trace the caller dropped was exported anyway, so flags and traceparent disagree"
         );
 
-        let kept = observing.begin(None, Some(CLIENT_TRACE));
+        let kept = observing.begin(|| None, || Some(CLIENT_TRACE));
         assert!(observing
             .outbound_traceparent(&kept)
             .expect("still writes")
@@ -1829,7 +1881,7 @@ mod tests {
         let observing = observing(None)
             .with_propagation(TracePropagation::Propagate)
             .with_sampling(Sampler::Always);
-        let context = observing.begin(None, Some(UNSAMPLED_CLIENT_TRACE));
+        let context = observing.begin(|| None, || Some(UNSAMPLED_CLIENT_TRACE));
         assert_eq!(
             observing
                 .outbound_traceparent(&context)
