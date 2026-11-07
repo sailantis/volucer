@@ -890,6 +890,21 @@ real syscall — about 16 per request on the reference host. Switching to `tsc` 
 with `constant_tsc`) removed 2.7 µs of front-end CPU per request, worth +2.8% throughput. This
 is a host setting, not a volucer one, and it is worth checking before buying capacity.
 
+Re-measured on the same host against the current build, `GET /items`, `attach`, 32 workers, c=96,
+alternating the clocksource every round so drift lands on both equally:
+
+| clocksource | throughput | front-end CPU |
+|---|---:|---:|
+| `xen` | 37,385 rps | 60.6 µs/req |
+| `tsc` | **38,309 rps (+2.5%)** | **57.8 µs/req (−4.6%)** |
+
+The syscall cost is the whole of it: `time.monotonic_ns()` is **245 ns** under `xen` and **104 ns**
+under `tsc`, and PHP's `hrtime()` is **191 ns** against **57 ns**. That is why the figure keeps
+reproducing across builds and backends — it is a property of the host, not of the code, and it is
+paid by every PHP process as well as by volucer. Two related costs are *not* worth chasing:
+`opcache.huge_code_pages` measured inside the noise, and the jemalloc allocation that a `perf`
+profile shows at 1.4% of the front-end is cheaper than the code that would remove it.
+
 ## Running as a different user
 
 Volucer needs read access to the document root and write access to the ACME cache. It does
