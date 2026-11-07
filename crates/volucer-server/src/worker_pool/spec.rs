@@ -95,6 +95,12 @@ pub(super) struct Spec {
     /// be handed in at every replacement site is one that would eventually be forgotten at one — with
     /// the symptom being one slot that quietly stops being kept alive while its siblings are not.
     pub(super) keepalive: Option<Duration>,
+    /// Whether each request should measure how long it waited for a slot.
+    ///
+    /// On the spec for the reason `keepalive` is: it is a property of this pool for its whole
+    /// life rather than something read per request, and a *replacement* worker joins a pool whose
+    /// measurement decision was already made at construction.
+    pub(super) measure_wait: bool,
 }
 
 impl Spec {
@@ -154,16 +160,16 @@ impl Spec {
             // readiness-driven, so a handful of threads holds the whole pool.
             runtime: match config.transport {
                 WorkerTransport::Socket => Some(Arc::new(
-                    crate::worker_pool::AsyncRuntime::start(config.workers as usize).map_err(
-                        |source| ServerError::Misconfigured {
+                    crate::worker_pool::AsyncRuntime::start(name, config.workers as usize)
+                        .map_err(|source| ServerError::Misconfigured {
                             backend: name.to_string(),
                             reason: format!("could not start the worker runtime: {source}"),
-                        },
-                    )?,
+                        })?,
                 )),
                 WorkerTransport::Pipe => None,
             },
             keepalive: keepalive_of(config.idle_ping_ms, name)?,
+            measure_wait: config.measure_wait,
         })
     }
 
@@ -191,6 +197,7 @@ impl Spec {
                 grpc_serve_any: false,
                 grpc_proto: Vec::new(),
                 grpc_proto_services: Vec::new(),
+                measure_wait: false,
                 checksum: config.checksum,
                 transport: config.transport,
                 socket: config.socket.clone(),
@@ -233,7 +240,7 @@ impl Spec {
             // worker's transport is a socket, which the front-end's runtime drives instead of a
             // thread. The count is the pool's concurrency, which is what the runtime is sized from.
             runtime: Some(Arc::new(
-                crate::worker_pool::AsyncRuntime::start(config.workers as usize).map_err(
+                crate::worker_pool::AsyncRuntime::start(name, config.workers as usize).map_err(
                     |source| ServerError::Misconfigured {
                         backend: name.to_string(),
                         reason: format!("could not start the attach runtime: {source}"),
@@ -241,6 +248,7 @@ impl Spec {
                 )?,
             )),
             keepalive: keepalive_of(config.idle_ping_ms, name)?,
+            measure_wait: config.measure_wait,
         })
     }
 
@@ -380,6 +388,7 @@ mod tests {
             grpc_serve_any: false,
             grpc_proto: Vec::new(),
             grpc_proto_services: Vec::new(),
+            measure_wait: false,
             transport: Default::default(),
             socket: Default::default(),
         }
@@ -397,6 +406,7 @@ mod tests {
             grpc_serve_any: false,
             grpc_proto: Vec::new(),
             grpc_proto_services: Vec::new(),
+            measure_wait: false,
         }
     }
 

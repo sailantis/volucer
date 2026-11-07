@@ -133,12 +133,29 @@ files. A missing file is not an error; Volucer serves the original instead.
 
 ## Cost
 
-Serving a file does not use a PHP worker or `spawn_blocking`. Path resolution performs one
-blocking `stat`; file contents are streamed in 64 KiB blocks with a content-length frame,
-so the response is not chunked.
+Serving a file does not use a PHP worker. Path resolution performs one `stat`, on the
+runtime thread.
 
-Volucer does not use zero-copy `sendfile`; that would require a separate Unix-only code
-path. File data is copied in blocks as it is streamed.
+A slice of 256 KiB or less is read once with a single `pread` and sent as one already-in-memory
+frame, which is the shape a small response wants: an exact `Content-Length` and no stream to
+poll. Larger slices are streamed in 512 KiB blocks from a `tokio` file, with a `Content-Length`
+frame, so the response is never chunked.
+
+Both sizes were chosen by measurement, not by taste. Reading a small file through
+`tokio::fs::File` costs a `spawn_blocking` per read — two thread wakeups and a `Mutex` handoff to
+copy a few kilobytes — and removing that hop was worth 3.1x at 4,976 bytes. Streaming a large
+one in 64 KiB blocks was worth 16 reads and 16 wakeups per MiB, and 512 KiB blocks were worth
+3.6x at 1 MiB. 1 MiB blocks were measured too and are slightly slower.
+
+Serving a small file therefore does not block a runtime thread for longer than a `pread` out of
+the page cache. On a local filesystem that is microseconds. On a network filesystem a `stat` or
+read is a round trip, so keep the document root local and serve remote files behind the
+application instead.
+
+Volucer does not use zero-copy `sendfile`; that would require a separate Unix-only code path, and
+it is the one case where a competing server is faster: at 4,976 bytes a `sendfile`-based server
+reaches about 111,000 responses a second against 243,000 here, while copy-based streaming is
+faster than it from 100 KiB upward. File data is still copied as it is served.
 
 ## Configuration
 

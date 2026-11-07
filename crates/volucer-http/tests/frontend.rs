@@ -142,6 +142,7 @@ fn worker_config(workers: u32) -> Config {
                 grpc_serve_any: false,
                 grpc_proto: Vec::new(),
                 grpc_proto_services: Vec::new(),
+                measure_wait: false,
                 transport: Default::default(),
                 socket: None,
             }),
@@ -882,6 +883,7 @@ fn unreachable_config() -> Config {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket,
                 max_connections: None,
+                request_timeout_ms: None,
                 services: Vec::new(),
             }),
         )]
@@ -3769,6 +3771,7 @@ fn sendfile_server(response: &'static str, roots: Option<Vec<PathBuf>>) -> Optio
         BackendConfig::External(volucer_core::config::ExternalConfig {
             socket,
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         }),
     );
@@ -4944,6 +4947,7 @@ fn streaming_server(
         BackendConfig::External(volucer_core::config::ExternalConfig {
             socket,
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         }),
     );

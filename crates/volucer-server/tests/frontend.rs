@@ -267,6 +267,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
     let socket_of = |port: u16| volucer_core::config::ExternalConfig {
         socket: format!("127.0.0.1:{port}"),
         max_connections: None,
+        request_timeout_ms: None,
         services: Vec::new(),
     };
     let config = Config {
@@ -529,6 +530,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket: "127.0.0.1:1".to_string(),
                 max_connections: None,
+                request_timeout_ms: None,
                 services: Vec::new(),
             }),
         )]
@@ -735,6 +737,7 @@ fn a_body_over_server_max_body_bytes_is_a_413_over_a_real_connection() {
             BackendConfig::External(volucer_core::config::ExternalConfig {
                 socket: "127.0.0.1:1".to_string(),
                 max_connections: None,
+                request_timeout_ms: None,
                 services: Vec::new(),
             }),
         )]
@@ -1927,6 +1930,7 @@ fn a_workers_streamed_response_is_re_framed_as_separate_records() {
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
         grpc_proto_services: Vec::new(),
+        measure_wait: false,
         transport: Default::default(),
         socket: None,
     };

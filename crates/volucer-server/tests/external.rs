@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -130,34 +131,55 @@ impl Drop for ExternalServer {
 /// than about the protocol.
 struct ConcurrentServer {
     port: u16,
+    /// Requests inside `serve_once` right now, and the highest that figure ever was.
+    ///
+    /// **The measurement the cap is actually about.** A test that asserted a *duration* to prove a
+    /// cap was enforced would pass on a broken pool whenever the second request happened to be slow
+    /// to arrive; counting what the backend itself saw cannot. Read with [`Self::peak`].
+    live: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl ConcurrentServer {
     fn start(sleep: Duration) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
         let port = listener.local_addr().expect("address").port();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let observed = (Arc::clone(&live), Arc::clone(&peak));
 
         thread::spawn(move || {
             let mut workers = Vec::new();
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
+                let (live, peak) = (Arc::clone(&observed.0), Arc::clone(&observed.1));
                 workers.push(thread::spawn(move || {
-                    serve_once(Stream::Tcp(stream), sleep)
+                    serve_once(Stream::Tcp(stream), sleep, &live, &peak)
                 }));
             }
         });
 
-        ConcurrentServer { port }
+        ConcurrentServer { port, live, peak }
     }
 
     fn socket(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
+
+    /// The most requests this server was answering at the same instant.
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    /// Requests being answered right now.
+    fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
 }
 
 /// Read one FastCGI request and answer it, sleeping first to widen the window in
 /// which the pool's concurrency is observable.
-fn serve_once(stream: Stream, sleep: Duration) {
+fn serve_once(stream: Stream, sleep: Duration, live: &AtomicUsize, peak: &AtomicUsize) {
     let mut stream = stream;
 
     // BEGIN_REQUEST, PARAMS, PARAMS-terminator, STDIN, STDIN-terminator.
@@ -168,7 +190,12 @@ fn serve_once(stream: Stream, sleep: Duration) {
         }
     }
 
+    // Counted around the sleep rather than around the whole function, because the sleep is what
+    // stands in for the application thinking — the part a connection cap is meant to serialise.
+    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+    peak.fetch_max(now, Ordering::SeqCst);
     thread::sleep(sleep);
+    live.fetch_sub(1, Ordering::SeqCst);
 
     let body = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nCONCURRENT";
     if write_records(&mut stream, RecordType::Stdout, REQUEST_ID, body, true).is_err() {
@@ -189,6 +216,15 @@ fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
 }
 
 fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) -> Dispatcher {
+    dispatcher_tuned(socket, root, max_connections, None)
+}
+
+fn dispatcher_tuned(
+    socket: &str,
+    root: &Path,
+    max_connections: Option<usize>,
+    request_timeout_ms: Option<u64>,
+) -> Dispatcher {
     let config = Config {
         server: ServerConfig {
             http: Some("127.0.0.1:8080".to_string()),
@@ -201,6 +237,7 @@ fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) ->
             BackendConfig::External(ExternalConfig {
                 socket: socket.to_string(),
                 max_connections,
+                request_timeout_ms,
                 services: Vec::new(),
             }),
         )]
@@ -217,6 +254,23 @@ fn dispatcher_with(socket: &str, root: &Path, max_connections: Option<usize>) ->
         ..Routing::default()
     };
     Dispatcher::from_config(&config, routing).expect("the dispatcher starts")
+}
+
+/// A request to a backend that routes on nothing, for the fixtures that answer any request the same.
+fn plain_request() -> Request {
+    Request {
+        params: build_params(
+            &RequestInfo {
+                method: "POST".to_string(),
+                uri: "/".to_string(),
+                ..RequestInfo::default()
+            },
+            &Routing::default(),
+        )
+        .expect("params build"),
+        body: b"x".to_vec(),
+        keep_conn: true,
+    }
 }
 
 fn request_for(root: &Path, marker: &str) -> Request {
@@ -307,27 +361,35 @@ fn an_external_backend_reuses_its_connection_across_requests() {
 
 /// A `max_connections` cap makes requests wait rather than open more connections.
 ///
-/// The assertion is about *arrival*, not throughput: with a cap of 1, four concurrent requests
-/// must reach the server one after another, so the wall time is about four delays instead of
-/// one. The uncapped call is the control — without it this test would pass on any serialising
-/// bug, which is exactly the mistake `concurrent_requests_reach_the_backend_at_the_same_time`
-/// documents. It uses `ConcurrentServer` rather than a real `php-cgi` for the same reason that
-/// one does: a lone `php-cgi` serves a single connection at a time, so it would serialise the
-/// control arm and prove nothing about the cap.
+/// **The assertion is about what the backend saw, not about how long it took.** The original version
+/// of this test measured the wall time of four requests against a cap of 1 and against no cap, which
+/// is the weakest possible evidence: a duration separates "overlapped" from "serialised" only if
+/// nothing else does, and on a loaded runner a serialising pool can still finish fast. Counting the
+/// requests the fixture was answering at the same instant is the property itself — a cap of 1 can
+/// never show a peak above 1, and the uncapped control reaches 4.
+///
+/// It uses `ConcurrentServer` rather than a real `php-cgi` for the same reason
+/// `concurrent_requests_reach_the_backend_at_the_same_time` does: a lone `php-cgi` serves a single
+/// connection at a time, so it would serialise the control arm and prove nothing about the cap.
 #[test]
 fn a_connection_cap_serialises_requests_instead_of_refusing_them() {
     let _serial = serial();
 
-    const REQUESTS: usize = 4;
     const SLEEP: Duration = Duration::from_millis(200);
 
     let server = ConcurrentServer::start(SLEEP);
 
-    let run = |dispatcher: &Dispatcher| {
-        let started = Instant::now();
+    fn run(server: &ConcurrentServer, max_connections: Option<usize>) -> usize {
+        const REQUESTS: usize = 4;
+        let dispatcher = dispatcher_with(
+            &server.socket(),
+            std::env::temp_dir().as_path(),
+            max_connections,
+        );
+        let before = server.peak();
         std::thread::scope(|scope| {
             for _ in 0..REQUESTS {
-                let dispatcher = &*dispatcher;
+                let dispatcher = &dispatcher;
                 scope.spawn(move || {
                     let request = Request {
                         params: build_params(
@@ -348,25 +410,220 @@ fn a_connection_cap_serialises_requests_instead_of_refusing_them() {
                 });
             }
         });
-        started.elapsed()
-    };
+        server.peak() - before
+    }
 
-    let uncapped = dispatcher_with(&server.socket(), std::env::temp_dir().as_path(), None);
-    let overlapping = run(&uncapped);
-
-    let capped = dispatcher_with(&server.socket(), std::env::temp_dir().as_path(), Some(1));
-    let serialised = run(&capped);
-
-    // Loose bounds: this separates "at the same time" from "one after another", and is not a
-    // benchmark. Four sleeps of 200 ms is 800 ms serialised against 200 ms overlapped.
-    assert!(
-        overlapping < Duration::from_millis(600),
-        "without a cap the requests should overlap, took {overlapping:?}"
+    // The control first, because without it a pool that serialises *everything* — the original
+    // one-connection-per-backend defect — would satisfy the capped arm.
+    const REQUESTS: usize = 4;
+    let uncapped = run(&server, None);
+    assert_eq!(
+        REQUESTS, uncapped,
+        "without a cap all {REQUESTS} requests must reach the backend at once, but it never saw \
+         more than {uncapped}"
     );
-    assert!(
-        serialised > Duration::from_millis(600),
-        "with a cap of 1 the requests must queue, took {serialised:?} \
-         (uncapped took {overlapping:?})"
+
+    // A fresh server, so the control's peak cannot stand in for this one's.
+    let capped = ConcurrentServer::start(SLEEP);
+    let peak = run(&capped, Some(1));
+    assert_eq!(
+        1, peak,
+        "with a cap of 1 the backend must never see two requests at once, but it saw {peak}"
+    );
+}
+
+/// The two paths share one admission count.
+///
+/// `max_connections` is a statement about how many requests the backend sees at once, so a blocking
+/// and an awaited request must contend for the same budget. Two counters would admit one of each
+/// with a cap of 1, which is two.
+///
+/// **The assertion is what the backend saw, not how long anything took.** With separate counters the
+/// awaited request is admitted at once and opens a second connection, so the fixture — which answers
+/// every connection on its own thread — is serving two at the same instant. That is the difference
+/// between one budget and two, and it is a property rather than a duration. The `spawn_cgi` version
+/// of this test originally measured elapsed time and passed against a deliberately broken pool,
+/// because the second request simply waited for the backend either way.
+#[test]
+fn the_two_paths_share_one_admission_count() {
+    let _serial = serial();
+
+    const SLEEP: Duration = Duration::from_millis(400);
+    let server = ConcurrentServer::start(SLEEP);
+    let dispatcher = Arc::new(dispatcher_with(
+        &server.socket(),
+        std::env::temp_dir().as_path(),
+        Some(1),
+    ));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let before = server.peak();
+    std::thread::scope(|scope| {
+        let blocking = Arc::clone(&dispatcher);
+        scope.spawn(move || {
+            blocking
+                .dispatch(&plain_request())
+                .expect("the blocking request is served")
+        });
+
+        // The blocking request must be *inside* the backend before the awaited one starts, so that
+        // the awaited one is genuinely the waiter — otherwise either could take the permit first and
+        // the test would prove nothing about the second admission.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.live() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            1,
+            server.live(),
+            "the blocking request should be holding the backend before the awaited one starts"
+        );
+        assert_eq!(
+            Some(1),
+            dispatcher.in_flight("fpm"),
+            "the blocking request should be the one inside the cap"
+        );
+
+        let awaited = Arc::clone(&dispatcher);
+        let served = scope.spawn(move || {
+            runtime
+                .block_on(async move { awaited.dispatch_to_async("fpm", &plain_request()).await })
+        });
+
+        // A deferred admission is the only way the shared count can be observed as *shared* rather
+        // than as merely present: with two counters this would return at once and the backend would
+        // see two requests at the same instant.
+        served
+            .join()
+            .expect("the awaited request is served")
+            .expect("the awaited request is answered");
+    });
+
+    assert_eq!(
+        1,
+        server.peak() - before,
+        "a cap of 1 bounds both paths together, so the backend must never see two requests at \
+         once; it saw {}",
+        server.peak() - before
+    );
+}
+
+/// An awaited request over the cap waits **without parking the runtime thread it runs on**.
+///
+/// **This is the defect the `spawn_cgi` change fixed and `external` did not.** `Limit::enter` is a
+/// `Condvar::wait`, and calling it from an `async fn` parks whichever thread polls the future. That
+/// thread is a runtime worker, so the task's own socket future can no longer be polled by it — and
+/// if the permit that task is waiting for is held by another task *on the same runtime*, nothing can
+/// ever make progress. It is a deadlock, not a slowdown, and on a small runtime a handful of queued
+/// requests are enough to reach it.
+///
+/// So the shape of the test is the deadlock's: a **single-threaded** runtime, a cap of 1 and two
+/// awaited requests. The first takes the permit and is inside the backend for `SLEEP`; the second
+/// must wait for it. With `enter_async` the waiting task yields and the first one finishes; with
+/// `enter` the one runtime thread blocks in the condvar and the test never returns.
+///
+/// Bounded rather than joined, because the failure being tested for *is* a hang: a regression has to
+/// report in a few seconds, not park the suite for ever.
+#[test]
+fn an_awaited_request_waits_for_a_permit_without_parking_its_runtime() {
+    let _serial = serial();
+
+    const SLEEP: Duration = Duration::from_millis(300);
+    let server = ConcurrentServer::start(SLEEP);
+    let dispatcher = Arc::new(dispatcher_with(
+        &server.socket(),
+        std::env::temp_dir().as_path(),
+        Some(1),
+    ));
+
+    let (tx, rx) = mpsc::channel();
+    let runner = Arc::clone(&dispatcher);
+    let worker = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (one, two) = (plain_request(), plain_request());
+        let served = runtime.block_on(async move {
+            tokio::join!(
+                runner.dispatch_to_async("fpm", &one),
+                runner.dispatch_to_async("fpm", &two),
+            )
+        });
+        let _ = tx.send(served);
+    });
+
+    let deadline = Duration::from_secs(10);
+    let (first, second) = rx
+        .recv_timeout(deadline)
+        .unwrap_or_else(|_| panic!("the second awaited request never got its place within {deadline:?} — a waiting request must yield, not park the runtime"));
+    worker.join().expect("the runtime thread finished");
+    first.expect("the first request is served");
+    second.expect("the second request is served");
+}
+
+/// Both paths together hold **one** warm connection, not one each.
+///
+/// `MAX_IDLE_CONNECTIONS` is one because every parked connection removes a child from `php-fpm`'s
+/// dispatch set — measured, not assumed: against a 12-child pool, retaining 4 cost 7% of throughput
+/// at concurrency 32 and retaining 12 cost 26%. That cost is per **child**, so it does not halve
+/// when a backend serves two paths: a per-list check would keep one blocking connection and one
+/// awaited one, which is two children gone for a deployment that uses both front-ends — exactly the
+/// configuration volucer documents and the one this test sets up.
+///
+/// Nothing in a request's behaviour shows the difference. Both connections work, every request is
+/// served, and the only visible symptom is a child quietly missing from the far side's pool — which
+/// is why the count has to be asserted directly.
+#[test]
+fn both_paths_share_one_warm_connection() {
+    let _serial = serial();
+
+    const SLEEP: Duration = Duration::from_millis(50);
+    let server = ConcurrentServer::start(SLEEP);
+    let dispatcher = Arc::new(dispatcher_with(
+        &server.socket(),
+        std::env::temp_dir().as_path(),
+        None,
+    ));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    // Blocking first, so its connection is the one parked; then an awaited request, which would
+    // park a second one under a per-mode cap.
+    dispatcher
+        .dispatch_to("fpm", &plain_request())
+        .expect("the blocking request is served");
+    runtime
+        .block_on(dispatcher.dispatch_to_async("fpm", &plain_request()))
+        .expect("the awaited request is served");
+
+    assert_eq!(
+        Some(1),
+        dispatcher.retained("fpm"),
+        "one backend may park one warm connection in total, whatever mixture of paths it serves"
+    );
+
+    // And each path still reuses what is there rather than opening a fresh socket per request, so
+    // the single connection is genuinely shared rather than merely counted.
+    dispatcher
+        .dispatch_to("fpm", &plain_request())
+        .expect("a second blocking request is served");
+    runtime
+        .block_on(dispatcher.dispatch_to_async("fpm", &plain_request()))
+        .expect("a second awaited request is served");
+    assert_eq!(
+        Some(1),
+        dispatcher.retained("fpm"),
+        "reuse must not grow the parked set past the one connection it is allowed"
     );
 }
 
@@ -531,4 +788,158 @@ fn concurrent_requests_reach_the_backend_at_the_same_time() {
         "{REQUESTS} concurrent requests took {done:?}, which is close to the \
          {serial:?} they would take if they were serialised on one connection"
     );
+}
+
+/// A FastCGI server that reads the request and then never answers.
+///
+/// The shape `php-fpm` has after a child wedges: the connection is accepted, the request arrives in
+/// full, and no record ever comes back. Nothing in FastCGI makes that detectable from this side, so
+/// the only thing that can end the request is a deadline — which is the point of the test below.
+struct SilentServer {
+    port: u16,
+    /// Held so the accepted sockets outlive the request: a closed socket would be an EOF, which is a
+    /// transport error rather than the silence this fixture exists to produce.
+    held: Arc<std::sync::Mutex<Vec<Stream>>>,
+}
+
+impl SilentServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+        let port = listener.local_addr().expect("address").port();
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted = Arc::clone(&held);
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                // Read the whole request so the client's write completes — a backend that did not
+                // read would give the client a broken pipe, which is a different failure.
+                let mut stream = Stream::Tcp(stream);
+                for _ in 0..5 {
+                    match read_record(&mut stream) {
+                        Ok(Some(_)) => {}
+                        _ => break,
+                    }
+                }
+                if let Ok(mut held) = accepted.lock() {
+                    held.push(stream);
+                }
+            }
+        });
+
+        SilentServer { port, held }
+    }
+
+    fn socket(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
+/// An awaited request to a server that never answers fails on its deadline, rather than for ever.
+///
+/// **`external` had no deadline at all before this key existed**, on either path, and it is the
+/// backend where that matters most: `worker` and `spawn_cgi` own their processes and can kill one
+/// that stops answering, while an `external` child belongs to `php-fpm`. A request to it that is
+/// accepted and never answered therefore held its connection and its `max_connections` permit for
+/// the life of the process, with the count only ever going up.
+///
+/// The awaited path is the one that needs the *wrapper* rather than a socket option, because
+/// `SO_RCVTIMEO` is cleared when a socket is adopted by a runtime. Both are tested here through the
+/// same public entry point, so a fix that only reached one of them shows up.
+#[test]
+fn a_backend_that_never_answers_fails_on_the_request_deadline() {
+    let _serial = serial();
+
+    const TIMEOUT_MS: u64 = 400;
+    let server = SilentServer::start();
+    // A cap, so the permit count below is observable at all — `in_flight` is `None` for an uncapped
+    // backend, because there is no count to report. It is large enough not to serialise anything.
+    let dispatcher = dispatcher_tuned(
+        &server.socket(),
+        std::env::temp_dir().as_path(),
+        Some(8),
+        Some(TIMEOUT_MS),
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    // Awaited first, because that is the path whose deadline did not exist: the socket has no
+    // receive timeout once a runtime owns it, so only `tokio::time::timeout` can end this.
+    //
+    // **Bounded from the outside too**, because the failure being tested for is a hang: without the
+    // wrapper inside the backend the future never resolves, and a test that simply awaited it would
+    // park the suite instead of reporting. Ten seconds is many times the deadline and still short
+    // enough to be a failure rather than a timeout.
+    let budget = Duration::from_secs(10);
+    let started = Instant::now();
+    let outcome = runtime.block_on(async {
+        tokio::time::timeout(
+            budget,
+            dispatcher.dispatch_to_async("fpm", &plain_request()),
+        )
+        .await
+    });
+    let elapsed = started.elapsed();
+    let err = outcome
+        .unwrap_or_else(|_| {
+            panic!(
+                "the awaited request never returned, so it is bounded by nothing; a backend that \
+                 accepts a request and never answers would hold its connection for ever"
+            )
+        })
+        .expect_err("a server that never answers must not answer");
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the awaited request should fail on its {TIMEOUT_MS} ms deadline, but took {elapsed:?}"
+    );
+    assert!(
+        err.to_string().contains("request_timeout_ms"),
+        "the error should name the key the operator configured: {err}"
+    );
+
+    // Then the blocking path, whose deadline is the socket's own. It must not be *slower* than the
+    // awaited one, which is what a missing `SO_RCVTIMEO` on the reconnect would produce. Bounded on
+    // its own thread for the same reason as above — a socket with no receive timeout blocks its
+    // reader for ever, and that is a hang rather than a failure.
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let blocking = &dispatcher;
+        let tx = tx.clone();
+        scope.spawn(move || {
+            let started = Instant::now();
+            let outcome = blocking
+                .dispatch_to("fpm", &plain_request())
+                .map_err(|err| err.to_string());
+            let _ = tx.send((outcome, started.elapsed()));
+        });
+        let (outcome, elapsed) = rx.recv_timeout(budget).unwrap_or_else(|_| {
+            panic!("the blocking request never returned, so it is bounded by nothing")
+        });
+        let err = outcome.expect_err("a server that never answers must not answer");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the blocking request should fail on its {TIMEOUT_MS} ms deadline, but took {elapsed:?}"
+        );
+        assert!(
+            err.contains("request_timeout_ms"),
+            "the error should name the key the operator configured: {err}"
+        );
+    });
+    drop(tx);
+
+    // Nothing is left in flight behind either failure: a timed-out request that kept its permit
+    // would leak the cap one request at a time, which is the failure mode the deadline exists to
+    // stop.
+    assert_eq!(
+        Some(0),
+        dispatcher.in_flight("fpm"),
+        "a request that timed out must not still be holding a place"
+    );
+
+    drop(server.held.lock().map(|held| held.len()));
 }

@@ -31,12 +31,23 @@ use crate::rpc::RpcGrants;
 /// a blocking-pool thread per in-flight request was measured at 185 threads and 78.9 µs of front-end
 /// CPU per request against the awaited worker path's 46.3.
 ///
-/// `spawn_cgi` is the one that looks like it belongs and does not. It speaks the same FastCGI, but
-/// its exchange is owned by a supervised slot — the permit that bounds it is released by whatever
-/// finishes the request — so making it awaited is a change to the slot lifecycle rather than to a
-/// socket. Until that is done it keeps the blocking path, deliberately.
+/// `spawn_cgi` belongs to the awaited set as well, and it is the one that had to change *how it waits*
+/// rather than *what it speaks*. It is the same FastCGI conversation `external` conducts, but its
+/// exchange is owned by a slot this crate supervises — and the slot used to admit a request with a
+/// `Condvar`, which parks whichever thread asked. On the HTTP front-end that thread is a runtime
+/// thread, so twelve concurrent requests parked all twelve and nothing was left running to release
+/// one. That one count now has a second way to wait on it, and the connections the pool already owned
+/// are driven by a runtime of its own. See
+/// [`CgiPool::drives_connections`](crate::CgiPool::drives_connections) for the one case that keeps it
+/// blocking: a Windows named pipe, which no runtime can register.
 pub fn answers_asynchronously(backend: &Backend) -> bool {
-    matches!(backend, Backend::Worker { .. } | Backend::External { .. })
+    match backend {
+        Backend::Worker { .. } | Backend::External { .. } => true,
+        // Asked of the pool rather than of the kind, because the answer depends on the slot's
+        // *address* as well: a unix socket or a loopback port can be awaited, a named pipe cannot.
+        Backend::SpawnCgi { pool, .. } => pool.drives_connections(),
+        Backend::Upstream { .. } => false,
+    }
 }
 
 /// [`answers_asynchronously`], from a backend's configured *name* — which is the question the tests
@@ -46,8 +57,13 @@ pub fn answers_asynchronously(backend: &Backend) -> bool {
 /// The names are the four `kind` values of `[backends.*]`, and the list is kept here rather than
 /// derived from `BackendConfig` so that adding a kind is a compile error in one place instead of a
 /// silent `false` in the gate.
+///
+/// `spawn_cgi` is here, and it is the one entry a kind cannot fully answer: whether *this* pool can be
+/// awaited depends on its slot address — a unix socket or a loopback port can, a Windows named pipe
+/// cannot. So this says what the kind is capable of, and [`Dispatcher::answers_asynchronously`] asks
+/// the pool, which knows. That is why the two exist as separate functions rather than one.
 pub fn answers_asynchronously_kind(kind: &str) -> bool {
-    matches!(kind, "worker" | "attach" | "external")
+    matches!(kind, "worker" | "attach" | "external" | "spawn_cgi")
 }
 
 /// [`Dispatcher::is_upstream`], from a backend's configured *name*. See
@@ -1319,7 +1335,7 @@ impl Dispatcher {
         backend.request_async(request).await
     }
 
-    /// [`Self::dispatch_to_relayed`], without parking the calling thread while a worker answers.
+    /// [`Dispatcher::dispatch_to_relayed`], without parking the calling thread while a worker answers.
     ///
     /// Same lookup, same errors, same relay policy. See [`Backend::request_relayed_async`].
     pub async fn dispatch_to_relayed_async(
@@ -1471,6 +1487,25 @@ impl Dispatcher {
         }
     }
 
+    /// Requests the named backend is admitting right now, or `None` when it has no such counter.
+    ///
+    /// One line of passthrough to [`Backend::in_flight`], which see for why the number is exposed at
+    /// all: a test proves that a blocking and an awaited request share one `max_connections` budget
+    /// by watching the count reach the cap, and there is no other observable that distinguishes
+    /// "shared" from "one each".
+    pub fn in_flight(&self, backend: &str) -> Option<usize> {
+        self.backends.get(backend).and_then(Backend::in_flight)
+    }
+
+    /// Warm connections the named backend is holding open, or `None` when it holds none.
+    ///
+    /// The other half of the pair above, and for a different property: `MAX_IDLE_CONNECTIONS` is a
+    /// total across both paths, so a deployment serving both front-ends from one backend must park
+    /// one child rather than one per mode. See [`Backend::retained`].
+    pub fn retained(&self, backend: &str) -> Option<usize> {
+        self.backends.get(backend).and_then(Backend::retained)
+    }
+
     /// Stop every backend.
     ///
     /// `&mut self`, and only reachable by the owner: `Drop` is what reaps the
@@ -1619,6 +1654,7 @@ mod tests {
         BackendConfig::External(ExternalConfig {
             socket,
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         })
     }
@@ -1691,10 +1727,14 @@ mod tests {
     /// `is_upstream` is exactly one variant, and `answers_asynchronously` is a different set. A single
     /// predicate returning one answer for both is the defect.
     ///
-    /// `external` joined the awaited set when `volucer_fcgi::AsyncClient` was written. It is not a
-    /// property of the protocol — `spawn_cgi` speaks the same FastCGI and stays blocking, because its
-    /// exchange is owned by a supervised slot rather than by a socket the caller holds — so the
-    /// distinction is stated per kind and asserted per kind.
+    /// `external` joined the awaited set when `volucer_fcgi::AsyncClient` was written, and `spawn_cgi`
+    /// joined it when `CgiPool` stopped waiting for a place on a `Condvar`. Both were the same
+    /// statement: a blocking exchange parks a thread, and on the HTTP front-end that thread is a
+    /// runtime thread.
+    ///
+    /// `spawn_cgi` is asserted at the *kind* level here and at the *pool* level elsewhere, because the
+    /// two are different questions — a kind can be capable of being awaited while one slot address
+    /// cannot be (a Windows named pipe), which is why `Backend::request_async` asks the pool.
     #[test]
     fn the_async_gate_names_only_the_kinds_that_can_take_it() {
         // What `Backend::` can be, as far as either question is concerned.
@@ -1711,15 +1751,16 @@ mod tests {
         );
 
         // `worker` and `external` can be awaited — `attach` is a worker reached differently, so it
-        // answers the same question the same way. `spawn_cgi` deliberately does not: a FastCGI
-        // conversation is not enough, and its slot lifecycle is what blocks.
+        // answers the same question the same way. `spawn_cgi` can too; unlike the other two, whether
+        // *this* pool can depends on its slot address, which is `answers_asynchronously`'s question
+        // rather than this one's.
         assert_eq!(
             KINDS
                 .iter()
                 .filter(|kind| answers_asynchronously_kind(kind))
                 .copied()
                 .collect::<Vec<_>>(),
-            vec!["external", "worker"]
+            vec!["external", "spawn_cgi", "worker"]
         );
         assert!(answers_asynchronously_kind("attach"));
 
@@ -2293,6 +2334,7 @@ url = "redis://127.0.0.1:6379"
                 BackendConfig::External(volucer_core::config::ExternalConfig {
                     socket: socket.to_string(),
                     max_connections: None,
+                    request_timeout_ms: None,
                     services: Vec::new(),
                 }),
             )],

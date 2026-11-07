@@ -313,6 +313,13 @@ limited by the remote pool.
 `max_connections` limits how many connections Volucer keeps open to the pool. If omitted,
 Volucer opens connections as needed.
 
+`request_timeout_ms` (default `30000`) is the deadline for one request. **This backend needs
+it more than the kinds Volucer starts itself, not less.** A `worker` or `spawn_cgi` slot that
+stops answering is eventually killed by the pool that owns it; a `php-fpm` child is not
+Volucer's to kill, so the deadline is the only thing that ends a request the far side
+accepted and never answered — otherwise it holds its connection and its `max_connections`
+place for the life of the server. `0` is refused rather than read as "no limit".
+
 `php-fpm` manages worker recycling itself. Its `pm.max_requests` setting serves the same
 purpose as `max_requests` on other backends.
 

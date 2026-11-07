@@ -1039,6 +1039,7 @@ command = "php worker.php"
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
 | `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
+| `measure_wait` | boolean | `false` | Measure how long each request waited for a slot, and report the mean and p50/p99 at shutdown. Off by default: the figures are read once, at exit, and producing them costs a clock read per request — a syscall at ~245 ns where the clocksource is not TSC. Turn it on when tuning `workers`; the report then says `wait not measured` rather than `0 us`, because those are different facts. |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
 | `transport` | string | platform default | `"pipe"` or `"socket"`. |
 | `socket` | string | absent | Where the socket transport listens. |
@@ -1073,6 +1074,7 @@ instead of starting worker processes.
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
 | `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
+| `measure_wait` | boolean | `false` | The same key and the same default as a `worker` backend's `measure_wait`: report slot waiting at shutdown, or pay nothing per request. |
 
 ### `kind = "external"`
 
@@ -1082,7 +1084,16 @@ Connect to an already-running FastCGI server, such as `php-fpm`.
 |---|---|---|---|
 | `socket` | string | **required** | The FastCGI address, e.g. `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`. |
 | `max_connections` | integer | absent | How many connections to keep open to the pool. |
+| `request_timeout_ms` | integer | `30000` | How long one request may take before Volucer abandons it. `0` is refused. |
 | `services` | array of strings | empty | What this backend's application may reach over `[rpc]`, by namespace or by method. See [Services](08-SERVICES.md#an-application-that-is-not-a-worker). |
+
+`request_timeout_ms` matters more here than on the kinds Volucer starts itself. A `worker`
+or `spawn_cgi` backend that stops answering is eventually killed by the pool that owns it;
+an `external` backend's children belong to `php-fpm`, so Volucer can only abandon the
+request. Without a deadline, one that is accepted and never answered would hold its
+connection, its `max_connections` place and, on the HTTP front-end, a runtime task for the
+life of the server. It bounds a single exchange, not a whole relayed body: for a streamed
+response it means "the backend stopped producing", one read at a time.
 
 There is no `workers` setting for `external`: the pool is managed separately. Configure
 its size where that server is configured, for example with `pm.max_children` or

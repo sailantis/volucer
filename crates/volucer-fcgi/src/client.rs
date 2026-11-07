@@ -67,8 +67,6 @@ pub struct Response {
     pub end: Option<EndRequest>,
     /// Whether the connection may be reused for another request.
     pub keep_conn: bool,
-    /// How long the backend took to answer.
-    pub duration: Duration,
 }
 
 /// A parsed header block, borrowed from the payload it was found in.
@@ -702,11 +700,9 @@ impl<T: Read + Write> Client<T> {
 
     /// Send one request and read its response.
     pub fn request(&mut self, request: &Request) -> Result<Response> {
-        let started = Instant::now();
         self.keep_conn_requested = request.keep_conn;
         self.send(request)?;
-        let mut response = self.receive()?;
-        response.duration = started.elapsed();
+        let response = self.receive()?;
         if !response.keep_conn {
             self.closed_by_backend = true;
         }
@@ -905,7 +901,6 @@ impl<T: Read + Write> Client<T> {
             stderr,
             end,
             keep_conn,
-            duration: started.elapsed(),
         }))
     }
 

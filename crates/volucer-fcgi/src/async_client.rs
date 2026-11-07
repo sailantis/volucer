@@ -39,7 +39,7 @@
 use std::io;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -50,6 +50,22 @@ use crate::message::EndRequest;
 use crate::protocol::{RecordType, HEADER_LEN};
 use crate::record::Header;
 use crate::transport::{Endpoint, Stream};
+
+/// Read buffer for the awaited client: the same size, and for the same reason, as the blocking
+/// client's.
+///
+/// A FastCGI response is not one write. It is a run of small records — a `STDOUT` header, its
+/// body, a terminating empty record, an `END_REQUEST` — and [`read_record`] asks for each piece
+/// separately. An unbuffered stream turns every one of those `read` calls into its own `read(2)`,
+/// so the awaited path paid roughly twice the syscalls of the blocking client for the same bytes
+/// on the same socket. Measured against a C responder on a unix socket, 64 slots at `-c100`:
+/// **12.5 syscalls per request unbuffered against 7.7 buffered**, over rotated rounds.
+///
+/// 8 KiB is [`crate::client::BUF_LEN`]'s figure, kept deliberately: a fill should cost one socket
+/// read rather than a copy of the whole response, and a socket hands over about that much at a
+/// time. The two clients must not diverge on this again, which is why the reasoning is stated in
+/// both places.
+const BUF_LEN: usize = 8 * 1024;
 
 /// A connected backend that a runtime drives.
 #[derive(Debug)]
@@ -255,7 +271,10 @@ fn append_records(out: &mut Vec<u8>, record_type: RecordType, content: &[u8], te
 /// that is [`AsyncStream`], and the read/write helpers below are the only places that know it.
 #[derive(Debug)]
 pub struct AsyncClient {
-    stream: AsyncStream,
+    /// Buffered on the same terms as [`Client`]'s transport, and for the reason [`BUF_LEN`] gives:
+    /// reads go through it, writes reach the socket with `get_mut`, and the socket itself is
+    /// untouched by either.
+    stream: BufReader<AsyncStream>,
     /// The assembled request, reused across requests. See [`Client`] for why it is a field.
     out: Vec<u8>,
     /// The encoded `PARAMS` payload, kept apart so it can be built without borrowing `out`.
@@ -275,7 +294,7 @@ impl AsyncClient {
     /// Wrap an already-connected backend.
     pub fn from_stream(stream: AsyncStream) -> Self {
         AsyncClient {
-            stream,
+            stream: BufReader::with_capacity(BUF_LEN, stream),
             out: Vec::with_capacity(1024),
             params: Vec::with_capacity(512),
             keep_conn_requested: false,
@@ -306,11 +325,9 @@ impl AsyncClient {
     /// difference between the two would be a correctness bug on one of them, so the shape is
     /// intentionally the same.
     pub async fn request(&mut self, request: &Request) -> Result<Response> {
-        let started = std::time::Instant::now();
         self.keep_conn_requested = request.keep_conn;
         self.send(request).await?;
-        let mut response = self.receive().await?;
-        response.duration = started.elapsed();
+        let response = self.receive().await?;
         if !response.keep_conn {
             self.closed_by_backend = true;
         }
@@ -336,8 +353,8 @@ impl AsyncClient {
         append_records(&mut self.out, RecordType::Params, &self.params, true);
         append_records(&mut self.out, RecordType::Stdin, &request.body, true);
 
-        self.stream.write_all(&self.out).await?;
-        self.stream.flush().await?;
+        self.stream.get_mut().write_all(&self.out).await?;
+        self.stream.get_mut().flush().await?;
         Ok(())
     }
 
@@ -472,7 +489,6 @@ impl AsyncClient {
             stderr,
             end,
             keep_conn,
-            duration: started.elapsed(),
         }))
     }
 

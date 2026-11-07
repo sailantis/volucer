@@ -3393,16 +3393,27 @@ fn report_tls(stats: &volucer_http::HttpStats) {
 /// measurement is read from, so the text they land in is worth a test that does not need
 /// a server, a signal or a terminal.
 fn contention_line(contention: &Contention) -> String {
-    format!(
-        "slots: {} worker(s), {} request(s), wait mean {} us, wait p50 {} us, wait p99 {} us, \
-         busiest slot {} at {} us",
-        contention.workers,
-        contention.served,
+    // The wait figures are optional because the pool does not measure them unless configured
+    // to. Saying "not measured" is the honest rendering of that: printing `0 us` would report an
+    // uninstrumented pool as an uncontended one, which is the one reading an operator would draw
+    // the wrong conclusion from.
+    let (Some(mean), Some(p50), Some(p99), Some(busiest), Some(busiest_us)) = (
         contention.mean_us,
         contention.p50_us,
         contention.p99_us,
         contention.busiest,
         contention.busiest_us,
+    ) else {
+        return format!(
+            "slots: {} worker(s), {} request(s), wait not measured \
+             (`measure_wait = true` on the backend to report it)",
+            contention.workers, contention.served,
+        );
+    };
+    format!(
+        "slots: {} worker(s), {} request(s), wait mean {} us, wait p50 {} us, wait p99 {} us, \
+         busiest slot {} at {} us",
+        contention.workers, contention.served, mean, p50, p99, busiest, busiest_us,
     )
 }
 
@@ -4813,6 +4824,21 @@ fn check(
                 match external.max_connections {
                     Some(max) => format!("{max} (requests beyond it wait)"),
                     None => "none (one connection per request in flight)".to_string(),
+                }
+            );
+            // The deadline, and it is worth a line here more than on the pools volucer starts: a
+            // wrong `request_timeout_ms` on this backend is the only thing that ends a request
+            // php-fpm accepted and never answered, and there is no killed process to notice it by.
+            // Resolved through the same method `serve` uses, so `check` cannot print a default that
+            // the running server does not apply.
+            println!(
+                "      request timeout:   {}",
+                match external.request_timeout(name) {
+                    Ok(timeout) => format!("{} ms", timeout.as_millis()),
+                    // Unreachable in practice — `validate` refuses a zero and this runs after it —
+                    // but printed as the refusal rather than as a plausible number, because a
+                    // `check` that guessed would be wrong in the one case somebody reads it.
+                    Err(reason) => format!("<refused: {reason}>"),
                 }
             );
             // What the far side says about itself, when it says anything. This is the only
@@ -6383,11 +6409,11 @@ mod tests {
             backend: "app".to_string(),
             workers: 12,
             served: 40_000,
-            mean_us: 812,
-            p50_us: 1,
-            p99_us: 16_384,
-            busiest: 7,
-            busiest_us: 41_233,
+            mean_us: Some(812),
+            p50_us: Some(1),
+            p99_us: Some(16_384),
+            busiest: Some(7),
+            busiest_us: Some(41_233),
             dropped_metrics: 0,
         };
         let line = contention_line(&reported);
@@ -6399,6 +6425,37 @@ mod tests {
             "slots: 12 worker(s), 40000 request(s), wait mean 812 us, wait p50 1 us, \
              wait p99 16384 us, busiest slot 7 at 41233 us"
         );
+    }
+
+    /// The counterpart, and the one that matters more: a pool that is not measuring must not
+    /// print `0 us`. Zero is the reading that says "this pool was never contended", and it is
+    /// exactly the wrong conclusion to draw from a pool that was never instrumented.
+    #[test]
+    fn an_unmeasured_pool_reports_that_it_did_not_measure() {
+        let reported = Contention {
+            backend: "app".to_string(),
+            workers: 12,
+            served: 40_000,
+            mean_us: None,
+            p50_us: None,
+            p99_us: None,
+            busiest: None,
+            busiest_us: None,
+            dropped_metrics: 0,
+        };
+        let line = contention_line(&reported);
+        let flat: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("wait not measured"),
+            "the line must say it did not measure: {flat}"
+        );
+        assert!(
+            !flat.contains("0 us"),
+            "and must not report a zero wait, which reads as an idle pool: {flat}"
+        );
+        // The counts that *are* always available still have to be there.
+        assert!(flat.contains("12 worker(s)"), "{flat}");
+        assert!(flat.contains("40000 request(s)"), "{flat}");
     }
 
     #[test]

@@ -872,14 +872,38 @@ Two things cap a single process long before the cores do, and both are configura
   for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
   gets most of it; the last few percent needs two or three per core.
 
-If a single process on the largest host available is still short, run more *hosts*. Multiple
-processes on one host is the one arrangement measured to lose throughput.
+If a single process on the largest host available is still short, run more *hosts*. Several
+processes on one host only help in the shape described above — each confined to a few cores — and
+unpinned they are no better than one process, which is the measurement the earlier version of this
+section mistook for a statement about process count.
+
+Whatever the layout, **do not count the same address twice.** `max_connections` is per listener, so
+N processes on N ports give N times the ceiling, and the same is true of the connection registry,
+the counters, the rate limit and the access log — every one of those is per process because volucer
+has nothing shared between processes. Three processes are three independent servers that happen to
+run the same configuration, and everything an operator reads from one of them is a third of the
+truth.
 
 One host-level note, since it is free: check `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`.
 Under a hypervisor it is often `xen`, which is not vDSO-eligible, so every `clock_gettime` is a
 real syscall — about 16 per request on the reference host. Switching to `tsc` (available there
 with `constant_tsc`) removed 2.7 µs of front-end CPU per request, worth +2.8% throughput. This
 is a host setting, not a volucer one, and it is worth checking before buying capacity.
+
+Re-measured on the same host against the current build, `GET /items`, `attach`, 32 workers, c=96,
+alternating the clocksource every round so drift lands on both equally:
+
+| clocksource | throughput | front-end CPU |
+|---|---:|---:|
+| `xen` | 37,385 rps | 60.6 µs/req |
+| `tsc` | **38,309 rps (+2.5%)** | **57.8 µs/req (−4.6%)** |
+
+The syscall cost is the whole of it: `time.monotonic_ns()` is **245 ns** under `xen` and **104 ns**
+under `tsc`, and PHP's `hrtime()` is **191 ns** against **57 ns**. That is why the figure keeps
+reproducing across builds and backends — it is a property of the host, not of the code, and it is
+paid by every PHP process as well as by volucer. Two related costs are *not* worth chasing:
+`opcache.huge_code_pages` measured inside the noise, and the jemalloc allocation that a `perf`
+profile shows at 1.4% of the front-end is cheaper than the code that would remove it.
 
 ## Running as a different user
 

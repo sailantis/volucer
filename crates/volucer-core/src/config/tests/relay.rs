@@ -156,6 +156,7 @@ fn attach_with_relay(relay: Option<&str>) -> AttachConfig {
         workers: 1,
         max_requests: None,
         checksum: Default::default(),
+        measure_wait: false,
         idle_ping_ms: None,
         services: Vec::new(),
         grpc_services: Vec::new(),
@@ -207,5 +208,78 @@ socket = "127.0.0.1:9000"
     assert!(
         message.contains("remove the key"),
         "and points at the spelling of \"no cap\": {message}"
+    );
+}
+
+/// An `external` backend has a request deadline, thirty seconds by default, and refuses a zero.
+///
+/// **The key that was missing**, and the reason it matters more here than on the two pools that had
+/// it: `worker` and `spawn_cgi` own their processes and can kill one that stops answering, while an
+/// `external` child belongs to `php-fpm` and volucer can only abandon the request. Without a default
+/// there is no deadline at all, which is what this asserts against.
+#[test]
+fn an_external_backend_has_a_request_deadline_by_default_and_refuses_a_zero() {
+    let plain = r#"
+[server]
+default_backend = "app"
+http = "127.0.0.1:8080"
+
+[backends.app]
+kind = "external"
+socket = "127.0.0.1:9000"
+"#;
+    let external = |text: &str| {
+        let config = Config::from_toml(text).expect("the fixture parses");
+        config.validate().expect("the fixture validates");
+        config
+            .backends
+            .get("app")
+            .and_then(|backend| match backend {
+                BackendConfig::External(external) => Some(external.clone()),
+                _ => None,
+            })
+            .expect("the backend is external")
+    };
+
+    let default = external(plain);
+    assert_eq!(
+        None, default.request_timeout_ms,
+        "absent must read as absent, so the constant is what applies"
+    );
+    assert_eq!(
+        std::time::Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
+        default.request_timeout("app").expect("a default resolves"),
+        "thirty seconds, the same default the other two kinds have"
+    );
+
+    let stated = external(&plain.replace(
+        r#"socket = "127.0.0.1:9000""#,
+        "socket = \"127.0.0.1:9000\"\nrequest_timeout_ms = 2500",
+    ));
+    assert_eq!(
+        std::time::Duration::from_millis(2500),
+        stated
+            .request_timeout("app")
+            .expect("a stated value resolves")
+    );
+
+    let zero = plain.replace(
+        r#"socket = "127.0.0.1:9000""#,
+        "socket = \"127.0.0.1:9000\"\nrequest_timeout_ms = 0",
+    );
+    let err = Config::from_toml(&zero)
+        .expect("the file parses; the value is what is wrong")
+        .validate()
+        .expect_err("a deadline of zero must not validate");
+    let message = err.to_string();
+    assert!(
+        message.contains("backends.app") && message.contains("request_timeout_ms = 0"),
+        "the message names the key and its value: {message}"
+    );
+    // The noun is the connection, not the slot: this backend has no slot of its own to hold, and a
+    // message that said "slot" would send an operator looking for a `workers` key that does not exist.
+    assert!(
+        message.contains("hold a connection for ever"),
+        "and names what is actually held: {message}"
     );
 }

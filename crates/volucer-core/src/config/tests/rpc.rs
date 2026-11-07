@@ -76,6 +76,7 @@ fn a_backend_that_grants_nothing_is_told_nothing() {
         BackendConfig::External(ExternalConfig {
             socket: "127.0.0.1:9001".to_string(),
             max_connections: None,
+            request_timeout_ms: None,
             services: Vec::new(),
         }),
     );

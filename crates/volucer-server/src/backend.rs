@@ -3,7 +3,9 @@
 //! One enum covers every backend shape from the configuration, so the
 //! dispatcher and both front-ends have exactly one thing to call.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use volucer_core::config::BackendConfig;
 use volucer_fcgi::{Endpoint, Request, Response};
@@ -14,7 +16,7 @@ use crate::pool::CgiPool;
 use crate::upstream_pool::Supervisor;
 use crate::worker_pool::WorkerPool;
 
-/// How many idle connections to an external backend to hold open.
+/// How many idle connections to an external backend to hold open, **in total across both paths**.
 ///
 /// Exactly one, which is not an arbitrary small number. `php-fpm` accepts a
 /// connection *into a child* and then waits for the request on it, and a child
@@ -35,6 +37,15 @@ use crate::worker_pool::WorkerPool;
 /// which is the correct default when the front-end is nginx and the connection is
 /// a unix socket. volucer's front-end is not nginx, and the reconnect is
 /// measurable, so one is kept.
+///
+/// **One in total, not one per mode.** The pool keeps two lists, because a
+/// connection's mode is a property of the file description rather than of the
+/// handle and cannot be changed back. That split is about *which* list a
+/// connection may live in, not about how many may be parked: the cost above is
+/// measured per **child**, and a deployment serving both the blocking and the
+/// awaited path from one backend would park two children if each list kept its
+/// own. Nothing asserts the combined total if the check is per list, so
+/// [`ClientPool::retained`] counts both and [`ClientPool::release`] asks it.
 const MAX_IDLE_CONNECTIONS: usize = 1;
 
 /// Connections to one external backend, checked out per request.
@@ -58,6 +69,15 @@ const MAX_IDLE_CONNECTIONS: usize = 1;
 #[derive(Debug)]
 pub struct ClientPool {
     endpoint: Endpoint,
+    /// How long one request may take before volucer abandons it.
+    ///
+    /// Resolved at construction from `[backends.<n>].request_timeout_ms` — see
+    /// [`ExternalConfig::request_timeout`], which refuses a zero rather than reading it as "no
+    /// limit". **This backend needs it more than the other two, not less**: a `worker` or
+    /// `spawn_cgi` slot that stops answering is eventually killed by the pool that owns it, and an
+    /// `external` child belongs to `php-fpm`, so without a deadline here a hung request holds a
+    /// connection, a permit and (on the awaited path) a runtime task for the life of the process.
+    request_timeout: Duration,
     /// Warm connections, checked out by `acquire` and returned by `release`.
     idle: Mutex<Vec<volucer_fcgi::Client>>,
     /// Warm connections driven by a runtime, checked out by `acquire_async`.
@@ -66,26 +86,69 @@ pub struct ClientPool {
     /// the awaited path needs `O_NONBLOCK` and no `SO_RCVTIMEO`, and neither can be undone for a
     /// socket a blocking read might touch. See [`ClientPool::acquire_async`].
     async_idle: Mutex<Vec<volucer_fcgi::AsyncClient>>,
+    /// Connections parked across **both** lists, so [`MAX_IDLE_CONNECTIONS`] is a total.
+    ///
+    /// An atomic rather than `idle.len() + async_idle.len()` under one lock, because the two lists
+    /// have to stay separate and there is no single lock that could answer the question without
+    /// deadlocking against a release that already holds the other. Updated under the list's own lock
+    /// and read without one, which is enough: the value only decides whether one more connection may
+    /// be kept, and being off by one against a concurrent release is the same answer either way.
+    retained: AtomicUsize,
     /// Requests in flight, when the operator asked for a ceiling.
     ///
-    /// A counter with a condvar rather than an async semaphore, because the request path is
-    /// synchronous: a request over the cap has to *wait*, and waiting is the feature — the
-    /// alternative is another connection, which is what an unbounded client already does.
+    /// One counter for both paths, with a condvar for the blocking one and a `Notify` for the awaited
+    /// one — see [`Limit`] for why a second counter would be a second limit rather than a detail.
     limit: Option<Arc<Limit>>,
 }
 
 impl ClientPool {
-    fn new(endpoint: Endpoint, max_connections: Option<usize>) -> Self {
+    fn new(endpoint: Endpoint, max_connections: Option<usize>, request_timeout: Duration) -> Self {
         ClientPool {
             endpoint,
+            request_timeout,
             idle: Mutex::new(Vec::new()),
             async_idle: Mutex::new(Vec::new()),
+            retained: AtomicUsize::new(0),
             limit: max_connections.map(Limit::new),
         }
     }
 
     fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// How many connections are parked warm right now, across both lists.
+    ///
+    /// The total [`MAX_IDLE_CONNECTIONS`] bounds. Exposed for the same reason [`Self::in_flight`] is
+    /// — a test has to observe the number the constant is about, and "one per mode" and "one in
+    /// total" are indistinguishable from a request's point of view: both serve every request, and
+    /// only the number of children the backend has parked says which one happened.
+    pub fn retained(&self) -> usize {
+        self.retained.load(Ordering::Relaxed)
+    }
+
+    /// Whether another connection may be parked, given the ones already are.
+    ///
+    /// Consulted **after** the list's lock is taken and before a connection is pushed, so two
+    /// releases cannot both decide there is room. See [`MAX_IDLE_CONNECTIONS`] for why the answer is
+    /// a total rather than a count per list.
+    fn may_retain(&self) -> bool {
+        self.retained.load(Ordering::Relaxed) < MAX_IDLE_CONNECTIONS
+    }
+
+    /// The deadline one request has, for a message that names the key rather than the socket.
+    fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// How many requests are inside the `max_connections` cap right now, or `None` when the backend
+    /// is uncapped or the count cannot be read without waiting.
+    ///
+    /// **The permit count, not the number of sockets.** A request waiting for admission is absent
+    /// from it, which is exactly the distinction a "the two paths share one limit" test needs: two
+    /// counters would each reach 1 and never 2.
+    pub fn in_flight(&self) -> Option<usize> {
+        self.limit.as_ref().and_then(|limit| limit.in_flight())
     }
 
     /// Take a connection, reusing a warm one when there is one.
@@ -115,13 +178,17 @@ impl ClientPool {
                 .idle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            idle.pop()
+            let client = idle.pop();
+            if client.is_some() {
+                self.retained.fetch_sub(1, Ordering::Relaxed);
+            }
+            client
         };
         if let Some(client) = pooled {
             return Ok((client, permit));
         }
 
-        volucer_fcgi::Client::connect(&self.endpoint, None)
+        volucer_fcgi::Client::connect(&self.endpoint, Some(self.request_timeout))
             .map(|client| (client, permit))
             .map_err(|source| ServerError::Worker {
                 backend: backend.to_string(),
@@ -142,8 +209,11 @@ impl ClientPool {
             .idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if idle.len() < MAX_IDLE_CONNECTIONS {
+        // Both the room check and the increment happen under this list's lock, so a blocking and an
+        // awaited release cannot both conclude there is room for their own connection.
+        if idle.is_empty() && self.may_retain() {
             idle.push(client);
+            self.retained.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -156,6 +226,12 @@ impl ClientPool {
     /// the list it lives in, instead of something a caller has to remember.
     ///
     /// The retention cap is the same constant, for the same measured reason.
+    ///
+    /// The place in the cap is taken with [`Limit::enter_async`] rather than on the condvar the
+    /// blocking path uses. **Calling `enter` here would park a runtime thread**, which is the exact
+    /// defect the `spawn_cgi` slot permits were given a second wake-up to avoid — and it is worse
+    /// here, because a queued `external` request has no pool of its own to notice and no supervisor
+    /// to kill anything.
     async fn acquire_async(
         &self,
         backend: &str,
@@ -164,7 +240,8 @@ impl ClientPool {
             None => None,
             Some(limit) => Some(
                 limit
-                    .enter()
+                    .enter_async()
+                    .await
                     .map(|permit| BackendPermit { _permit: permit })?,
             ),
         };
@@ -174,13 +251,17 @@ impl ClientPool {
                 .async_idle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            idle.pop()
+            let client = idle.pop();
+            if client.is_some() {
+                self.retained.fetch_sub(1, Ordering::Relaxed);
+            }
+            client
         };
         if let Some(client) = pooled {
             return Ok((client, permit));
         }
 
-        volucer_fcgi::AsyncClient::connect(&self.endpoint, None)
+        volucer_fcgi::AsyncClient::connect(&self.endpoint, Some(self.request_timeout))
             .await
             .map(|client| (client, permit))
             .map_err(|source| ServerError::Worker {
@@ -198,8 +279,11 @@ impl ClientPool {
             .async_idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if idle.len() < MAX_IDLE_CONNECTIONS {
+        // The same total as the blocking half — see [`MAX_IDLE_CONNECTIONS`]. Taking this list's lock
+        // before asking is what keeps a release from each path from both finding room.
+        if idle.is_empty() && self.may_retain() {
             idle.push(client);
+            self.retained.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -217,6 +301,8 @@ impl ClientPool {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         async_idle.clear();
+        // Both emptied together, so the total is the truth rather than the sum of two histories.
+        self.retained.store(0, Ordering::Relaxed);
     }
 }
 
@@ -229,15 +315,28 @@ struct BackendPermit {
     _permit: LimitPermit,
 }
 
-/// A blocking ceiling on how many requests reach one backend at once.
+/// A ceiling on how many requests reach one backend at once.
 ///
-/// A counter and a condvar, not a semaphore: the request path is synchronous, and a request
-/// over the cap has to *block* — which is the point. Failing it instead would turn a
-/// deliberate back-pressure setting into a source of 503s.
+/// A counter with two wake-ups rather than an async semaphore, because **both paths share the one
+/// count and they wait differently**. The blocking path has to *block* — that is its whole nature —
+/// and the awaited path must not: parking a runtime thread is the defect this whole change exists to
+/// remove, and the `spawn_cgi` pool's slot permits have the same two-way shape for the same reason.
+/// One counter, two ways to wait on it, and which one a caller uses is a property of the path it
+/// took — never of the limit.
+///
+/// **One counter rather than one per kind, and that is a correctness requirement.** `max_connections`
+/// is a statement about how many requests the backend sees at once; two counters would make a cap of
+/// 1 admit one request of each kind simultaneously, which is two. It is also what
+/// [`Backend::in_flight`] reads, so a test can prove the two paths contend rather than assert it from
+/// a duration.
 #[derive(Debug)]
 struct Limit {
     state: Mutex<LimitState>,
+    /// Blocking waiters. Signalled on every release, whether or not one is waiting.
     changed: Condvar,
+    /// Awaited waiters. Signalled on every release for the same reason, and a signal nobody is
+    /// waiting for is a lock-free no-op.
+    released_async: tokio::sync::Notify,
 }
 
 #[derive(Debug)]
@@ -251,6 +350,7 @@ impl Limit {
         Arc::new(Limit {
             state: Mutex::new(LimitState { in_flight: 0, max }),
             changed: Condvar::new(),
+            released_async: tokio::sync::Notify::new(),
         })
     }
 
@@ -274,6 +374,52 @@ impl Limit {
             limit: Arc::clone(self),
         })
     }
+
+    /// [`Self::enter`], without parking the calling thread.
+    ///
+    /// **The awaited path used to call `enter`, which is a `Condvar::wait` inside an `async fn`.** A
+    /// runtime worker that blocks in a condvar is not yielding — the task it was running stays on
+    /// that thread and the driver cannot make progress on it — so with the cap reached, every queued
+    /// awaited request parked a runtime thread, on a runtime sized at a handful. That is the same
+    /// defect the `spawn_cgi` pool had, and it is why this method exists at all.
+    ///
+    /// The notification is registered **before** the check, so a release that lands between the two
+    /// cannot be lost: `enable()` arms it and the loop re-tests after every wake. That ordering is
+    /// load-bearing rather than stylistic — a request that missed the wake would wait for a release
+    /// that has already happened, for the life of the process.
+    async fn enter_async(
+        self: &Arc<Self>,
+    ) -> std::result::Result<LimitPermit, volucer_fcgi::FcgiError> {
+        loop {
+            let released = self.released_async.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.in_flight < state.max {
+                    state.in_flight += 1;
+                    return Ok(LimitPermit {
+                        limit: Arc::clone(self),
+                    });
+                }
+            }
+
+            released.await;
+        }
+    }
+
+    /// How many requests are inside the cap right now.
+    ///
+    /// `try_lock`, because the only caller is a test asking whether a permit was taken, and a
+    /// diagnostic that waited for the lock would be waiting for the request it is reporting on.
+    /// `None` means "not knowable from here", which a caller treats as "not yet".
+    fn in_flight(&self) -> Option<usize> {
+        self.state.try_lock().ok().map(|state| state.in_flight)
+    }
 }
 
 /// Releases its place on drop, which is the only way the budget comes back.
@@ -290,7 +436,11 @@ impl Drop for LimitPermit {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.in_flight -= 1;
+        // Both signals for one release, so whichever kind of waiter is queued takes the place and
+        // the other kind's signal finds nobody waiting. Outside the lock, so the woken request does
+        // not immediately contend with the releaser for the value it was just told had changed.
         self.limit.changed.notify_one();
+        self.limit.released_async.notify_one();
     }
 }
 
@@ -307,18 +457,26 @@ pub struct Contention {
     /// Requests this pool served. A request replayed on a second slot counts twice.
     pub served: u64,
     /// Mean time a request waited for a slot, in microseconds.
-    pub mean_us: u64,
+    ///
+    /// **`None` when the pool is not measuring**, which is the default: the figures are
+    /// read once, at shutdown, so a deployment that never looks must not pay two clock
+    /// reads per request to produce them (see `WorkerPool::wait_us`). `None` and `Some(0)`
+    /// are different answers — the first is "nothing was measured", the second is "the
+    /// pool was not contended" — and reporting the first as the second would make a pool
+    /// that was never instrumented look like a pool that was never busy.
+    pub mean_us: Option<u64>,
     /// The wait only one request in a hundred exceeded, and the median, in microseconds.
     ///
     /// The pair is the point: a mean says how much waiting there was, and these say how it
     /// was spread. A pool whose p99 is far above its p50 is queueing unfairly - most
     /// requests are served at once and a few wait for whole requests - which a mean cannot
     /// show and which is exactly the shape of a latency tail.
-    pub p50_us: u64,
-    pub p99_us: u64,
-    /// The slot that took the most wait, and how much.
-    pub busiest: usize,
-    pub busiest_us: u64,
+    /// `None` for the same reason [`Self::mean_us`] is.
+    pub p50_us: Option<u64>,
+    pub p99_us: Option<u64>,
+    /// The slot that took the most wait, and how much. `None` when not measuring.
+    pub busiest: Option<usize>,
+    pub busiest_us: Option<u64>,
     /// Worker-emitted samples this pool refused because its queue was full.
     ///
     /// **The only report of this that a deployment without `[status.metrics]` ever gets.** The counter in the
@@ -460,9 +618,22 @@ impl Backend {
                         reason: format!("{} is not a usable socket: {source}", external.socket),
                     }
                 })?;
+                // Resolved here rather than defaulted at each connect, so a `request_timeout_ms = 0`
+                // is a startup failure naming the key — the same rule `CgiPool::start` follows, and
+                // the only place this backend can report it: it has no supervisor to discover it.
+                let request_timeout = external.request_timeout(name).map_err(|reason| {
+                    ServerError::Misconfigured {
+                        backend: name.to_string(),
+                        reason,
+                    }
+                })?;
                 Ok(Backend::External {
                     name: name.to_string(),
-                    pool: Arc::new(ClientPool::new(endpoint, external.max_connections)),
+                    pool: Arc::new(ClientPool::new(
+                        endpoint,
+                        external.max_connections,
+                        request_timeout,
+                    )),
                 })
             }
             BackendConfig::SpawnCgi(cgi) => Ok(Backend::SpawnCgi {
@@ -621,10 +792,22 @@ impl Backend {
             // and 78.9 us of front-end CPU per request against 46.3 for the awaited worker path.
             // `volucer_fcgi::AsyncClient` is that `async fn`.
             Backend::External { name, pool } => Self::external_async(name, pool, request).await,
-            // `spawn_cgi` keeps the blocking path: its exchange is also a FastCGI conversation, but
-            // the slot that owns the connection is a process this crate supervises, and the permit
-            // is released by the thread that finishes the request. Making that awaited is a change
-            // to the slot lifecycle rather than to a socket, and it is measurable on its own.
+            // **`spawn_cgi` is awaited too, and it took a change to the slot lifecycle rather than to
+            // a socket.** Its permit used to be taken with a `Condvar`, which parks whichever thread
+            // asked — a runtime thread, on this path, twelve of which is the whole runtime. That one
+            // count now has a second way to wait on it (`tokio::sync::Notify`) used when the request
+            // is awaited, and the pool drives the connections it already owned from a runtime of its
+            // own, so the same request is answered without parking anything. See
+            // `CgiPool::request_async` and `CgiPool::drives_connections`.
+            //
+            // The guard is not enough on its own: `request_async` is unix-only, because a Windows slot
+            // address may be a named pipe, which no runtime can drive. On that platform the `other`
+            // arm answers it and `drives_connections` is `false`, so both statements are true and the
+            // blocking path is the one that runs.
+            #[cfg(unix)]
+            Backend::SpawnCgi { pool, .. } if pool.drives_connections() => {
+                pool.request_async(request).await
+            }
             other => other.request(request),
         }
     }
@@ -635,34 +818,55 @@ impl Backend {
     /// reused connection the backend closed, give it back — with the socket driven by the runtime
     /// instead of a parked thread. The retry rule is identical because it is a property of the
     /// backend (php-fpm closes idle connections), not of the transport.
+    ///
+    /// # The deadline is enforced here, by `tokio::time::timeout`
+    ///
+    /// **It has to be, because this path has no socket timeout at all.** The blocking client's
+    /// deadline is its `SO_RCVTIMEO`, set by `Endpoint::connect`; `prepare_for_async` *clears* it,
+    /// since a pending `epoll` operation against a receive timeout is documented to panic. So
+    /// `request_timeout` reaches this function as a connect budget and a number to quote in the
+    /// error, and without the wrapper a backend that accepts the request and never answers would
+    /// hold this future — and the `max_connections` permit — for ever, shrinking the pool one
+    /// request at a time until nothing is admitted. `volucer_fcgi::AsyncClient::connect`'s own doc
+    /// says as much: *"reads are bounded by the caller's own deadline"*, and before this existed
+    /// there was no caller deadline on this backend to bound them with.
+    ///
+    /// Nothing is retried after an expiry: a timed-out request has already been waited for once,
+    /// and spending a second budget on a server that is plainly not answering is what
+    /// [`is_deadline_expired`] exists to prevent.
     async fn external_async(name: &str, pool: &ClientPool, request: &Request) -> Result<Response> {
+        let timeout = pool.request_timeout();
         let (mut client, _permit) = pool.acquire_async(name).await?;
         let reused = client.is_reusable();
 
         for attempt in 0..2 {
-            match client.request(request).await {
-                Ok(response) => {
+            match tokio::time::timeout(timeout, client.request(request)).await {
+                Ok(Ok(response)) => {
                     pool.release_async(client);
                     return Ok(response);
                 }
-                Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+                // **The connection is not returned after an expiry.** It is mid-exchange with a
+                // server that did not answer, so the pool must not find it in `async_idle`: it is
+                // dropped with `client`, which closes the socket and hands the child back.
+                Ok(Err(source))
+                    if reused
+                        && attempt == 0
+                        && is_transport_error(&source)
+                        && !is_deadline_expired(&source) =>
+                {
                     tracing::debug!(
                         backend = %name,
                         "the backend closed a reused connection; reconnecting"
                     );
-                    client = volucer_fcgi::AsyncClient::connect(pool.endpoint(), None)
+                    client = volucer_fcgi::AsyncClient::connect(pool.endpoint(), Some(timeout))
                         .await
                         .map_err(|source| ServerError::Worker {
                             backend: name.to_string(),
                             source,
                         })?;
                 }
-                Err(source) => {
-                    return Err(ServerError::Worker {
-                        backend: name.to_string(),
-                        source,
-                    })
-                }
+                Ok(Err(source)) => return Err(deadline_or_worker(name, timeout, source)),
+                Err(_) => return Err(deadline_expired(name, timeout)),
             }
         }
 
@@ -690,6 +894,17 @@ impl Backend {
             Backend::Worker { pool, .. } => pool.request_relayed_async(request, relay).await,
             Backend::External { name, pool } => {
                 Self::external_relayed_async(name, pool, request, buffer, relay).await
+            }
+            // **A `spawn_cgi` slot is awaited too, when its own address is one a runtime can drive.**
+            // It is a change to the slot lifecycle rather than to a socket — the permit used to be
+            // taken with a `Condvar` that parks whichever thread asked — so one admission count now
+            // has a `Notify` for awaited requests as well; see `CgiPool::request_relayed_async`.
+            //
+            // The `false` arm is a Windows named-pipe slot, which no runtime can register. It keeps
+            // the blocking path, and that is a correctness fallback rather than a performance one.
+            #[cfg(unix)]
+            Backend::SpawnCgi { pool, .. } if pool.drives_connections() => {
+                pool.request_relayed_async(request, buffer, relay).await
             }
             other => other.request_relayed(request, buffer, relay),
         }
@@ -906,6 +1121,7 @@ impl Backend {
 
         let (mut client, _permit) = pool.acquire(name)?;
         let reused = client.is_reusable();
+        let timeout = pool.request_timeout();
 
         for attempt in 0..2 {
             match client.request(request) {
@@ -921,20 +1137,17 @@ impl Backend {
                         backend = %name,
                         "the backend closed a reused connection; reconnecting"
                     );
-                    client =
-                        volucer_fcgi::Client::connect(pool.endpoint(), None).map_err(|source| {
-                            ServerError::Worker {
-                                backend: name.clone(),
-                                source,
-                            }
+                    // **The replacement carries the deadline too.** A reconnect with `None` would
+                    // hand the retry — and every later read on that connection — no `SO_RCVTIMEO`,
+                    // so one stale-socket recovery would quietly exempt the connection from
+                    // `request_timeout_ms` for the rest of its life.
+                    client = volucer_fcgi::Client::connect(pool.endpoint(), Some(timeout))
+                        .map_err(|source| ServerError::Worker {
+                            backend: name.clone(),
+                            source,
                         })?;
                 }
-                Err(source) => {
-                    return Err(ServerError::Worker {
-                        backend: name.clone(),
-                        source,
-                    })
-                }
+                Err(source) => return Err(deadline_or_worker(name, timeout, source)),
             }
         }
 
@@ -960,6 +1173,16 @@ impl Backend {
     /// The permit therefore has to outlive this function, which is why it moves into the reader
     /// thread. Dropping it here would let the pool exceed `max_connections` for as long as a download
     /// takes.
+    ///
+    /// **`on_end` sees the client and deliberately drops it, while its awaited twin returns it, and
+    /// the asymmetry is not an oversight — it is the transport.** `spawn_reader` drains the response
+    /// on the reader thread, so by the time `on_end` runs the client *is* reusable and the awaited
+    /// path hands it to `release_async`. The blocking path could do the same, and does not: the
+    /// reader thread is a `std::thread`, and putting a `Mutex<Vec<Client>>` push on it means the
+    /// blocking pool's lock is taken from a thread that is not a request thread — a lock held across
+    /// the end of a download rather than the start of one. It costs one reconnect for a streamed
+    /// response on this path only, which is the trade `MAX_IDLE_CONNECTIONS` already made for the
+    /// buffered one.
     fn external_relayed(
         name: &str,
         pool: &ClientPool,
@@ -969,6 +1192,7 @@ impl Backend {
     ) -> Result<crate::pool::Delivery> {
         let (mut client, permit) = pool.acquire(name)?;
         let reused = client.is_reusable();
+        let timeout = pool.request_timeout();
 
         // One retry, on the same rule as `request_external`: a reused connection the backend has
         // closed is indistinguishable from a working one until it is written to, and re-establishing
@@ -983,20 +1207,13 @@ impl Backend {
                         backend = %name,
                         "the backend closed a reused connection; reconnecting"
                     );
-                    client =
-                        volucer_fcgi::Client::connect(pool.endpoint(), None).map_err(|source| {
-                            ServerError::Worker {
-                                backend: name.to_string(),
-                                source,
-                            }
+                    client = volucer_fcgi::Client::connect(pool.endpoint(), Some(timeout))
+                        .map_err(|source| ServerError::Worker {
+                            backend: name.to_string(),
+                            source,
                         })?;
                 }
-                Err(source) => {
-                    return Err(ServerError::Worker {
-                        backend: name.to_string(),
-                        source,
-                    })
-                }
+                Err(source) => return Err(deadline_or_worker(name, timeout, source)),
             }
         };
 
@@ -1012,10 +1229,11 @@ impl Backend {
                     client,
                     stream,
                     move |_client, _stream| {
-                        // The connection is *not* returned to the pool: it is only reusable once
-                        // `FCGI_KEEP_CONN` held and the response finished, and `spawn_reader` has
-                        // already drained it by the time this runs. The permit, which is what
-                        // `max_connections` actually bounds, is given back here and only here.
+                        // The client is dropped rather than returned — see this function's own note
+                        // on why the blocking arm and its awaited twin differ. The permit, which is
+                        // what `max_connections` actually bounds, is given back here and only here,
+                        // because a relayed response holds its place for as long as the download
+                        // takes.
                         drop(permit);
                     },
                 )
@@ -1041,6 +1259,14 @@ impl Backend {
     /// `awaits_its_backend` warned about. It showed up as throughput going **down** (44.4k to 39.0k)
     /// while front-end CPU went down too (78.9 to 54.4 us), which is what a serialised runtime looks
     /// like from the outside.
+    ///
+    /// # The deadline is per chunk, not per body
+    ///
+    /// A large response legitimately takes longer than `request_timeout_ms`, so what that number
+    /// means here is "the backend stopped producing", which is exactly one read. Without it a body
+    /// that stalls half way through parks this task — and the permit, and a connection from
+    /// `php-fpm` — for the life of the process, and unlike a `spawn_cgi` slot there is no supervisor
+    /// here to notice.
     async fn external_relayed_async(
         name: &str,
         pool: &Arc<ClientPool>,
@@ -1048,32 +1274,36 @@ impl Backend {
         buffer: usize,
         relay: volucer_fcgi::Relay,
     ) -> Result<crate::pool::Delivery> {
+        let timeout = pool.request_timeout();
         let (mut client, permit) = pool.acquire_async(name).await?;
         let reused = client.is_reusable();
 
         let mut attempt = 0;
         let delivery = loop {
-            match client.request_streaming(request, buffer, relay).await {
-                Ok(delivery) => break delivery,
-                Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+            match tokio::time::timeout(timeout, client.request_streaming(request, buffer, relay))
+                .await
+            {
+                Ok(Ok(delivery)) => break delivery,
+                Ok(Err(source))
+                    if reused
+                        && attempt == 0
+                        && is_transport_error(&source)
+                        && !is_deadline_expired(&source) =>
+                {
                     attempt += 1;
                     tracing::debug!(
                         backend = %name,
                         "the backend closed a reused connection; reconnecting"
                     );
-                    client = volucer_fcgi::AsyncClient::connect(pool.endpoint(), None)
+                    client = volucer_fcgi::AsyncClient::connect(pool.endpoint(), Some(timeout))
                         .await
                         .map_err(|source| ServerError::Worker {
                             backend: name.to_string(),
                             source,
                         })?;
                 }
-                Err(source) => {
-                    return Err(ServerError::Worker {
-                        backend: name.to_string(),
-                        source,
-                    })
-                }
+                Ok(Err(source)) => return Err(deadline_or_worker(name, timeout, source)),
+                Err(_) => return Err(deadline_expired(name, timeout)),
             }
         };
 
@@ -1098,18 +1328,41 @@ impl Backend {
                     let mut stream = stream;
                     let mut failed = false;
                     loop {
-                        match client.next_chunk(&mut stream).await {
-                            Ok(Some(chunk)) => {
+                        // Every chunk is bounded by the same deadline as the head — see this
+                        // function's own note. A per-chunk budget rather than a whole-body one,
+                        // because a large response legitimately takes longer than
+                        // `request_timeout_ms`; what the number means here is "the backend stopped
+                        // producing", which is exactly one read.
+                        match tokio::time::timeout(timeout, client.next_chunk(&mut stream)).await {
+                            Ok(Ok(Some(chunk))) => {
                                 if sender.send(bytes::Bytes::from(chunk)).await.is_err() {
-                                    // The client went away: drain rather than abandon, so the slot's
-                                    // pipe is not left half-read.
-                                    while let Ok(Some(_)) = client.next_chunk(&mut stream).await {}
+                                    // The client went away: drain rather than abandon, so the
+                                    // connection is not left half-read and can go back to the
+                                    // pool. Each read is bounded for the same reason as the loop
+                                    // above — a backend that stalls mid-drain must not park this
+                                    // task for ever either.
+                                    while let Ok(Ok(Some(_))) = tokio::time::timeout(
+                                        timeout,
+                                        client.next_chunk(&mut stream),
+                                    )
+                                    .await
+                                    {}
                                     break;
                                 }
                             }
-                            Ok(None) => break,
-                            Err(err) => {
+                            Ok(Ok(None)) => break,
+                            Ok(Err(err)) => {
                                 tracing::warn!(backend = %backend, %err, "a streamed response failed part way through");
+                                failed = true;
+                                break;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    backend = %backend,
+                                    timeout_ms = timeout.as_millis() as u64,
+                                    "a streamed response stalled past `request_timeout_ms`; \
+                                     abandoning the connection"
+                                );
                                 failed = true;
                                 break;
                             }
@@ -1139,7 +1392,7 @@ impl Backend {
         let Backend::Worker { name, pool } = self else {
             return None;
         };
-        let (busiest, busiest_us) = pool.busiest_slot_wait_us();
+        let busiest = pool.busiest_slot_wait_us();
         Some(Contention {
             backend: name.clone(),
             workers: pool.len(),
@@ -1147,10 +1400,43 @@ impl Backend {
             mean_us: pool.mean_slot_wait_us(),
             p50_us: pool.slot_wait_percentile_us(0.50),
             p99_us: pool.slot_wait_percentile_us(0.99),
-            busiest,
-            busiest_us,
+            busiest: busiest.map(|(slot, _)| slot),
+            busiest_us: busiest.map(|(_, us)| us),
             dropped_metrics: pool.dropped_metrics(),
         })
+    }
+
+    /// Requests this backend is admitting right now, or `None` when it has no counter to report.
+    ///
+    /// **Exists for one test and one property**: that a blocking and an awaited request to the same
+    /// `external` backend contend for *one* `max_connections` budget rather than one each. That
+    /// cannot be asserted from a duration — with two counters the second request simply opens a
+    /// second connection, so the wall time is unchanged and the bug is invisible — and it cannot be
+    /// asserted from the connection count either, because a connection is what the cap is *about*
+    /// rather than what it *is*. The admission count is the thing itself, so it is the thing
+    /// exposed. Reported as the count and not as a bool, so a test can also say the cap is being
+    /// reached rather than merely shared.
+    ///
+    /// `None` for every other kind: a worker pool counts slot contention instead, and a CGI slot
+    /// publishes [`CgiPool::in_flight`](crate::CgiPool::in_flight) per slot.
+    pub fn in_flight(&self) -> Option<usize> {
+        match self {
+            Backend::External { pool, .. } => pool.in_flight(),
+            _ => None,
+        }
+    }
+
+    /// Warm connections this backend is holding open, or `None` when it holds none by design.
+    ///
+    /// See [`ClientPool::retained`] for why the number is exposed: [`MAX_IDLE_CONNECTIONS`] is a
+    /// **total**, and a per-mode check would park one connection on each path — two children of
+    /// somebody else's `php-fpm` for a deployment that serves both front-ends from one backend, which
+    /// is twice the cost the constant was derived to avoid.
+    pub fn retained(&self) -> Option<usize> {
+        match self {
+            Backend::External { pool, .. } => Some(pool.retained()),
+            _ => None,
+        }
     }
 
     /// Stop the backend and everything it started.
@@ -1252,6 +1538,53 @@ pub fn is_transport_error(err: &volucer_fcgi::FcgiError) -> bool {
     }
 }
 
+/// Report a failed exchange the way `request_timeout_ms` would describe it.
+///
+/// **A deadline is named as a deadline.** `os error 10060` and "a connection attempt failed" are what
+/// the OS says when a read times out; the operator configured `request_timeout_ms`, and a message that
+/// does not say so sends them looking for a network problem that does not exist. Shared by every
+/// backend that has the key, because one sentence with three copies in it is three chances to drift.
+pub(crate) fn deadline_or_worker(
+    backend: &str,
+    timeout: Duration,
+    source: volucer_fcgi::FcgiError,
+) -> ServerError {
+    if is_deadline_expired(&source) {
+        return ServerError::Worker {
+            backend: backend.to_string(),
+            source: volucer_fcgi::FcgiError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the backend did not answer within {} ms — that is the deadline \
+                     `request_timeout_ms` sets for this backend, not a network timeout",
+                    timeout.as_millis()
+                ),
+            )),
+        };
+    }
+    ServerError::Worker {
+        backend: backend.to_string(),
+        source,
+    }
+}
+
+/// The error for an awaited exchange that `tokio::time::timeout` cut off.
+///
+/// The same sentence [`deadline_or_worker`] produces for a socket-level timeout, because to an
+/// operator the two are one fact: the backend did not answer inside `request_timeout_ms`. The source
+/// is a `TimedOut` `FcgiError` rather than a `tokio` elapsed error so that every layer above —
+/// [`is_deadline_expired`], the status mapping, the log line — treats it as the deadline it is.
+pub(crate) fn deadline_expired(backend: &str, timeout: Duration) -> ServerError {
+    deadline_or_worker(
+        backend,
+        timeout,
+        volucer_fcgi::FcgiError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the exchange did not complete",
+        )),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,6 +1597,7 @@ mod tests {
             &BackendConfig::External(ExternalConfig {
                 socket: "127.0.0.1:9000".to_string(),
                 max_connections: None,
+                request_timeout_ms: None,
                 services: Vec::new(),
             }),
         )
@@ -1285,6 +1619,7 @@ mod tests {
             &BackendConfig::External(ExternalConfig {
                 socket: socket.to_string(),
                 max_connections: None,
+                request_timeout_ms: None,
                 services: Vec::new(),
             }),
         )
@@ -1313,6 +1648,7 @@ mod tests {
                 grpc_serve_any: false,
                 grpc_proto: Vec::new(),
                 grpc_proto_services: Vec::new(),
+                measure_wait: false,
                 transport: Default::default(),
                 socket: None,
             }),

@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`measure_wait`, opt-in slot-contention reporting.** A `worker` or `attach` backend now collects how long each request waited for a slot only when asked to, and the shutdown summary says `wait not measured` when it did not. See *Changed* below for why the default flipped.
+
+### Changed
+
+- **Slot waiting is no longer measured unless configured to be.** The pool timed every request twice — on acquisition and on completion — to fill counters whose only reader is the exit summary, so a deployment that never looked paid two clock reads per request for nothing. On a host whose clocksource is not TSC (`xen` on a virtual machine, which is the ordinary case) `clock_gettime` is a **syscall at ~245 ns** rather than a vDSO call, which put a real cost on the request path. Set `measure_wait = true` on a `worker` or `attach` backend to get the mean and p50/p99 back; the report distinguishes "not measured" from "measured, and it was zero".
+- **`Response::duration` is gone.** Both the worker pool and the FastCGI clients timed every backend exchange and stored the result in a public field that nothing in this workspace read. The timing went with the field. `ResponseStream::head_duration()` remains.
+
 ## [0.5.0] - 2026-11-04
 
 ### Added

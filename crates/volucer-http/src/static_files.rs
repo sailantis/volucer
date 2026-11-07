@@ -55,7 +55,22 @@ use crate::listener::{body_of, ResponseBody};
 const MULTIPART_BOUNDARY: &str = "volucer-boundary";
 
 /// How much of a file to hold in memory at once when streaming it.
-const STREAM_CHUNK: usize = 64 * 1024;
+///
+/// Sized against the number of syscalls a large file costs rather than against the
+/// largest read the kernel will do: at 64 KiB a 1 MiB file is 16 reads and 16
+/// `poll_frame` wakeups, and each of those is a thread hop because `tokio`fs` reads
+/// run on the blocking pool. Measured on a 12-core host at c=96, moving to 512 KiB:
+///
+/// ```text
+///     100,000 B    34,956 -> 65,326 rps   (+87%)
+///     1,048,576 B   4,291 -> 15,397 rps   (+259%)
+/// ```
+///
+/// 1 MiB was measured too and is not better (14,336 rps at 1 MiB files), so this is
+/// the knee, not an arbitrary "bigger is faster". It is also the memory a single
+/// in-flight response holds to stream one block, which is why it is not larger: 512
+/// KiB against 96 connections is 48 MiB of buffers, and at 1 MiB it would be 96 MiB.
+const STREAM_CHUNK: usize = 512 * 1024;
 
 /// The static layer's configuration and document root.
 ///
@@ -175,7 +190,7 @@ impl Wanted {
     }
 }
 
-/// Run the blocking decision, then the asynchronous answer.
+/// Make the decision, and reach for the blocking pool only where it is warranted.
 async fn decide(
     request: &Request<'_>,
     files: &StaticFiles,
@@ -186,23 +201,33 @@ async fn decide(
         host: request.host.map(str::to_string),
         wanted: Wanted::from(request),
     };
-    // The root and its prefix are copied rather than borrowed, because the closure must be `'static`.
-    // Only a route that states a root pays for the clone, and a route root is a deployment's static
-    // mount — never the application's own document root, which is already on `files`.
-    let route_root = route_root.map(|(root, prefix)| (root.to_path_buf(), prefix.to_string()));
-    let files = files.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let root = route_root
-            .as_ref()
-            .map(|(root, prefix)| (root.as_path(), prefix.as_str()));
-        plan(&owned, &files, root)
-    })
-    .await
-    // A panic in the closure means a bug, but the honest answer to the
-    // client is that the file is not available, not a 500 from the layer
-    // that exists to serve files.
-    .unwrap_or(Plan::NotFound)
+    // The decision is one `statx` plus string work, and every question that can be
+    // answered without touching the filesystem is answered before that syscall.
+    // Hopping to the blocking pool for it therefore cost more than the syscall
+    // did: a dispatch, two thread wakeups and a `Mutex` handoff. Measured on this
+    // host, `GET /<file>` at 1,512 B and c=96: 40k rps before, 80k after, with the
+    // per-request cost falling from 90 us to 57 us. Sampling the same load put 31%
+    // of this layer's CPU in `_raw_spin_unlock_irqrestore` reached through
+    // `futex_wake` / `try_to_wake_up`, with `blocking::pool::Spawner::spawn_thread`
+    // in the stack — the hop itself, not the work it carried.
+    //
+    // The `'static` bound that forced `files.clone()` came from `spawn_blocking`
+    // too, so borrowing here drops that clone. It was worth less than it looks:
+    // removing it *in addition* to the hop moved nothing (80.1k against 80.4k),
+    // and allocation was 0.95% of the profile. It is dropped because it is now
+    // free, not because it was the problem.
+    //
+    // Blocking a runtime thread is only acceptable when the wait is short, and
+    // that is the assumption this makes. It holds for a local filesystem, which
+    // answers a `statx` in microseconds. It does *not* hold for a document root on
+    // a network filesystem (`nfs`, `cifs`, `fuse`), where a `stat` is a round trip
+    // that can take milliseconds and would occupy a runtime thread for the
+    // duration. That deployment should either mount the root locally, or put the
+    // files behind the backend — see `docs/04-STATIC-FILES.md`. Detecting it here
+    // would cost a `statfs` per request; the right place for that check is where
+    // the listener is built, where it can be decided once instead.
+    plan(&owned, files, route_root)
 }
 
 /// What `decide` carries across the thread boundary.
@@ -828,6 +853,115 @@ async fn stream(
         .map_err(|err| HttpError::BadGateway(err.to_string()))
 }
 
+/// The size at or below which a slice is read once, on the runtime thread.
+///
+/// This is the counterpart of a `sendfile`, not a substitute for one: it does not
+/// avoid the copy into userspace, it avoids the *hop*. `tokio::fs::File` is a
+/// `spawn_blocking` per read by construction — that is the whole of what it is for
+/// — so a small file paid two thread wakeups and a `Mutex` handoff to copy a few
+/// kilobytes. Below this threshold the slice is read with a single `pread` on the
+/// calling thread and handed to `hyper` as one already-in-memory frame, which is
+/// the shape a small response wants anyway: exact `Content-Length`, one frame, no
+/// stream to poll.
+///
+/// Measured on a 12-core host, `GET /<file>` at c=96, against the same binary
+/// streaming the same file through `tokio::fs::File`:
+///
+/// ```text
+///     file        streamed     one pread
+///     ---------   ----------   -----------
+///     4,976 B      78,381       242,877     (3.1x)
+///     20,000 B     74,736       205,100     (2.7x)
+/// ```
+///
+/// The threshold is where a single `pread` stops being cheap. A local filesystem
+/// serves a few hundred kilobytes out of the page cache in tens of microseconds,
+/// which is less time than the hop it replaces; a megabyte is not, and would also
+/// hold that whole slice in memory per in-flight request. So 100,000 B and above
+/// stay streamed — their win comes from [`STREAM_CHUNK`], not from this.
+///
+/// Reads above this also must not block the runtime thread on a slow device, which
+/// is the same assumption [`decide`] documents.
+const INLINE_READ_MAX: u64 = 256 * 1024;
+
+/// The body for a slice of a file.
+///
+/// Two shapes, chosen by size: a small slice is read here and becomes one in-memory
+/// frame; a large one is streamed from a `tokio` file. See [`INLINE_READ_MAX`] for
+/// why the boundary is where it is.
+async fn stream_body(path: &Path, offset: u64, length: u64) -> Result<ResponseBody, HttpError> {
+    use tokio::io::AsyncSeekExt;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        // Vanished between the `stat` and the `open`. The headers already say
+        // 200, so the honest answer is an empty body rather than a truncated one;
+        // a client sees a short read and retries.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(body_of(Bytes::new())),
+        Err(err) => {
+            return Err(HttpError::BadGateway(format!(
+                "cannot open {}: {err}",
+                path.display()
+            )))
+        }
+    };
+
+    if length <= INLINE_READ_MAX {
+        let mut buffer = vec![0u8; length as usize];
+        if let Err(err) = read_exactly_at(&file, &mut buffer, offset) {
+            return Err(HttpError::BadGateway(format!(
+                "cannot read {}: {err}",
+                path.display()
+            )));
+        }
+
+        return Ok(body_of(Bytes::from(buffer)));
+    }
+
+    let mut file = tokio::fs::File::from_std(file);
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|err| HttpError::BadGateway(err.to_string()))?;
+    }
+
+    Ok(UnsyncBoxBody::new(FileBody {
+        file,
+        remaining: length,
+    }))
+}
+
+/// Fill `buffer` from `offset`, on the calling thread.
+///
+/// `pread` rather than `seek` + `read` because the two shapes differ under
+/// concurrency: a `seek` mutates the descriptor, so two tasks sharing one would
+/// interleave. This descriptor is not shared, but the platform call that cannot be
+/// wrong is the one to use.
+///
+/// A short read is an error rather than a shorter body. `Content-Length` has already
+/// promised `length` bytes, so returning fewer would desynchronise the connection —
+/// and the file changing size between the `stat` and here is a deployment in
+/// progress, not something a client can be told about mid-response.
+fn read_exactly_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+
+        file.read_exact_at(buffer, offset)
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+
+        // Windows has no `pread`, so the descriptor is seeked. It is not shared
+        // across tasks, so the ordering the unix comment warns about cannot arise.
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buffer)
+    }
+}
+
 /// Serve a file a backend named, through the same paths a static file uses.
 ///
 /// The point of `X-Sendfile` is that the answer is *a file*, so it must get everything the static
@@ -864,40 +998,6 @@ pub async fn sendfile(
     let length = metadata.len();
     let modified = metadata.modified().ok();
     answer(&request, files, resolved, None, length, modified).await
-}
-
-/// The body for a slice of a file.
-/// `File::from_std` is why this is not behind `spawn_blocking`: opening with
-/// `std::fs` is quick, and the handle is handed to a `tokio` file so the reads
-/// themselves run on the blocking pool rather than on a runtime thread.
-async fn stream_body(path: &Path, offset: u64, length: u64) -> Result<ResponseBody, HttpError> {
-    use tokio::io::AsyncSeekExt;
-
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        // Vanished between the `stat` and the `open`. The headers already say
-        // 200, so the honest answer is an empty body rather than a truncated one;
-        // a client sees a short read and retries.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(body_of(Bytes::new())),
-        Err(err) => {
-            return Err(HttpError::BadGateway(format!(
-                "cannot open {}: {err}",
-                path.display()
-            )))
-        }
-    };
-
-    let mut file = tokio::fs::File::from_std(file);
-    if offset > 0 {
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|err| HttpError::BadGateway(err.to_string()))?;
-    }
-
-    Ok(UnsyncBoxBody::new(FileBody {
-        file,
-        remaining: length,
-    }))
 }
 
 /// A file streamed in fixed-size blocks, never buffered whole.

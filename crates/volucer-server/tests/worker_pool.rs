@@ -95,6 +95,7 @@ fn config(workers: u32) -> WorkerConfig {
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
@@ -1082,6 +1083,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
@@ -1201,6 +1203,7 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
@@ -1391,9 +1394,17 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
+    };
+    // Opted in: this test is *about* the measurement, and the pool does not collect it unless
+    // asked — precisely so that no other test, and no deployment, pays a clock read per request
+    // for a figure that is read once at shutdown.
+    let config = WorkerConfig {
+        measure_wait: true,
+        ..config
     };
     let mut pool = WorkerPool::start("test", &config).expect("pool starts");
     // The default bound is the production one, and this test is about the measurement rather
@@ -1414,8 +1425,8 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     assert_eq!(pool.requests_served(), 1);
     let idle = pool.mean_slot_wait_us();
     assert!(
-        idle < 1_000,
-        "one request against two idle workers waits for nothing but the scan: {idle} us"
+        idle.is_some_and(|us| us < 1_000),
+        "one request against two idle workers waits for nothing but the scan: {idle:?} us"
     );
 
     // Contended: eight requests for two workers. The gate is closed first, then the two
@@ -1474,8 +1485,12 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     assert!(answers.iter().all(|status| *status == 200));
 
     assert_eq!(pool.requests_served(), 1 + requests as u64);
-    let (busiest, busiest_us) = pool.busiest_slot_wait_us();
-    let mean = pool.mean_slot_wait_us();
+    let (busiest, busiest_us) = pool
+        .busiest_slot_wait_us()
+        .expect("the pool is measuring, so it has a busiest slot");
+    let mean = pool
+        .mean_slot_wait_us()
+        .expect("the pool is measuring, so it has a mean");
     let mean_floor_us = hold_us / 2 / 5;
     // The wall clock comes first because it says whether there was anything to queue for.
     // Eight requests of `hold_us` on two workers is four batches, so anything near eight
@@ -1504,8 +1519,12 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     // tail and the tail above the median, or the two figures are not measuring a spread.
     // A mean alone cannot tell contention that is spread evenly from contention that
     // starves a few, and the second kind is the one that makes a latency tail.
-    let p50 = pool.slot_wait_percentile_us(0.50);
-    let p99 = pool.slot_wait_percentile_us(0.99);
+    let p50 = pool
+        .slot_wait_percentile_us(0.50)
+        .expect("the pool is measuring, so it has a median");
+    let p99 = pool
+        .slot_wait_percentile_us(0.99)
+        .expect("the pool is measuring, so it has a p99");
     assert!(
         p50 <= p99,
         "the median wait cannot exceed the tail: p50 {p50} us, p99 {p99} us"
@@ -1563,6 +1582,7 @@ fn slow_pool(tag: &str, workers: u32, micros: u64, max_wait: Option<Duration>) -
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
@@ -3146,6 +3166,7 @@ $worker->run(static function (Request $request, Worker $worker): Response {{
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
@@ -3481,6 +3502,7 @@ fn booting_pool(tag: &str, workers: u32, marker_dir: &Path, micros: u64) -> Work
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
         transport: Default::default(),
         socket: None,
@@ -3664,6 +3686,7 @@ fn an_attached_pool_reports_that_it_cannot_be_swept() {
         grpc_services: Vec::new(),
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
+        measure_wait: false,
         grpc_proto_services: Vec::new(),
     };
     let pool = match WorkerPool::start_attached("attached", &config, None) {

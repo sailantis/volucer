@@ -200,6 +200,26 @@ pub struct WorkerConfig {
     /// simply keeps checksumming — see [`ChecksumMode`].
     #[serde(default)]
     pub checksum: ChecksumMode,
+
+    /// Measure how long each request waited for a slot, and report it at shutdown.
+    ///
+    /// **Off by default, because the figures were always produced and almost never read.** The
+    /// pool charged every request two clock reads — one on acquisition, one on completion — to
+    /// fill counters whose only consumer is the exit summary. That is not a cheap pair on every
+    /// host: where the clocksource is not TSC (`xen` on a virtualised host, which is the common
+    /// case) `clock_gettime` is a **syscall at ~245 ns**, so the pair was a syscall and a
+    /// conditional subtraction on the hot path of every request for a number nobody looked at.
+    ///
+    /// Turning it on is the right thing for a deployment tuning `workers`, where the mean and
+    /// the p50/p99 spread are exactly the evidence that says whether a slow tail is the pool's
+    /// queueing or something else. Turning it on *costs* that measurement, which is why it is a
+    /// decision and not a default.
+    ///
+    /// When off, the shutdown report says nothing rather than reporting zero: "not measured" and
+    /// "measured, and it was zero" are different facts, and the second one is the interesting
+    /// answer.
+    #[serde(default)]
+    pub measure_wait: bool,
     // `services` is declared above, before the transport docs, because it is the key an
     // operator reads first: it is the one that decides what the application may ask for.
     /// How the server and a worker are connected.
