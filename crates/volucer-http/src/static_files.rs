@@ -175,7 +175,7 @@ impl Wanted {
     }
 }
 
-/// Run the blocking decision, then the asynchronous answer.
+/// Make the decision, and reach for the blocking pool only where it is warranted.
 async fn decide(
     request: &Request<'_>,
     files: &StaticFiles,
@@ -186,23 +186,33 @@ async fn decide(
         host: request.host.map(str::to_string),
         wanted: Wanted::from(request),
     };
-    // The root and its prefix are copied rather than borrowed, because the closure must be `'static`.
-    // Only a route that states a root pays for the clone, and a route root is a deployment's static
-    // mount — never the application's own document root, which is already on `files`.
-    let route_root = route_root.map(|(root, prefix)| (root.to_path_buf(), prefix.to_string()));
-    let files = files.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let root = route_root
-            .as_ref()
-            .map(|(root, prefix)| (root.as_path(), prefix.as_str()));
-        plan(&owned, &files, root)
-    })
-    .await
-    // A panic in the closure means a bug, but the honest answer to the
-    // client is that the file is not available, not a 500 from the layer
-    // that exists to serve files.
-    .unwrap_or(Plan::NotFound)
+    // The decision is one `statx` plus string work, and every question that can be
+    // answered without touching the filesystem is answered before that syscall.
+    // Hopping to the blocking pool for it therefore cost more than the syscall
+    // did: a dispatch, two thread wakeups and a `Mutex` handoff. Measured on this
+    // host, `GET /<file>` at 1,512 B and c=96: 40k rps before, 80k after, with the
+    // per-request cost falling from 90 us to 57 us. Sampling the same load put 31%
+    // of this layer's CPU in `_raw_spin_unlock_irqrestore` reached through
+    // `futex_wake` / `try_to_wake_up`, with `blocking::pool::Spawner::spawn_thread`
+    // in the stack — the hop itself, not the work it carried.
+    //
+    // The `'static` bound that forced `files.clone()` came from `spawn_blocking`
+    // too, so borrowing here drops that clone. It was worth less than it looks:
+    // removing it *in addition* to the hop moved nothing (80.1k against 80.4k),
+    // and allocation was 0.95% of the profile. It is dropped because it is now
+    // free, not because it was the problem.
+    //
+    // Blocking a runtime thread is only acceptable when the wait is short, and
+    // that is the assumption this makes. It holds for a local filesystem, which
+    // answers a `statx` in microseconds. It does *not* hold for a document root on
+    // a network filesystem (`nfs`, `cifs`, `fuse`), where a `stat` is a round trip
+    // that can take milliseconds and would occupy a runtime thread for the
+    // duration. That deployment should either mount the root locally, or put the
+    // files behind the backend — see `docs/04-STATIC-FILES.md`. Detecting it here
+    // would cost a `statfs` per request; the right place for that check is where
+    // the listener is built, where it can be decided once instead.
+    plan(&owned, files, route_root)
 }
 
 /// What `decide` carries across the thread boundary.
