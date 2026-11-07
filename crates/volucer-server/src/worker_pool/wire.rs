@@ -279,9 +279,49 @@ where
     ) -> Result<()> {
         let mut header = Header::with_checksum(message_type, request_id, payload, self.checksum)?;
         header.flags |= extra_flags;
-        self.writer.write_all(&header.encode()).await?;
-        self.writer.write_all(payload).await?;
+        self.write_frame(&header.encode(), payload).await?;
         self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Write a header and its payload as **one** vectored send.
+    ///
+    /// The obvious spelling is two `write_all` calls, and it was: header, then payload. Under a
+    /// `BufWriter` whose buffer is larger than both that reaches the socket as two `sendto` calls,
+    /// because `tokio`'s `BufWriter` forwards a write larger than the space left rather than
+    /// splitting it to fill the buffer. Measured on the `attach` relay at 32 workers, the second
+    /// call cost a second syscall *and* a second wakeup of the blocked PHP reader:
+    ///
+    /// ```text
+    /// 9.06%  UnixStream::poll_write -> sendto -> unix_stream_sendmsg -> sock_def_readable
+    /// ```
+    ///
+    /// A half-duplex relay has no reason to hand the peer a partial message, so the two slices
+    /// are written as one `IoSlice` pair. The buffer is bypassed rather than filled first: filling
+    /// it would still need the flush below to reach the socket, which is the syscall this removes.
+    async fn write_frame(&mut self, header: &[u8], payload: &[u8]) -> Result<()> {
+        if payload.is_empty() {
+            return self.writer.write_all(header).await.map_err(Into::into);
+        }
+
+        let slices = [io::IoSlice::new(header), io::IoSlice::new(payload)];
+        let total = header.len() + payload.len();
+        let written = self.writer.write_vectored(&slices).await?;
+
+        // A short write means the socket's send buffer filled. Finish the remainder from whichever
+        // slice it landed in. Dropping it would desynchronise the frame stream rather than fail, so
+        // this is not an optimisation but the correctness half of using `write_vectored`.
+        if written < total {
+            if written < header.len() {
+                self.writer.write_all(&header[written..]).await?;
+                self.writer.write_all(payload).await?;
+            } else {
+                self.writer
+                    .write_all(&payload[written - header.len()..])
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 
