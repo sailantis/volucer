@@ -184,6 +184,14 @@ pub struct AttachConfig {
     #[serde(default)]
     pub checksum: ChecksumMode,
 
+    /// Measure how long each request waited for a slot, and report it at shutdown.
+    ///
+    /// The same key with the same meaning and the same default as [`WorkerConfig::measure_wait`]:
+    /// off, because the counters it fills are read once at shutdown, and paying a clock read per
+    /// request for a figure nobody looks at is a cost with no consumer.
+    #[serde(default)]
+    pub measure_wait: bool,
+
     /// How often to ping an idle connection, in milliseconds. **`0` means never, and never is the
     /// default.**
     ///

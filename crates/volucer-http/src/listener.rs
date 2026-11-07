@@ -2311,7 +2311,6 @@ async fn handle(
     } else {
         front_end.observe.anonymous_context()
     };
-    let started = Instant::now();
     // The request parts are needed for the record afterwards, so they are taken now rather than
     // inside `prepare`: consuming the request there would leave nothing to log.
     //
@@ -2449,6 +2448,11 @@ async fn handle(
     // with `[telemetry]` and no `[server.access_log]` — the ordinary way to try tracing first — must
     // still export spans. The access log keeps its own guard below.
     if front_end.observe.is_active() {
+        // Taken here rather than on entry: the only reader is the access log below, so a deployment
+        // without one was paying a clock read per request for a duration nothing consumed. On this
+        // host that read is not free — the clocksource is `xen`, so `clock_gettime` lands in the
+        // kernel at ~245 ns instead of the vDSO.
+        let started = Instant::now();
         // The body's exact length when the body knows it, and `0` when it does not. A `Full<Bytes>`
         // answer from a backend knows it; a streamed static file or an origin's `Incoming` does not,
         // and the count only exists after the write. Wrapping every response body in a counter to

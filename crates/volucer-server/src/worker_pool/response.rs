@@ -3,7 +3,6 @@
 //! phrase table. **Pure**, and deliberately the only place the translation happens,
 //! so both front-ends stay identical.
 
-use std::time::Duration;
 use volucer_fcgi::protocol::ProtocolStatus;
 use volucer_fcgi::{EndRequest, Response};
 use volucer_worker::codec::WorkerResponse;
@@ -36,7 +35,12 @@ pub(crate) fn render_head(head: &volucer_worker::ResponseHead) -> Vec<u8> {
 /// of headers, while a front-end relays a `Status:`-prefixed block. Translating
 /// once, at the backend, is what keeps both front-ends identical for every
 /// backend kind.
-pub(crate) fn render(response: WorkerResponse, duration: Duration) -> Response {
+///
+/// No duration argument, and that is a fix rather than a simplification: the pool used to
+/// time every request and store the result in `Response::duration`, which nothing in this
+/// workspace ever read. It was a clock read on the request path — a syscall at ~245 ns where
+/// the clocksource is `xen` — for a field with no consumer.
+pub(crate) fn render(response: WorkerResponse) -> Response {
     let mut stdout = render_head(&response.head);
     stdout.extend_from_slice(&response.body);
 
@@ -55,7 +59,6 @@ pub(crate) fn render(response: WorkerResponse, duration: Duration) -> Response {
         // ready for the next request. Nothing reads this to decide whether the
         // *client* connection survives — that is the client's own keep-alive.
         keep_conn: true,
-        duration,
     }
 }
 
@@ -153,7 +156,7 @@ mod tests {
             metrics: Vec::new(),
         };
 
-        let rendered = render(response, Duration::from_millis(3));
+        let rendered = render(response);
         assert_eq!(
         rendered.stdout,
         b"Status: 404 Not Found\r\nContent-Type: text/plain\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nnot found"
@@ -171,16 +174,14 @@ mod tests {
 
     #[test]
     fn a_worker_with_no_telemetry_produces_no_stderr() {
-        assert!(render(WorkerResponse::default(), Duration::ZERO)
-            .stderr
-            .is_empty());
+        assert!(render(WorkerResponse::default()).stderr.is_empty());
     }
 
     #[test]
     fn a_negative_application_status_is_clamped_rather_than_wrapped() {
         let mut response = WorkerResponse::default();
         response.end.app_status = -1;
-        assert_eq!(render(response, Duration::ZERO).app_status(), Some(0));
+        assert_eq!(render(response).app_status(), Some(0));
     }
 
     #[test]
@@ -190,8 +191,6 @@ mod tests {
         assert_eq!(reason_phrase(599), "");
         let mut response = WorkerResponse::default();
         response.head.status = 599;
-        assert!(render(response, Duration::ZERO)
-            .stdout
-            .starts_with(b"Status: 599 \r\n"));
+        assert!(render(response).stdout.starts_with(b"Status: 599 \r\n"));
     }
 }

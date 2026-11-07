@@ -1930,6 +1930,7 @@ fn a_workers_streamed_response_is_re_framed_as_separate_records() {
         grpc_serve_any: false,
         grpc_proto: Vec::new(),
         grpc_proto_services: Vec::new(),
+        measure_wait: false,
         transport: Default::default(),
         socket: None,
     };

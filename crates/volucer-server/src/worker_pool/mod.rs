@@ -108,16 +108,15 @@ mod response;
 /// `volucer-worker`; see the module's own docs.
 mod wire;
 
-/// Render a worker's response into the crate's `Response`, with the duration it took.
+/// Render a worker's response into the crate's `Response`.
 ///
 /// Re-exported beside `render_head` for the async streamed path, which reaches a complete response
 /// after the relay policy has already been consulted and must answer with the same bytes the
 /// synchronous path would have produced.
 pub(crate) fn render_worker(
     response: volucer_worker::codec::WorkerResponse,
-    duration: std::time::Duration,
 ) -> volucer_fcgi::Response {
-    response::render(response, duration)
+    response::render(response)
 }
 mod spec;
 
@@ -554,6 +553,15 @@ pub struct WorkerPool {
     /// `Relaxed` throughout: these are counters for a human to read, nothing in the
     /// program branches on them, and ordering them would put a fence on the request
     /// path to make a diagnostic look tidier.
+    ///
+    /// **Empty unless something reads them.** They are consumed at shutdown and nowhere
+    /// else — [`crate::backend::Backend::worker_contention`] has one caller, the exit
+    /// summary — so a deployment that never looks was paying two `Instant::now()` calls
+    /// per request for figures it would not read. That is not a small read on every host:
+    /// where the clocksource is not TSC (`xen` here) `clock_gettime` is a syscall at
+    /// ~245 ns, and the pair sat on the hot path of every request. Empty is the honest
+    /// representation of "nobody is counting", and it makes the getters below report
+    /// nothing rather than report zero as if they had measured.
     wait_us: Vec<AtomicU64>,
     /// Every slot wait, counted into powers of two, so a percentile can be read without
     /// keeping a sample per request.
@@ -567,7 +575,17 @@ pub struct WorkerPool {
     /// enough that `Backend::Worker` would dominate its own enum - a lint, and a real one:
     /// the enum is moved around on the startup path, not per request. One allocation, once
     /// per pool, in exchange for not paying for the counters on every move.
+    ///
+    /// Empty for the same reason [`Self::wait_us`] is; the two are always the same
+    /// emptiness, and [`Self::record_wait_us`] is the only thing that reads both.
     wait_buckets: Box<[AtomicU64]>,
+    /// Whether a slot wait should be measured at all.
+    ///
+    /// One relaxed load on a `bool` is what replaces two clock reads, so it is worth
+    /// having even though it duplicates "the vectors are not empty": the vectors are
+    /// `Vec`s, and asking them costs a length load through a pointer on a path that is
+    /// otherwise two syscalls cheaper than it was.
+    measure_wait: bool,
     /// Requests served, so a total can be read as a mean. Counts *attempts*, so a
     /// request the pool replayed on a second slot counts twice.
     served: AtomicU64,
@@ -991,6 +1009,10 @@ impl WorkerPool {
         let keepalive_parker =
             (spec.keepalive.is_some() && starts_keepalive).then(KeepaliveParker::new);
 
+        // Read before `spec` is moved into the pool below: it decides whether the two counters are
+        // allocated at all, and whether any request path reads a clock for them.
+        let measure_wait = spec.measure_wait;
+
         let pool = WorkerPool {
             name: name.to_string(),
             spec,
@@ -1005,8 +1027,17 @@ impl WorkerPool {
             slot_freed: tokio::sync::Notify::new(),
             max_wait: MAX_SLOT_WAIT,
             slots,
-            wait_us: (0..count as usize).map(|_| AtomicU64::new(0)).collect(),
-            wait_buckets: (0..WAIT_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            wait_us: if measure_wait {
+                (0..count as usize).map(|_| AtomicU64::new(0)).collect()
+            } else {
+                Vec::new()
+            },
+            wait_buckets: if measure_wait {
+                (0..WAIT_BUCKETS).map(|_| AtomicU64::new(0)).collect()
+            } else {
+                Box::new([])
+            },
+            measure_wait,
             served: AtomicU64::new(0),
             memory_limit_bytes: memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
             max_requests,
@@ -1097,14 +1128,21 @@ impl WorkerPool {
     /// of a lock taken and released to ask a question — microseconds, against the
     /// milliseconds a real queue is made of. A figure of a few microseconds on an idle
     /// pool is that cost, not contention.
-    pub fn mean_slot_wait_us(&self) -> u64 {
+    pub fn mean_slot_wait_us(&self) -> Option<u64> {
+        // Empty means nothing was measured, which `total / served` would otherwise report as
+        // `0` and read as an idle pool rather than an uninstrumented one.
+        if self.wait_us.is_empty() {
+            return None;
+        }
         let total: u64 = self
             .wait_us
             .iter()
             .map(|us| us.load(Ordering::Relaxed))
             .sum();
         let served = self.served.load(Ordering::Relaxed);
-        total.checked_div(served).unwrap_or(0)
+        // A pool that served nothing has no mean to report; that is still "measured", but there
+        // is no quotient, and inventing one would be a number nobody asked for.
+        (served != 0).then(|| total / served)
     }
 
     /// The largest wait that at most `fraction` of requests exceeded, in microseconds.
@@ -1113,10 +1151,13 @@ impl WorkerPool {
     /// the client's figure, measured inside the pool so the two can be compared without a
     /// load generator in between. A histogram edge rather than an exact sample, so the
     /// answer is never smaller than the truth; see [`bucket_upper_edge`].
-    pub fn slot_wait_percentile_us(&self, fraction: f64) -> u64 {
+    pub fn slot_wait_percentile_us(&self, fraction: f64) -> Option<u64> {
+        if !self.measure_wait {
+            return None;
+        }
         let served = self.served.load(Ordering::Relaxed);
         if served == 0 {
-            return 0;
+            return None;
         }
         let counts: Vec<u64> = self
             .wait_buckets
@@ -1127,10 +1168,10 @@ impl WorkerPool {
         for (index, count) in counts.iter().enumerate() {
             cumulative += count;
             if cumulative as f64 >= fraction * served as f64 {
-                return bucket_upper_edge(index);
+                return Some(bucket_upper_edge(index));
             }
         }
-        bucket_upper_edge(WAIT_BUCKETS - 1)
+        Some(bucket_upper_edge(WAIT_BUCKETS - 1))
     }
 
     /// Requests this pool attempted, which is the denominator of the means above.
@@ -1142,13 +1183,35 @@ impl WorkerPool {
     ///
     /// The counterpart of [`WorkerPool::mean_slot_wait_us`]: a mean hides the shape
     /// this exists to detect, where one slot takes the queueing and the rest are idle.
-    pub fn busiest_slot_wait_us(&self) -> (usize, u64) {
+    pub fn busiest_slot_wait_us(&self) -> Option<(usize, u64)> {
+        if !self.measure_wait {
+            return None;
+        }
         self.wait_us
             .iter()
             .enumerate()
             .map(|(index, us)| (index, us.load(Ordering::Relaxed)))
             .max_by_key(|(_, us)| *us)
-            .unwrap_or((0, 0))
+    }
+
+    /// Charge one request's wait for a slot to the counters the shutdown report reads.
+    ///
+    /// `queued_at` is the acquisition's `Instant`, or `None` when this pool is not measuring. The
+    /// `Option` carries the decision rather than a closure so that the clock is read once, at the
+    /// one place it is taken, and only when someone will read the answer — on a host whose
+    /// clocksource is `xen`, reading it is a syscall rather than a vDSO call.
+    #[inline]
+    fn record_wait_us(&self, index: usize, queued_at: Option<Instant>) {
+        let Some(queued_at) = queued_at else {
+            return;
+        };
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1250,21 +1313,14 @@ impl WorkerPool {
             dyn FnMut() -> std::result::Result<Option<Vec<u8>>, volucer_worker::WorkerError> + Send,
         >,
     ) -> std::result::Result<Response, FailedAttempt> {
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         let lease = self.acquire().map_err(|source| FailedAttempt {
             source,
             retryable: false,
         })?;
         let index = lease.index();
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
 
         let mut slot = self.slots[index]
             .lock()
@@ -1354,10 +1410,9 @@ impl WorkerPool {
                     self.stash_metrics(response.metrics.to_vec());
                 }
                 self.after_response(&mut slot, &response);
-                let duration = started.elapsed();
                 drop(slot);
                 drop(lease);
-                Ok(render(response, duration))
+                Ok(render(response))
             }
             Err((stage, source)) => {
                 if source.is_fatal() {
@@ -1758,21 +1813,17 @@ impl WorkerPool {
     /// failure drops the exchange so the slot is replaced before it serves anything else, and a
     /// non-fatal one leaves the consumer in rotation.
     pub fn job(&self, pipeline: &str, job: &volucer_jobs::Job) -> Result<Ack> {
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         let lease = self.acquire()?;
         let index = lease.index();
         // The same three counters the request path charges, and for the same reason: a consumer waiting
         // for a slot is queueing exactly as a request is, and a pool that published `requests_queue` and
         // the wait histogram as zero for a busy consumer pool would be a graph that says there is no
         // contention while jobs queue behind one another.
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
+        // Restored here: the job path is the one that *does* consume a duration, through
+        // `after_job`, so its clock was never the dead one.
         let started = Instant::now();
 
         let mut slot = self.slots[index]
@@ -2159,7 +2210,7 @@ impl WorkerPool {
         request: &Request,
         relay: volucer_fcgi::Relay,
     ) -> std::result::Result<Delivery, FailedAttempt> {
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         let lease = self
             .acquire_owned_async()
             .await
@@ -2168,15 +2219,8 @@ impl WorkerPool {
                 retryable: false,
             })?;
         let index = lease.index;
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
 
         // One critical section for everything that needs the slot, and the wait is `await`ed
         // outside it: a `MutexGuard` across an `await` would make this future `!Send`, and the
@@ -2226,6 +2270,7 @@ impl WorkerPool {
 
         // The ending owns the lease, so the slot comes back when the body does — the same contract
         // the blocking path has.
+        let started = Instant::now();
         let ending = PoolEnding {
             pool: Arc::clone(self),
             spec: self.spec.clone(),
@@ -2357,7 +2402,7 @@ impl WorkerPool {
         request: &Request,
         relay: volucer_fcgi::Relay,
     ) -> std::result::Result<Delivery, FailedAttempt> {
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         // The awaited acquisition, for the reason `attempt_async` gives: this is reached from
         // `request_relayed_async`, which the front-end awaits, so the thread waiting here is a new
         // runtime one. A pipe worker's *exchange* stays on its own thread — that is what this
@@ -2371,15 +2416,8 @@ impl WorkerPool {
                 retryable: false,
             })?;
         let index = lease.index;
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
 
         let head = {
             let translated = borrowed_request(request);
@@ -2418,6 +2456,7 @@ impl WorkerPool {
                 });
             }
 
+            let started = Instant::now();
             let ending = PoolEnding {
                 pool: Arc::clone(self),
                 spec: self.spec.clone(),
@@ -2555,7 +2594,7 @@ impl WorkerPool {
         self: &Arc<Self>,
         request: &Request,
     ) -> std::result::Result<Response, FailedAttempt> {
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         // **The awaited acquisition, not `acquire`.** `acquire` parks the calling thread on a
         // `Condvar` when the pool is full, and the caller here is a task on the HTTP front-end's
         // runtime: at `c=100` with twelve workers a hundred of these park every runtime thread and
@@ -2570,15 +2609,8 @@ impl WorkerPool {
                 retryable: false,
             })?;
         let index = lease.index;
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
 
         // The head is encoded here, while the CGI environment it borrows is alive — the exchange
         // thread cannot borrow it, for the reason `invoke` documents.
@@ -2741,10 +2773,8 @@ impl WorkerPool {
         if !response.metrics.is_empty() {
             self.stash_metrics(response.metrics.to_vec());
         }
-
-        let duration = started.elapsed();
         self.after_response(&mut slot, &response);
-        Ok(render(response, duration))
+        Ok(render(response))
     }
 
     /// One try at a relayed request. The counterpart of [`Self::attempt`].
@@ -2753,21 +2783,14 @@ impl WorkerPool {
         request: &Request,
         relay: volucer_fcgi::Relay,
     ) -> std::result::Result<Delivery, FailedAttempt> {
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         let lease = self.acquire_owned().map_err(|source| FailedAttempt {
             source,
             retryable: false,
         })?;
         let index = lease.index;
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
 
         let mut slot = self.slots[index]
             .lock()
@@ -2813,6 +2836,7 @@ impl WorkerPool {
         // because it needs the pool's own state, and moved to the exchange thread because that is
         // where the last frame is read. It holds the pool rather than the pool's fields, so the
         // lifecycle guard is still reached through the one handle that owns it.
+        let started = Instant::now();
         let ending = PoolEnding {
             pool: Arc::clone(self),
             spec: self.spec.clone(),
@@ -2902,7 +2926,7 @@ impl WorkerPool {
                 if !response.metrics.is_empty() {
                     self.stash_metrics(response.metrics.to_vec());
                 }
-                Ok(Delivery::Buffered(render(response, started.elapsed())))
+                Ok(Delivery::Buffered(render(response)))
             }
             // A streamed response. Its ending has already been reported to the pool on the exchange
             // thread, so there is nothing left to decide here.
@@ -2948,7 +2972,7 @@ impl WorkerPool {
         // in any more — the old path locked a slot in the scan and then locked the same
         // slot again to serve, and the wait lived in whichever of the two happened to
         // block.
-        let queued_at = Instant::now();
+        let queued_at = self.measure_wait.then(Instant::now);
         let lease = self.acquire().map_err(|source| FailedAttempt {
             source,
             // Nothing was sent, so nothing can be repeated: a full pool is a capacity
@@ -2956,15 +2980,8 @@ impl WorkerPool {
             retryable: false,
         })?;
         let index = lease.index();
-        let waited_us = queued_at.elapsed().as_micros() as u64;
-        if let Some(counter) = self.wait_us.get(index) {
-            counter.fetch_add(waited_us, Ordering::Relaxed);
-        }
-        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_wait_us(index, queued_at);
         self.served.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
 
         // The lease is held for everything below and released when it drops, so this slot
         // cannot be handed to another request until this one is finished with it.
@@ -3041,10 +3058,8 @@ impl WorkerPool {
         if !response.metrics.is_empty() {
             self.stash_metrics(response.metrics.to_vec());
         }
-
-        let duration = started.elapsed();
         self.after_response(&mut slot, &response);
-        Ok(render(response, duration))
+        Ok(render(response))
     }
 
     /// Move a consumer's telemetry into the pool's queue for the next scrape.

@@ -457,18 +457,26 @@ pub struct Contention {
     /// Requests this pool served. A request replayed on a second slot counts twice.
     pub served: u64,
     /// Mean time a request waited for a slot, in microseconds.
-    pub mean_us: u64,
+    ///
+    /// **`None` when the pool is not measuring**, which is the default: the figures are
+    /// read once, at shutdown, so a deployment that never looks must not pay two clock
+    /// reads per request to produce them (see `WorkerPool::wait_us`). `None` and `Some(0)`
+    /// are different answers — the first is "nothing was measured", the second is "the
+    /// pool was not contended" — and reporting the first as the second would make a pool
+    /// that was never instrumented look like a pool that was never busy.
+    pub mean_us: Option<u64>,
     /// The wait only one request in a hundred exceeded, and the median, in microseconds.
     ///
     /// The pair is the point: a mean says how much waiting there was, and these say how it
     /// was spread. A pool whose p99 is far above its p50 is queueing unfairly - most
     /// requests are served at once and a few wait for whole requests - which a mean cannot
     /// show and which is exactly the shape of a latency tail.
-    pub p50_us: u64,
-    pub p99_us: u64,
-    /// The slot that took the most wait, and how much.
-    pub busiest: usize,
-    pub busiest_us: u64,
+    /// `None` for the same reason [`Self::mean_us`] is.
+    pub p50_us: Option<u64>,
+    pub p99_us: Option<u64>,
+    /// The slot that took the most wait, and how much. `None` when not measuring.
+    pub busiest: Option<usize>,
+    pub busiest_us: Option<u64>,
     /// Worker-emitted samples this pool refused because its queue was full.
     ///
     /// **The only report of this that a deployment without `[status.metrics]` ever gets.** The counter in the
@@ -1384,7 +1392,7 @@ impl Backend {
         let Backend::Worker { name, pool } = self else {
             return None;
         };
-        let (busiest, busiest_us) = pool.busiest_slot_wait_us();
+        let busiest = pool.busiest_slot_wait_us();
         Some(Contention {
             backend: name.clone(),
             workers: pool.len(),
@@ -1392,8 +1400,8 @@ impl Backend {
             mean_us: pool.mean_slot_wait_us(),
             p50_us: pool.slot_wait_percentile_us(0.50),
             p99_us: pool.slot_wait_percentile_us(0.99),
-            busiest,
-            busiest_us,
+            busiest: busiest.map(|(slot, _)| slot),
+            busiest_us: busiest.map(|(_, us)| us),
             dropped_metrics: pool.dropped_metrics(),
         })
     }
@@ -1640,6 +1648,7 @@ mod tests {
                 grpc_serve_any: false,
                 grpc_proto: Vec::new(),
                 grpc_proto_services: Vec::new(),
+                measure_wait: false,
                 transport: Default::default(),
                 socket: None,
             }),

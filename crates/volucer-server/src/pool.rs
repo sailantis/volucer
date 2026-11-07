@@ -94,7 +94,7 @@ impl RelayOpening {
 /// an `X-Sendfile` instruction, a body the worker measured — and when it does the caller must get
 /// exactly the bytes it would have got from the ordinary path. One helper, so the two cannot drift.
 pub(crate) fn rendered(response: volucer_worker::codec::WorkerResponse) -> Response {
-    crate::worker_pool::render_worker(response, std::time::Duration::ZERO)
+    crate::worker_pool::render_worker(response)
 }
 
 /// What an async streamed exchange opened: a body still arriving, or a complete response.

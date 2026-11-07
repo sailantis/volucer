@@ -325,11 +325,9 @@ impl AsyncClient {
     /// difference between the two would be a correctness bug on one of them, so the shape is
     /// intentionally the same.
     pub async fn request(&mut self, request: &Request) -> Result<Response> {
-        let started = std::time::Instant::now();
         self.keep_conn_requested = request.keep_conn;
         self.send(request).await?;
-        let mut response = self.receive().await?;
-        response.duration = started.elapsed();
+        let response = self.receive().await?;
         if !response.keep_conn {
             self.closed_by_backend = true;
         }
@@ -491,7 +489,6 @@ impl AsyncClient {
             stderr,
             end,
             keep_conn,
-            duration: started.elapsed(),
         }))
     }
 

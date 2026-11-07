@@ -1311,6 +1311,7 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
             socket: None,
         },
         checksum: Checksum::Optional,
+        measure_wait: false,
         request_timeout: crate::worker_pool::REQUEST_TIMEOUT,
         // A spawned worker's pipes are blocking, so no runtime drives anything.
         runtime: None,

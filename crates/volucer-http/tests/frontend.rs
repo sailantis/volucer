@@ -142,6 +142,7 @@ fn worker_config(workers: u32) -> Config {
                 grpc_serve_any: false,
                 grpc_proto: Vec::new(),
                 grpc_proto_services: Vec::new(),
+                measure_wait: false,
                 transport: Default::default(),
                 socket: None,
             }),

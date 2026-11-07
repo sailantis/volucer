@@ -1039,6 +1039,7 @@ command = "php worker.php"
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
 | `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
+| `measure_wait` | boolean | `false` | Measure how long each request waited for a slot, and report the mean and p50/p99 at shutdown. Off by default: the figures are read once, at exit, and producing them costs a clock read per request — a syscall at ~245 ns where the clocksource is not TSC. Turn it on when tuning `workers`; the report then says `wait not measured` rather than `0 us`, because those are different facts. |
 | `checksum` | string | `"required"` | `"required"` or `"optional"`. |
 | `transport` | string | platform default | `"pipe"` or `"socket"`. |
 | `socket` | string | absent | Where the socket transport listens. |
@@ -1073,6 +1074,7 @@ instead of starting worker processes.
 | `grpc_services` | array of strings | empty | The gRPC services this backend may serve. |
 | `grpc_serve_any` | boolean | `false` | Serve any gRPC service instead of naming them. Refused beside a non-empty `grpc_services`. |
 | `grpc_proto` | array of paths | empty | Read the gRPC services from `.proto` files or directories. Refused beside both `grpc_services` and `grpc_serve_any`; re-read on reload. |
+| `measure_wait` | boolean | `false` | The same key and the same default as a `worker` backend's `measure_wait`: report slot waiting at shutdown, or pay nothing per request. |
 
 ### `kind = "external"`
 

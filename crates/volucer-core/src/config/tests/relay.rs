@@ -156,6 +156,7 @@ fn attach_with_relay(relay: Option<&str>) -> AttachConfig {
         workers: 1,
         max_requests: None,
         checksum: Default::default(),
+        measure_wait: false,
         idle_ping_ms: None,
         services: Vec::new(),
         grpc_services: Vec::new(),
