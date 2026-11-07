@@ -4270,8 +4270,14 @@ pub fn from_cgi(
     // Compression is decided from what the application sent, before `Body` is built: the
     // encoding, the length and `Vary` are header facts, and a body handed to `hyper` cannot be
     // replaced afterwards.
+    //
+    // **The view map is built only when compression can actually happen.** `compress` returns
+    // `Unchanged` immediately when the feature is off or the body is under the threshold, but the
+    // map was assembled before the call: a `HeaderMap::new()` plus a clone of every header, per
+    // request, to be discarded. `static_files` and every `attach`/`worker` site with
+    // `[server.compression] enabled = false` (the default) paid it for nothing.
     let original = body;
-    let decision = {
+    let decision = if settings.enabled && original.len() >= settings.min_length {
         let view = {
             let mut map = hyper::header::HeaderMap::new();
             for (name, value) in &outgoing {
@@ -4290,6 +4296,8 @@ pub fn from_cgi(
             content_type.as_deref(),
             original.clone(),
         )
+    } else {
+        crate::compress::Outcome::Unchanged
     };
 
     let body = match decision {
