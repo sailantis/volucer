@@ -66,6 +66,8 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
+use bytes::BufMut;
+
 use volucer_worker::codec::{Delivery, RequestStage, StreamedHead, WorkerResponse};
 use volucer_worker::{
     flags, Checksum, Codec, Control, Header, Json, LogRecord, MessageType, MetricRecord,
@@ -284,21 +286,30 @@ where
         Ok(())
     }
 
-    /// Write a header and its payload as **one** vectored send.
+    /// Write a header and its payload without handing the peer a partial message.
     ///
     /// The obvious spelling is two `write_all` calls, and it was: header, then payload. Under a
-    /// `BufWriter` whose buffer is larger than both that reaches the socket as two `sendto` calls,
-    /// because `tokio`'s `BufWriter` forwards a write larger than the space left rather than
-    /// splitting it to fill the buffer. Measured on the `attach` relay at 32 workers, the second
-    /// call cost a second syscall *and* a second wakeup of the blocked PHP reader:
+    /// `BufWriter` whose buffer is larger than both, the second call does **not** append to the
+    /// first — `tokio`'s `BufWriter::poll_write` hands a large write straight to the socket while
+    /// still holding the first in its buffer, so the peer sees the payload before the header.
+    /// Measured on the `attach` relay at 32 workers:
     ///
     /// ```text
     /// 9.06%  UnixStream::poll_write -> sendto -> unix_stream_sendmsg -> sock_def_readable
     /// ```
     ///
-    /// A half-duplex relay has no reason to hand the peer a partial message, so the two slices
-    /// are written as one `IoSlice` pair. The buffer is bypassed rather than filled first: filling
-    /// it would still need the flush below to reach the socket, which is the syscall this removes.
+    /// **The `IoSlice` pair does not turn this into one `writev`.** `AsyncStream` has no
+    /// `poll_write_vectored`, so `BufWriter` takes its non-vectored branch: the header fits in the
+    /// buffer and is copied into it, and the payload — being larger than the space left — goes out
+    /// directly. What makes the write whole is therefore not a scatter-gather syscall but ordering:
+    /// the payload leaves first, the buffered header follows at the flush, and the frame is never
+    /// interleaved with half of itself.
+    ///
+    /// Implementing `poll_write_vectored` on `AsyncStream` would let this reach the socket as a
+    /// single `writev`. It is not done here because it has not been measured: at the frame sizes a
+    /// worker exchange produces, the buffer already coalesces everything below `BUFFER_CAPACITY`
+    /// into one syscall per frame, and the exchange is not the bottleneck (see the profile of
+    /// `attempt_relayed_async`).
     async fn write_frame(&mut self, header: &[u8], payload: &[u8]) -> Result<()> {
         if payload.is_empty() {
             return self.writer.write_all(header).await.map_err(Into::into);
@@ -382,15 +393,14 @@ where
         Ok(())
     }
 
-    /// Read exactly one frame, or `None` at a clean end of stream.
+    /// Validate the header and return it, with its declared payload length.
     ///
-    /// The payload is bounded and checksum-verified here rather than by a helper in the worker
-    /// crate, because doing so needs *no* state beyond the policy — and routing it through the
-    /// worker crate would mean that crate owning an `AsyncRead` bound it has no other reason to
-    /// have. The rules themselves are `Header`'s: the cap is `MAX_PAYLOAD_LEN`, the flag that
-    /// turns verification off is `declares_no_checksum`, and the hash is `Header::decode`'s own
-    /// checksum field.
-    async fn read_frame(&mut self) -> Result<Option<(Header, Vec<u8>)>> {
+    /// Everything that can reject a frame **before its payload is read** happens here: a frame
+    /// refused for its checksum policy or its length is refused while its payload is still on the
+    /// wire, which is the same point the one-function version refused it. Splitting the read in two
+    /// is what lets a caller choose the destination *after* the header has been validated — the
+    /// response loops append a body frame straight into the body they are building.
+    async fn read_header(&mut self) -> Result<Option<(Header, usize)>> {
         let mut bytes = [0u8; HEADER_LEN];
         // A clean end of stream *before the first byte* is the only `None`; a stream that stops
         // part-way through a header is a truncated frame, which must not read as a clean close.
@@ -414,20 +424,66 @@ where
             });
         }
 
-        let mut payload = vec![0u8; len];
-        if let Err(source) = self.reader.read_exact(&mut payload).await {
-            if source.kind() == io::ErrorKind::UnexpectedEof {
-                return Err(WorkerError::TruncatedFrame {
-                    offset: 0,
-                    needed: len,
-                });
+        Ok(Some((header, len)))
+    }
+
+    /// Read a length-delimited payload, appending it to `into`.
+    ///
+    /// The payload is bounded and checksum-verified here rather than by a helper in the worker
+    /// crate, because doing so needs *no* state beyond the policy — and routing it through the
+    /// worker crate would mean that crate owning an `AsyncRead` bound it has no other reason to
+    /// have. The rules themselves are `Header`'s: the cap is `MAX_PAYLOAD_LEN`, the flag that
+    /// turns verification off is `declares_no_checksum`, and the hash is `Header::decode`'s own
+    /// checksum field.
+    ///
+    /// # Why the payload lands in a caller-owned `Vec`
+    ///
+    /// It used to land in its own `vec![0u8; len]`, allocated per frame, and every caller that
+    /// wanted the bytes kept then copied them a second time — `body.extend_from_slice(&payload)`
+    /// in the response loops. For a body the front-end is about to send anyway that is one
+    /// allocation and one copy of the whole body per request, for a buffer whose lifetime ends two
+    /// lines later. Appending in place removes both.
+    ///
+    /// On any failure the destination is truncated back to where it started, so a rejected frame
+    /// leaves no trace in a body that will never be sent. The *stream* is desynchronised either
+    /// way, which is why the caller must end the connection — the contract a truncated payload
+    /// always had.
+    async fn read_payload(
+        &mut self,
+        header: &Header,
+        len: usize,
+        into: &mut Vec<u8>,
+    ) -> Result<()> {
+        // `reserve` rather than `resize`, so the bytes are not zeroed before the read overwrites
+        // them — a memset of the whole payload that nothing ever reads. `limit` is what caps the
+        // read to this frame's declared length, since the destination is the caller's buffer and
+        // may already hold earlier frames.
+        let start = into.len();
+        into.reserve(len);
+        {
+            let mut target = BufMut::limit(&mut *into, len);
+            while target.has_remaining_mut() {
+                match self.reader.read_buf(&mut target).await {
+                    Ok(0) => {
+                        into.truncate(start);
+                        return Err(WorkerError::TruncatedFrame {
+                            offset: start,
+                            needed: len,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(source) => {
+                        into.truncate(start);
+                        return Err(WorkerError::Io(source));
+                    }
+                }
             }
-            return Err(WorkerError::Io(source));
         }
 
         if !header.declares_no_checksum() {
-            let computed = volucer_worker::crc32c(&payload);
+            let computed = volucer_worker::crc32c(&into[start..]);
             if computed != header.checksum {
+                into.truncate(start);
                 return Err(WorkerError::ChecksumMismatch {
                     request_id: header.request_id,
                     expected: header.checksum,
@@ -436,6 +492,19 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    /// Read one frame into a freshly allocated payload.
+    ///
+    /// The shape every caller wants except the response-body loops, which use [`Self::read_header`]
+    /// and [`Self::read_payload`] to append without the second copy.
+    async fn read_frame(&mut self) -> Result<Option<(Header, Vec<u8>)>> {
+        let Some((header, len)) = self.read_header().await? else {
+            return Ok(None);
+        };
+        let mut payload = Vec::new();
+        self.read_payload(&header, len, &mut payload).await?;
         Ok(Some((header, payload)))
     }
 
@@ -482,11 +551,36 @@ where
         let metric_mark = self.metrics.len();
 
         loop {
-            let Some((header, payload)) = self.read_frame().await? else {
+            let Some((header, len)) = self.read_header().await? else {
                 return Err(WorkerError::Closed(format!(
                     "the worker closed its output while answering request {request_id}"
                 )));
             };
+
+            // A body frame is read **into** `body`, so the bytes the front-end is about to send
+            // are never copied a second time. Every other frame type is small, JSON-decoded on the
+            // spot, and gets its own buffer.
+            if header.message_type == MessageType::Body {
+                if header.request_id != request_id {
+                    return Err(WorkerError::WrongRequestId {
+                        expected: request_id,
+                        actual: header.request_id,
+                    });
+                }
+                if !have_head {
+                    return Err(WorkerError::Remote {
+                        message: format!("request {request_id} sent a body before its head"),
+                    });
+                }
+                self.read_payload(&header, len, &mut body).await?;
+                if header.flags & flags::LAST != 0 {
+                    seen_last_body = true;
+                }
+                continue;
+            }
+
+            let mut payload = Vec::new();
+            self.read_payload(&header, len, &mut payload).await?;
 
             match header.message_type {
                 MessageType::Response => {
@@ -515,23 +609,6 @@ where
                     }
                     response.head = head;
                     have_head = true;
-                }
-                MessageType::Body => {
-                    if header.request_id != request_id {
-                        return Err(WorkerError::WrongRequestId {
-                            expected: request_id,
-                            actual: header.request_id,
-                        });
-                    }
-                    if !have_head {
-                        return Err(WorkerError::Remote {
-                            message: format!("request {request_id} sent a body before its head"),
-                        });
-                    }
-                    body.extend_from_slice(&payload);
-                    if header.flags & flags::LAST != 0 {
-                        seen_last_body = true;
-                    }
                 }
                 MessageType::End => {
                     if header.request_id != request_id {
@@ -957,25 +1034,32 @@ where
         let expected_body = if streamed { 0 } else { response.head.body_len };
 
         loop {
-            let Some((header, payload)) = self.read_frame().await? else {
+            let Some((header, len)) = self.read_header().await? else {
                 return Err(WorkerError::Closed(format!(
                     "the worker closed its output while answering request {request_id}"
                 )));
             };
 
-            match header.message_type {
-                MessageType::Body => {
-                    if header.request_id != request_id {
-                        return Err(WorkerError::WrongRequestId {
-                            expected: request_id,
-                            actual: header.request_id,
-                        });
-                    }
-                    body.extend_from_slice(&payload);
-                    if header.flags & flags::LAST != 0 {
-                        seen_last_body = true;
-                    }
+            // Same split as `collect_response`: the body is read straight into `body`, so it is
+            // never copied a second time.
+            if header.message_type == MessageType::Body {
+                if header.request_id != request_id {
+                    return Err(WorkerError::WrongRequestId {
+                        expected: request_id,
+                        actual: header.request_id,
+                    });
                 }
+                self.read_payload(&header, len, &mut body).await?;
+                if header.flags & flags::LAST != 0 {
+                    seen_last_body = true;
+                }
+                continue;
+            }
+
+            let mut payload = Vec::new();
+            self.read_payload(&header, len, &mut payload).await?;
+
+            match header.message_type {
                 MessageType::End => {
                     if header.request_id != request_id {
                         return Err(WorkerError::WrongRequestId {
@@ -1187,7 +1271,6 @@ impl std::fmt::Debug for AsyncExchange {
 /// concrete socket: `tokio::net::UnixStream` does not exist on Windows, and a relay over loopback
 /// TCP is a supported configuration on every platform.
 pub(super) type Wire = WireChannel<AsyncStream, AsyncStream>;
-
 /// A connected worker, over whichever transport the relay named.
 ///
 /// The async twin of [`volucer_fcgi::transport::Stream`], and written the same way for the same
