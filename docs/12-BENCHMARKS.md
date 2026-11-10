@@ -12,9 +12,11 @@ Each chart identifies its host, method, and measured software versions.
 
 ## C1 — Echo — `GET /echo`
 
-Measurements were interleaved across server arms, process counts, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is the number of PHP processes serving requests and provides a resource-use context for each result.
+Measurements were interleaved across server arms, sizing numbers, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is how many PHP processes serve requests, and it provides a resource-use context for each result.
 
-With `spawn_cgi` and `children`, multiple PHP processes serve through one slot. The process-count column makes this configuration comparable with other arms that use one process per slot.
+With `spawn_cgi` and `children`, multiple PHP processes serve through one slot. The sizing column makes this configuration comparable with other arms that use one process per slot.
+
+One row's number is not a process count: FrankenPHP runs a single OS process, so its value is how many worker *threads* that process starts. The row names its own unit. The two are compared because both are what the host pays for.
 
 Each chart shows request rate in requests per second, with bars that start at zero for direct visual comparison.
 
@@ -37,12 +39,12 @@ The **factor** compares each row with the fastest server in the table (`x1.0`). 
 | volucer | attach (warm, unix relay) | 32 | **110,830** | 0.82 ms | 2.02 ms | x1.0 |
 | volucer | attach (warm, unix relay) | 16 | **85,807** | 1.08 ms | 3.25 ms | x1.3 (1.29–1.31) |
 | RoadRunner | worker (warm, pipe) | 32 | **74,833** | 1.14 ms | 3.61 ms | x1.5 (1.48–1.50) |
-| FrankenPHP | worker (warm, embedded) | 8 | **74,076** | 1.15 ms | 4.25 ms | x1.5 (1.49–1.52) |
+| FrankenPHP | worker (warm, embedded) | 8 threads | **74,076** | 1.15 ms | 4.25 ms | x1.5 (1.49–1.52) |
 | RoadRunner | worker (warm, pipe) | 16 | **69,785** | 1.28 ms | 2.73 ms | x1.6 (1.59–1.61) |
 | volucer | attach (warm, unix relay) | 8 | **59,175** | 1.62 ms | 6.2 ms | x1.9 (1.83–1.90) |
 | RoadRunner | worker (warm, pipe) | 8 | **52,168** | 1.76 ms | 3.02 ms | x2.1 (2.12–2.17) |
-| FrankenPHP | worker (warm, embedded) | 16 | **51,514** | 1.75 ms | 5.33 ms | x2.2 (2.13–2.20) |
-| FrankenPHP | worker (warm, embedded) | 32 | **45,004** | 1.9 ms | 5.85 ms | x2.5 (2.40–3.68) |
+| FrankenPHP | worker (warm, embedded) | 16 threads | **51,514** | 1.75 ms | 5.33 ms | x2.2 (2.13–2.20) |
+| FrankenPHP | worker (warm, embedded) | 32 threads | **45,004** | 1.9 ms | 5.85 ms | x2.5 (2.40–3.68) |
 | nginx + php-fpm | cold, unix socket | 32 | **41,428** | 2.22 ms | 4.13 ms | x2.7 (2.66–2.73) |
 | volucer | spawn_cgi (cold, unix, children) | 32 | **40,096** | 2.32 ms | 4.86 ms | x2.8 (2.74–2.83) |
 | nginx + php-fpm | cold, unix socket | 16 | **38,440** | 2.46 ms | 3.25 ms | x2.9 (2.88–2.92) |
@@ -63,7 +65,7 @@ This table compares the two cold PHP process pools at equal process counts: `spa
 
 The factor is `spawn_cgi` throughput divided by php-fpm throughput at the same process count. Values above 1.0 indicate higher measured throughput for `spawn_cgi`; values below 1.0 indicate higher throughput for php-fpm.
 
-This table compares each arm across each step between consecutive published process counts, so an arm that peaks in the middle is visible as a step of its own. Ratios are paired by measurement round. A ratio above 1.0 indicates higher throughput at the larger process count, and below 1.0 higher throughput at the smaller one; a range including 1.0 means the measured rounds also include equal throughput.
+This table compares each arm across each step between consecutive published sizing numbers, so an arm that peaks in the middle is visible as a step of its own. Ratios are paired by measurement round. A ratio above 1.0 indicates higher throughput at the larger number, and below 1.0 higher throughput at the smaller one; a range including 1.0 means the measured rounds also include equal throughput.
 
 | server | model | step (PHP procs) | rps at smaller | rps at larger | larger/smaller (range) |
 |---|---|---|---:|---:|---:|
@@ -71,8 +73,8 @@ This table compares each arm across each step between consecutive published proc
 | volucer | attach (warm, unix relay) | 16 → 32 | 85,807 | 110,830 | x1.29 (1.29–1.31) |
 | RoadRunner | worker (warm, pipe) | 8 → 16 | 52,168 | 69,785 | x1.34 (1.32–1.35) |
 | RoadRunner | worker (warm, pipe) | 16 → 32 | 69,785 | 74,833 | x1.07 (1.07–1.08) |
-| FrankenPHP | worker (warm, embedded) | 8 → 16 | 74,076 | 51,514 | x0.70 (0.69–0.70) |
-| FrankenPHP | worker (warm, embedded) | 16 → 32 | 51,514 | 45,004 | x0.87 (0.86–0.90) |
+| FrankenPHP | worker (warm, embedded) | 8 → 16 threads | 74,076 | 51,514 | x0.70 (0.69–0.70) |
+| FrankenPHP | worker (warm, embedded) | 16 → 32 threads | 51,514 | 45,004 | x0.87 (0.86–0.90) |
 | volucer | spawn_cgi (cold, unix, children) | 8 → 16 | 26,276 | 34,090 | x1.30 (1.27–1.32) |
 | volucer | spawn_cgi (cold, unix, children) | 16 → 32 | 34,090 | 40,096 | x1.18 (1.15–1.20) |
 | nginx + php-fpm | cold, unix socket | 8 → 16 | 34,069 | 38,440 | x1.13 (1.11–1.15) |
@@ -90,7 +92,7 @@ RSS is shown in parentheses for reference. Summed across processes, RSS counts s
 |---|---|---:|---:|---:|
 | volucer | attach (warm, unix relay) | 68.8 (280) | 82.0 (487) | 100.2 (878) |
 | RoadRunner | worker (warm, pipe) | 252.8 (505) | 420.5 (950) | 749.6 (1,837) |
-| FrankenPHP | worker (warm, embedded) | 131.8 (132) | 146.4 (146) | 170.0 (170) |
+| FrankenPHP | worker (warm, embedded), threads | 131.8 (132) | 146.4 (146) | 170.0 (170) |
 | volucer | spawn_cgi (cold, unix, children) | 65.5 (301) | 73.3 (523) | 93.2 (973) |
 | nginx + php-fpm | cold, unix socket | 54.8 (312) | 63.6 (543) | 80.5 (1,003) |
 
@@ -117,9 +119,11 @@ Forked children can share memory pages inherited from their master. PSS accounts
 
 ## C3 — API Items — `GET /api/items`
 
-Measurements were interleaved across server arms, process counts, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is the number of PHP processes serving requests and provides a resource-use context for each result.
+Measurements were interleaved across server arms, sizing numbers, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is how many PHP processes serve requests, and it provides a resource-use context for each result.
 
-With `spawn_cgi` and `children`, multiple PHP processes serve through one slot. The process-count column makes this configuration comparable with other arms that use one process per slot.
+With `spawn_cgi` and `children`, multiple PHP processes serve through one slot. The sizing column makes this configuration comparable with other arms that use one process per slot.
+
+One row's number is not a process count: FrankenPHP runs a single OS process, so its value is how many worker *threads* that process starts. The row names its own unit. The two are compared because both are what the host pays for.
 
 Each chart shows request rate in requests per second, with bars that start at zero for direct visual comparison.
 
@@ -140,14 +144,14 @@ The **factor** compares each row with the fastest server in the table (`x1.0`). 
 | server | model | PHP procs | rps | p50 | p99 | factor (range) |
 |---|---|---:|---:|---:|---:|---:|
 | volucer | attach (warm, unix relay) | 32 | **72,286** | 1.25 ms | 3.14 ms | x1.0 |
-| FrankenPHP | worker (warm, embedded) | 8 | **62,800** | 1.34 ms | 4.74 ms | x1.2 (1.14–4.54) |
+| FrankenPHP | worker (warm, embedded) | 8 threads | **62,800** | 1.34 ms | 4.74 ms | x1.2 (1.14–4.54) |
 | volucer | attach (warm, unix relay) | 16 | **55,913** | 1.68 ms | 4.8 ms | x1.3 (1.26–1.31) |
 | RoadRunner | worker (warm, pipe) | 16 | **45,756** | 1.99 ms | 3.72 ms | x1.6 (1.55–1.60) |
 | RoadRunner | worker (warm, pipe) | 32 | **45,394** | 1.97 ms | 4.68 ms | x1.6 (1.55–1.60) |
 | volucer | attach (warm, unix relay) | 8 | **43,562** | 2.22 ms | 8.04 ms | x1.7 (1.58–1.74) |
-| FrankenPHP | worker (warm, embedded) | 16 | **41,469** | 2.2 ms | 6.42 ms | x1.7 (1.70–1.77) |
+| FrankenPHP | worker (warm, embedded) | 16 threads | **41,469** | 2.2 ms | 6.42 ms | x1.7 (1.70–1.77) |
 | RoadRunner | worker (warm, pipe) | 8 | **37,431** | 2.47 ms | 3.94 ms | x1.9 (1.88–1.93) |
-| FrankenPHP | worker (warm, embedded) | 32 | **34,846** | 2.5 ms | 7.24 ms | x2.1 (2.00–2.14) |
+| FrankenPHP | worker (warm, embedded) | 32 threads | **34,846** | 2.5 ms | 7.24 ms | x2.1 (2.00–2.14) |
 | volucer | spawn_cgi (cold, unix, children) | 32 | **15,388** | 6.15 ms | 12.31 ms | x4.7 (4.59–4.86) |
 | nginx + php-fpm | cold, unix socket | 32 | **14,876** | 6.31 ms | 8.89 ms | x4.9 (4.77–4.91) |
 | nginx + php-fpm | cold, unix socket | 16 | **12,916** | 7.33 ms | 9.26 ms | x5.6 (5.40–5.69) |
@@ -168,7 +172,7 @@ This table compares the two cold PHP process pools at equal process counts: `spa
 
 The factor is `spawn_cgi` throughput divided by php-fpm throughput at the same process count. Values above 1.0 indicate higher measured throughput for `spawn_cgi`; values below 1.0 indicate higher throughput for php-fpm.
 
-This table compares each arm across each step between consecutive published process counts, so an arm that peaks in the middle is visible as a step of its own. Ratios are paired by measurement round. A ratio above 1.0 indicates higher throughput at the larger process count, and below 1.0 higher throughput at the smaller one; a range including 1.0 means the measured rounds also include equal throughput.
+This table compares each arm across each step between consecutive published sizing numbers, so an arm that peaks in the middle is visible as a step of its own. Ratios are paired by measurement round. A ratio above 1.0 indicates higher throughput at the larger number, and below 1.0 higher throughput at the smaller one; a range including 1.0 means the measured rounds also include equal throughput.
 
 | server | model | step (PHP procs) | rps at smaller | rps at larger | larger/smaller (range) |
 |---|---|---|---:|---:|---:|
@@ -176,8 +180,8 @@ This table compares each arm across each step between consecutive published proc
 | volucer | attach (warm, unix relay) | 16 → 32 | 55,913 | 72,286 | x1.29 (1.26–1.31) |
 | RoadRunner | worker (warm, pipe) | 8 → 16 | 37,431 | 45,756 | x1.22 (1.19–1.24) |
 | RoadRunner | worker (warm, pipe) | 16 → 32 | 45,756 | 45,394 | x0.99 (0.98–1.00) — tie |
-| FrankenPHP | worker (warm, embedded) | 8 → 16 | 62,800 | 41,469 | x0.66 (0.65–2.67) — tie |
-| FrankenPHP | worker (warm, embedded) | 16 → 32 | 41,469 | 34,846 | x0.84 (0.83–0.85) |
+| FrankenPHP | worker (warm, embedded) | 8 → 16 threads | 62,800 | 41,469 | x0.66 (0.65–2.67) — tie |
+| FrankenPHP | worker (warm, embedded) | 16 → 32 threads | 41,469 | 34,846 | x0.84 (0.83–0.85) |
 | volucer | spawn_cgi (cold, unix, children) | 8 → 16 | 9,412 | 12,757 | x1.36 (1.34–1.39) |
 | volucer | spawn_cgi (cold, unix, children) | 16 → 32 | 12,757 | 15,388 | x1.21 (1.19–1.22) |
 | nginx + php-fpm | cold, unix socket | 8 → 16 | 9,662 | 12,916 | x1.34 (1.32–1.36) |
@@ -195,7 +199,7 @@ RSS is shown in parentheses for reference. Summed across processes, RSS counts s
 |---|---|---:|---:|---:|
 | volucer | attach (warm, unix relay) | 68.8 (280) | 82.0 (487) | 100.2 (878) |
 | RoadRunner | worker (warm, pipe) | 252.8 (505) | 420.5 (950) | 749.6 (1,837) |
-| FrankenPHP | worker (warm, embedded) | 131.8 (132) | 146.4 (146) | 170.0 (170) |
+| FrankenPHP | worker (warm, embedded), threads | 131.8 (132) | 146.4 (146) | 170.0 (170) |
 | volucer | spawn_cgi (cold, unix, children) | 65.5 (301) | 73.3 (523) | 93.2 (973) |
 | nginx + php-fpm | cold, unix socket | 54.8 (312) | 63.6 (543) | 80.5 (1,003) |
 
@@ -222,9 +226,11 @@ Forked children can share memory pages inherited from their master. PSS accounts
 
 ## C5 — HTML Items — `GET /items-fast`
 
-Measurements were interleaved across server arms, process counts, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is the number of PHP processes serving requests and provides a resource-use context for each result.
+Measurements were interleaved across server arms, sizing numbers, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is how many PHP processes serve requests, and it provides a resource-use context for each result.
 
-With `spawn_cgi` and `children`, multiple PHP processes serve through one slot. The process-count column makes this configuration comparable with other arms that use one process per slot.
+With `spawn_cgi` and `children`, multiple PHP processes serve through one slot. The sizing column makes this configuration comparable with other arms that use one process per slot.
+
+One row's number is not a process count: FrankenPHP runs a single OS process, so its value is how many worker *threads* that process starts. The row names its own unit. The two are compared because both are what the host pays for.
 
 Each chart shows request rate in requests per second, with bars that start at zero for direct visual comparison.
 
@@ -250,9 +256,9 @@ The **factor** compares each row with the fastest server in the table (`x1.0`). 
 | RoadRunner | worker (warm, pipe) | 32 | **31,707** | 2.85 ms | 6.45 ms | x1.6 (1.58–1.62) |
 | RoadRunner | worker (warm, pipe) | 16 | **31,342** | 2.92 ms | 5.08 ms | x1.6 (1.60–1.64) |
 | RoadRunner | worker (warm, pipe) | 8 | **27,112** | 3.44 ms | 5.05 ms | x1.9 (1.87–1.90) |
-| FrankenPHP | worker (warm, embedded) | 8 | **23,692** | 3.88 ms | 6.22 ms | x2.2 (2.11–2.19) |
-| FrankenPHP | worker (warm, embedded) | 16 | **19,341** | 4.72 ms | 8.56 ms | x2.7 (2.59–2.69) |
-| FrankenPHP | worker (warm, embedded) | 32 | **18,164** | 4.85 ms | 13.14 ms | x2.8 (2.72–2.86) |
+| FrankenPHP | worker (warm, embedded) | 8 threads | **23,692** | 3.88 ms | 6.22 ms | x2.2 (2.11–2.19) |
+| FrankenPHP | worker (warm, embedded) | 16 threads | **19,341** | 4.72 ms | 8.56 ms | x2.7 (2.59–2.69) |
+| FrankenPHP | worker (warm, embedded) | 32 threads | **18,164** | 4.85 ms | 13.14 ms | x2.8 (2.72–2.86) |
 | volucer | spawn_cgi (cold, unix, children) | 32 | **12,631** | 7.49 ms | 14.8 ms | x4.1 (3.90–4.11) |
 | nginx + php-fpm | cold, unix socket | 32 | **12,165** | 7.72 ms | 10.71 ms | x4.2 (4.06–4.24) |
 | nginx + php-fpm | cold, unix socket | 16 | **10,786** | 8.82 ms | 10.8 ms | x4.8 (4.59–4.77) |
@@ -273,7 +279,7 @@ This table compares the two cold PHP process pools at equal process counts: `spa
 
 The factor is `spawn_cgi` throughput divided by php-fpm throughput at the same process count. Values above 1.0 indicate higher measured throughput for `spawn_cgi`; values below 1.0 indicate higher throughput for php-fpm.
 
-This table compares each arm across each step between consecutive published process counts, so an arm that peaks in the middle is visible as a step of its own. Ratios are paired by measurement round. A ratio above 1.0 indicates higher throughput at the larger process count, and below 1.0 higher throughput at the smaller one; a range including 1.0 means the measured rounds also include equal throughput.
+This table compares each arm across each step between consecutive published sizing numbers, so an arm that peaks in the middle is visible as a step of its own. Ratios are paired by measurement round. A ratio above 1.0 indicates higher throughput at the larger number, and below 1.0 higher throughput at the smaller one; a range including 1.0 means the measured rounds also include equal throughput.
 
 | server | model | step (PHP procs) | rps at smaller | rps at larger | larger/smaller (range) |
 |---|---|---|---:|---:|---:|
@@ -281,8 +287,8 @@ This table compares each arm across each step between consecutive published proc
 | volucer | attach (warm, unix relay) | 16 → 32 | 41,433 | 51,281 | x1.24 (1.20–1.25) |
 | RoadRunner | worker (warm, pipe) | 8 → 16 | 27,112 | 31,342 | x1.16 (1.14–1.18) |
 | RoadRunner | worker (warm, pipe) | 16 → 32 | 31,342 | 31,707 | x1.01 (1.01–1.03) |
-| FrankenPHP | worker (warm, embedded) | 8 → 16 | 23,692 | 19,341 | x0.82 (0.81–0.82) |
-| FrankenPHP | worker (warm, embedded) | 16 → 32 | 19,341 | 18,164 | x0.94 (0.92–0.95) |
+| FrankenPHP | worker (warm, embedded) | 8 → 16 threads | 23,692 | 19,341 | x0.82 (0.81–0.82) |
+| FrankenPHP | worker (warm, embedded) | 16 → 32 threads | 19,341 | 18,164 | x0.94 (0.92–0.95) |
 | volucer | spawn_cgi (cold, unix, children) | 8 → 16 | 8,433 | 10,571 | x1.25 (1.25–1.28) |
 | volucer | spawn_cgi (cold, unix, children) | 16 → 32 | 10,571 | 12,631 | x1.19 (1.17–1.20) |
 | nginx + php-fpm | cold, unix socket | 8 → 16 | 8,346 | 10,786 | x1.29 (1.28–1.31) |
@@ -300,7 +306,7 @@ RSS is shown in parentheses for reference. Summed across processes, RSS counts s
 |---|---|---:|---:|---:|
 | volucer | attach (warm, unix relay) | 68.8 (280) | 82.0 (487) | 100.2 (878) |
 | RoadRunner | worker (warm, pipe) | 252.8 (505) | 420.5 (950) | 749.6 (1,837) |
-| FrankenPHP | worker (warm, embedded) | 131.8 (132) | 146.4 (146) | 170.0 (170) |
+| FrankenPHP | worker (warm, embedded), threads | 131.8 (132) | 146.4 (146) | 170.0 (170) |
 | volucer | spawn_cgi (cold, unix, children) | 65.5 (301) | 73.3 (523) | 93.2 (973) |
 | nginx + php-fpm | cold, unix socket | 54.8 (312) | 63.6 (543) | 80.5 (1,003) |
 
