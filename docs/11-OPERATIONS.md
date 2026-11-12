@@ -536,46 +536,63 @@ Publishing such a port with `-p` does not make the listener externally reachable
 
 ### Adding PHP to the image
 
-Both images contain only the binary. The `musl` image is `scratch`, with no libc, so PHP cannot run in it. The `glibc` image is Debian-based and has no PHP runtime. A `worker` with `command = "php worker.php"`, as in the [README](../README.md), therefore needs an image that includes PHP. Build one from the official `php` image and copy the binary from the `-glibc` image:
+The published images contain only Volucer: the `musl` image is `scratch` and the `glibc` image has no PHP runtime. A worker such as `command = "php worker.php"` therefore needs an application image with PHP.
+
+Use the CI-built and verified recipes:
+[`Dockerfile.ubuntu`](../examples/docker/Dockerfile.ubuntu) or
+[`Dockerfile.alpine`](../examples/docker/Dockerfile.alpine). The
+[`verify.sh`](../examples/docker/verify.sh) test starts each image, waits for its health check,
+and serves a request. Treat the Dockerfiles as the source of truth.
+
+Build from the repository root:
+
+```sh
+docker build -f examples/docker/Dockerfile.ubuntu -t app .
+docker build -f examples/docker/Dockerfile.alpine -t app:alpine .
+```
+
+The Ubuntu recipe uses distribution PHP packages instead of the compiler toolchain retained by
+the official `php` image for `docker-php-ext-install`. Sizes below are decimal MB from
+`docker image ls` on `linux/amd64`:
+
+| Image                                                                        | On disk  | To pull  |
+| ---------------------------------------------------------------------------- | -------- | -------- |
+| `php:8.5-cli-bookworm`                                                       | 798 MB   | 181 MB   |
+| the same, plus the Volucer binary                                            | 819 MB   | 189 MB   |
+| `ubuntu:26.04` + `php8.5-cli` + Volucer                                       | 229 MB   | 55 MB    |
+| the same, plus `cgi`, `mbstring`, `curl`, `xml` and `sqlite3`                 | 287 MB   | 69 MB    |
+| `examples/docker/Dockerfile.ubuntu` (+ Composer and the application)          | 294 MB   | 71 MB    |
+| `examples/docker/Dockerfile.alpine` (the same, on musl)                       | 98 MB    | 23 MB    |
+| the Ubuntu recipe plus `mysql`, `intl`, `bcmath` and `gd`                     | 376 MB   | 93 MB    |
+
+The official image's extra size is largely its compiler toolchain (~330 MB) and PHP build
+headers (~170 MB); Ubuntu's `php8.5-cli` package is a 12 MB prebuilt binary. Ubuntu 26.04
+provides PHP 8.5 directly; Ubuntu 24.04 stops at 8.3 and needs `packages.sury.org/php`.
 
 ```dockerfile
-# Use `-cli`, not `-fpm` or `-apache`. Those two are built with `--disable-cgi`, so a
-# `spawn_cgi` pool would have no `php-cgi` to start. `-cli` builds both SAPIs, so this one base
-# supports a `worker` (`php worker.php`) and a `spawn_cgi` pool (`php-cgi -b …`).
-# The Debian suite is named explicitly. The plain `8.5-cli` tag follows Debian's default, which
-# currently resolves to `-trixie`. Naming the suite avoids a surprise when that default changes.
-FROM php:8.5-cli-bookworm
+# See the CI-verified Dockerfile above for the full recipe. Ubuntu's `php8.5-cli`
+# includes `pcntl` (required by `attach`); install `ca-certificates` for TLS and
+# `unzip` for Composer. The base image provides `www-data`.
+FROM ubuntu:26.04
 
-# Use the `-glibc` image, not the default `musl` tag. This base is Debian, and the `glibc` stage
-# of `packaging/docker/Dockerfile` builds the matching binary. Pin the version.
-COPY --from=ghcr.io/sailantis/volucer:0.5.0-glibc /usr/local/bin/volucer /usr/local/bin/volucer
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        php8.5-cli php8.5-cgi php8.5-mbstring php8.5-curl \
+        php8.5-xml php8.5-sqlite3 php8.5-zip unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Add the extensions the application needs. Each one is a compile step in this Dockerfile,
-# not a version in this project's release matrix.
-RUN docker-php-ext-install pdo_mysql
-
-# Composer is not in the base image. Copying its binary avoids a separate installer step.
+COPY --from=ghcr.io/sailantis/volucer:0.6.0-glibc /usr/local/bin/volucer /usr/local/bin/volucer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /srv/app
+COPY examples/docker/app /srv/app
+RUN composer install --no-dev --no-interaction --optimize-autoloader \
+    && chown -R www-data:www-data /srv/app
 
-# Copy the application. Exclude `vendor/` and local environment files in `.dockerignore`, so
-# dependencies are installed inside the image.
-COPY . /srv/app
-RUN composer install --no-dev --no-interaction --optimize-autoloader
-
-# Match the published image's contract, so an argument after the image name is passed to Volucer.
-# This replaces the base image's `docker-php-entrypoint`, which would treat `docker run … version`
-# as a program named `version`. `php` remains available through `docker exec` and a backend's
-# `command`.
+USER www-data
 EXPOSE 8080 9080
-
-# The base image defines no health check, and the binary serves as its own probe. Use `/health`
-# rather than `/ready`, as the published images do: a slow worker pool must not fail the check
-# and restart the container. The variable tells the probe where the file is, because the working
-# directory belongs to the application, not the configuration.
 ENV VOLUCER_HEALTH_CONFIG=/etc/volucer/volucer.toml
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/volucer", "health"]
 
@@ -584,7 +601,7 @@ CMD ["serve", "--config", "/etc/volucer/volucer.toml"]
 ```
 
 The configuration then refers to `php` by name. Both binaries are already on `PATH`
-(`/usr/local/bin/php` and `/usr/local/bin/php-cgi`), so no path needs to be written into it:
+(`/usr/bin/php` and `/usr/bin/php-cgi`), so no path needs to be written into it:
 
 ```toml
 [server]
@@ -592,8 +609,7 @@ http = "0.0.0.0:8080"
 document_root = "/srv/app/public"    # the WORKDIR above, plus the application's own public/
 front_controller = "index.php"
 
-# Address that `volucer health` probes. Use `0.0.0.0` in both places, so the probe reaches the
-# listener inside the container and `-p` reaches it from outside.
+# `volucer health` probes this listener; bind to 0.0.0.0 for container access.
 [status]
 listen = "0.0.0.0:9080"
 
@@ -603,7 +619,7 @@ command = "php worker.php"
 working_dir = "/srv/app"
 ```
 
-Bind both listeners to `0.0.0.0`, as explained in [Running it](#running-it). Run it the same way:
+Bind both listeners to `0.0.0.0` (see [Running it](#running-it)):
 
 ```sh
 docker run --rm -p 8080:8080 -p 9080:9080 \
@@ -611,41 +627,49 @@ docker run --rm -p 8080:8080 -p 9080:9080 \
     my-app
 ```
 
-The document root and application are already in the image, so only the configuration is
-mounted. An edit takes effect on `docker restart`, without a rebuild.
+The app and document root are in the image; mount only the config. Config edits take effect
+after `docker restart`.
 
-Review these details before the first build:
+Key differences from the official `php` image:
 
-- **PHP 8.5 builds OPcache into the binary.** Do not run `docker-php-ext-install opcache`.
-  From 8.5, the extension is always compiled in and loaded, the `--enable-opcache` configure
-  flags are removed, and no `opcache.so` is produced for that command to install. A
-  `spawn_cgi` pool uses it through `opcache.enable`, which defaults to on. A `worker` runs
-  under the CLI SAPI, where `opcache.enable_cli` defaults to off. Leaving it off has no cost,
-  because a resident worker compiles its code once at boot. On PHP 8.4 and older, the
-  extension must still be installed.
-- **Extensions that link a system library need that library's `-dev` package first.** For
-  example, `intl` requires `libicu-dev`, and `gd` requires `libpng-dev libjpeg62-turbo-dev
-libfreetype6-dev`. Install these with `apt-get install` in a layer before
-  `docker-php-ext-install`. The image includes `ca-certificates`, so ACME issuance and outbound
-  TLS work without changes. Place settings in `$PHP_INI_DIR/conf.d/`
-  (`/usr/local/etc/php/conf.d`), starting from the `php.ini-production` file the image ships.
-- **A copied binary does not bring a user with it.** This image runs as `root` unless
-  configured otherwise. The published `glibc` image, by contrast, creates a `volucer` user. To
-  drop privileges, add `USER www-data` after the `RUN composer install` line, and `chown` the
-  application directory to that user. In an Azera application, `writable/` must remain
-  writable by the user the workers run as.
+- **`pcntl` is built into `php8.5-cli`**, along with `posix`, `sockets`, and SysV IPC.
+  `attach` requires these; the official PHP image needs `docker-php-ext-install pcntl`.
+- **OPcache is included.** CLI OPcache is off by default; `spawn_cgi` uses `opcache.enable`,
+  which defaults on.
+- **Extensions are separate Ubuntu packages.** The recipe installs `mbstring`, `curl`, `xml`,
+  `sqlite3`, and `zip`; add `php8.5-mysql`, `php8.5-intl`, `php8.5-bcmath`, or `php8.5-gd`
+  as needed. Ubuntu and the official image have different extension sets; compare `php -m`
+  rather than assuming either is a superset.
+- **CGI is optional.** Install `php8.5-cgi` only for `spawn_cgi`; it adds about 32 MB and
+  uses `/etc/php/8.5/cgi/` settings. CLI settings are under `/etc/php/8.5/cli/`.
+- The recipe includes `ca-certificates` for TLS and runs as `www-data`. Ensure application
+  directories such as Azera's `writable/` are writable by that user.
 
-The base image defines no `HEALTHCHECK`, so the recipe adds one, using the line from
-[Health checks in the image](#health-checks-in-the-image). It works here for the same reason it
-works there: the check runs the binary, not `curl`.
+Ubuntu defines no `HEALTHCHECK`, so the recipe adds the Volucer health check described in
+[Health checks in the image](#health-checks-in-the-image).
 
-The recipe also replaces the base image's `ENTRYPOINT`, so an argument after the image name is
-passed to Volucer. To run PHP in that container, name the program explicitly:
+Ubuntu has no `ENTRYPOINT`; arguments run through Volucer. To run PHP, specify it explicitly:
 
 ```sh
 docker run --rm --entrypoint php my-app -m
 docker exec my-app php -m                 # in a running container
 ```
+
+### Alpine
+
+[`examples/docker/Dockerfile.alpine`](../examples/docker/Dockerfile.alpine) provides the same
+verified setup on musl: 98 MB versus 294 MB for Ubuntu. Its PHP packages need a few explicit
+steps:
+
+- Alpine installs `/usr/bin/php85`, so the recipe creates `/usr/bin/php` for commands such as
+  `php worker.php`.
+- Install `php85-pcntl` for `attach`, and `php85-phar`, `php85-zip`, and `unzip` for Composer.
+- Install `php85-sockets` and `php85-posix` for the Unix-socket relay used by `attach`.
+
+PHP 8.5 requires Alpine 3.23 (3.22 provides 8.4). The published musl image is the default
+Volucer image, so its tag has no `-glibc` suffix. CI verifies the Alpine recipe with the same
+[`verify.sh`](../examples/docker/verify.sh) used for Ubuntu; compare installed extensions
+rather than assuming Alpine includes Ubuntu's packages.
 
 ### Health checks in the image
 

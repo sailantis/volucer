@@ -1,0 +1,10 @@
+{
+    "name": "sailantis/volucer-example",
+    "description": "A minimal application for the example Dockerfiles.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "sailantis/volucer-worker": "^0.4"
+    }
+}

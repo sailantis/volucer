@@ -5,6 +5,42 @@ All notable changes to volucer are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`examples/docker/`: two complete, CI-verified image recipes.** `Dockerfile.ubuntu` (294 MB)
+  and `Dockerfile.alpine` (98 MB) build a `worker`-ready image with PHP 8.5, Composer and the
+  published binary. `verify.sh` starts the image, waits for its health check, and serves a real
+  request, so a package renamed upstream or a `COPY` whose source moved fails a pull request
+  rather than a user's first `docker run`. A new `Examples` job in `ci.yml` runs it against both.
+
+### Changed
+
+- **The documented PHP image recipe is Ubuntu, not the official `php` image.** The official
+  `php:8.5-cli-bookworm` keeps a 330 MB compiler toolchain so that `docker-php-ext-install`
+  works, and leaves a PHP compiled with its headers in place; a `worker` image built on it is
+  819 MB. The same image on `ubuntu:26.04` + `php8.5-cli` is 229 MB, and the full recipe with
+  `mbstring`, `curl`, `xml`, `sqlite3`, Composer and the application is 294 MB — about a third,
+  and 71 MB instead of 189 MB to pull. Ubuntu 26.04 carries PHP 8.5 in its own repositories, so
+  the change needs no third-party repository. See
+  [Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image).
+- **`pcntl` needs no install on Ubuntu, and the docs now say so.** Ubuntu compiles `pcntl`,
+  `posix`, `sockets`, `shmop` and the SysV IPC extensions into `php8.5-cli`, so the `attach`
+  backend works out of the box; the official image needs `docker-php-ext-install pcntl`. The
+  reverse is also recorded: the official image bakes in `mbstring`, `curl`, `dom`/`xml*`,
+  `sqlite3` and `mysqlnd`, which are separate `php8.5-*` packages on Ubuntu, so neither
+  extension list is a superset of the other.
+
+### Fixed
+
+- **The old recipe could not run `composer install`.** Composer unpacks `dist` archives with
+  `ext-zip` or an `unzip` binary, and the documented Dockerfile installed neither, so it failed
+  with "The zip extension and unzip/7z commands are both missing" on any real application. Both
+  example recipes now install `unzip`, and Alpine also needs `php85-phar` — Composer is a
+  `.phar` and refuses to start without it, which Ubuntu's `php8.5-cli` provides but Alpine's
+  `php85` does not.
+
 ## [0.6.0] - 2026-11-08
 
 This is the release the published benchmark pins: the numbers in

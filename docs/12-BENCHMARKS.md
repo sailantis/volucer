@@ -117,7 +117,7 @@ The **vs one per slot** value is the separate-slot median divided by the forked-
 
 Forked children can share memory pages inherited from their master. PSS accounts for this sharing, which is why the forked-pool and separate-slot arrangements can have different total PSS at the same number of serving processes.
 
-## C3 — API Items — `GET /api/items`
+## C6 — API Items — `GET /api/items-fast`
 
 Measurements were interleaved across server arms, sizing numbers, and load levels on the same host. The order rotated between rounds to reduce ordering effects. **PHP procs** is how many PHP processes serve requests, and it provides a resource-use context for each result.
 
@@ -135,9 +135,9 @@ If a factor range includes 1.0, the measured range includes equal throughput. Th
 
 ### OPcache on
 
-![OPcache on at c=32](images/benchmarks/benchmarks/benchmarks-api-items-on-c32.svg)
-![OPcache on at c=64](images/benchmarks/benchmarks/benchmarks-api-items-on-c64.svg)
-![OPcache on at c=96](images/benchmarks/benchmarks/benchmarks-api-items-on-c96.svg)
+![OPcache on at c=32](images/benchmarks/benchmarks/benchmarks-api-items-fast-on-c32.svg)
+![OPcache on at c=64](images/benchmarks/benchmarks/benchmarks-api-items-fast-on-c64.svg)
+![OPcache on at c=96](images/benchmarks/benchmarks/benchmarks-api-items-fast-on-c96.svg)
 
 The **factor** compares each row with the fastest server in the table (`x1.0`). A factor of `x2.5` means about 40% of the reference throughput. The range shows the round-paired comparison; **tie** marks a range that includes 1.0.
 
@@ -193,7 +193,7 @@ Memory is measured after the run across the full process tree. The table reports
 
 RSS is shown in parentheses for reference. Summed across processes, RSS counts shared pages once for every process that maps them, while PSS divides their contribution among those processes.
 
-![Proportional memory against the number of PHP processes](images/benchmarks/benchmarks/benchmarks-memory-api-items.svg)
+![Proportional memory against the number of PHP processes](images/benchmarks/benchmarks/benchmarks-memory-api-items-fast.svg)
 
 | server | model | 8 procs | 16 procs | 32 procs |
 |---|---|---:|---:|---:|
@@ -209,7 +209,7 @@ Each value is PSS in MiB; RSS in MiB is shown in parentheses.
 
 This comparison holds the number of serving PHP processes constant: one process per slot versus multiple forked children behind a slot.
 
-![The same PHP processes, arranged two ways](images/benchmarks/benchmarks/benchmarks-memory-same-processes-api-items.svg)
+![The same PHP processes, arranged two ways](images/benchmarks/benchmarks/benchmarks-memory-same-processes-api-items-fast.svg)
 
 | shape | PHP processes | median PSS (MiB) | min | max | vs one per slot |
 |---|---:|---:|---:|---:|---:|

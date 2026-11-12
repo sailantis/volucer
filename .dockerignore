@@ -20,6 +20,11 @@ target/
 docs/
 packaging/
 
+# The example images in `examples/docker/` build from this same root context, and their
+# `COPY examples/docker/app` needs the fixture inside it. That is two PHP files and a
+# `composer.json` — under a megabyte — and the published images never name the path, so leaving it
+# in the context costs a layer no published image contains. Excluding it would break the examples.
+
 # Editor and OS noise, which changes constantly and would invalidate the build layer for a reason
 # no compile depends on.
 .idea/

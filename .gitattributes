@@ -19,5 +19,8 @@
 # endings is rejected by some Windows hosts on the first line.
 *.ps1 text eol=crlf
 
-# The Dockerfile's `RUN` lines are shell too.
+# The Dockerfile's `RUN` lines are shell too. `Dockerfile.*` covers the variant names used by the
+# examples (`Dockerfile.ubuntu`, `Dockerfile.alpine`); a pattern of `Dockerfile` alone matches only
+# a file with exactly that name.
 Dockerfile text eol=lf
+Dockerfile.* text eol=lf

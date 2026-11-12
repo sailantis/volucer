@@ -95,7 +95,19 @@ The Docker `HEALTHCHECK` runs `volucer health` and reads its probe address from
 See [Docker operations](docs/11-OPERATIONS.md#docker) for `docker run`, Compose, and guidance on choosing `/health` or `/ready`.
 
 Those images do not include PHP, so the `worker` configuration does not run as written.
-[Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image) shows how to build on a PHP base image.
+[Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image) shows how to build on
+Ubuntu — roughly a third of the size of the same thing on the official `php` image, and with
+`pcntl` already compiled in for the `attach` backend.
+
+Two complete recipes are in the repository, built and verified by CI on every pull request:
+
+```sh
+docker build -f examples/docker/Dockerfile.ubuntu -t app .   # 294 MB
+docker build -f examples/docker/Dockerfile.alpine -t app .   #  98 MB, musl
+```
+
+`examples/docker/verify.sh <image>` is what checks them: it starts the container, waits for the
+health check, and serves a request.
 
 ### Build from source
 

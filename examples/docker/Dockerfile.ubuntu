@@ -1,0 +1,80 @@
+# An image with PHP and volucer, built on Ubuntu.
+#
+# The official `php` images are build *bases*: they keep gcc, g++ and autoconf so that
+# `docker-php-ext-install` works, and a PHP compiled with its headers left in place. That is why
+# `php:8.5-cli-bookworm` is 798 MB and this image is 294 MB with more extensions enabled.
+#
+# The build context is the **repository root**, because the fixture arrives through
+# `COPY examples/docker/app`, which needs the root-relative path. Run from the checkout:
+#
+#     docker build -f examples/docker/Dockerfile.ubuntu -t app .
+#     docker run --rm -p 8080:8080 -p 9080:9080 \
+#         -v "$PWD/examples/docker/volucer.toml:/etc/volucer/volucer.toml:ro" app
+#
+# See docs/11-OPERATIONS.md, "Adding PHP to the image", for the reasoning behind each line.
+FROM ubuntu:26.04
+
+# `ca-certificates` is not in the Ubuntu base image. Without it an ACME client cannot verify the
+# CA's own endpoint and every outbound TLS connection fails, which reads as a network error
+# rather than as a missing trust store.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Ubuntu splits PHP into packages where the official image compiles extensions in. `pcntl` is not
+# in this list because it is already inside `php8.5-cli` — which is what makes the `attach`
+# backend work, since `Volucer\Supervisor::serve()` forks. The official image needs
+# `docker-php-ext-install pcntl` for the same thing.
+#
+# `php8.5-cgi` is here for a `spawn_cgi` backend. It brings a second configuration tree and a
+# `tzdata` dependency, 32 MB in total, so drop it for `worker` or `attach`.
+#
+# `unzip` is not decoration: Composer unpacks a package's `dist` archive with either `ext-zip` or
+# an `unzip` binary, and Ubuntu's `php8.5-cli` bundles `zip`, so the binary is what guarantees it
+# works. The `php8.5-zip` extension is here for the application: most frameworks require it at
+# runtime, and it is not in the base package.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        php8.5-cli \
+        php8.5-cgi \
+        php8.5-mbstring \
+        php8.5-curl \
+        php8.5-xml \
+        php8.5-sqlite3 \
+        php8.5-zip \
+        unzip \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# `-glibc`, not the default `musl` tag: this base is Ubuntu, and the `glibc` stage of
+# `packaging/docker/Dockerfile` builds the matching binary. Pin the version; `latest` moves.
+COPY --from=ghcr.io/sailantis/volucer:0.6.0-glibc /usr/local/bin/volucer /usr/local/bin/volucer
+
+# Composer is not in the base image. `apt-get install composer` works, but it brings about thirty
+# `php-*` packages for its own runtime; the upstream binary is one file.
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /srv/app
+
+COPY examples/docker/app /srv/app
+RUN composer install --no-dev --no-interaction --optimize-autoloader \
+    && chown -R www-data:www-data /srv/app
+
+# The `attach` backend's relay lives somewhere the worker user can create a socket, and the
+# documentation's example is `unix:/run/app/workers.sock`. Without this the supervisor fails at
+# `stream_socket_server()` with a permission error that reads as a broken relay.
+RUN mkdir -p /run/app && chown www-data:www-data /run/app
+
+# Ubuntu's base image provides `www-data`; a copied binary brings no user of its own. Drop
+# privileges after the install, so `composer` still runs as root.
+USER www-data
+
+EXPOSE 8080 9080
+
+ENV VOLUCER_HEALTH_CONFIG=/etc/volucer/volucer.toml
+
+# `/health`, not `/ready`: Docker restarts a container whose health check fails, and a server
+# that is merely still booting its worker pool must not be killed for it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/volucer", "health"]
+
+ENTRYPOINT ["/usr/local/bin/volucer"]
+CMD ["serve", "--config", "/etc/volucer/volucer.toml"]

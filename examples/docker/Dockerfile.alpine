@@ -1,0 +1,78 @@
+# The same image on Alpine.
+#
+# Build from the repository root, as the Ubuntu recipe does:
+#
+#     docker build -f examples/docker/Dockerfile.alpine -t app:alpine .
+#
+# Read the caveats in docs/11-OPERATIONS.md before choosing this over the Ubuntu recipe. In short:
+# it is 98 MB instead of 294 MB, uses musl instead of glibc, and needs three things the Ubuntu
+# recipe does not — a `php` symlink, `php85-pcntl` as a package, and `php85-phar`/`php85-zip` for
+# Composer. All three fail silently rather than at build time, which is why verify.sh checks them.
+FROM alpine:3.23
+
+# Alpine 3.23 is the first release with `php85`; 3.22 stops at 8.4. The version matters because
+# the worker protocol's PHP floor is 8.2, but an application's own `composer.json` may want more.
+#
+# Every extension is a separate package here, including several the official `php` image compiles
+# in: `dom`, `session`, `tokenizer`, `ctype`, `fileinfo`, `openssl`, `posix` and `sockets`. That
+# last group is not optional clutter — `Supervisor::serve()` calls `stream_socket_server()` on a
+# `unix:` relay, and `pcntl` is what lets it fork.
+#
+# `php85-zip`, `php85-phar` and `unzip` are here for Composer, and each of the three is needed
+# for a different reason. It unpacks a package's `dist` archive as a zip, which needs either
+# `ext-zip` or an `unzip` binary; Composer is itself a `.phar` and refuses to start without
+# `ext-phar`. Ubuntu's `php8.5-cli` bundles `phar` and `zip`, so its recipe gets away with the
+# `unzip` binary alone — Alpine splits all three out.
+RUN apk add --no-cache \
+        php85 \
+        php85-pcntl \
+        php85-mbstring \
+        php85-curl \
+        php85-dom \
+        php85-pdo_sqlite \
+        php85-session \
+        php85-tokenizer \
+        php85-ctype \
+        php85-fileinfo \
+        php85-openssl \
+        php85-posix \
+        php85-sockets \
+        php85-zip \
+        php85-phar \
+        unzip \
+        ca-certificates
+
+# Alpine installs `/usr/bin/php85` and **no** `php`. Every configuration in the documentation
+# writes `command = "php worker.php"`, so without this symlink the image starts a backend that
+# fails on its first request. Add `php85-cgi` and a matching `php-cgi` symlink for `spawn_cgi`.
+RUN ln -sf /usr/bin/php85 /usr/bin/php
+
+# The default (`musl`) image is the matching libc here, so this tag carries no `-glibc` suffix.
+COPY --from=ghcr.io/sailantis/volucer:0.6.0 /usr/local/bin/volucer /usr/local/bin/volucer
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /srv/app
+
+COPY examples/docker/app /srv/app
+RUN composer install --no-dev --no-interaction --optimize-autoloader
+
+# Alpine has no `www-data`. The uid is pinned so a bind mount written by the host user, or a
+# volume shared with another container, has an owner that does not move between rebuilds.
+RUN adduser -D -u 1000 app && chown -R app:app /srv/app
+
+# The `attach` backend's relay lives somewhere the worker user can create a socket. This is the
+# path the documentation uses; a deployment that prefers a volume drops this line and mounts one.
+RUN mkdir -p /run/app && chown app:app /run/app
+
+USER app
+
+EXPOSE 8080 9080
+
+ENV VOLUCER_HEALTH_CONFIG=/etc/volucer/volucer.toml
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/volucer", "health"]
+
+ENTRYPOINT ["/usr/local/bin/volucer"]
+CMD ["serve", "--config", "/etc/volucer/volucer.toml"]

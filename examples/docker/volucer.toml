@@ -1,0 +1,20 @@
+# The configuration both example images expect. Mount it, or copy it, to
+# `/etc/volucer/volucer.toml` — the path the images' `CMD` and `HEALTHCHECK` name.
+#
+#     docker run --rm -p 8080:8080 -p 9080:9080 \
+#         -v "$PWD/examples/docker/volucer.toml:/etc/volucer/volucer.toml:ro" app
+#
+# Bind both listeners to `0.0.0.0`. A `127.0.0.1` listener is reachable only inside the
+# container's network namespace, and publishing the port with `-p` does not change that.
+
+[server]
+http = "0.0.0.0:8080"
+document_root = "/srv/app/public"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+# The address `volucer health` probes, and what `EXPOSE 9080` names.
+[status]
+listen = "0.0.0.0:9080"

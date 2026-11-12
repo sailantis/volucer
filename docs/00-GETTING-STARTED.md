@@ -119,7 +119,9 @@ or `curl`. See [Docker operations](11-OPERATIONS.md#docker) for `docker run`, Co
 and guidance on when to use `/health` or `/ready`.
 
 Those images do not include PHP, so the `worker` configuration does not run as written.
-[Adding PHP to the image](docs/11-OPERATIONS.md#adding-php-to-the-image) shows how to build on a PHP base image.
+[Adding PHP to the image](11-OPERATIONS.md#adding-php-to-the-image) shows how to build on
+Ubuntu — roughly a third of the size of the same thing on the official `php` image, and with
+`pcntl` already compiled in for the `attach` backend.
 
 ### Directly
 
