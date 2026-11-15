@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Windows static-file requests now open the file once**, avoiding a separate `stat` handle.
+  At c=100, `/index.html` throughput rose from 10,107 to 14,550 rps; twelve distinct URLs rose
+  from 22,177 to 27,583. A `304` still uses only `stat`. Unix retains `stat` first: the change
+  was within noise there, and opening before `fstat` could block on a FIFO. See
+  [Cost](docs/04-STATIC-FILES.md#cost).
 - **The documented PHP image recipe is Ubuntu, not the official `php` image.** The official
   `php:8.5-cli-bookworm` keeps a 330 MB compiler toolchain so that `docker-php-ext-install`
   works, and leaves a PHP compiled with its headers in place; a `worker` image built on it is
@@ -33,6 +38,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extension list is a superset of the other.
 
 ### Fixed
+
+- **The operations guide described the runtime wrongly, and its sizing advice was scoped to one
+  backend shape.** "Volucer runs one multi-threaded Tokio runtime" is not true: there is one per
+  async listener (HTTP, HTTPS, HTTP/3, and the status listener's own two-thread pool) plus one per
+  `attach`/socket pool, so `TOKIO_WORKER_THREADS` is multiplicative and the documented "pick 4–8"
+  range could over- or under-size a deployment by a factor of two. The section now says so, adds
+  the thread count a real process holds (18 at the default and 10 with `TOKIO_WORKER_THREADS=4` on
+  a 12-core host with one listener), and reports a second sweep on an `upstream` front-end where
+  the opposite conclusion holds — shrinking the runtime there costs throughput rather than buying
+  it. That is also the stated reason the default is unchanged: no single clamp is right for both
+  a front-end waiting on a process pool and one that is CPU-bound itself.
 
 - **The old recipe could not run `composer install`.** Composer unpacks `dist` archives with
   `ext-zip` or an `unzip` binary, and the documented Dockerfile installed neither, so it failed

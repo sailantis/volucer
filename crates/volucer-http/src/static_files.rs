@@ -31,6 +31,7 @@
 //!   compressed here, because doing it per request spends a worker thread on work
 //!   the build should have done once.
 
+use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -142,13 +143,24 @@ pub async fn respond_with_root(
             .header(LOCATION, location)
             .body(body_of(Bytes::new()))
             .expect("a redirect is a valid response")),
-        Plan::File {
-            path,
-            encoding,
-            length,
-            modified,
-        } => answer(&request, files, path, encoding, length, modified).await,
+        Plan::File(file) => answer(&request, files, file).await,
     })
+}
+
+/// One file to serve: where it is, and the handle that already measured it.
+///
+/// The handle is the point on Windows. There `plan` opens the file it measures, so
+/// a request for a real file arrives holding the descriptor its length and
+/// modification time came from, and there is no second `open` for a file the server
+/// has already opened once. Unix leaves it `None` and opens in the body; see
+/// [`measure`] for why the platforms differ.
+#[derive(Debug)]
+struct ServeFile {
+    path: PathBuf,
+    encoding: Option<&'static str>,
+    length: u64,
+    modified: Option<SystemTime>,
+    open: Option<File>,
 }
 
 /// What the blocking half decided.
@@ -164,12 +176,8 @@ enum Plan {
     BadRequest(String),
     /// A directory URL without its trailing slash.
     Redirect(String),
-    File {
-        path: PathBuf,
-        encoding: Option<&'static str>,
-        length: u64,
-        modified: Option<SystemTime>,
-    },
+    /// A real file, with the handle it was measured through when there is one.
+    File(ServeFile),
 }
 
 /// The values the blocking closure needs, copied out of the request.
@@ -180,13 +188,42 @@ enum Plan {
 #[derive(Debug, Default)]
 struct Wanted {
     accept_encoding: Option<String>,
+    /// Whether the client already holds a version, so the answer may be a `304`
+    /// with no body.
+    ///
+    /// Only consulted on Windows, where it decides the syscall order rather than
+    /// the response: when it is set the answer is complete from a `stat` alone, so
+    /// opening the file first would create a handle nothing reads. A revalidating
+    /// client is the common case for a cached asset, so that handle was not a rare
+    /// cost. On Unix the order does not depend on it, so it is not computed — see
+    /// [`Wanted::revalidating`].
+    #[cfg(windows)]
+    revalidating: bool,
 }
 
 impl Wanted {
     fn from(request: &Request<'_>) -> Self {
         Wanted {
             accept_encoding: header(request.headers, ACCEPT_ENCODING).map(str::to_string),
+            #[cfg(windows)]
+            revalidating: request.headers.contains_key(IF_NONE_MATCH)
+                || request.headers.contains_key(IF_MODIFIED_SINCE),
         }
+    }
+
+    /// Whether this looks like a conditional request.
+    ///
+    /// A method rather than the field, so that Unix does not pay for two header
+    /// lookups whose answer it never reads: there it is a constant, and the caller
+    /// passes it to a [`measure`] that ignores it.
+    #[cfg(windows)]
+    fn revalidating(&self) -> bool {
+        self.revalidating
+    }
+
+    #[cfg(not(windows))]
+    fn revalidating(&self) -> bool {
+        false
     }
 }
 
@@ -293,65 +330,99 @@ fn plan(owned: &Owned, files: &StaticFiles, root: Option<(&Path, &str)>) -> Plan
     }
 
     // A directory URL is answered before anything else is stat-ed, because the
-    // only file it can name is its own index. `is_file()` then `describe` would
-    // stat that one file twice.
+    // only file it can name is its own index.
     if files.config.directory_index && path.ends_with('/') {
         let index = resolved.join("index.html");
-        return match std::fs::metadata(&index) {
-            Ok(metadata) if metadata.is_file() => describe(index, metadata, owned, files),
+        return match measure(&index, owned.wanted.revalidating()) {
+            Some((file, metadata)) => describe(index, metadata, file, owned, files),
             // A directory with no index is not a file, so PHP gets it — an
             // application may well have a route for it.
-            _ => Plan::NotAFile,
+            None => Plan::NotAFile,
         };
     }
 
-    // One `stat`, and it is the only one. `is_dir()` and `is_file()` each stat on
-    // their own, so asking both cost two round trips to learn a single fact — and
-    // for a front-controller application that is two round trips on *every* path
-    // in the application, since none of them names a file. The metadata answers
-    // both questions, and it is also what `describe` needs, so the file case costs
-    // one stat where it used to cost two as well.
-    //
-    // Measured: `GET /items` went from 2.05 `statx` per request to 1.05, which is
-    // the one this line makes.
-    let Some(metadata) = std::fs::metadata(&resolved).ok() else {
-        // Not there. `NotAFile` rather than a 404: a path that names no file may
-        // still be the application's, and this layer's job is to get out of the
-        // way rather than to shadow a route that exists.
-        return Plan::NotAFile;
-    };
+    // One measurement, and it is the only one. What it costs depends on the
+    // platform and on whether the answer can be a bodyless `304` at all -- see
+    // [`measure`], which is where that decision lives.
+    if let Some((file, metadata)) = measure(&resolved, owned.wanted.revalidating()) {
+        return describe(resolved, metadata, file, owned, files);
+    }
 
-    if files.config.directory_index && metadata.is_dir() && resolved.join("index.html").is_file() {
+    // Not a regular file. A directory without its trailing slash redirects;
+    // anything else is the application's business.
+    if files.config.directory_index && resolved.join("index.html").is_file() {
         // A directory without its trailing slash: `docs` becomes `docs/`, so
         // relative links inside the page resolve against it.
         return Plan::Redirect(directory_location(owned, files.server_port));
     }
 
-    if !metadata.is_file() {
-        return Plan::NotAFile;
+    // Not there, or not something this layer serves. `NotAFile` rather than a
+    // 404: a path that names no file may still be the application's, and this
+    // layer's job is to get out of the way rather than to shadow a route that
+    // exists.
+    Plan::NotAFile
+}
+/// Measure `path`, opening it only when the response will need the bytes.
+///
+/// `None` means "not a regular file", which the caller turns into a redirect or
+/// `NotAFile`.
+///
+/// **This is a Windows-only optimisation, and the branch is the point.** On Windows
+/// a `stat` of a *present* file is the call that does not scale — 1.10x for 12
+/// threads against 1, where the same path's `open` reaches 1.44x — so `stat`+`open`
+/// becomes `open`+`fstat`, replacing the serialising call with one that
+/// parallelises. Measured at +44% end to end there.
+///
+/// On Unix the same change is worth nothing: `statx` is ~1.3 us and already scales
+/// 7.6x, so there is no serialising call to remove, and an interleaved A/B measured
+/// the difference as noise. Unix therefore keeps its original shape — one `stat`,
+/// and the `open` left to the body — which is also the only safe order there: a FIFO
+/// opened for reading blocks until a writer appears, so the type must be known
+/// before the open.
+///
+/// `revalidating` is the Windows exception again: a `304` is complete from a `stat`
+/// alone, and opening a handle nothing reads measured slower than not opening one.
+/// A cached asset revalidates on every load, so that is not a rare path.
+fn measure(path: &Path, revalidating: bool) -> Option<(Option<File>, std::fs::Metadata)> {
+    #[cfg(windows)]
+    if !revalidating {
+        // A directory cannot be opened on Windows, so this doubles as the type
+        // check: `File::open` fails with `PermissionDenied` for a directory and
+        // `NotFound` for a missing path, and neither can block. The metadata comes
+        // from the handle, so the file served is the file measured.
+        let file = File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        return metadata.is_file().then_some((Some(file), metadata));
     }
 
-    describe(resolved, metadata, owned, files)
+    // One `stat`, and the handle is left to the body. `is_dir()` and `is_file()`
+    // each stat on their own, so asking both would be two round trips to learn one
+    // fact; the metadata answers both and is what the answer is built from.
+    let metadata = std::fs::metadata(path).ok()?;
+    metadata.is_file().then_some((None, metadata))
 }
 
 /// Turn a file that is known to exist into a `Plan::File`.
 ///
-/// The metadata is passed in rather than read here: the caller has already stat-ed
-/// the path to establish that it is a file, and a second `stat` of the same file
-/// would be a second round trip for a fact already in hand.
+/// The metadata is passed in rather than read here: the caller has already opened
+/// (or stat-ed) the path to establish that it is a file, and asking again would be
+/// a second round trip for a fact already in hand.
 fn describe(
     path: PathBuf,
     metadata: std::fs::Metadata,
+    open: Option<File>,
     owned: &Owned,
     files: &StaticFiles,
 ) -> Plan {
-    let (path, encoding, length) = choose_encoding(&path, metadata.len(), &owned.wanted, files);
-    Plan::File {
+    let (path, encoding, length, open) =
+        choose_encoding(&path, metadata.len(), open, &owned.wanted, files);
+    Plan::File(ServeFile {
         path,
         encoding,
         length,
         modified: metadata.modified().ok(),
-    }
+        open,
+    })
 }
 
 /// Resolve a URL path to a file under the document root.
@@ -416,11 +487,15 @@ fn directory_location(owned: &Owned, server_port: Option<u16>) -> String {
 async fn answer(
     request: &Request<'_>,
     files: &StaticFiles,
-    path: PathBuf,
-    encoding: Option<&'static str>,
-    length: u64,
-    modified: Option<SystemTime>,
+    file: ServeFile,
 ) -> Result<StaticResponse, HttpError> {
+    let ServeFile {
+        path,
+        encoding,
+        length,
+        modified,
+        open,
+    } = file;
     let mut headers = HeaderMap::new();
 
     // A `Last-Modified` that cannot be formatted would be worse than none: a
@@ -487,7 +562,9 @@ async fn answer(
     };
 
     match range {
-        None | Some(Ranges::Ignore) => stream(&path, 0, length, &headers, StatusCode::OK).await,
+        None | Some(Ranges::Ignore) => {
+            stream(&path, open, 0, length, &headers, StatusCode::OK).await
+        }
         Some(Ranges::Unsatisfiable) => Ok(build(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(CONTENT_RANGE, format!("bytes */{length}"))
             .body(body_of(Bytes::new()))
@@ -500,6 +577,7 @@ async fn answer(
             );
             stream(
                 &path,
+                open,
                 range.start,
                 range.len(),
                 &headers,
@@ -507,6 +585,9 @@ async fn answer(
             )
             .await
         }
+        // A multi-range answer reads the same file once per part, so it keeps the
+        // path rather than the handle: a handle carries one file offset, and
+        // handing it to the assembler would make the parts depend on each other.
         Some(Ranges::Many(ranges)) => {
             multi_range(
                 &path,
@@ -692,17 +773,24 @@ fn header(headers: &HeaderMap, name: hyper::header::HeaderName) -> Option<&str> 
 ///
 /// Only an *existing* variant is chosen, so a missing `file.gz` falls back to the
 /// original rather than a 404 — the file the client asked for does exist.
+///
+/// Returns the handle to stream from. When a variant is chosen the handle `open`
+/// is dropped and the variant's is opened instead, because a variant is a different
+/// file with a different length; the metadata the answer is built from is the
+/// variant's own, so a `Last-Modified` and a length never describe the original
+/// while the bytes come from the variant.
 fn choose_encoding(
     path: &Path,
     length: u64,
+    open: Option<File>,
     wanted: &Wanted,
     files: &StaticFiles,
-) -> (PathBuf, Option<&'static str>, u64) {
+) -> (PathBuf, Option<&'static str>, u64, Option<File>) {
     if !files.config.precompressed {
-        return (path.to_path_buf(), None, length);
+        return (path.to_path_buf(), None, length, open);
     }
     let Some(accept) = wanted.accept_encoding.as_deref() else {
-        return (path.to_path_buf(), None, length);
+        return (path.to_path_buf(), None, length, open);
     };
 
     // Brotli first: it is smaller than gzip for text, so when the client accepts
@@ -712,14 +800,16 @@ fn choose_encoding(
             continue;
         }
         let candidate = PathBuf::from(format!("{}{suffix}", path.display()));
-        if let Ok(metadata) = std::fs::metadata(&candidate) {
-            if metadata.is_file() {
-                return (candidate, Some(encoding), metadata.len());
-            }
+        // Opened rather than stat-ed, and its handle kept: it is the file the body
+        // will be read from, so this costs one handle where a `stat` and a later
+        // `open` would cost two. A variant is never the answer to a `304`: it is a
+        // different file from the one the validator was computed for.
+        if let Some((file, metadata)) = measure(&candidate, false) {
+            return (candidate, Some(encoding), metadata.len(), file);
         }
     }
 
-    (path.to_path_buf(), None, length)
+    (path.to_path_buf(), None, length, open)
 }
 
 /// Whether an `Accept-Encoding` value offers this encoding with a non-zero
@@ -835,8 +925,12 @@ fn parse_ranges(value: &str, length: u64) -> Ranges {
 }
 
 /// Stream a slice of a file as the response body.
+///
+/// `open` is the handle [`measure`] already took, when there is one. It is `None`
+/// on Unix by design, and on Windows for a path that was measured by `stat`.
 async fn stream(
     path: &Path,
+    open: Option<File>,
     offset: u64,
     length: u64,
     headers: &HeaderMap,
@@ -849,7 +943,7 @@ async fn stream(
     builder = builder.header(CONTENT_LENGTH, length);
 
     builder
-        .body(stream_body(path, offset, length).await?)
+        .body(stream_body(path, open, offset, length).await?)
         .map_err(|err| HttpError::BadGateway(err.to_string()))
 }
 
@@ -889,21 +983,37 @@ const INLINE_READ_MAX: u64 = 256 * 1024;
 /// Two shapes, chosen by size: a small slice is read here and becomes one in-memory
 /// frame; a large one is streamed from a `tokio` file. See [`INLINE_READ_MAX`] for
 /// why the boundary is where it is.
-async fn stream_body(path: &Path, offset: u64, length: u64) -> Result<ResponseBody, HttpError> {
+///
+/// `open` is the handle [`measure`] took, which exists only on Windows — see that
+/// function for why. It covers the whole file and a single range of it alike,
+/// because seeking a descriptor of this task's own is safe: it is not shared, so a
+/// range does not have to resolve the path again. `None` opens the path here, which
+/// is what Unix always did.
+async fn stream_body(
+    path: &Path,
+    open: Option<File>,
+    offset: u64,
+    length: u64,
+) -> Result<ResponseBody, HttpError> {
     use tokio::io::AsyncSeekExt;
 
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        // Vanished between the `stat` and the `open`. The headers already say
-        // 200, so the honest answer is an empty body rather than a truncated one;
-        // a client sees a short read and retries.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(body_of(Bytes::new())),
-        Err(err) => {
-            return Err(HttpError::BadGateway(format!(
-                "cannot open {}: {err}",
-                path.display()
-            )))
-        }
+    let file = match open {
+        Some(file) => file,
+        None => match File::open(path) {
+            Ok(file) => file,
+            // Vanished between the `stat` and the `open`. The headers already say
+            // 200, so the honest answer is an empty body rather than a truncated
+            // one; a client sees a short read and retries.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(body_of(Bytes::new()))
+            }
+            Err(err) => {
+                return Err(HttpError::BadGateway(format!(
+                    "cannot open {}: {err}",
+                    path.display()
+                )))
+            }
+        },
     };
 
     if length <= INLINE_READ_MAX {
@@ -997,7 +1107,21 @@ pub async fn sendfile(
     };
     let length = metadata.len();
     let modified = metadata.modified().ok();
-    answer(&request, files, resolved, None, length, modified).await
+    answer(
+        &request,
+        files,
+        ServeFile {
+            path: resolved,
+            encoding: None,
+            length,
+            modified,
+            // Not the handle this layer opened: `resolve` stat-ed the path the
+            // backend named, and the file is opened here from the path it
+            // returned so the bytes come from the file that was checked.
+            open: None,
+        },
+    )
+    .await
 }
 
 /// A file streamed in fixed-size blocks, never buffered whole.
@@ -1260,13 +1384,19 @@ mod tests {
     }
 
     /// A request as the blocking half sees it, with no headers set.
+    ///
+    /// Built through [`Wanted::from`] rather than by hand, so the tests cannot
+    /// drift from the fields the platform actually has.
     fn owned(path: &str, headers: &HeaderMap) -> Owned {
         Owned {
             path: path.to_string(),
             host: Some("example.test".to_string()),
-            wanted: Wanted {
-                accept_encoding: header(headers, ACCEPT_ENCODING).map(str::to_string),
-            },
+            wanted: Wanted::from(&Request {
+                method: &Method::GET,
+                path,
+                headers,
+                host: Some("example.test"),
+            }),
         }
     }
 
@@ -1570,6 +1700,106 @@ mod tests {
         }
     }
 
+    /// What the platform promises about the handle a plan carries.
+    ///
+    /// Windows opens the file while measuring it, so the body must never resolve the
+    /// path again — a plan that lost its handle would silently go back to two path
+    /// resolutions with no visible difference in the response. Unix leaves the
+    /// `open` to the body on purpose, and asserts that instead, so neither platform
+    /// can drift into the other's shape unnoticed.
+    #[test]
+    fn a_planned_file_carries_a_handle_exactly_where_the_platform_opens_one() {
+        let root = fixture("carries", &[("a.txt", "hello"), ("b.txt", "world")]);
+        let files = layer(&root, true);
+        let headers = no_headers();
+
+        for path in ["/a.txt", "/b.txt"] {
+            match plan(&owned(path, &headers), &files, None) {
+                Plan::File(file) => {
+                    #[cfg(windows)]
+                    assert!(file.open.is_some(), "{path} lost its handle");
+                    #[cfg(not(windows))]
+                    assert!(file.open.is_none(), "{path} should not be open yet");
+                    assert_eq!(file.length, 5);
+                    assert_eq!(file.path, root.join(path.trim_start_matches('/')));
+                }
+                other => panic!("{path}: unexpected {}", name_of(&other)),
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A variant is a different file, so its length must be the variant's.
+    ///
+    /// Answering with the original's length and the variant's bytes — or the other
+    /// way round — promises a `Content-Length` the body does not satisfy, which
+    /// desynchronises the connection. The handle is only checked on the platform
+    /// that opens variants eagerly; the length is checked everywhere.
+    #[test]
+    fn a_variant_is_served_with_its_own_length_and_its_own_handle() {
+        let root = fixture(
+            "variant-handle",
+            &[("a.txt", "plain"), ("a.txt.br", "compressed-bytes")],
+        );
+        let mut files = layer(&root, true);
+        files.config.precompressed = true;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "br".parse().unwrap());
+
+        match plan(&owned("/a.txt", &headers), &files, None) {
+            Plan::File(file) => {
+                assert_eq!(file.encoding, Some("br"));
+                assert_eq!(file.length, 16, "the length must be the variant's");
+                assert!(file.path.ends_with("a.txt.br"));
+
+                #[cfg(windows)]
+                {
+                    assert!(file.open.is_some(), "the variant lost its handle");
+                    let mut probe = [0u8; 1];
+                    use std::io::Read;
+                    let mut open = file.open.unwrap();
+                    open.read_exact(&mut probe)
+                        .expect("the variant is readable");
+                    assert_eq!(&probe, b"c", "the handle must be the variant's");
+                }
+                #[cfg(not(windows))]
+                let _ = file.open;
+            }
+            other => panic!("unexpected {}", name_of(&other)),
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A path that is not a regular file is refused rather than opened.
+    ///
+    /// A FIFO under the document root would block the open until a writer appeared,
+    /// which would hang a runtime thread per request instead of answering — so the
+    /// type is settled before the open on the platform where that is possible.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_never_opened() {
+        let root = fixture("fifo", &[("index.html", "home")]);
+        let fifo = root.join("pipe");
+        // `mkfifo` as a subprocess rather than a `libc` call, so the test needs no
+        // dependency this crate does not otherwise have.
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should be available");
+        assert!(created.success(), "could not create the FIFO");
+
+        let files = layer(&root, true);
+        // If this hangs, `plan` opened the FIFO: the test is the assertion.
+        let outcome = plan(&owned("/pipe", &no_headers()), &files, None);
+        assert_eq!(name_of(&outcome), "not a file");
+
+        let _ = fs::remove_file(&fifo);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn an_encoding_is_accepted_only_with_a_non_zero_quality() {
         assert!(accepts_encoding("gzip", "gzip"));
@@ -1689,7 +1919,16 @@ mod tests {
 
         // And a real file is still served, from the metadata the plan already had.
         match plan(&owned("/file.txt", &headers), &files, None) {
-            Plan::File { length, .. } => assert_eq!(length, 1),
+            Plan::File(file) => {
+                assert_eq!(file.length, 1);
+                // The handle travels with the plan on the platform that opens it
+                // while measuring; Unix keeps its original shape and leaves the
+                // `open` to the body.
+                #[cfg(windows)]
+                assert!(file.open.is_some(), "the plan should carry its handle");
+                #[cfg(not(windows))]
+                assert!(file.open.is_none(), "unix leaves the open to the body");
+            }
             other => panic!("unexpected: {}", name_of(&other)),
         };
 
@@ -1718,9 +1957,11 @@ mod tests {
         // A directory with an index is served through the index.
         match plan(&owned("/assets/", &headers), &files, None) {
             Plan::NotAFile => {}
-            Plan::File { path, .. } => assert!(path.ends_with("index.html"), "{}", path.display()),
+            Plan::File(file) => {
+                assert!(file.path.ends_with("index.html"), "{}", file.path.display())
+            }
             other => panic!("unexpected: {}", name_of(&other)),
-        }
+        };
 
         // A directory with no index is not a file, so PHP gets it.
         fs::create_dir_all(root.join("empty")).expect("create the directory");
