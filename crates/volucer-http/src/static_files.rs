@@ -395,6 +395,14 @@ fn measure(path: &Path, revalidating: bool) -> Option<(Option<File>, std::fs::Me
         return metadata.is_file().then_some((Some(file), metadata));
     }
 
+    // The parameter stays in the signature on both platforms because the callers
+    // compute it unconditionally, but only the Windows branch above reads it. On
+    // Unix this is the whole story, and an unread binding under `-D warnings` is an
+    // error rather than a hint — which is how this compiled everywhere except the
+    // one platform CI builds on.
+    #[cfg(not(windows))]
+    let _ = revalidating;
+
     // One `stat`, and the handle is left to the body. `is_dir()` and `is_file()`
     // each stat on their own, so asking both would be two round trips to learn one
     // fact; the metadata answers both and is what the answer is built from.

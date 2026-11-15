@@ -357,6 +357,10 @@ fn attach_config(relay: String, workers: u32, max_requests: Option<u64>) -> Atta
         workers,
         max_requests,
         checksum: Default::default(),
+        // Off, which is the field's own default and what every other literal in the
+        // workspace sets: the counters it fills are read once at shutdown, and these
+        // tests assert on throughput and pids rather than on wait figures.
+        measure_wait: false,
         idle_ping_ms: None,
         services: Vec::new(),
         grpc_services: Vec::new(),
