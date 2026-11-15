@@ -351,6 +351,14 @@ It checks the staged content, so it catches a formatted file that was never `git
 commit that would otherwise pass locally and fail in CI. Run `cargo fmt --all` (twice: rustfmt is
 not always idempotent in one pass) to fix what it reports, or `git commit --no-verify` to bypass it.
 
+`rust-toolchain.toml` pins the channel so that the hook and the CI job are formatting with the
+same rustfmt. Without it both ran whatever rustup default they found, which is how a commit can
+pass every check locally and still go red. The pin is a minor version (`1.99`), so a patch release
+is picked up; it is not the minimum supported compiler, which is `rust-version` in `Cargo.toml` and
+is verified by the `msrv` job against an explicit `+1.88.0`. Note that a pin named `1.99` is a
+separate rustup toolchain from `stable` even when both are the same version, so the first build
+here may install a second copy.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

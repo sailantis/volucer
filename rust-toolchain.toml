@@ -1,0 +1,38 @@
+# The toolchain this repository is built and formatted with, so that "clean locally" and "clean in
+# CI" are the same statement rather than two measurements taken on different days.
+#
+# Why it exists: `cargo fmt --all --check` is a required CI job, and without this file it checked
+# whatever rustup default the runner image happened to have, while the hook in `.githooks` checked
+# whatever this machine has. rustfmt's layout is not stable across releases, so those two can
+# disagree — and when they do, the failing commit is one that passed every check available before
+# it was pushed. Pinning both ends to one channel closes that window instead of explaining it after
+# a red run.
+#
+# What it costs, stated plainly because the price is not obvious: a channel named `1.99` is a
+# *different* rustup toolchain from `stable`, even when the two happen to be the same version. So a
+# machine whose default is `stable` gets a second toolchain directory the first time a `cargo`
+# command runs in this checkout, and it keeps updating 1.99 while `stable` moves on to 1.100. That
+# is the trade being made deliberately: what this file buys is that the formatter does not change
+# the moment `stable` advances to the next minor, which is exactly when a layout change lands.
+#
+# The channel is a **minor version, not a patch**, so a rustfmt fix released as 1.99.2 is picked up
+# rather than held back. An exact `1.99.0` would pin a patch that may be known-broken and would
+# still not be the same copy as the one on `stable`.
+#
+# The minimum supported version is a *different* promise and does not live here — it is
+# `rust-version` in `Cargo.toml`, verified by the `msrv` job. An explicit `+toolchain` still wins
+# over this file, which is what lets that job run `cargo +1.88.0 check` against the real floor.
+#
+# `rustfmt` is named because the hook needs it and `rustc` does not imply it: a machine with only
+# the compiler installed fails the hook with "rustfmt is not on PATH". `clippy` is named for the
+# same reason — the `clippy` job runs three passes and a toolchain without the component fails the
+# first one. Both are in rustup's default profile, so on a normal install this records a fact
+# rather than changing one.
+#
+# CI needs no change to read this: rustup resolves the file for every `cargo` and `rustup`
+# invocation in the checkout, which is why the workflows name no toolchain. The one job that
+# overrides it on purpose is `msrv`, and it does so with an explicit `+1.88.0`.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]
+
