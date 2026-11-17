@@ -220,12 +220,16 @@ minimum supported version.
 The `worker` backend launches worker processes. The `attach` backend instead connects to a
 relay served by your application, using one connection per worker slot.
 
-This model lets the application boot once and then fork workers, so each child inherits the
-already-loaded interpreter, classes, and OPcache segment.
+This model lets the application boot once and then fork workers. Each child inherits the
+initialized application state; with OPcache enabled, PHP bytecode is shared across processes
+independently.
 
 The application must own the fork: it also owns the listening socket, and the PHP SDK does
 not pass that socket to a separate Volucer process. `Volucer\Supervisor` provides the
 application-side supervisor:
+
+The `App` below is illustrative, not a Volucer class. Its `bootstrap()` and `handle()` methods
+stand in for the startup and request-handling APIs of your application.
 
 ```php
 <?php
@@ -233,10 +237,12 @@ application-side supervisor:
 require __DIR__ . '/vendor/autoload.php';
 
 $app = new App();
-$app->bootstrap();                  // boot before the fork, or every child boots its own
+// Initialize reusable application state before forking; children inherit it.
+// Open DB, Redis, and other process-local connections lazily in the handler,
+// after the fork, so each child creates and owns its own connection.
+$app->bootstrap();
 
 Volucer\Supervisor::serve(
-    null,                           // or 'unix:/run/app/workers.sock'
     static fn (Volucer\Request $request): Volucer\Response => new Volucer\Response(
         200,
         [['Content-Type', 'text/html; charset=utf-8']],
@@ -248,17 +254,15 @@ Volucer\Supervisor::serve(
 ```toml
 [backends.app]
 kind    = "attach"
+command = "php supervisor.php"
 workers = 16
 ```
 
-The handler has the same signature as the callable passed to `Worker::run()`. In many
-applications, adapting a worker script to run under the supervisor only requires changing
-the final call.
+The HTTP handler has the same signature as the callable passed to `Worker::run()`. In many applications, adapting an existing HTTP worker to run under the supervisor only requires changing how it serves the connection.
 
 ### The relay address
 
-If the first argument is `null`, the supervisor reads `VOLUCER_RELAY_SOCKET`. The server
-uses the same variable when `relay` is omitted:
+The relay is optional and usually the environment's to name, so the handler is often the only argument. The supervisor reads `VOLUCER_RELAY_SOCKET`, and the server uses the same variable when `relay` is omitted:
 
 ```ini
 # the unit file, or a container's environment
@@ -269,21 +273,28 @@ Unlike `VOLUCER_WORKER_SOCKET`, which Volucer sets for a spawned worker, the ope
 `VOLUCER_RELAY_SOCKET` for both sides. An explicit address passed to `serve()` or configured
 as `relay` takes precedence over the environment variable.
 
+Relay addresses use `unix:` or `host:port` and are not callable. Because handlers may be function names, the method selects the call form based on whether a second argument is present:
+
+| Call                           | Relay source | Child limit |
+| ------------------------------ | ------------ | ----------- |
+| `serve($handler)`              | environment  | no limit    |
+| `serve($handler, children: 4)` | environment  | `4`         |
+| `serve($relay, $handler)`      | argument     | no limit    |
+| `serve($relay, $handler, 4)`   | argument     | `4`         |
+
+An address without a handler is rejected. In the short form, the second positional argument is reserved for the handler, so pass a child limit by name; `serve($handler, 4)` is rejected.
+
 ### `children` needs no tuning
 
-The third argument limits the number of child processes. Its default, `0`, means no
+The child-cap argument limits the number of child processes. Its default, `0`, means no
 additional limit. In an `attach` deployment, Volucer opens one connection per configured
 worker slot, which already bounds the number of active children.
 
 ### Boot before the fork, connect after it
 
-Forking after application boot lets each child inherit the initialized runtime and reusable
-in-memory state.
+Forking after application boot lets each child inherit the initialized runtime and reusable in-memory state.
 
-Do not open database connections before forking if the children must use independent
-connections. Each child would inherit the same socket, and concurrent use could corrupt
-communication. Open connections lazily in each child, for example when handling its first
-request.
+**Do not open database connections before forking if the children must use independent connections. Each child would inherit the same socket, and concurrent use could corrupt communication. Open connections lazily in each child, for example when handling its first request.**
 
 ### Unix only
 
@@ -293,8 +304,7 @@ than silently running a single process. On Windows, use `kind = "worker"` or
 
 ## Writing a supervisor yourself
 
-`Supervisor::serve()` is optional. A custom supervisor can support the `attach` backend as
-long as it serves a connection that it opened, using `Worker::create()`:
+`Supervisor::serve()` is optional. A custom supervisor can support the `attach` backend as long as it serves a connection that it opened, using `Worker::create()`:
 
 ```php
 $listener = stream_socket_server('unix:///run/app/workers.sock', $errno, $errstr);
@@ -314,14 +324,11 @@ while (true) {
 }
 ```
 
-Use `Worker::create()`, not `connect()`, because the accepted connection is passed directly
-to the worker. Accept each connection in the master process before forking. If all children
-share the listener and accept independently, connection distribution is not guaranteed;
-one child could receive multiple connections while another receives none.
+Use `Worker::create()`, not `connect()`, because the accepted connection is passed directly to the worker. Accept each connection in the master process before forking. If all children share the listener and accept independently, connection distribution is not guaranteed; one child could receive multiple connections while another receives none.
 
 ## Consuming jobs
 
-The same worker file can consume a queue instead of serving HTTP:
+The SDK can also run a job consumer. This is a separate worker mode. Volucer starts the consumer using `[jobs.pool]`; `Worker::connect()` reads the worker socket supplied by Volucer, and `consume()` handles job frames. See the [job-pool configuration example](08-SERVICES.md#configuring-the-server-side).
 
 ```php
 Worker::connect()->consume(function (Volucer\Job $job, Worker $worker) {
@@ -339,13 +346,10 @@ The handler's return value determines the job outcome:
 | `false`                         | `requeue` — run it again            |
 | a string                        | `reject` — the string is the reason |
 
-If the handler throws, the SDK requeues the job rather than acknowledging it. The job lease
-then expires before it is retried, preventing an immediate retry loop.
+If the handler throws, the SDK requeues the job rather than acknowledging it. The job lease then expires before it is retried, preventing an immediate retry loop.
 
 See [Services](08-SERVICES.md) for the queue API.
 
 ## An example to copy
 
-The SDK includes a runnable worker at `example/worker.php` with `/`, `/health`, `/echo`,
-`/big`, `/boom`, and `/recycle` routes. The example demonstrates request handling, exception
-recovery, and worker recycling.
+The SDK includes a runnable worker at `example/worker.php` with `/`, `/health`, `/echo`, `/big`, `/boom`, and `/recycle` routes. The example demonstrates request handling, exception recovery, and worker recycling.

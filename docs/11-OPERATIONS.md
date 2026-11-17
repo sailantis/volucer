@@ -8,11 +8,11 @@ and release operations.
 Three distinct operations, three distinct verbs. They are separated because they mean
 different things and a deployment that conflates them either does not deploy or drops requests.
 
-| Verb                    | Signal                | What it does                                                     | Drops a request? |
-| ----------------------- | --------------------- | ---------------------------------------------------------------- | ---------------- |
-| Reload configuration    | `SIGHUP`              | Re-reads the file and applies the reloadable settings            | No               |
-| Roll application code   | `SIGUSR2`             | Replaces the worker processes, keeping every address             | No               |
-| Stop                    | `SIGTERM` / `SIGINT`  | Stops accepting, finishes in-flight requests, then exits         | No               |
+| Verb                  | Signal               | What it does                                             | Drops a request? |
+| --------------------- | -------------------- | -------------------------------------------------------- | ---------------- |
+| Reload configuration  | `SIGHUP`             | Re-reads the file and applies the reloadable settings    | No               |
+| Roll application code | `SIGUSR2`            | Replaces the worker processes, keeping every address     | No               |
+| Stop                  | `SIGTERM` / `SIGINT` | Stops accepting, finishes in-flight requests, then exits | No               |
 
 `SIGUSR1` is deliberately ignored with a warning. It means "reopen the log" in nginx, so a
 `logrotate` script written for nginx sends it; volucer reopens its access log on `SIGHUP` instead.
@@ -75,15 +75,15 @@ were replaced, skipped as busy, or failed.
 
 What each backend kind does:
 
-| Backend               | A sweep…                                                                     |
-| --------------------- | ---------------------------------------------------------------------------- |
-| `worker`              | replaces each idle slot's process, in place                                  |
-| `spawn_cgi`           | replaces each idle slot's process **on its own address**                      |
-| `attach`              | does nothing — the supervisor that started those processes owns them          |
-| `external` (php-fpm)  | does nothing — reload php-fpm instead (`SIGHUP`/`USR2` to its own master)     |
-| `upstream`            | restarts the origin **if** volucer supervises it; in-flight requests are lost |
+| Backend              | A sweep…                                                                      |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `worker`             | replaces each idle slot's process, in place                                   |
+| `spawn_cgi`          | replaces each idle slot's process **on its own address**                      |
+| `attach`             | does nothing — the supervisor that started those processes owns them          |
+| `external` (php-fpm) | does nothing — reload php-fpm instead (`SIGHUP`/`USR2` to its own master)     |
+| `upstream`           | restarts the origin **if** volucer supervises it; in-flight requests are lost |
 
-The `attach` and `external` rows are reported as *unmanaged*, with the reason, rather than
+The `attach` and `external` rows are reported as _unmanaged_, with the reason, rather than
 counted as success. An `upstream` origin is the one kind that cannot be rolled without losing
 requests: it serves many at once and has no idle state, so the restart is announced and the
 origin's readiness gate is waited out before the sweep reports success.
@@ -98,8 +98,8 @@ requests that are already in flight finish, up to `[server] shutdown_timeout_ms`
 Give your supervisor a longer grace period than that deadline, or it will `SIGKILL` mid-drain
 and produce exactly the truncation the drain exists to avoid:
 
-| Supervisor | Setting to check                                             |
-| ---------- | ------------------------------------------------------------ |
+| Supervisor | Setting to check                                              |
+| ---------- | ------------------------------------------------------------- |
 | systemd    | `TimeoutStopSec` and `KillSignal=SIGTERM`                     |
 | Docker     | `docker stop -t <seconds>`, or `stop_grace_period` in Compose |
 | Kubernetes | `terminationGracePeriodSeconds`                               |
@@ -124,13 +124,13 @@ The following settings can be reloaded:
 The following settings require a restart. Volucer reports them during reload:
 
 | Setting                                                 | Why it cannot be reloaded                                                                                                      |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --- | ------------------- | --------------------- |
 | `http`, `https`, `fastcgi`                              | A bound socket cannot move                                                                                                     |
 | Backends, their commands and worker counts              | Those are running processes with live pipes                                                                                    |
 | `[server.env]` and a backend's `env`                    | Existing processes retain their environment; replacement workers could otherwise receive different values from running workers |
 | `[server.tls]` `min_version` and `alpn`                 | They are baked into the `rustls` server config the acceptor holds                                                              |
 | `[server.proxy]`                                        | Whose forwarded headers are believed is a statement about this deployment's topology                                           |
-| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   || `[status]` `listen`                                     | The listener is bound                                                                                                          |
+| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   |     | `[status]` `listen` | The listener is bound |
 
 ### A reload is whole-or-nothing
 
@@ -552,22 +552,9 @@ docker build -f examples/docker/Dockerfile.alpine -t app:alpine .
 ```
 
 The Ubuntu recipe uses distribution PHP packages instead of the compiler toolchain retained by
-the official `php` image for `docker-php-ext-install`. Sizes below are decimal MB from
-`docker image ls` on `linux/amd64`:
+the official `php` image for `docker-php-ext-install`.
 
-| Image                                                                        | On disk  | To pull  |
-| ---------------------------------------------------------------------------- | -------- | -------- |
-| `php:8.5-cli-bookworm`                                                       | 798 MB   | 181 MB   |
-| the same, plus the Volucer binary                                            | 819 MB   | 189 MB   |
-| `ubuntu:26.04` + `php8.5-cli` + Volucer                                       | 229 MB   | 55 MB    |
-| the same, plus `cgi`, `mbstring`, `curl`, `xml` and `sqlite3`                 | 287 MB   | 69 MB    |
-| `examples/docker/Dockerfile.ubuntu` (+ Composer and the application)          | 294 MB   | 71 MB    |
-| `examples/docker/Dockerfile.alpine` (the same, on musl)                       | 98 MB    | 23 MB    |
-| the Ubuntu recipe plus `mysql`, `intl`, `bcmath` and `gd`                     | 376 MB   | 93 MB    |
-
-The official image's extra size is largely its compiler toolchain (~330 MB) and PHP build
-headers (~170 MB); Ubuntu's `php8.5-cli` package is a 12 MB prebuilt binary. Ubuntu 26.04
-provides PHP 8.5 directly; Ubuntu 24.04 stops at 8.3 and needs `packages.sury.org/php`.
+The official PHP image is about 800 MB; its extra size is largely its compiler toolchain (~330 MB) and PHP build headers (~170 MB); Ubuntu is much smaller, about 230 MB for the base PHP 8.5 image. Ubuntu 26.04 provides PHP 8.5 directly; Ubuntu 24.04 stops at 8.3 and needs `packages.sury.org/php`.
 
 ```dockerfile
 # See the CI-verified Dockerfile above for the full recipe. Ubuntu's `php8.5-cli`
@@ -692,13 +679,13 @@ volucer: could not connect to 127.0.0.1:9080: connection refused
 
 The command chooses its probe target using these settings, in order of increasing precedence:
 
-| Setting                 | Effect                                                                                                                        |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| the default file        | `volucer.toml`, then `.volucer.toml`, in the working directory.                                                               |
-| `VOLUCER_CONFIG`        | The configuration file to read, shared with `serve`.                                                                          |
+| Setting                 | Effect                                                                                                                                             |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the default file        | `volucer.toml`, then `.volucer.toml`, in the working directory.                                                                                    |
+| `VOLUCER_CONFIG`        | The configuration file to read, shared with `serve`.                                                                                               |
 | `VOLUCER_HEALTH_CONFIG` | The configuration file to read, for this probe only. The image defaults to `/etc/volucer/volucer.toml`; set this if the file is mounted elsewhere. |
-| `VOLUCER_HEALTH_URL`    | A URL to probe instead of reading the configuration.                                                                          |
-| `--url` / `--config`    | The flags, which win over all of them — so a variable someone forgot does not fight a probe typed by hand.                     |
+| `VOLUCER_HEALTH_URL`    | A URL to probe instead of reading the configuration.                                                                                               |
+| `--url` / `--config`    | The flags, which win over all of them — so a variable someone forgot does not fight a probe typed by hand.                                         |
 
 The image's built-in health check uses `/health`, not `/ready`. A failed Docker health check
 may lead to a container restart, so a server should not fail it merely because its worker
@@ -716,7 +703,7 @@ Use a published image, or build from the checkout:
 ```yaml
 services:
   app:
-    image: ghcr.io/sailantis/volucer:0.5.0 # or: build: {context: ., target: musl}
+    image: ghcr.io/sailantis/volucer:0.6.0 # or: build: {context: ., target: musl}
     ports:
       - "8080:8080"
       - "9080:9080"
@@ -769,38 +756,55 @@ see [Observability](06-OBSERVABILITY.md#the-access-log).
 Use the install scripts to install the binary. See
 [Getting Started](00-GETTING-STARTED.md#install).
 
-Each release includes a target-specific archive and a corresponding `.sha256` checksum file:
-
-```
-volucer-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz
-volucer-0.1.0-aarch64-unknown-linux-gnu.tar.gz
-volucer-0.1.0-aarch64-apple-darwin.tar.gz
-volucer-0.1.0-x86_64-apple-darwin.tar.gz
-volucer-0.1.0-x86_64-pc-windows-msvc.zip
-```
+Each release includes a target-specific archive and a corresponding `.sha256` checksum file.
 
 Each archive contains the binary, README, license, and systemd unit.
 
 ## Sizing the runtime
 
-Volucer runs one multi-threaded Tokio runtime, and by default Tokio starts **one worker thread
-per core**. That default is tuned for a CPU-bound server and this one is not: a request spends
-its time waiting for a backend process, not computing. On a machine with many cores the extra
-threads mostly contend with each other, and the measurement is unambiguous.
+**Volucer creates a Tokio runtime per async listener.** HTTP, HTTPS, and HTTP/3 each have one;
+the status listener has a fixed two-thread runtime. Each `attach` or socket-transport pool also
+has a 2–4-thread runtime based on its slot count. These fixed sizes ignore
+`TOKIO_WORKER_THREADS`, which applies to request-facing listeners and multiplies across them.
+For example, `http` and `https` with `TOKIO_WORKER_THREADS=4` use eight front-end threads.
 
-On a 12-core host with an `external` backend in front of 96 `php-fpm` children, same binary and
-same configuration, varying only `TOKIO_WORKER_THREADS`:
+By default, each listener runtime uses one worker thread per core. This suits CPU-bound work;
+when a front-end waits on a backend, extra threads can contend without improving throughput.
 
-| concurrency | 12 threads (default) | 4 threads | throughput | front-end CPU |
-|---:|---:|---:|---:|---:|
-| 12 | 28,168 rps | **30,625 rps** | **+8.7%** | −8.7% |
-| 100 | 54,229 rps | **55,740 rps** | +2.8% | −10.0% |
-| 400 | 62,920 rps | **64,103 rps** | +1.9% | −10.5% |
+On a 12-core host with an `external` backend and 96 `php-fpm` children, varying only
+`TOKIO_WORKER_THREADS`:
 
-Four threads is better or equal everywhere and costs about a tenth less CPU per request. Below
-that it falls off a cliff — two threads on the same host drop to 38,280 rps at concurrency 100,
-because there is no longer enough parallelism to keep the backend busy.
+| concurrency | 12 threads (default) |      4 threads | throughput | front-end CPU |
+| ----------: | -------------------: | -------------: | ---------: | ------------: |
+|          12 |           28,168 rps | **30,625 rps** |  **+8.7%** |         −8.7% |
+|         100 |           54,229 rps | **55,740 rps** |      +2.8% |        −10.0% |
+|         400 |           62,920 rps | **64,103 rps** |      +1.9% |        −10.5% |
+
+Four threads matched or beat the default in this test and used about 10% less CPU per request.
+Two threads reduced throughput to 38,280 rps at concurrency 100.
+
+### The same sweep, on an `upstream` front-end
+
+The result differs when the front-end does more of the work. This sweep used an `upstream` HTTP
+origin and a static-file arm on a separate 12-core Windows host:
+
+| concurrency | arm      | 12 threads (default) |       8 threads |        4 threads |       2 threads |
+| ----------: | -------- | -------------------: | --------------: | ---------------: | --------------: |
+|          12 | `upstream` |        22,455 rps · 158 µs | **23,544 · 156** | 23,068 · 134 | 15,252 · 119 |
+|         100 | `upstream` |        26,734 rps · 134 µs | **28,109 · 135** | 22,304 · 133 | 13,783 · 129 |
+|         400 | `upstream` |        23,058 rps · 165 µs | **24,939 · 147** | 19,702 · 146 | 12,543 · 141 |
+|          12 | `static`   |        10,156 rps · 366 µs | 10,344 · 349 | 9,792 · 303 | 7,812 · 231 |
+|         100 | `static`   |         9,868 rps · 365 µs | 10,187 · 362 | **10,531 · 298** | 8,050 · 232 |
+|         400 | `static`   |        10,023 rps · 357 µs | 10,100 · 362 | **10,397 · 302** | 7,887 · 235 |
+
+The best setting depends on workload: eight threads led for `upstream`, while four led for
+static files at higher concurrency. Two threads sharply reduced throughput across these tests.
+The default stayed unchanged because it was within 8% of the best result across both arms, while
+lower counts traded throughput for CPU savings that varied by workload. For example, `upstream`
+at c=100 lost 17% throughput with four threads; static-file CPU savings were 15–18%.
+
+The `external` and `upstream` sweeps used different hosts (12-core Linux and 12-logical-core,
+6-physical-core Windows, respectively). Compare workload trends, not absolute throughput.
 
 The setting is Tokio's own environment variable, so it needs no key in the configuration:
 
@@ -816,53 +820,44 @@ Environment=TOKIO_WORKER_THREADS=4
 ExecStart=/usr/local/bin/volucer serve --config /etc/volucer/volucer.toml
 ```
 
-Pick the number from your concurrency rather than your core count. The useful range in the
-measurements above is 4–8 on 12 cores; the ceiling is where per-request CPU starts rising again,
-which means the runtime threads are the queue. If you are unsure, leave the default — it is
-correct, just not optimal — and measure with `volucer status` before and after.
+Choose based on concurrency and backend, not core count. Four threads performed best for the
+slow `external` backend in this test; fast `upstream`, static, and `attach` workloads may need
+more. If unsure, keep the default and benchmark before changing it.
+
+Measure actual process threads as well as `TOKIO_WORKER_THREADS`: runtime counts add across
+listeners. Use `ps -o nlwp` or `Get-Process | Select-Object Threads`. On a 12-core host with
+only HTTP, the process used 18 threads by default and 10 with `TOKIO_WORKER_THREADS=4`; adding
+`[status]` raised those counts to 21 and 13.
 
 ## Scaling a single process
 
-Throughput is **linear in cores up to the point where the cores run out**, and a single process
-uses all of them. Measured on the 12-core reference host with an `attach` backend and 96
-children, pinning the front-end and the supervisor to N cores, at concurrency 400:
+Throughput is **linear in cores up to the point where the cores run out**, and a single process uses all of them. Measured on the 12-core reference host with an `attach` backend and 96 children, pinning the front-end and the supervisor to N cores, at concurrency 400:
 
-| cores | throughput | rps per core | front-end CPU per request |
-|---:|---:|---:|---:|
-| 12 | 101,022 rps | 8,418 | 46.9 µs |
-| 8 | 80,154 rps | 10,019 | 47.3 µs |
-| 6 | 59,212 rps | 9,869 | 47.5 µs |
-| 4 | 39,114 rps | 9,778 | 48.0 µs |
-| 2 | 19,250 rps | 9,625 | 49.6 µs |
+| cores |  throughput | rps per core | front-end CPU per request |
+| ----: | ----------: | -----------: | ------------------------: |
+|    12 | 101,022 rps |        8,418 |                   46.9 µs |
+|     8 |  80,154 rps |       10,019 |                   47.3 µs |
+|     6 |  59,212 rps |        9,869 |                   47.5 µs |
+|     4 |  39,114 rps |        9,778 |                   48.0 µs |
+|     2 |  19,250 rps |        9,625 |                   49.6 µs |
 
-Per-request cost is flat to within 6% across the whole range, and from 2 to 8 cores throughput
-tracks the core count at ~10,000 rps per core. **The last row is not linear and is not a
-ceiling:** 8 → 12 cores is 1.26× throughput for 1.50× cores, because at 12 the box is full —
-front-end 4.67 + PHP 4.90 + load generator 1.93 = 11.50 of 12 cores, 96% busy. The cell measures
-how much of the machine the whole arrangement needs, not how far the front-end can scale, and
-the generator is on the same cores it is measuring. Read the table as "one process consumes
-~0.8 cores per 10,000 rps", not as a per-core rate that holds at every count.
+Per-request cost is flat to within 6% across the whole range, and from 2 to 8 cores throughput tracks the core count at ~10,000 rps per core. **The last row is not linear and is not a ceiling:** 8 → 12 cores is 1.26× throughput for 1.50× cores, because at 12 the box is full — front-end 4.67 + PHP 4.90 + load generator 1.93 = 11.50 of 12 cores, 96% busy. The cell measures how much of the machine the whole arrangement needs, not how far the front-end can scale, and the generator is on the same cores it is measuring. Read the table as "one process consumes ~0.8 cores per 10,000 rps", not as a per-core rate that holds at every count.
 
-That the 12-core point is CPU-bound rather than serialised is confirmed from the other side: at
-a fixed 96 children, concurrency 100 → 200 → 400 gives 101.5k → 102.1k → 102.2k with the box at
-98–100% busy. Throughput stops because the CPU is gone; nothing is waiting on a lock.
+That the 12-core point is CPU-bound rather than serialised is confirmed from the other side: at a fixed 96 children, concurrency 100 → 200 → 400 gives 101.5k → 102.1k → 102.2k with the box at 98–100% busy. Throughput stops because the CPU is gone; nothing is waiting on a lock.
 
-So there is no per-process serialisation to work around, and **one process on a bigger host is
-the right answer before several processes on the same host** — running two front-ends against
-one pool was measured *slower* than one (91–95k against 97k) because the same work is then done
-less efficiently.
+So there is no per-process serialisation to work around, and **one process on a bigger host is the right answer before several processes on the same host** — running two front-ends against one pool was measured _slower_ than one (91–95k against 97k) because the same work is then done less efficiently.
 
 **Correction (measured later, on the same host): that conclusion was about thread
 oversubscription, not about process count.** The test behind it ran two processes with twelve
-runtime threads *each* — 24 threads on 12 cores, neither pinned — which is measurably no better
+runtime threads _each_ — 24 threads on 12 cores, neither pinned — which is measurably no better
 than one process (54.7k against 53.9k). What actually matters is **how many cores the front-end's
 threads are spread over**, and a single process is spread across all of them:
 
-| layout (one pool, 96 children, c=100) | rps | p50 | front-end CPU/req |
-|---|---:|---:|---:|
-| 1 process × 12 threads | 53,446 | 1.67 ms | 53.9 µs |
-| 4 processes × 12 threads, **pinned to 4 cores** | **67,807** | **1.24 ms** | **42.2 µs** |
-| 4 processes × 12 threads, **unpinned** (12 cores) | 54,692 | — | 58.6 µs |
+| layout (one pool, 96 children, c=100)             |        rps |         p50 | front-end CPU/req |
+| ------------------------------------------------- | ---------: | ----------: | ----------------: |
+| 1 process × 12 threads                            |     53,446 |     1.67 ms |           53.9 µs |
+| 4 processes × 12 threads, **pinned to 4 cores**   | **67,807** | **1.24 ms** |       **42.2 µs** |
+| 4 processes × 12 threads, **unpinned** (12 cores) |     54,692 |           — |           58.6 µs |
 
 Pinning is the whole effect: the same four processes on four cores gain 27%, and released onto
 twelve lose all of it. A single process on fewer cores shows the same thing (54.1 µs of
@@ -879,7 +874,7 @@ pool, that layout is **68,796 rps against nginx's 63,763** at concurrency 100 (f
 rounds) and **76,545 against 70,829** at concurrency 200.
 
 If a single process on the largest host available is still short, prefer **more processes confined
-to few cores each** over one process spread across all of them, and more *hosts* after that.
+to few cores each** over one process spread across all of them, and more _hosts_ after that.
 
 Two things cap a single process long before the cores do, and both are configuration:
 
@@ -896,7 +891,7 @@ Two things cap a single process long before the cores do, and both are configura
   for 12 → 24 → 48 → 96 children, and 144 gave 101.2k. Sizing children at roughly one per core
   gets most of it; the last few percent needs two or three per core.
 
-If a single process on the largest host available is still short, run more *hosts*. Several
+If a single process on the largest host available is still short, run more _hosts_. Several
 processes on one host only help in the shape described above — each confined to a few cores — and
 unpinned they are no better than one process, which is the measurement the earlier version of this
 section mistook for a statement about process count.
@@ -909,7 +904,7 @@ run the same configuration, and everything an operator reads from one of them is
 truth.
 
 One host-level note, since it is free: check `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`.
-Under a hypervisor it is often `xen`, which is not vDSO-eligible, so every `clock_gettime` is a
+Under a hypervisor it could be `xen`, which is not vDSO-eligible, so every `clock_gettime` is a
 real syscall — about 16 per request on the reference host. Switching to `tsc` (available there
 with `constant_tsc`) removed 2.7 µs of front-end CPU per request, worth +2.8% throughput. This
 is a host setting, not a volucer one, and it is worth checking before buying capacity.
@@ -917,15 +912,15 @@ is a host setting, not a volucer one, and it is worth checking before buying cap
 Re-measured on the same host against the current build, `GET /items`, `attach`, 32 workers, c=96,
 alternating the clocksource every round so drift lands on both equally:
 
-| clocksource | throughput | front-end CPU |
-|---|---:|---:|
-| `xen` | 37,385 rps | 60.6 µs/req |
-| `tsc` | **38,309 rps (+2.5%)** | **57.8 µs/req (−4.6%)** |
+| clocksource |             throughput |           front-end CPU |
+| ----------- | ---------------------: | ----------------------: |
+| `xen`       |             37,385 rps |             60.6 µs/req |
+| `tsc`       | **38,309 rps (+2.5%)** | **57.8 µs/req (−4.6%)** |
 
 The syscall cost is the whole of it: `time.monotonic_ns()` is **245 ns** under `xen` and **104 ns**
 under `tsc`, and PHP's `hrtime()` is **191 ns** against **57 ns**. That is why the figure keeps
 reproducing across builds and backends — it is a property of the host, not of the code, and it is
-paid by every PHP process as well as by volucer. Two related costs are *not* worth chasing:
+paid by every PHP process as well as by volucer. Two related costs are _not_ worth chasing:
 `opcache.huge_code_pages` measured inside the noise, and the jemalloc allocation that a `perf`
 profile shows at 1.4% of the front-end is cheaper than the code that would remove it.
 
