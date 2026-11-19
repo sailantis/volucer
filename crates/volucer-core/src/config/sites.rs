@@ -131,6 +131,16 @@ pub struct SiteConfig {
     #[serde(default)]
     pub compression: Option<CompressionOverrides>,
 
+    /// This site's error pages. Absent inherits `[server.error_pages]`.
+    ///
+    /// **An overlay, not a replacement**: a key this table does not name keeps the deployment's
+    /// page, which is what makes two brands sharing one server possible without restating every
+    /// code. The merge happens before wildcard expansion, so a server `"404"` still wins over a site
+    /// that only broadened with `"4xx"` — the more specific answer is the one an operator writing
+    /// two files would predict.
+    #[serde(default)]
+    pub error_pages: Option<ErrorPageOverrides>,
+
     /// What this site answers with; see [`ServeOnly`].
     ///
     /// Absent inherits the `[server]` value, which itself defaults to

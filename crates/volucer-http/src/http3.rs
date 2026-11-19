@@ -50,8 +50,8 @@ use volucer_server::Dispatcher;
 
 use crate::error::{HttpError, Result};
 use crate::listener::{
-    body_of, handle_http3, FrontEnd, HttpLimits, HttpShutdown, HttpStats, ListenerSettings,
-    Payload, ReloadHandles, ResponseBody,
+    error_response, handle_http3, request_host, FrontEnd, HttpLimits, HttpShutdown, HttpStats,
+    ListenerSettings, Payload, ReloadHandles, ResponseBody,
 };
 
 /// The ALPN identifier HTTP/3 is negotiated with.
@@ -513,6 +513,10 @@ async fn serve_connection(
     max_body_bytes: usize,
 ) {
     let remote = incoming.remote_address();
+    // The address the client reached, from the socket this connection arrived on. The same fact
+    // `getsockname` gives the TCP listener, and the half of site selection a `Host` header cannot
+    // supply.
+    let local = incoming.local_ip();
     let connection = match incoming.await {
         Ok(connection) => connection,
         Err(err) => {
@@ -552,7 +556,7 @@ async fn serve_connection(
                 Ok(Some(resolver)) => {
                     let front_end = Arc::clone(&front_end);
                     requests.spawn(async move {
-                        serve_request(resolver, front_end, max_body_bytes, remote).await;
+                        serve_request(resolver, front_end, max_body_bytes, remote, local).await;
                     });
                 }
                 // No more streams will be opened: the connection is closing.
@@ -570,11 +574,17 @@ async fn serve_connection(
 }
 
 /// Resolve, dispatch and answer one HTTP/3 request.
+///
+/// `local` is the address the connection reached, which is the same fact the TCP listener gets from
+/// `getsockname`: a site bound to `addresses` must not be selectable over QUIC either, and the
+/// refusal path below resolves a site before `handle` can.
+#[allow(clippy::too_many_arguments)]
 async fn serve_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     front_end: Arc<FrontEnd>,
     max_body_bytes: usize,
     peer: SocketAddr,
+    local: Option<std::net::IpAddr>,
 ) {
     let (request, mut stream) = match resolver.resolve_request().await {
         Ok(pair) => pair,
@@ -605,8 +615,19 @@ async fn serve_request(
     // applied as the bytes arrive, so an oversized upload is refused without being buffered first.
     let body = match read_body(&mut stream, max_body_bytes).await {
         Ok(body) => Payload::Buffered(body),
-        Err(HttpError::BodyTooLarge { limit }) => {
-            respond(&mut stream, error_page(&HttpError::BodyTooLarge { limit })).await;
+        Err(refusal @ HttpError::BodyTooLarge { .. }) => {
+            // **Answered through the same renderer every other error uses**, so a deployment that
+            // wrote a `413` page gets it here too. The site is resolved from the headers alone —
+            // `handle` has not run — because which brand a client reached must not change what a
+            // refusal for its own oversized upload looks like.
+            let host = request_host(request.headers(), request.uri());
+            let state = front_end.state();
+            let resolved =
+                state.resolve_request(host, local, volucer_core::config::SiteProtocol::Https);
+            let page = state
+                .error_page(&resolved.site.name, refusal.status())
+                .map(std::path::PathBuf::from);
+            respond(&mut stream, error_response(&refusal, page.as_deref())).await;
             return;
         }
         Err(err) => {
@@ -616,7 +637,7 @@ async fn serve_request(
         }
     };
 
-    let response = handle_http3(request.map(|()| body), front_end, peer, None).await;
+    let response = handle_http3(request.map(|()| body), front_end, peer, local).await;
     respond(&mut stream, response).await;
 }
 
@@ -708,21 +729,6 @@ async fn respond(
     if let Err(err) = stream.finish().await {
         tracing::debug!(%err, "http3 response finish failed");
     }
-}
-
-/// A plain error page, for the failures that happen before a request reaches `prepare`.
-///
-/// The body-too-large refusal is answered here because the request never became one `prepare` could
-/// see — it is refused while being read.
-fn error_page(err: &HttpError) -> Response<ResponseBody> {
-    let body = format!("{err}\n");
-    Response::builder()
-        .status(err.status())
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        // A refusal this server produced must not be cached as the resource.
-        .header(hyper::header::CACHE_CONTROL, "no-store")
-        .body(body_of(Bytes::from(body)))
-        .expect("a plain error page is a valid response")
 }
 
 /// Parse a UDP `host:port`, which is what a QUIC listener binds.

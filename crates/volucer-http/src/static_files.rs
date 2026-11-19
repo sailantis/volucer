@@ -762,9 +762,16 @@ fn precondition_failed(headers: &HeaderMap) -> StaticResponse {
         .expect("headers are valid")
 }
 
-/// A status with no headers and no body.
+/// A refusal with no body.
+///
+/// **`no-store` is set here rather than left to the caller**, and it is the one header a refusal
+/// must never omit: a `404` with no caching directive is *heuristically cacheable* — RFC 9111 §4.2.2
+/// lets a cache keep it for any freshness it can guess — so a URL that 404s once can keep 404ing
+/// for a client long after the file is deployed. The error-page renderer sets the same header on the
+/// answers it builds, which is what keeps the two paths indistinguishable to a cache.
 fn status_only(status: StatusCode) -> StaticResponse {
     build(status)
+        .header(CACHE_CONTROL, "no-store")
         .body(body_of(Bytes::new()))
         .expect("a status alone is a valid response")
 }

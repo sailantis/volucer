@@ -678,13 +678,18 @@ http = "127.0.0.1:8080"
     let pages = &config.server.error_pages;
     assert_eq!(pages.codes(), vec![404, 429, 502]);
     assert_eq!(pages.page(502), Some(Path::new("pages/502.html")));
-    assert_eq!(pages.page(500), None, "a code with no page has none");
+    assert_eq!(
+        pages.page(500),
+        None,
+        "a code with no page and no class and no default has none"
+    );
 
     // A code that cannot be an error status is refused by name, and the page is the only key.
     for (key, expected) in [
         ("\"200\" = \"pages/ok.html\"", "not an error status"),
         ("\"302\" = \"pages/moved.html\"", "not an error status"),
         ("\"not-a-code\" = \"x.html\"", "not a status code"),
+        ("\"3xx\" = \"pages/moved.html\"", "not an error class"),
     ] {
         let text = format!("[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.error_pages]\n{key}\n");
         let config = Config::from_toml(&text).expect("parses");
@@ -694,6 +699,90 @@ http = "127.0.0.1:8080"
             message.contains(expected),
             "{key}: the refusal has to say {expected:?}: {message}"
         );
+    }
+}
+
+/// **A class answers every status in it, and `default` answers everything else.**
+///
+/// The whole point of the two wildcards: an operator writing one page for "any client error" should
+/// not have to list five codes, and a status nobody predicted should still get a page.
+#[test]
+fn a_class_and_a_default_cover_the_statuses_they_name() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.error_pages]
+"502" = "pages/502.html"
+"4xx" = "pages/not-found.html"
+"default" = "pages/error.html"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let pages = &config.server.error_pages;
+
+    assert_eq!(pages.page(404), Some(Path::new("pages/not-found.html")));
+    assert_eq!(pages.page(403), Some(Path::new("pages/not-found.html")));
+    assert_eq!(
+        pages.page(502),
+        Some(Path::new("pages/502.html")),
+        "an exact key beats the class"
+    );
+    assert_eq!(
+        pages.page(503),
+        Some(Path::new("pages/error.html")),
+        "a status no key names falls back to `default`"
+    );
+
+    // An exact key written for the server still beats a site's class, because the merge happens
+    // before the wildcards expand — the more specific answer survives.
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[server.error_pages]
+"404" = "pages/server-404.html"
+[backends.app]
+kind = "external"
+socket = "unix:/run/php.sock"
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+[sites.shop.error_pages]
+"4xx" = "pages/shop-4xx.html"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::Sites::from_config(&config, Path::new("/srv/default"));
+    let shop = sites.named().get("shop").expect("the site exists");
+
+    assert_eq!(
+        shop.error_pages.page(404),
+        Some(Path::new("pages/server-404.html")),
+        "the deployment's exact key wins over the site's broader one"
+    );
+    assert_eq!(
+        shop.error_pages.page(410),
+        Some(Path::new("pages/shop-4xx.html")),
+        "and the site still adds what the deployment did not name"
+    );
+    assert_eq!(shop.error_pages.page(502), None, "nothing was inherited");
+}
+
+/// A page's own extension says what it is, and an extension nobody recognises keeps the HTML
+/// default so a page written before this existed is unchanged.
+#[test]
+fn an_error_page_is_typed_by_its_extension() {
+    use crate::config::error_page_content_type;
+    for (page, expected) in [
+        ("pages/404.html", "text/html; charset=utf-8"),
+        ("pages/404.htm", "text/html; charset=utf-8"),
+        ("pages/404.json", "application/json"),
+        ("pages/404.txt", "text/plain; charset=utf-8"),
+        ("pages/404.xml", "application/xml"),
+        ("pages/404", "text/html; charset=utf-8"),
+        ("pages/404.HTML", "text/html; charset=utf-8"),
+    ] {
+        assert_eq!(error_page_content_type(Path::new(page)), expected, "{page}");
     }
 }
 

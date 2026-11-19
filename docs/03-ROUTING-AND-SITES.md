@@ -259,7 +259,20 @@ remaining settings.
 
 `static_files` inherits per key. For example, a site can set `precompressed` and inherit
 the server's `cache_control`. The same per-key behavior applies to `compression`, `acme`,
-and `hsts`.
+`hsts` and `error_pages`.
+
+`error_pages` is an **overlay**: a site states the codes it wants to differ and inherits every
+other page from `[server.error_pages]`. The merge happens before the wildcard keys expand, so a
+deployment's `"404"` still wins over a site that only broadened with `"4xx"` — the more specific
+key is the one that survives.
+
+```toml
+[server.error_pages]
+"404" = "pages/404.html"
+
+[sites.shop.error_pages]
+"404" = "shop/404.html"
+```
 
 A site's `routes` replaces `[server.routes]`; the two route lists are not merged. Once a
 site defines routes, it does not inherit any routes from `[server]`.

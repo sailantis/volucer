@@ -380,7 +380,35 @@ pub fn write_error<W: Write>(
     message: &str,
     reason: ServerErrorKind,
 ) -> Result<()> {
-    write_error_with(writer, request_id, message, reason, None)
+    write_error_with(writer, request_id, message, reason, None, None)
+}
+
+/// [`write_error`] with the deployment's page for the status this failure means.
+///
+/// The page replaces the body and nothing else: the `Status:` line still comes from `reason`, so an
+/// operator's `502` page is answered as a `502`. That split is the same one the HTTP path makes, and
+/// it is why the page is a parameter rather than something the caller assembles — the status and the
+/// body would otherwise be two decisions that could disagree.
+pub fn write_error_page<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    message: &str,
+    reason: ServerErrorKind,
+    retry_after_secs: Option<u64>,
+    page: Option<Page<'_>>,
+) -> Result<()> {
+    write_error_with(writer, request_id, message, reason, retry_after_secs, page)
+}
+
+/// A page a deployment wrote for an error status, already read and typed.
+///
+/// Borrowed rather than owned because the writer only ever copies it into a record, and the caller
+/// has already had to hold the bytes to know their length. `content_type` comes from
+/// [`volucer_core::config::error_page_content_type`], so both front ends type one page alike.
+#[derive(Debug, Clone, Copy)]
+pub struct Page<'a> {
+    pub body: &'a [u8],
+    pub content_type: &'a str,
 }
 
 /// A refusal that tells the client when to come back.
@@ -400,6 +428,7 @@ pub fn write_rate_limited<W: Write>(
         message,
         ServerErrorKind::RateLimited,
         Some(retry_after_secs.max(1)),
+        None,
     )
 }
 
@@ -416,6 +445,28 @@ pub fn write_forbidden<W: Write>(writer: &mut W, request_id: u16, message: &str)
         message,
         ServerErrorKind::AddressDenied,
         None,
+        None,
+    )
+}
+
+/// [`write_forbidden`] with the deployment's page for `403`.
+///
+/// The refusal is `[server.access]`'s, so there is no body to preserve and the page is the whole
+/// answer — but it still travels with the reason rather than beside it, so the status and the body
+/// cannot be chosen by two callers that disagree.
+pub fn write_forbidden_page<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    message: &str,
+    page: Option<Page<'_>>,
+) -> Result<()> {
+    write_error_with(
+        writer,
+        request_id,
+        message,
+        ServerErrorKind::AddressDenied,
+        None,
+        page,
     )
 }
 
@@ -488,6 +539,7 @@ fn write_error_with<W: Write>(
     message: &str,
     reason: ServerErrorKind,
     retry_after_secs: Option<u64>,
+    page: Option<Page<'_>>,
 ) -> Result<()> {
     // `no-store` on both of the refuse-with-a-status kinds, and it is not decoration: a shared
     // cache that stored a 429 or a 413 would serve it to every other client of the same URL, which
@@ -504,8 +556,21 @@ fn write_error_with<W: Write>(
         ) => "Cache-Control: no-store\r\n".to_string(),
         _ => String::new(),
     };
+    // **A configured page replaces the body and nothing else.** The `Status:` line still comes from
+    // `reason`, so a page written for a `502` is answered as a `502` — the same split the HTTP path
+    // makes, and the reason the two are not assembled by the caller.
+    let (content_type, body) = match page {
+        Some(page) => (
+            page.content_type.to_string(),
+            String::from_utf8_lossy(page.body).into_owned(),
+        ),
+        None => (
+            "text/plain; charset=utf-8".to_string(),
+            format!("volucer: {message}\r\n"),
+        ),
+    };
     let body = format!(
-        "Status: {}\r\nContent-Type: text/plain; charset=utf-8\r\n{extra}\r\nvolucer: {message}\r\n",
+        "Status: {}\r\nContent-Type: {content_type}\r\n{extra}\r\n{body}",
         reason.status_line()
     );
 

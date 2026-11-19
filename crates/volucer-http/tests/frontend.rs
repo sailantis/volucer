@@ -1389,6 +1389,250 @@ fn a_dotfile_is_not_served_and_is_not_reported_as_missing() {
     // 404 rather than 403: whether a file exists is not a client's business, and
     // a 403 would confirm it is there.
     assert_eq!(response.status, 404, "{response:?}");
+    // And `no-store`, because a 404 with no caching directive is heuristically cacheable — a URL
+    // that misses once would keep missing for a client long after the file is deployed.
+    assert_eq!(
+        response.header("cache-control"),
+        Some("no-store"),
+        "a refusal must not be storable: {response:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **Two sites send two different 404 pages**, which is what the per-site key is for.
+///
+/// Without it a multi-site deployment shares one table, so two brands answer with one brand's page.
+/// The assertion is the client-visible one: the same listener, the same missing path, two hosts.
+#[test]
+fn two_sites_answer_with_their_own_error_pages() {
+    let base = static_root("error-page-sites");
+    let page_a = base.join("a-404.html");
+    let page_b = base.join("b-404.html");
+    std::fs::write(&page_a, "site A").expect("write A's page");
+    std::fs::write(&page_b, "site B").expect("write B's page");
+
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {default:?}
+serve_only = "static"
+[server.error_pages]
+"404" = {page_a:?}
+
+[sites.b]
+hosts = ["b.test"]
+document_root = {default:?}
+[sites.b.error_pages]
+"404" = {page_b:?}
+"#,
+        default = base.to_string_lossy(),
+        page_a = page_a.to_string_lossy(),
+        page_b = page_b.to_string_lossy(),
+    );
+    let config = Config::from_toml(&text).expect("the test's configuration parses");
+    config.validate().expect("valid");
+    let routing = Routing {
+        document_root: base.clone(),
+        front_controller: None,
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(Sites::from_config(&config, &base));
+
+    // Resolved through the same function `serve` uses, so the test pins the wiring rather than a
+    // hand-built map that could agree with itself and not with the process.
+    let pages = [
+        (
+            "<default>".to_string(),
+            config.server.error_pages.expanded(&base),
+        ),
+        (
+            "b".to_string(),
+            sites.named()["b"].error_pages.expanded(&base),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_error_pages(pages);
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+    else {
+        return;
+    };
+
+    let a = get_as(&server.address, "a.test", "/missing");
+    assert_eq!(a.status, 404, "{a:?}");
+    assert_eq!(a.text(), "site A");
+
+    let b = get_as(&server.address, "b.test", "/missing");
+    assert_eq!(b.status, 404, "{b:?}");
+    assert_eq!(
+        b.text(),
+        "site B",
+        "a site's own page has to be the one its clients receive"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_traversal_is_refused_with_no_store() {
+    let root = static_root("traversal-store");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/../Cargo.toml");
+    assert_eq!(response.status, 403, "{response:?}");
+    assert_eq!(
+        response.header("cache-control"),
+        Some("no-store"),
+        "a refusal must not be storable: {response:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A configured page is sent for a file that is not there, typed by its own extension.**
+///
+/// The case the whole feature exists for: an operator wrote `"404" = "pages/404.html"` and expects
+/// it on the request that actually 404s — which on a files-only site is a file that is not there.
+#[test]
+fn a_configured_page_answers_a_missing_file_and_is_typed_by_extension() {
+    let root = static_root("error-page");
+    let pages = static_root("error-page-pages");
+    std::fs::write(pages.join("404.html"), "<h1>gone</h1>").expect("write the page");
+    std::fs::write(pages.join("403.json"), r#"{"error":"forbidden"}"#).expect("write the page");
+    std::fs::write(pages.join("410.txt"), "gone for good").expect("write the page");
+
+    let mut error_pages = std::collections::BTreeMap::new();
+    for (status, name) in [(404u16, "404.html"), (403, "403.json"), (410, "410.txt")] {
+        error_pages.insert(status, pages.join(name));
+    }
+
+    let config = Config::from_toml(&format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {:?}\nserve_only = \"static\"\n",
+        root.to_string_lossy()
+    ))
+    .expect("the test's configuration parses");
+    config.validate().expect("valid");
+    let routing = Routing {
+        document_root: root.clone(),
+        front_controller: None,
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(Sites::from_config(&config, &root));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_error_pages(
+        [("<default>".to_string(), error_pages)]
+            .into_iter()
+            .collect(),
+    );
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+    else {
+        return;
+    };
+
+    let missing = get(&server.address, "/no-such-file");
+    assert_eq!(missing.status, 404, "{missing:?}");
+    assert_eq!(
+        missing.header("content-type"),
+        Some("text/html; charset=utf-8"),
+        "the page's own extension decides the type: {missing:?}"
+    );
+    assert_eq!(missing.text(), "<h1>gone</h1>");
+    assert_eq!(
+        missing.header("cache-control"),
+        Some("no-store"),
+        "a substituted page is still an error a cache must not keep: {missing:?}"
+    );
+
+    // A dotfile is a 404 the static layer refuses, so it gets the same page.
+    let dotfile = get(&server.address, "/.env");
+    assert_eq!(dotfile.status, 404, "{dotfile:?}");
+    assert_eq!(dotfile.text(), "<h1>gone</h1>");
+
+    // And a `json` page is answered as JSON, which is what makes this usable for an API site.
+    let forbidden = get(&server.address, "/../etc/passwd");
+    assert_eq!(forbidden.status, 403, "{forbidden:?}");
+    assert_eq!(
+        forbidden.header("content-type"),
+        Some("application/json"),
+        "{forbidden:?}"
+    );
+    assert_eq!(forbidden.text(), r#"{"error":"forbidden"}"#);
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&pages);
+}
+
+/// **A page that cannot be read falls back to plain text with the status preserved.**
+///
+/// The status is the answer and the body is decoration: a page deleted after `check` passed must not
+/// turn a `404` into a `500`, and it must not produce an empty body either — which is the worst of
+/// the three outcomes, because a client cannot tell an empty page from a truncated response.
+#[test]
+fn an_unreadable_page_falls_back_to_plain_text_and_keeps_the_status() {
+    let root = static_root("error-page-missing");
+    let mut error_pages = std::collections::BTreeMap::new();
+    error_pages.insert(
+        404u16,
+        std::env::temp_dir().join("volucer-no-such-page-anywhere.html"),
+    );
+
+    let config = Config::from_toml(&format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {:?}\nserve_only = \"static\"\n",
+        root.to_string_lossy()
+    ))
+    .expect("parses");
+    config.validate().expect("valid");
+    let routing = Routing {
+        document_root: root.clone(),
+        front_controller: None,
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let sites = Arc::new(Sites::from_config(&config, &root));
+    let handles = volucer_http::ReloadHandles::new(Arc::new(volucer_http::Registry::new(
+        volucer_http::SharedState::new((*sites).clone()),
+    )))
+    .with_error_pages(
+        [("<default>".to_string(), error_pages)]
+            .into_iter()
+            .collect(),
+    );
+    let Some(server) = Server::start_with_handles(dispatcher, HttpLimits::default(), handles)
+    else {
+        return;
+    };
+
+    let response = get(&server.address, "/nothing-here");
+    assert_eq!(response.status, 404, "{response:?}");
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/plain; charset=utf-8"),
+        "{response:?}"
+    );
+    assert!(
+        !response.body.is_empty(),
+        "an error page that cannot be read must still answer with something: {response:?}"
+    );
+    assert!(
+        response.text().contains("404"),
+        "and the body has to say what the status says: {}",
+        response.text()
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

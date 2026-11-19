@@ -9,11 +9,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[server.error_pages]` works per site, per class, and behind nginx.** A site states only the
+  pages it wants to differ, and inherits every other key from the deployment's table — the merge
+  happens before wildcards expand, so a server `"404"` still wins over a site that only broadened
+  with `"4xx"`. Keys accept a class (`"4xx"`, `"5xx"`) and `"default"`, so one page can answer a
+  family instead of five near-identical files. A configured page is typed by its own extension
+  (`.html`, `.json`, `.txt`, `.xml`), which is what makes this usable for an API site. The FastCGI
+  front end honours the same tables, so a deployment behind nginx no longer answers a `404`, a `403`
+  or a `502` with a `volucer:` line, and the HTTP/3 body-too-large refusal goes through the same
+  renderer as every other error. See [Error pages](docs/06-OBSERVABILITY.md#error-pages).
 - **`examples/docker/`: two complete, CI-verified image recipes.** `Dockerfile.ubuntu` (294 MB)
   and `Dockerfile.alpine` (98 MB) build a `worker`-ready image with PHP 8.5, Composer and the
   published binary. `verify.sh` starts the image, waits for its health check, and serves a real
   request, so a package renamed upstream or a `COPY` whose source moved fails a pull request
   rather than a user's first `docker run`. A new `Examples` job in `ci.yml` runs it against both.
+
+### Fixed
+
+- **A site's relative `document_root` is absolutised.** It never was, despite the field's own
+  documentation: the command line absolutised the default site's root and stopped there. A site
+  writing `document_root = "shop"` therefore handed a relative path to `SCRIPT_FILENAME`, and
+  because `php-cgi` `chdir()`s into the directory of the script it executed, the second request
+  onwards answered `No input file specified` — the exact failure the default site's rule exists to
+  prevent.
+- **The static layer's `403` and `404` carry `Cache-Control: no-store`.** They carried no caching
+  directive at all, so a refusal was *heuristically cacheable*: a URL that missed once could keep
+  missing for a client long after the file was deployed.
+- **A configured error page that cannot be read answers with plain text rather than an empty
+  body.** The static layer's substitution sent a bare status with no body, which a client cannot
+  tell from a truncated response; it now falls back to the same page the other error path sends,
+  with the status preserved.
+
 
 ### Changed
 

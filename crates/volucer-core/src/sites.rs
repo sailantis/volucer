@@ -154,6 +154,12 @@ pub struct ResolvedSite {
     /// Resolved here for the same reason as the static layer: a site's override must be applied
     /// once, against the same snapshot the rest of the request reads.
     pub compression: crate::config::CompressionSetting,
+    /// Error pages, with inheritance already applied.
+    ///
+    /// Resolved here for the same reason as the static layer and compression: a site's overlay must
+    /// be applied once, against the snapshot the request reads, so a reload cannot land between
+    /// "which site" and "which page".
+    pub error_pages: crate::config::ErrorPages,
     /// The route table in effect for this site.
     pub routes: Vec<RouteConfig>,
     /// The backend a request matching no route goes to.
@@ -254,6 +260,7 @@ impl Sites {
             static_files: default_statics.clone(),
             static_files_suppressed: false,
             compression: default_compression.clone(),
+            error_pages: config.server.error_pages.clone(),
             routes: config.server.routes.clone(),
             default_backend: config
                 .implied_backend(config.server.default_backend.as_deref())
@@ -293,10 +300,20 @@ impl Sites {
                 &default_statics,
                 &default_compression,
                 &config.server.routes,
+                &config.server.error_pages,
                 config.implied_backend(config.server.default_backend.as_deref()),
                 config.server.redirect_to_https,
                 default.hsts.as_ref(),
             );
+            // **A site's root is absolutised here, exactly as the default site's is.** A site states
+            // its own root, and the command line that absolutised the default site's root does not
+            // reach it — so a site writing `document_root = "shop"` used to hand a relative path to
+            // `SCRIPT_FILENAME`. `php-cgi` runs in a persistent pool and `chdir()`s into the
+            // directory of the script it executed, so the second request onwards resolved against
+            // the previous request's directory and answered `No input file specified`. Doing it in
+            // the table rather than in `Config` keeps the written path visible to the preflight
+            // warnings, which have to name what the operator typed.
+            resolved.document_root = absolute(&resolved.document_root);
             suppress_unused_static_layer(
                 &mut resolved,
                 can_shadow_a_backend,
@@ -581,6 +598,27 @@ fn is_script_extension(extension: &std::ffi::OsStr) -> bool {
     )
 }
 
+/// A site'root made absolute, because a relative one silently breaks PHP.
+///
+/// `SCRIPT_FILENAME` is built by joining this root, and `php-cgi` runs in a persistent pool: it
+/// `chdir()`s into the directory of the script it executed, so a relative root resolves against
+/// the *previous* request's directory from the second request onwards and the answer is
+/// `No input file specified`. The default site's root is absolutised by the command line for the
+/// same reason; a site states its own root and never passes through that path, which is why this
+/// exists here.
+///
+/// Best-effort: a working directory that cannot be read has nothing better to offer than the path
+/// as written, and the preflight warning for a root that does not exist already covers the case
+/// where something is wrong.
+fn absolute(root: &Path) -> PathBuf {
+    if root.is_absolute() {
+        return root.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(root))
+        .unwrap_or_else(|_| root.to_path_buf())
+}
+
 /// Apply the fallbacks that turn a [`SiteConfig`] into a [`ResolvedSite`].
 ///
 /// One place, so a site that omits a key and a site that repeats the global value
@@ -595,6 +633,7 @@ fn resolve_site(
     default_statics: &StaticConfig,
     default_compression: &crate::config::CompressionSetting,
     default_routes: &[RouteConfig],
+    default_error_pages: &crate::config::ErrorPages,
     default_backend: Option<&str>,
     default_redirect_to_https: bool,
     default_hsts: Option<&crate::config::HstsPolicy>,
@@ -628,6 +667,13 @@ fn resolve_site(
         None => default_compression.clone(),
     };
 
+    // An overlay rather than a replacement, so a site that names one code keeps the deployment's
+    // pages for every other one — the rule `static_files` and `compression` already follow.
+    let error_pages = match &site.error_pages {
+        Some(overrides) => overrides.apply(default_error_pages),
+        None => default_error_pages.clone(),
+    };
+
     // Parsed here rather than on the request path, and *tolerantly*: validation has already refused
     // an entry that does not parse, so a malformed one reaching this point means the table was built
     // without `validate` — and dropping it is the direction that cannot expose a site. An entry that
@@ -654,6 +700,7 @@ fn resolve_site(
         // site can use the layer is a property of its document root, not of the server's.
         static_files_suppressed: false,
         compression,
+        error_pages,
         routes: site
             .routes
             .clone()

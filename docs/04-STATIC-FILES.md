@@ -41,6 +41,18 @@ Use `--front-controller ''` to return 404 for paths that do not name a file. Oth
 the default front controller (`index.php`) remains active. If it cannot handle a request,
 Volucer returns 500. `volucer check` reports this configuration issue at startup.
 
+A `404` this layer produces is answered with a body you can control:
+
+```toml
+[server.error_pages]
+"404" = "pages/404.html"
+```
+
+The file is read from the configuration file's directory, not the document root, and its
+extension decides the `Content-Type` — so `pages/404.json` answers a JSON API. Without a
+configured page the refusal is a status with `Cache-Control: no-store` and no body. See
+[Error pages](06-OBSERVABILITY.md#error-pages).
+
 ## Request handling
 
 By default, static files and scripts use the same document root:
@@ -99,7 +111,7 @@ These protections apply whether or not static serving is enabled:
 | Precompressed files | Tries `file.br`, then `file.gz`, when requested by the client. Disabled by default; the requested file must exist. |
 | Directory indexes | Serves `index.html` for directories and redirects `/docs` to `/docs/` with a 301 response. |
 | Caching | Applies the configured `Cache-Control` value to all served files. |
-| Refusals | Returns 404 for dotfiles and 403 for paths containing a `..` segment. |
+| Refusals | Returns 404 for dotfiles and 403 for paths containing a `..` segment. Both carry `Cache-Control: no-store`, so a refusal is never heuristically cached. |
 | Scripts | Never serves `.php`, `.php3`, or `.phtml` files from disk, preventing source disclosure. |
 
 ## Methods

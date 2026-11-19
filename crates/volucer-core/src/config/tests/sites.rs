@@ -716,6 +716,110 @@ max_age_s = 600
     );
 }
 
+// ---- error pages -----------------------------------------------------------------
+
+/// **A site's pages are an overlay, not a replacement.**
+///
+/// The property an operator is buying: two brands sharing one server can each state the page that
+/// differs and inherit every other one, rather than restating the deployment's table twice.
+#[test]
+fn a_sites_error_pages_overlay_the_servers_per_key() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[server.error_pages]
+"404" = "pages/404.html"
+"502" = "pages/502.html"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+
+[sites.shop.error_pages]
+"404" = "shop/404.html"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv/default"));
+
+    let shop = &sites.named()["shop"];
+    assert_eq!(
+        shop.error_pages.page(404),
+        Some(std::path::Path::new("shop/404.html")),
+        "the site's own key replaces the deployment's"
+    );
+    assert_eq!(
+        shop.error_pages.page(502),
+        Some(std::path::Path::new("pages/502.html")),
+        "and a key it did not name is inherited"
+    );
+
+    // The default site is untouched by a site's overlay.
+    assert_eq!(
+        sites.default_site().error_pages.page(404),
+        Some(std::path::Path::new("pages/404.html"))
+    );
+
+    // A site that states no table at all inherits everything, which is the ordinary case.
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+[server.error_pages]
+"404" = "pages/404.html"
+[sites.api]
+hosts = ["api.test"]
+document_root = "/srv/api"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv/default"));
+    assert_eq!(
+        sites.named()["api"].error_pages.page(404),
+        Some(std::path::Path::new("pages/404.html"))
+    );
+}
+
+/// **A site's relative `document_root` is absolutised**, because a relative one silently breaks PHP.
+///
+/// `php-cgi` runs in a persistent pool and `chdir()`s into the directory of the script it executed,
+/// so a relative root resolves against the *previous* request's directory from the second request
+/// onwards. The default site's root is absolutised by the command line; a site states its own and
+/// never passes through that path, which is the gap this pins.
+#[test]
+fn a_relative_site_document_root_is_absolutised() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "shop"
+
+[sites.absolute]
+hosts = ["absolute.test"]
+document_root = "/srv/absolute"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv/default"));
+
+    let working_directory = std::env::current_dir().expect("a working directory");
+    assert_eq!(
+        sites.named()["shop"].document_root,
+        working_directory.join("shop"),
+        "a relative root has to become absolute before it reaches SCRIPT_FILENAME"
+    );
+    assert_eq!(
+        sites.named()["absolute"].document_root,
+        std::path::PathBuf::from("/srv/absolute"),
+        "and an absolute one is left exactly as written"
+    );
+}
+
 #[test]
 fn the_header_value_is_spelled_the_way_the_specification_writes_it() {
     use crate::config::HstsPolicy;

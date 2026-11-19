@@ -189,6 +189,26 @@ impl HttpError {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, HttpError>;
 
+/// The reason phrase for a status, for the answers that no `HttpError` describes.
+///
+/// Only the statuses this server produces are listed, and anything else falls back to a generic
+/// phrase rather than an empty one: a plain-text body of `"500 "` reads as a bug in the server.
+pub fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Content Too Large",
+        416 => "Range Not Satisfiable",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Error",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

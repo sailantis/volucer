@@ -27,6 +27,7 @@
 //! Multipart parsing is not done here either way — the bytes go to the SDK, or to PHP, which owns
 //! `$_FILES` and `is_uploaded_file()`.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -657,18 +658,19 @@ impl FrontEnd {
     /// under exactly one configuration even if a reload lands while it is in flight. A
     /// reload therefore affects the *next* request, which is the only ordering that can be
     /// explained to an operator.
-    fn state(&self) -> Arc<Reloaded> {
+    pub(crate) fn state(&self) -> Arc<Reloaded> {
         self.state.load()
     }
 
     /// The page this deployment configured for an error status, from the generation being served.
     ///
     /// A method rather than a field read at the call site, so the one place that decides which page
-    /// belongs to which status also decides which *generation* it comes from. `None` for a code with
-    /// no page, which is every code on a deployment that wrote none.
-    fn error_page(&self, status: u16) -> Option<std::path::PathBuf> {
+    /// belongs to which status also decides which *generation* it comes from — and which site, since
+    /// `site` is the name the request resolved to. `None` for a code with no page, which is every
+    /// code on a deployment that wrote none, and for a request that failed before a site was chosen.
+    pub(crate) fn error_page(&self, site: Option<&str>, status: u16) -> Option<std::path::PathBuf> {
         self.state()
-            .error_page(status)
+            .error_page(site.unwrap_or(volucer_watch::DEFAULT_SITE_KEY), status)
             .map(std::path::PathBuf::from)
     }
 
@@ -792,7 +794,7 @@ pub struct ReloadHandles {
     ///
     /// Empty by default, so a deployment that wrote no pages costs one `BTreeMap::get` per error
     /// response and nothing per request.
-    pub error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+    pub error_pages: BTreeMap<String, BTreeMap<u16, std::path::PathBuf>>,
     /// The directories a backend may serve a file from, when the deployment allows it.
     ///
     /// On the handles for the reason `error_pages` is: it comes from `[server]`, so a listener builds
@@ -833,7 +835,7 @@ impl ReloadHandles {
     #[must_use]
     pub fn with_error_pages(
         mut self,
-        pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+        pages: BTreeMap<String, BTreeMap<u16, std::path::PathBuf>>,
     ) -> Self {
         self.error_pages = pages;
         self
@@ -1022,7 +1024,7 @@ impl ReloadHandle {
         &self,
         sites: Sites,
         grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
-        error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+        error_pages: BTreeMap<String, BTreeMap<u16, std::path::PathBuf>>,
     ) -> Arc<Reloaded> {
         self.apply_with_sendfile(sites, grpc_grants, error_pages, self.sendfile.clone())
     }
@@ -1039,7 +1041,7 @@ impl ReloadHandle {
         &self,
         sites: Sites,
         grpc_grants: Arc<volucer_watch::GrpcGrantsMap>,
-        error_pages: std::collections::BTreeMap<u16, std::path::PathBuf>,
+        error_pages: BTreeMap<String, BTreeMap<u16, std::path::PathBuf>>,
         sendfile: Option<volucer_core::SendfilePolicy>,
     ) -> Arc<Reloaded> {
         self.registry
@@ -2335,6 +2337,10 @@ async fn handle(
     let referer = active.then(|| header_str(request.headers(), "referer").map(str::to_owned));
 
     let mut hsts: Option<volucer_core::config::HstsPolicy> = None;
+    // Which site answered. Filled in by `prepare` once the table is resolved, so the page for an
+    // error this request produced is that site's — and `None` (a failure before resolution) takes
+    // the deployment's default pages.
+    let mut site_name: Option<String> = None;
     let mut response = match prepare(
         request,
         &front_end,
@@ -2342,6 +2348,7 @@ async fn handle(
         local,
         cleartext,
         &mut hsts,
+        &mut site_name,
         // The request's identity, taken in `handle` before anything could fail. Passed rather than
         // recomputed: a second `begin` would mint a second span id, and the header a backend
         // received would then name a span no exported span carries.
@@ -2357,8 +2364,10 @@ async fn handle(
             front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(status = err.status(), %err, "http request failed");
             // The page comes from the generation being served, read once here rather than inside
-            // the renderer, so the renderer has no way to consult a different generation.
-            let page = front_end.error_page(err.status());
+            // the renderer, so the renderer has no way to consult a different generation. The
+            // *site* is the one the request resolved to, which is what makes two brands sharing a
+            // server send their own 404.
+            let page = front_end.error_page(site_name.as_deref(), err.status());
             error_response(&err, page.as_deref())
         }
     };
@@ -2516,7 +2525,10 @@ fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Option<&'a str> 
 ///
 /// Returned borrowed from the request rather than as an owned `String`: this runs on every
 /// request, and the callers either read it or hand it straight to `select_route`.
-fn request_host<'a>(headers: &'a hyper::HeaderMap, uri: &'a hyper::Uri) -> Option<&'a str> {
+pub(crate) fn request_host<'a>(
+    headers: &'a hyper::HeaderMap,
+    uri: &'a hyper::Uri,
+) -> Option<&'a str> {
     header_str(headers, "host")
         .or_else(|| uri.authority().map(hyper::http::uri::Authority::as_str))
         // An empty `Host` means "no name", not a site called "". `resolve_request` treats the two
@@ -2626,6 +2638,12 @@ async fn prepare(
     local: Option<std::net::IpAddr>,
     cleartext: bool,
     hsts: &mut Option<volucer_core::config::HstsPolicy>,
+    // Which site answered, filled in as soon as it is resolved, for the same reason `hsts` is a
+    // parameter rather than a return value: `handle` renders the errors this function returns as
+    // `Err`, and a 404 a *site* produced has to be the page that site configured. An `Option`
+    // because a failure before resolution — a refused body, a bad request — belongs to no site and
+    // takes the default's pages.
+    site_name: &mut Option<String>,
     context: &volucer_observe::RequestContext,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
@@ -2748,8 +2766,15 @@ async fn prepare(
     };
     let resolved = state.resolve_request(host, local, protocol);
     let site = resolved.site;
-    let (routing, statics, site_compression) =
-        (resolved.routing, resolved.statics, resolved.compression);
+    // Recorded before anything below can fail, so an error this site produced is rendered with the
+    // page *this site* configured rather than the deployment's.
+    *site_name = Some(site.name.clone());
+    let (routing, statics, site_compression, site_error_pages) = (
+        resolved.routing,
+        resolved.statics,
+        resolved.compression,
+        resolved.error_pages,
+    );
 
     if cleartext && site.redirect_to_https {
         // **A listener with no port cannot redirect at all**, and a unix socket is that listener.
@@ -2889,7 +2914,7 @@ async fn prepare(
             // (every error it returns is a complete answer) and puts the decision where the
             // generation being served is in hand.
             return match answer {
-                Ok(response) => Ok(with_error_page(front_end, response)),
+                Ok(response) => Ok(with_error_page(response, site_error_pages)),
                 Err(err) => Err(err),
             };
         }
@@ -4409,7 +4434,10 @@ fn grpc_answer(response: volucer_fcgi::Response) -> Result<Response<ResponseBody
 /// page read from a snapshot taken elsewhere would let a reload land between "which status" and
 /// "which page", which is the two-answers-to-one-question shape the whole `Reloaded` design exists to
 /// prevent.
-fn error_response(err: &HttpError, page: Option<&std::path::Path>) -> Response<ResponseBody> {
+pub(crate) fn error_response(
+    err: &HttpError,
+    page: Option<&std::path::Path>,
+) -> Response<ResponseBody> {
     if let HttpError::Grpc { status, .. } = err {
         let (code, headers, body) = volucer_upstream::grpc_error(*status);
         let mut builder = Response::builder().status(code);
@@ -4424,51 +4452,55 @@ fn error_response(err: &HttpError, page: Option<&std::path::Path>) -> Response<R
     }
 
     let status = err.status();
-    // A page the deployment wrote for this status, when there is one and it can be read.
+    // A page the deployment wrote for this status, when there is one and it can be read. **Read
+    // through the same function the static layer's substitution uses**, so a page is typed, capped
+    // and reported identically whichever layer decided to send it.
     if let Some(page) = page {
-        match read_error_page(page) {
-            Ok(body) => {
-                return Response::builder()
-                    .status(status)
-                    .header(CONTENT_TYPE, "text/html; charset=utf-8")
-                    // `no-store` for the same reason the plain page sets it, and more so: a
-                    // configured 503 page is a page a cache must never keep.
-                    .header(hyper::header::CACHE_CONTROL, "no-store")
-                    .header(CONTENT_LENGTH, body.len())
-                    .body(body_of(body))
-                    .expect("a configured error page is a valid response");
-            }
-            // Reported rather than refused: the status is the answer and the body is decoration, so
-            // a page that cannot be read must not turn a 502 into a 500. The fallback is the page
-            // this server has always sent, which says what happened and nothing about the site's
-            // navigation.
-            Err(err) => tracing::warn!(
-                status,
-                page = %page.display(),
-                %err,
-                "an error page could not be read; the plain-text page is sent instead"
-            ),
-        }
+        return replace_body(plain_error_page(status, Some(err)), page);
     }
 
-    let body = format!("{}\n", err);
+    plain_error_page(status, Some(err))
+}
+
+/// The body this server has always sent for a failure, with no page configured.
+///
+/// `no-store`, for the same reason RoadRunner sets it: a 429 is the one response a cache must never
+/// keep, and a shared proxy that stored it would serve the refusal to every other client of the same
+/// URL — one caller's limit turned into an outage. A 404 earns it for the mirror-image reason: a
+/// heuristically cacheable miss keeps missing after the file is deployed.
+///
+/// `err` is `None` when the answer was an error *page* that could not be read, which is the one case
+/// the reason is not available: the status is still the answer, and inventing a sentence for it
+/// would be reporting a failure that did not happen.
+fn plain_error_page(status: u16, err: Option<&HttpError>) -> Response<ResponseBody> {
+    let body = match err {
+        Some(err) => format!("{err}\n"),
+        None => format!("{} {}\n", status, crate::error::reason_phrase(status)),
+    };
     let mut builder = Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        // **`no-store`, for the same reason RoadRunner sets it.** A 429 is the one response a cache
-        // must never keep: a shared proxy that stored it would serve the refusal to every other
-        // client of the same URL, which turns one caller's limit into an outage.
         .header(hyper::header::CACHE_CONTROL, "no-store")
         .header(CONTENT_LENGTH, body.len());
     // `Retry-After` in whole seconds, which is the only form RFC 9110 §10.2.3 defines for a delay.
     // Carried from the limiter's own arithmetic so the number the client is told is the number the
     // bucket will honour.
-    if let HttpError::RateLimited { retry_after, .. } = err {
+    if let Some(HttpError::RateLimited { retry_after, .. }) = err {
         builder = builder.header(hyper::header::RETRY_AFTER, retry_after.as_secs().max(1));
     }
     builder
         .body(body_of(Bytes::from(body)))
         .expect("a plain-text error page is a valid response")
+}
+
+/// The response header a page's own extension implies.
+///
+/// A configured page is chosen by status, not by media type, so the extension is the only signal
+/// there is — and it is a better one than a second configuration key would be, because the file an
+/// operator wrote already says what it is. An extension with no entry keeps the HTML default, which
+/// is what every page written before this was typed by extension got.
+fn page_content_type(page: &std::path::Path) -> &'static str {
+    volucer_core::config::error_page_content_type(page)
 }
 
 /// A page the deployment wrote for an error status, read from disk.
@@ -4512,23 +4544,40 @@ fn read_error_page(page: &std::path::Path) -> std::io::Result<Bytes> {
 /// **Only for `404` and `403`**, which are the two the static layer produces, and only when it
 /// produced no body. A rule that rewrote any error response would also rewrite a range refusal's
 /// `416` or a byte-range answer's headers, and those carry meaning the page would erase.
+///
+/// The table is the *requesting site's*, already merged and expanded by the generation being served,
+/// so two brands sharing one server send two different pages — see [`Reloaded::error_page`].
 fn with_error_page(
-    front_end: &FrontEnd,
     response: Response<ResponseBody>,
+    pages: &BTreeMap<u16, std::path::PathBuf>,
 ) -> Response<ResponseBody> {
     let status = response.status().as_u16();
     if !matches!(status, 403 | 404) {
         return response;
     }
-    let Some(page) = front_end.error_page(status) else {
+    let Some(page) = pages.get(&status) else {
         return response;
     };
-    match read_error_page(&page) {
+    replace_body(response, page)
+}
+
+/// Swap a bodiless error answer for the page's bytes, keeping the status.
+///
+/// Shared by the two substitution sites — the static layer's answer above, and the renderer for the
+/// errors this server raises — so a page is read, typed and logged by one implementation. A page
+/// that cannot be read is **reported and then ignored**: the status is the answer and the body is
+/// decoration, so an operator who deleted a page must not turn a 404 into a 500.
+fn replace_body(
+    response: Response<ResponseBody>,
+    page: &std::path::Path,
+) -> Response<ResponseBody> {
+    let status = response.status().as_u16();
+    match read_error_page(page) {
         Ok(body) => {
             let (mut parts, _) = response.into_parts();
             parts.headers.insert(
                 CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
+                HeaderValue::from_static(page_content_type(page)),
             );
             parts.headers.insert(
                 hyper::header::CONTENT_LENGTH,
@@ -4542,9 +4591,9 @@ fn with_error_page(
                 status,
                 page = %page.display(),
                 %err,
-                "an error page could not be read; the bare status is sent instead"
+                "an error page could not be read; the plain-text page is sent instead"
             );
-            response
+            plain_error_page(status, None)
         }
     }
 }
