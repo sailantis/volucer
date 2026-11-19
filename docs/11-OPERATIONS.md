@@ -112,7 +112,7 @@ The following settings can be reloaded:
 - `[sites.*]` `hosts`, `document_root`, `front_controller`, `script_extensions`,
   `serve_only`, `default_backend` and `routes`
 - `[server.static_files]`, including turning the layer on or off
-- `[server.error_pages]` and `[sites.*.error_pages]`. A page's *content* is read per response
+- `[server.error_pages]` and `[sites.*.error_pages]`. A page's _content_ is read per response
   anyway, so only the table itself needs the reload.
 - `redirect_to_https`
 - A backend's `grpc_services` and `grpc_serve_any` — a widened grant admits the next call,
@@ -791,14 +791,14 @@ Two threads reduced throughput to 38,280 rps at concurrency 100.
 The result differs when the front-end does more of the work. This sweep used an `upstream` HTTP
 origin and a static-file arm on a separate 12-core Windows host:
 
-| concurrency | arm      | 12 threads (default) |       8 threads |        4 threads |       2 threads |
-| ----------: | -------- | -------------------: | --------------: | ---------------: | --------------: |
-|          12 | `upstream` |        22,455 rps · 158 µs | **23,544 · 156** | 23,068 · 134 | 15,252 · 119 |
-|         100 | `upstream` |        26,734 rps · 134 µs | **28,109 · 135** | 22,304 · 133 | 13,783 · 129 |
-|         400 | `upstream` |        23,058 rps · 165 µs | **24,939 · 147** | 19,702 · 146 | 12,543 · 141 |
-|          12 | `static`   |        10,156 rps · 366 µs | 10,344 · 349 | 9,792 · 303 | 7,812 · 231 |
-|         100 | `static`   |         9,868 rps · 365 µs | 10,187 · 362 | **10,531 · 298** | 8,050 · 232 |
-|         400 | `static`   |        10,023 rps · 357 µs | 10,100 · 362 | **10,397 · 302** | 7,887 · 235 |
+| concurrency | arm        | 12 threads (default) |        8 threads |        4 threads |    2 threads |
+| ----------: | ---------- | -------------------: | ---------------: | ---------------: | -----------: |
+|          12 | `upstream` |  22,455 rps · 158 µs | **23,544 · 156** |     23,068 · 134 | 15,252 · 119 |
+|         100 | `upstream` |  26,734 rps · 134 µs | **28,109 · 135** |     22,304 · 133 | 13,783 · 129 |
+|         400 | `upstream` |  23,058 rps · 165 µs | **24,939 · 147** |     19,702 · 146 | 12,543 · 141 |
+|          12 | `static`   |  10,156 rps · 366 µs |     10,344 · 349 |      9,792 · 303 |  7,812 · 231 |
+|         100 | `static`   |   9,868 rps · 365 µs |     10,187 · 362 | **10,531 · 298** |  8,050 · 232 |
+|         400 | `static`   |  10,023 rps · 357 µs |     10,100 · 362 | **10,397 · 302** |  7,887 · 235 |
 
 The best setting depends on workload: eight threads led for `upstream`, while four led for
 static files at higher concurrency. Two threads sharply reduced throughput across these tests.

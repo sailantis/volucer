@@ -33,19 +33,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   onwards answered `No input file specified` — the exact failure the default site's rule exists to
   prevent.
 - **The static layer's `403` and `404` carry `Cache-Control: no-store`.** They carried no caching
-  directive at all, so a refusal was *heuristically cacheable*: a URL that missed once could keep
+  directive at all, so a refusal was _heuristically cacheable_: a URL that missed once could keep
   missing for a client long after the file was deployed.
 - **A configured error page that cannot be read answers with plain text rather than an empty
   body.** The static layer's substitution sent a bare status with no body, which a client cannot
   tell from a truncated response; it now falls back to the same page the other error path sends,
   with the status preserved.
-- **An error-page key is found however it was spelled.** `"4XX"`, `"DEFAULT"` and `" 502 "` were
-  accepted by validation and then never matched, because the lookup probes for the canonical key —
-  so a hand-written key whose only mistake was case or spacing silently served nothing. Keys are
-  now normalised on load, in both `[server.error_pages]` and a site's overlay.
-- **The plain-text fallback keeps the headers the status carries.** A `429` whose configured page
-  was missing lost its `Retry-After` and `no-store`, so the client was told to retry immediately
-  against a bucket that was still empty.
+- **Error-page keys are normalised on load.** Validation accepted variants such as `"4XX"`,
+  `"DEFAULT"` and `" 502 "`, but lookup used canonical keys, so these entries never matched.
+  Normalisation now applies to both `[server.error_pages]` and site overlays.
+- **Plain-text error fallbacks preserve status headers.** When a configured `429` page is missing,
+  the fallback now keeps `Retry-After` and `Cache-Control: no-store`, preventing premature retries
+  against an empty bucket.
 - **The FastCGI front end sends `Cache-Control: no-store` for every error it generates.** It was
   set only for the `413` and the `429`, so a `403` or a `502` behind nginx was heuristically
   cacheable while the same status over HTTP was not.
@@ -56,7 +55,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from the request's snapshot but the page from whatever `SIGHUP` had installed since, so a reload
   in between could pair one generation's site with another's table, or lose the page entirely if
   the site had been removed.
-
 
 ### Changed
 
@@ -106,11 +104,11 @@ This is the release the published benchmark pins: the numbers in
 `volucer-competition` are produced by this tag, so the table describes the artifact
 `cargo install` gives you rather than a working tree near it.
 
-Read *Changed* before upgrading. Two defaults flipped and one public field is gone.
+Read _Changed_ before upgrading. Two defaults flipped and one public field is gone.
 
 ### Added
 
-- **`measure_wait`, opt-in slot-contention reporting.** A `worker` or `attach` backend now collects how long each request waited for a slot only when asked to, and the shutdown summary says `wait not measured` when it did not. See *Changed* below for why the default flipped.
+- **`measure_wait`, opt-in slot-contention reporting.** A `worker` or `attach` backend now collects how long each request waited for a slot only when asked to, and the shutdown summary says `wait not measured` when it did not. See _Changed_ below for why the default flipped.
 
 ### Performance
 
