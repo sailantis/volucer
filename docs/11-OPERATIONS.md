@@ -112,6 +112,8 @@ The following settings can be reloaded:
 - `[sites.*]` `hosts`, `document_root`, `front_controller`, `script_extensions`,
   `serve_only`, `default_backend` and `routes`
 - `[server.static_files]`, including turning the layer on or off
+- `[server.error_pages]` and `[sites.*.error_pages]`. A page's *content* is read per response
+  anyway, so only the table itself needs the reload.
 - `redirect_to_https`
 - A backend's `grpc_services` and `grpc_serve_any` — a widened grant admits the next call,
   on the same connection
@@ -124,13 +126,14 @@ The following settings can be reloaded:
 The following settings require a restart. Volucer reports them during reload:
 
 | Setting                                                 | Why it cannot be reloaded                                                                                                      |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --- | ------------------- | --------------------- |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `http`, `https`, `fastcgi`                              | A bound socket cannot move                                                                                                     |
 | Backends, their commands and worker counts              | Those are running processes with live pipes                                                                                    |
 | `[server.env]` and a backend's `env`                    | Existing processes retain their environment; replacement workers could otherwise receive different values from running workers |
 | `[server.tls]` `min_version` and `alpn`                 | They are baked into the `rustls` server config the acceptor holds                                                              |
 | `[server.proxy]`                                        | Whose forwarded headers are believed is a statement about this deployment's topology                                           |
-| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   |     | `[status]` `listen` | The listener is bound |
+| `[server.access_log]` path, format, `request_id_header` | Chosen at startup. **The log file is reopened on every `SIGHUP` regardless**                                                   |
+| `[status]` `listen`                                     | The listener is bound                                                                                                          |
 
 ### A reload is whole-or-nothing
 

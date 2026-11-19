@@ -662,18 +662,6 @@ impl FrontEnd {
         self.state.load()
     }
 
-    /// The page this deployment configured for an error status, from the generation being served.
-    ///
-    /// A method rather than a field read at the call site, so the one place that decides which page
-    /// belongs to which status also decides which *generation* it comes from — and which site, since
-    /// `site` is the name the request resolved to. `None` for a code with no page, which is every
-    /// code on a deployment that wrote none, and for a request that failed before a site was chosen.
-    pub(crate) fn error_page(&self, site: Option<&str>, status: u16) -> Option<std::path::PathBuf> {
-        self.state()
-            .error_page(site.unwrap_or(volucer_watch::DEFAULT_SITE_KEY), status)
-            .map(std::path::PathBuf::from)
-    }
-
     /// The statistics handle, shared with the accept loops.
     ///
     /// An `Arc` rather than a `&HttpStats` because both accept loops hand a clone to the per-
@@ -2337,10 +2325,13 @@ async fn handle(
     let referer = active.then(|| header_str(request.headers(), "referer").map(str::to_owned));
 
     let mut hsts: Option<volucer_core::config::HstsPolicy> = None;
-    // Which site answered. Filled in by `prepare` once the table is resolved, so the page for an
-    // error this request produced is that site's — and `None` (a failure before resolution) takes
-    // the deployment's default pages.
-    let mut site_name: Option<String> = None;
+    // Which site answered, and the generation it was resolved from. Both are filled in by `prepare`
+    // once the table is resolved, so the page for an error this request produced is that site's —
+    // from that *same* snapshot, rather than from whatever `FrontEnd::state()` holds when the error
+    // is rendered. A reload landing in between would otherwise pair one generation's site name with
+    // another generation's page, or lose the page entirely if the site was removed. `None` for a
+    // failure before resolution, which belongs to no site and takes the default's pages.
+    let mut resolved_error_pages: Option<(Arc<Reloaded>, String)> = None;
     let mut response = match prepare(
         request,
         &front_end,
@@ -2348,7 +2339,7 @@ async fn handle(
         local,
         cleartext,
         &mut hsts,
-        &mut site_name,
+        &mut resolved_error_pages,
         // The request's identity, taken in `handle` before anything could fail. Passed rather than
         // recomputed: a second `begin` would mint a second span id, and the header a backend
         // received would then name a span no exported span carries.
@@ -2363,11 +2354,21 @@ async fn handle(
         Err(err) => {
             front_end.stats.failed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(status = err.status(), %err, "http request failed");
-            // The page comes from the generation being served, read once here rather than inside
-            // the renderer, so the renderer has no way to consult a different generation. The
-            // *site* is the one the request resolved to, which is what makes two brands sharing a
-            // server send their own 404.
-            let page = front_end.error_page(site_name.as_deref(), err.status());
+            // **The page comes from the snapshot the site was resolved from**, held by `prepare`
+            // rather than re-loaded here. Re-reading `FrontEnd::state()` would let a reload land
+            // between "which site" and "which page" and pair one generation's site with another's
+            // table — or drop the page if the site was removed. A failure before resolution has no
+            // site and therefore no snapshot, and takes the deployment's own pages from whichever
+            // generation is current, which is the only claim such a failure can make.
+            let page = match &resolved_error_pages {
+                Some((state, site)) => state
+                    .error_page(site, err.status())
+                    .map(std::path::PathBuf::from),
+                None => front_end
+                    .state()
+                    .error_page(volucer_watch::DEFAULT_SITE_KEY, err.status())
+                    .map(std::path::PathBuf::from),
+            };
             error_response(&err, page.as_deref())
         }
     };
@@ -2638,12 +2639,12 @@ async fn prepare(
     local: Option<std::net::IpAddr>,
     cleartext: bool,
     hsts: &mut Option<volucer_core::config::HstsPolicy>,
-    // Which site answered, filled in as soon as it is resolved, for the same reason `hsts` is a
-    // parameter rather than a return value: `handle` renders the errors this function returns as
-    // `Err`, and a 404 a *site* produced has to be the page that site configured. An `Option`
-    // because a failure before resolution — a refused body, a bad request — belongs to no site and
-    // takes the default's pages.
-    site_name: &mut Option<String>,
+    // Which site answered **and the generation it was resolved from**, filled in as soon as it is
+    // known, for the same reason `hsts` is a parameter rather than a return value: `handle` renders
+    // the errors this function returns as `Err`, and a 404 a *site* produced has to be the page that
+    // site configured — from the same snapshot the site came from. `None` because a failure before
+    // resolution — a refused body, a bad request — belongs to no site and takes the default's pages.
+    resolved_error_pages: &mut Option<(Arc<Reloaded>, String)>,
     context: &volucer_observe::RequestContext,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
@@ -2767,8 +2768,10 @@ async fn prepare(
     let resolved = state.resolve_request(host, local, protocol);
     let site = resolved.site;
     // Recorded before anything below can fail, so an error this site produced is rendered with the
-    // page *this site* configured rather than the deployment's.
-    *site_name = Some(site.name.clone());
+    // page *this site* configured — and, crucially, from *this* snapshot: `state` is moved in beside
+    // the name, so a reload between here and the renderer cannot pair one generation's site with
+    // another's pages.
+    *resolved_error_pages = Some((Arc::clone(&state), site.name.clone()));
     let (routing, statics, site_compression, site_error_pages) = (
         resolved.routing,
         resolved.statics,
@@ -4571,7 +4574,6 @@ fn replace_body(
     response: Response<ResponseBody>,
     page: &std::path::Path,
 ) -> Response<ResponseBody> {
-    let status = response.status().as_u16();
     match read_error_page(page) {
         Ok(body) => {
             let (mut parts, _) = response.into_parts();
@@ -4587,13 +4589,32 @@ fn replace_body(
             Response::from_parts(parts, body_of(body))
         }
         Err(err) => {
+            // **The answer keeps everything the replacement was going to erase.** `no-store`, and a
+            // `Retry-After` for the 429 whose page this was, are already on the response and belong
+            // to the *status*, not to the body — rebuilding a plain page from nothing would drop
+            // them and turn a rate limit into a response a client retries immediately.
+            let (mut parts, _) = response.into_parts();
             tracing::warn!(
-                status,
+                status = parts.status.as_u16(),
                 page = %page.display(),
                 %err,
                 "an error page could not be read; the plain-text page is sent instead"
             );
-            plain_error_page(status, None)
+            let body = format!(
+                "{} {}\n",
+                parts.status.as_u16(),
+                crate::error::reason_phrase(parts.status.as_u16())
+            );
+            parts.headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            parts.headers.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string())
+                    .expect("a length is a valid header value"),
+            );
+            Response::from_parts(parts, body_of(Bytes::from(body)))
         }
     }
 }
@@ -5524,6 +5545,40 @@ mod tests {
             "a directory is not a page"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The fallback keeps every header the status earned, not just the status.**
+    ///
+    /// A `429` whose configured page is missing still owes the client a `Retry-After`: that header is
+    /// the *status's* meaning, not the body's. Rebuilding the answer from nothing — which is what the
+    /// fallback used to do — told the client to retry immediately against a bucket that was still
+    /// empty, and dropped the `no-store` that stops a cache serving the refusal to everybody else.
+    #[test]
+    fn a_missing_page_keeps_the_headers_the_status_carries() {
+        let missing = std::env::temp_dir().join("volucer-no-such-429-page.html");
+        let _ = std::fs::remove_file(&missing);
+        let limited = HttpError::RateLimited {
+            key: volucer_core::KeyMode::Ip,
+            retry_after: std::time::Duration::from_secs(42),
+        };
+
+        let response = error_response(&limited, Some(&missing));
+        assert_eq!(response.status(), 429);
+        assert_eq!(
+            response.headers().get(hyper::header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("42")),
+            "a 429 without `Retry-After` is a client that retries immediately, for ever"
+        );
+        assert_eq!(
+            response.headers().get(hyper::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+            "a cacheable refusal would be served to every other client"
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "text/plain; charset=utf-8",
+            "the body still falls back to the plain page"
+        );
     }
 
     #[test]

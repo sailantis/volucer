@@ -39,6 +39,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   body.** The static layer's substitution sent a bare status with no body, which a client cannot
   tell from a truncated response; it now falls back to the same page the other error path sends,
   with the status preserved.
+- **An error-page key is found however it was spelled.** `"4XX"`, `"DEFAULT"` and `" 502 "` were
+  accepted by validation and then never matched, because the lookup probes for the canonical key —
+  so a hand-written key whose only mistake was case or spacing silently served nothing. Keys are
+  now normalised on load, in both `[server.error_pages]` and a site's overlay.
+- **The plain-text fallback keeps the headers the status carries.** A `429` whose configured page
+  was missing lost its `Retry-After` and `no-store`, so the client was told to retry immediately
+  against a bucket that was still empty.
+- **The FastCGI front end sends `Cache-Control: no-store` for every error it generates.** It was
+  set only for the `413` and the `429`, so a `403` or a `502` behind nginx was heuristically
+  cacheable while the same status over HTTP was not.
+- **A configured page is written byte for byte over FastCGI.** Formatting the body into a `String`
+  replaced every non-UTF-8 byte with `U+FFFD`, corrupting an XML page in a single-byte encoding —
+  which the HTTP path served intact.
+- **An error page comes from the generation its site was resolved from.** The site name was taken
+  from the request's snapshot but the page from whatever `SIGHUP` had installed since, so a reload
+  in between could pair one generation's site with another's table, or lose the page entirely if
+  the site had been removed.
 
 
 ### Changed

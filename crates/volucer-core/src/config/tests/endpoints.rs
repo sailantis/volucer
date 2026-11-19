@@ -965,6 +965,83 @@ fn an_absent_error_pages_table_is_empty() {
     assert!(config.server.error_pages.codes().is_empty());
 }
 
+/// **A key that validates is a key that is found**, whatever spelling it was written in.
+///
+/// `PageKey::parse` accepts `"4XX"`, `"DEFAULT"` and `" 404 "` on purpose — a key whose only mistake
+/// is case or spacing still names one unambiguous page — but the lookup is a map probe for the
+/// canonical spelling. Without normalising on the way in, every one of those spellings passes
+/// `validate` and then serves nothing, which reads to an operator as a feature that silently does not
+/// work. This pins both halves: the accepted spelling and the lookup it has to land on.
+#[test]
+fn an_error_page_key_is_found_however_it_was_spelled() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.error_pages]
+"4XX" = "pages/not-found.html"
+"DEFAULT" = "pages/error.html"
+" 502 " = "pages/502.html"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("the accepted spellings validate");
+    let pages = &config.server.error_pages;
+
+    assert_eq!(
+        pages.page(404),
+        Some(Path::new("pages/not-found.html")),
+        "a class written in caps must answer the statuses it names"
+    );
+    assert_eq!(
+        pages.page(502),
+        Some(Path::new("pages/502.html")),
+        "a padded exact key must beat the class and the default"
+    );
+    assert_eq!(
+        pages.page(503),
+        Some(Path::new("pages/error.html")),
+        "`default` written in caps must still answer what nothing else names"
+    );
+    // `codes()` and the report read the canonical spelling, so a page cannot be listed as one code
+    // and served as another.
+    assert_eq!(pages.codes(), vec![502]);
+}
+
+/// The same rule on a site's overlay, which is a separate deserialisation point.
+#[test]
+fn a_sites_error_page_key_is_found_however_it_was_spelled() {
+    let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[server.error_pages]
+"404" = "pages/404.html"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+
+[sites.shop.error_pages]
+"4XX" = "shop/4xx.html"
+"#;
+    let config = Config::from_toml(text).expect("parses");
+    config.validate().expect("valid");
+    let sites = crate::Sites::from_config(&config, Path::new("/srv/default"));
+    let shop = sites.named().get("shop").expect("the site exists");
+
+    assert_eq!(
+        shop.error_pages.page(404),
+        Some(Path::new("pages/404.html")),
+        "the deployment's exact key still wins over the site's broader one"
+    );
+    assert_eq!(
+        shop.error_pages.page(410),
+        Some(Path::new("shop/4xx.html")),
+        "and a site's capitalised class still answers what the deployment did not name"
+    );
+}
+
 // ------------------------------------------------------------ sendfile
 
 #[test]

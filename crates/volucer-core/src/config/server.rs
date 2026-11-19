@@ -702,15 +702,66 @@ impl PageKey {
 /// every other key from `[server.error_pages]`. Merging happens on keys, before the wildcard
 /// expansion, so a server `"404"` still wins over a site that only broadened with `"4xx"` — the more
 /// specific answer an operator would predict from the two files they wrote.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, transparent)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorPages {
     /// The page per key, e.g. `"502" = "pages/502.html"` or `"4xx" = "pages/not-found.html"`.
     ///
     /// A TOML key must be a string, so the codes are written as strings: `"502" = "…"`. Parsed
     /// strictly, because `[server.error_pages.502]` is not a table and a file that wrote a table
     /// would otherwise be read as no pages at all.
+    ///
+    /// Every key that names an error is stored in the **canonical** spelling [`PageKey::as_str`]
+    /// produces, which is what makes the hand-written spellings [`PageKey::parse`] accepts —
+    /// `"4XX"`, `"DEFAULT"`, `" 404 "` — pages that are actually served rather than keys that
+    /// validate and then never match. See [`canonicalize_keys`].
     pages: std::collections::BTreeMap<String, PathBuf>,
+}
+
+/// Deserialised through the canonical spelling, so a key that validates is a key that is found.
+///
+/// Written by hand rather than derived because the normalisation has to happen *between* the TOML
+/// and the map: a `#[serde(transparent)]` newtype would keep whatever spelling the operator typed,
+/// and [`ErrorPages::page`] probes for the canonical one.
+impl<'de> Deserialize<'de> for ErrorPages {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let pages = std::collections::BTreeMap::<String, PathBuf>::deserialize(deserializer)?;
+        Ok(ErrorPages {
+            pages: canonicalize_keys(pages),
+        })
+    }
+}
+
+impl Serialize for ErrorPages {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.pages.serialize(serializer)
+    }
+}
+
+/// Every key that names an error rewritten to the spelling the lookup uses.
+///
+/// [`PageKey::parse`] deliberately accepts `"4XX"`, `"DEFAULT"` and `" 404 "` — a hand-written key
+/// whose only mistake is case or spacing still names one unambiguous page — but [`ErrorPages::page`]
+/// is a map probe for the *canonical* spelling. Rewriting on the way in is what keeps those two
+/// halves agreeing; without it an accepted spelling validates and then silently serves nothing.
+///
+/// A key that names no error is left **exactly as written**, so [`ErrorPages::validate`] can quote
+/// the operator's own string back to them rather than a normalised one they never typed.
+fn canonicalize_keys(
+    pages: std::collections::BTreeMap<String, PathBuf>,
+) -> std::collections::BTreeMap<String, PathBuf> {
+    pages
+        .into_iter()
+        .map(|(key, page)| match PageKey::parse(&key) {
+            Ok(parsed) => (parsed.as_str(), page),
+            Err(_) => (key, page),
+        })
+        .collect()
 }
 
 impl ErrorPages {
@@ -819,10 +870,32 @@ impl ErrorPages {
 /// The same keys as the deployment's table, merged per key rather than replacing it — see
 /// [`ErrorPages::overlaid_with`]. Absent inherits the whole table, so the ordinary one-site
 /// deployment never writes this at all.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, transparent)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorPageOverrides {
+    /// Canonicalised on the way in, for the reason [`ErrorPages`]'s map is: a site writing `"4XX"`
+    /// has to land on the key its own overlay merge and the request-path lookup probe for.
     pages: std::collections::BTreeMap<String, PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for ErrorPageOverrides {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let pages = std::collections::BTreeMap::<String, PathBuf>::deserialize(deserializer)?;
+        Ok(ErrorPageOverrides {
+            pages: canonicalize_keys(pages),
+        })
+    }
+}
+
+impl Serialize for ErrorPageOverrides {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.pages.serialize(serializer)
+    }
 }
 
 impl ErrorPageOverrides {

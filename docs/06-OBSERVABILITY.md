@@ -200,13 +200,15 @@ to be readable by the process.
 Three key spellings, consulted in this order: an exact code, then a class (`"4xx"`, `"5xx"`), then
 `"default"`. Only `400`–`599` are accepted: a `2xx` or `3xx` page could never be reached, and
 accepting one is how an operator concludes the feature does not work rather than that the code is
-wrong.
+wrong. A key is matched regardless of case and surrounding spaces, so `"4XX"`, `"DEFAULT"` and
+`" 502 "` name the same pages as `"4xx"`, `"default"` and `"502"`.
 
 **Only the body is replaced, never the status.** A page for `502` is sent with `502` and
 `Cache-Control: no-store`, so a client can still tell what happened and a cache will not keep it. The
-same header is on the *unconfigured* `403` and `404` the static layer answers: a `404` with no
-caching directive is heuristically cacheable, so a URL that misses once would keep missing for a
-client long after the file is deployed.
+same header is on the *unconfigured* `403` and `404` the static layer answers, and on every other
+error this server generates — including the ones the FastCGI front end reports behind nginx: a `404`
+with no caching directive is heuristically cacheable, so a URL that misses once would keep missing
+for a client long after the file is deployed.
 
 **The page's own extension decides its `Content-Type`.** `.html` and `.htm` are
 `text/html; charset=utf-8`, `.json` is `application/json`, `.txt` is `text/plain; charset=utf-8` and
@@ -216,7 +218,11 @@ default, so an existing page is unchanged.
 If the page cannot be read — deleted after `check` passed, or pointed at a directory — the plain-text
 body is sent instead, with the status preserved and the reason logged at `warn`: the status is the
 answer and the body is decoration, so a missing page must not turn a `404` into a `500` or into an
-empty response.
+empty response. The status's own headers survive that fallback, so a `429` whose page is missing
+still carries `Retry-After` and `no-store`.
+
+A page is written byte for byte, whatever it is encoded in: a `.xml` page declaring a single-byte
+encoding arrives intact, not re-encoded.
 
 ### Per site
 
