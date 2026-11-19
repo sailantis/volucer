@@ -222,10 +222,10 @@ pub fn inspect_with_front_controller(
         let root = &site.document_root;
         if !root.is_dir() {
             // The same rule as the default site's, and the same three cases — see
-            // [`document_root_hint`]. A site's root is **not** absolutised by any caller (unlike
-            // the default site's, which the command line resolves), so the effective path is
-            // computed here: that is what the operating system will actually look at, and the hint
-            // is worth nothing if it names a path the operator cannot find.
+            // [`document_root_hint`]. A site's root is absolutised when the *site table* is built,
+            // not in `Config` — so what is checked here is still the path as written, which is what
+            // makes the hint name something the operator can find in their file. The effective path
+            // is computed for the message for the same reason.
             let hint = document_root_hint(Some(root), &effective(root)).replace(
                 "create it, or point server.document_root somewhere else",
                 "create it, or point this site's document_root somewhere else",

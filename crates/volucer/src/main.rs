@@ -2406,32 +2406,79 @@ fn endpoint(running: &RunningHttp) -> String {
     }
 }
 
-/// Resolve `[server.error_pages]` into the map a listener serves from.
+/// [`expand_error_pages`]'s result as a status list a person can read.
+///
+/// A class expands to a hundred codes, so the report collapses contiguous runs: `500-599` rather
+/// than a hundred comma-separated numbers, and `404, 410, 500-599` for a table that names one code
+/// inside a class. This is presentation only — the lookup the request path uses is per status.
+fn status_ranges(statuses: &[u16]) -> String {
+    let mut sorted = statuses.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    for status in sorted {
+        match ranges.last_mut() {
+            Some((_, end)) if *end + 1 == status => *end = status,
+            _ => ranges.push((status, status)),
+        }
+    }
+
+    ranges
+        .into_iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve every site's error pages into the map a listener serves from.
 ///
 /// A free function used by `serve` and by the reload, so the first generation and every reload
 /// resolve the paths the same way — a reload that resolved against the process's working directory
 /// instead of the file's would make a page work at startup and 404 after the first `SIGHUP`, which
 /// is the class of difference this codebase keeps removing.
 ///
+/// **Expanded per site, and expanded here rather than at request time.** A table may name an exact
+/// code, a class (`4xx`), or `default`, and resolving them at startup turns the request path into
+/// one `BTreeMap` lookup with no wildcard arithmetic — the same trade `Routing` and `StaticFiles`
+/// make, for the same reason. The expansion walks 400–599, which is two hundred entries per site
+/// at worst and only when a wildcard was written at all.
+///
+/// **Merged per key before it expands**, so a server `"404"` still wins over a site that only
+/// broadened with `"4xx"` — the more specific answer is the one an operator writing two files
+/// predicts.
+///
 /// A page whose file is missing is **not** a startup failure: the feature is a nicer body for an
 /// error, and refusing to serve because a `404` page is absent would be a deployment that cannot
 /// start for a cosmetic reason. `check` reports it instead, and the renderer falls back to the
 /// plain-text page it always sent.
 fn resolve_error_pages(
-    config: &Config,
+    sites: &volucer_core::sites::Sites,
     config_dir: &Path,
-) -> std::collections::BTreeMap<u16, PathBuf> {
-    let pages = &config.server.error_pages;
-    if pages.is_empty() {
-        return std::collections::BTreeMap::new();
-    }
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<u16, PathBuf>> {
     let mut resolved = std::collections::BTreeMap::new();
-    for code in pages.codes() {
-        if let Some(page) = pages.page(code) {
-            resolved.insert(code, config_dir.join(page));
-        }
+    // The default site first, so the map's shape is the same whether or not `[sites]` exists.
+    for site in std::iter::once(sites.default_site()).chain(sites.named().values()) {
+        resolved.insert(
+            site.name.clone(),
+            expand_error_pages(&site.error_pages, config_dir),
+        );
     }
     resolved
+}
+
+/// One site's table, with each key expanded to the statuses it answers.
+fn expand_error_pages(
+    pages: &volucer_core::config::ErrorPages,
+    config_dir: &Path,
+) -> std::collections::BTreeMap<u16, PathBuf> {
+    pages.expanded(config_dir)
 }
 
 /// Resolve `[server.sendfile]` into the allow-list a front end consults.
@@ -2704,7 +2751,11 @@ fn serve(
             )?
             .with_observability(Arc::clone(&observe))
             .with_rate_limit(Arc::clone(&rate_limit))
-            .with_access(Arc::clone(&access));
+            .with_access(Arc::clone(&access))
+            // The same tables the HTTP listeners get, from the same resolution — a deployment that
+            // runs both front-ends must not answer one protocol with a page and the other with the
+            // plain-text line, and a `404` behind nginx was exactly that before this.
+            .with_error_pages(resolve_error_pages(&sites, &source.dir()));
             // The bound address when there is one, and the configured path for a unix socket — which
             // has no address to report and whose path is what an operator matches against their file.
             match listener.local_addr() {
@@ -2943,7 +2994,7 @@ fn serve(
         let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry))
             .with_observability(Arc::clone(&observe))
             .with_client_ip(Arc::clone(&client_ip))
-            .with_error_pages(resolve_error_pages(&config, &source.dir()))
+            .with_error_pages(resolve_error_pages(&sites, &source.dir()))
             .with_rate_limit(Arc::clone(&rate_limit))
             .with_access(Arc::clone(&access))
             // The policy resolved above, not a second resolution: a relative root must mean the same
@@ -3944,7 +3995,7 @@ impl Reloader {
         // this server answers, so it is part of how a request is answered rather than a table beside
         // the site one. The paths are resolved here because the directory the file was read from is
         // the only thing a reload knows and a request must not.
-        let error_pages = resolve_error_pages(&config, &self.source.dir());
+        let error_pages = resolve_error_pages(&sites, &self.source.dir());
         // The sendfile allow-list is resolved independently of the tables above, so a root that no
         // longer exists leaves the sites, grants and pages reloaded and **keeps the previous list**
         // rather than turning the feature off as a side effect of an unrelated edit. `None` here
@@ -5087,6 +5138,10 @@ fn check(
     // file alone — the same reason the site table prints what it inherits one layer down.
     print_hsts(&config, &sites);
 
+    // Resolved once, and from the same table everything below reports, so a page that `serve` will
+    // read is the page `check` names.
+    let resolved_error_pages = resolve_error_pages(&sites, &config_dir);
+
     println!("  routes:");
     if config.server.routes.is_empty() {
         println!("    (none: every request goes to the default backend)");
@@ -5242,16 +5297,44 @@ fn check(
         );
     }
 
-    // The error pages, reported by code with the path `serve` will read, and a missing file called
-    // out — a page that does not exist falls back to the plain-text body at request time, which is
-    // a deployment answering a bare status where it had written a page. That is the silent-reader
-    // rule: a key an operator sets that no command reports is a key they cannot confirm.
-    if !config.server.error_pages.is_empty() {
-        let resolved = resolve_error_pages(&config, &config_dir);
-        println!("  error pages:");
-        for (code, path) in &resolved {
+    // The error pages, per site, with the wildcard keys already expanded to the statuses they
+    // answer — a missing file called out, because a page that does not exist falls back to the
+    // plain-text body at request time, which is a deployment answering a bare status where it had
+    // written a page. That is the silent-reader rule: a key an operator sets that no command
+    // reports is a key they cannot confirm.
+    //
+    // Printed per site rather than once because the whole point of the per-site key is that one
+    // site can differ. A site whose resolved table equals the default's is skipped, so the report
+    // reads as "what differs" rather than repeating the same five lines under every name.
+    let default_pages = resolved_error_pages.get(volucer_http::DEFAULT_SITE_KEY);
+    let mut printed_header = false;
+    for (name, pages) in &resolved_error_pages {
+        let inherited = name != volucer_http::DEFAULT_SITE_KEY && Some(pages) == default_pages;
+        if pages.is_empty() || inherited {
+            continue;
+        }
+        if !printed_header {
+            println!("  error pages:");
+            printed_header = true;
+        }
+        let label = if name == volucer_http::DEFAULT_SITE_KEY {
+            "    "
+        } else {
+            println!("    site {name}:");
+            "      "
+        };
+        // Expanded, so what is printed is what a client gets: `4xx` appears as the statuses it
+        // answers rather than as the wildcard that was written — but as *ranges*, because a class
+        // is a hundred codes and printing them one by one buries every other line of the report.
+        let mut grouped: std::collections::BTreeMap<&PathBuf, Vec<u16>> =
+            std::collections::BTreeMap::new();
+        for (status, path) in pages {
+            grouped.entry(path).or_default().push(*status);
+        }
+        for (path, statuses) in grouped {
             println!(
-                "    {code}: {} {}",
+                "{label}{}: {} {}",
+                status_ranges(&statuses),
                 path.display(),
                 if path.is_file() {
                     ""
@@ -6465,6 +6548,7 @@ mod tests {
             document_root: PathBuf::from("/srv/app"),
             front_controller: Some("index.php".to_string()),
             script_extensions: volucer_core::ScriptExtensions::default(),
+            error_pages: volucer_core::config::ErrorPages::default(),
             serve_only: volucer_core::config::ServeOnly::All,
             static_files: volucer_core::config::StaticConfig::default(),
             static_files_suppressed: false,
@@ -6513,6 +6597,7 @@ document_root = "/from/file"
             name: "<default>".to_string(),
             document_root: PathBuf::from("."),
             front_controller: None,
+            error_pages: volucer_core::config::ErrorPages::default(),
             script_extensions: volucer_core::ScriptExtensions::default(),
             serve_only: volucer_core::config::ServeOnly::All,
             static_files: volucer_core::config::StaticConfig::default(),

@@ -351,6 +351,22 @@ It checks the staged content, so it catches a formatted file that was never `git
 commit that would otherwise pass locally and fail in CI. Run `cargo fmt --all` (twice: rustfmt is
 not always idempotent in one pass) to fix what it reports, or `git commit --no-verify` to bypass it.
 
+Formatting is not the only thing that only fails in CI. `cargo fmt` reads a file's text, but
+`clippy` and `cargo check` read its *cfg expansion*, and this project supports two platforms with
+different ones: a parameter whose only reader sits inside `#[cfg(windows)]`, or a file that begins
+`#![cfg(unix)]`, compiles to nothing on macOS and Windows. Both of the last two red runs were that
+shape — a file that was simply not compiled on the machine checking it. So the CI commands can be
+run locally against Linux, in a container of the same toolchain:
+
+```sh
+scripts/check-linux.sh              # clippy + check, as the clippy and msrv jobs run them
+scripts/check-linux.sh --fmt        # also cargo fmt --all --check
+scripts/check-linux.sh --features   # also the http3 and amqp passes
+```
+
+It needs Docker, and it puts `target/` in a named volume so Linux artifacts never mix with a host
+build. Prefer it to pushing a branch to find out.
+
 `rust-toolchain.toml` pins the channel so that the hook and the CI job are formatting with the
 same rustfmt. Without it both ran whatever rustup default they found, which is how a commit can
 pass every check locally and still go red. The pin is a minor version (`1.99`), so a patch release

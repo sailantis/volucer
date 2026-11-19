@@ -627,10 +627,10 @@ impl Config {
             }
         }
 
-        // The error pages, per code. Checked here rather than only at render time because a page that
+        // The error pages, per key. Checked here rather than only at render time because a page that
         // cannot be read is a deployment that answers a bare status where it had written a page, and
         // discovering that during an incident is the wrong moment.
-        if let Err(reason) = self.server.error_pages.validate() {
+        if let Err(reason) = self.server.error_pages.validate("server.error_pages") {
             return Err(Error::Config(reason));
         }
 

@@ -295,6 +295,10 @@ impl std::fmt::Debug for SharedState {
     }
 }
 
+/// The table a site without error pages borrows, so the request path never branches on absence.
+static EMPTY_PAGES: std::sync::LazyLock<BTreeMap<u16, PathBuf>> =
+    std::sync::LazyLock::new(BTreeMap::new);
+
 /// The key the default site's routing is stored under.
 ///
 /// A name that cannot collide with a site's own, because a site name comes from a TOML
@@ -382,16 +386,23 @@ pub struct Reloaded {
     /// answered by one generation. A reload that changed a route *and* a grant moves both at once,
     /// so a call cannot be routed by the new table and admitted by the old grant.
     grpc_grants: Arc<GrpcGrantsMap>,
-    /// The page this server answers an error status with, by code.
+    /// The page this server answers an error status with, per site and by status.
     ///
     /// In `Reloaded` for the reason everything else here is: a request must be answered by one
     /// generation. It is also what makes the table **reloadable** — an operator who fixes a broken
     /// 502 page expects the next request to use it, not the next restart, and a page is a file whose
     /// *content* is read per request anyway.
     ///
-    /// The paths are already resolved against the configuration's directory, because that is the
-    /// only thing a reload cannot do at request time.
-    error_pages: std::collections::BTreeMap<u16, PathBuf>,
+    /// Keyed by site name, plus the default under [`DEFAULT_SITE_KEY`], for the same reason
+    /// `routings` and `statics` are: two brands sharing one server want two different 404 pages, and
+    /// a table beside the site table rather than inside it would be the one setting that forgot to
+    /// reload.
+    ///
+    /// The tables are **already merged and expanded** — a site's overlay applied over the
+    /// deployment's, then every class and `default` key turned into the statuses it answers — so the
+    /// request path is one `BTreeMap` lookup. The paths are already resolved against the
+    /// configuration's directory, because that is the only thing a reload cannot do at request time.
+    error_pages: BTreeMap<String, BTreeMap<u16, PathBuf>>,
     /// Which directories a backend may serve a file from, when the deployment allows it.
     ///
     /// In `Reloaded` because a root is a file's location and an operator who adds one expects the
@@ -419,7 +430,7 @@ impl Reloaded {
         sites: Arc<Sites>,
         server_port: Option<u16>,
         grpc_grants: Arc<GrpcGrantsMap>,
-        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+        error_pages: BTreeMap<String, BTreeMap<u16, PathBuf>>,
     ) -> Self {
         Self::from_sites_with_sendfile(sites, server_port, grpc_grants, error_pages, None)
     }
@@ -434,12 +445,16 @@ impl Reloaded {
         sites: Arc<Sites>,
         server_port: Option<u16>,
         grpc_grants: Arc<GrpcGrantsMap>,
-        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+        error_pages: BTreeMap<String, BTreeMap<u16, PathBuf>>,
         sendfile: Option<volucer_core::SendfilePolicy>,
     ) -> Self {
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
         let mut compression = BTreeMap::new();
+        // A resolved site always has a table, so the empty case is a caller that built no pages —
+        // which is every deployment that wrote no `[server.error_pages]`, and must cost one lookup
+        // rather than a branch on a missing entry.
+        let mut pages_by_site = BTreeMap::new();
         for site in sites
             .named()
             .values()
@@ -464,6 +479,9 @@ impl Reloaded {
                 },
             );
             compression.insert(site.name.clone(), site.compression.clone());
+            if let Some(pages) = error_pages.get(&site.name) {
+                pages_by_site.insert(site.name.clone(), pages.clone());
+            }
         }
         Reloaded {
             sites,
@@ -471,18 +489,25 @@ impl Reloaded {
             statics,
             compression,
             grpc_grants,
-            error_pages,
+            error_pages: pages_by_site,
             sendfile,
         }
     }
 
-    /// The page for an error status, if this generation has one.
+    /// The page for a status on one site, if this generation has one.
     ///
     /// `None` for a code the deployment did not write, which is the ordinary case: a server answers
-    /// far more error statuses than any deployment writes pages for.
+    /// far more error statuses than any deployment writes pages for. Falls back to the default
+    /// site's table for a name the map has no entry for, which is the same direction
+    /// [`Reloaded::for_site`] falls back for the other maps — serving the deployment's own page
+    /// rather than none.
     #[must_use]
-    pub fn error_page(&self, status: u16) -> Option<&std::path::Path> {
-        self.error_pages.get(&status).map(PathBuf::as_path)
+    pub fn error_page(&self, site: &str, status: u16) -> Option<&std::path::Path> {
+        self.error_pages
+            .get(site)
+            .or_else(|| self.error_pages.get(DEFAULT_SITE_KEY))
+            .and_then(|pages| pages.get(&status))
+            .map(PathBuf::as_path)
     }
 
     /// The allow-list a backend may name a file in, or `None` when the feature is off.
@@ -537,12 +562,13 @@ impl Reloaded {
     /// restriction.
     pub fn resolve(&self, host: Option<&str>) -> Resolved<'_> {
         let site = self.sites.resolve(host);
-        let (routing, statics, compression) = self.for_site(site);
+        let (routing, statics, compression, error_pages) = self.for_site(site);
         Resolved {
             site,
             routing,
             statics,
             compression,
+            error_pages,
         }
     }
 
@@ -558,12 +584,13 @@ impl Reloaded {
         protocol: volucer_core::config::SiteProtocol,
     ) -> Resolved<'_> {
         let site = self.sites.resolve_request(host, local, protocol);
-        let (routing, statics, compression) = self.for_site(site);
+        let (routing, statics, compression, error_pages) = self.for_site(site);
         Resolved {
             site,
             routing,
             statics,
             compression,
+            error_pages,
         }
     }
 
@@ -580,6 +607,7 @@ impl Reloaded {
         &Routing,
         &StaticFiles,
         &volucer_core::config::CompressionSetting,
+        &BTreeMap<u16, PathBuf>,
     ) {
         let routing = self
             .routings
@@ -596,7 +624,17 @@ impl Reloaded {
             .get(&site.name)
             .or_else(|| self.compression.get(DEFAULT_SITE_KEY))
             .expect("the default site is always built");
-        (routing, statics, compression)
+        // The one map that legitimately has no entry: a deployment that wrote no error pages has
+        // none at all, and the empty table is the answer rather than a fallback — there is no
+        // "deployment's own page" to fall back *to*. It is inserted for every site when the caller
+        // built one, so a missing entry means nothing was configured.
+        let empty_pages = &EMPTY_PAGES;
+        let error_pages = self
+            .error_pages
+            .get(&site.name)
+            .or_else(|| self.error_pages.get(DEFAULT_SITE_KEY))
+            .unwrap_or(empty_pages);
+        (routing, statics, compression, error_pages)
     }
 }
 
@@ -608,8 +646,7 @@ impl std::fmt::Debug for Reloaded {
     }
 }
 
-/// One request's configuration: a resolved site and the maps that go with it, from one generation.
-///
+/// One request's configuration: a resolved site and the maps that go with it, from one generation.///
 /// Returned as a single value rather than as a pair of calls because the pairing *is* the
 /// correctness. The site has to come from the `Reloaded` a request took, not from the shared table
 /// live at the moment of resolution: a reload landing between the two would otherwise resolve a
@@ -628,6 +665,12 @@ pub struct Resolved<'a> {
     pub statics: &'a StaticFiles,
     /// How its responses are compressed.
     pub compression: &'a volucer_core::config::CompressionSetting,
+    /// Its error pages, by status, with the site's overlay and the wildcard keys already applied.
+    ///
+    /// Borrowed from this generation rather than looked up on the fly for the reason the other
+    /// three are: a page belongs to the same configuration the site does, so a reload landing
+    /// between "which site" and "which page" must not be able to mix them.
+    pub error_pages: &'a BTreeMap<u16, PathBuf>,
 }
 
 /// The process's one reloadable state, and the handle a trigger applies a new configuration
@@ -745,7 +788,7 @@ impl Registry {
         &self,
         sites: Sites,
         grpc_grants: Arc<GrpcGrantsMap>,
-        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+        error_pages: BTreeMap<String, BTreeMap<u16, PathBuf>>,
     ) -> Option<Arc<Reloaded>> {
         self.apply_with_sendfile(sites, grpc_grants, error_pages, None)
     }
@@ -762,7 +805,7 @@ impl Registry {
         &self,
         sites: Sites,
         grpc_grants: Arc<GrpcGrantsMap>,
-        error_pages: std::collections::BTreeMap<u16, PathBuf>,
+        error_pages: BTreeMap<String, BTreeMap<u16, PathBuf>>,
         sendfile: Option<volucer_core::SendfilePolicy>,
     ) -> Option<Arc<Reloaded>> {
         let _replaced = self.shared.replace(sites);
@@ -899,14 +942,33 @@ mod tests {
     }
 
     /// A site table whose site and root are both named, so a sample can tell them apart.
+    ///
+    /// The root goes through [`site_root`] rather than being used verbatim, because a *named*
+    /// site's root is absolutised when the table is built and `"/srv/first"` is a relative path on
+    /// Windows. A caller that asserted on the name as written would be asserting on something the
+    /// table never holds.
     fn named_sites(root: &str) -> Sites {
+        let root = site_root(root);
         let text = format!(
             "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {root:?}\n\n\
              [sites.app]\nhosts = [\"app.test\"]\ndocument_root = {root:?}\n",
             root = root
         );
         let config = Config::from_toml(&text).expect("config parses");
-        Sites::from_config(&config, Path::new(root))
+        Sites::from_config(&config, Path::new(&root))
+    }
+
+    /// The path a named site's root resolves to, spelled per platform.
+    ///
+    /// `/srv/first` is absolute on unix and relative on Windows, and only an absolute root keeps
+    /// its spelling. Written as a helper rather than repeated at each assertion so the platform
+    /// difference lives in one place.
+    fn site_root(name: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!("C:/srv/{name}"))
+        } else {
+            std::path::PathBuf::from(format!("/srv/{name}"))
+        }
     }
 
     /// The sampling technique used by the concurrency test **would** catch a split generation.
@@ -925,9 +987,9 @@ mod tests {
     /// static layer, moved one after another.
     #[test]
     fn three_separate_swaps_be_observed_mid_generation() {
-        let table = Swappable::new(named_sites("/srv/first"));
-        let routings = Swappable::new(Path::new("/srv/first").to_path_buf());
-        let statics = Swappable::new(Path::new("/srv/first").to_path_buf());
+        let table = Swappable::new(named_sites("first"));
+        let routings = Swappable::new(site_root("first"));
+        let statics = Swappable::new(site_root("first"));
 
         let observed_a_mixture = std::sync::atomic::AtomicBool::new(false);
         let stop = AtomicBool::new(false);
@@ -949,11 +1011,7 @@ mod tests {
             for round in 0..20_000 {
                 // Alternating, so a reader that only ever samples one direction cannot look clean
                 // by accident.
-                let to = if round % 2 == 0 {
-                    "/srv/second"
-                } else {
-                    "/srv/first"
-                };
+                let to = if round % 2 == 0 { "second" } else { "first" };
                 // A yield between the three writes, which is what makes a mixture observable
                 // rather than a matter of luck: the reader's loop is pure atomic loads, so it gets
                 // in between them every time. Without the yields this test is a race that would
@@ -961,9 +1019,9 @@ mod tests {
                 // a control.
                 let _ = table.replace(named_sites(to));
                 std::thread::yield_now();
-                let _ = routings.replace(Path::new(to).to_path_buf());
+                let _ = routings.replace(site_root(to));
                 std::thread::yield_now();
-                let _ = statics.replace(Path::new(to).to_path_buf());
+                let _ = statics.replace(site_root(to));
             }
             stop.store(true, Ordering::Relaxed);
             reader.join().expect("the reader thread panicked");
@@ -985,7 +1043,7 @@ mod tests {
     #[test]
     fn one_swap_never_yields_a_partial_generation() {
         let state = Swappable::new(Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(GrpcGrantsMap::new()),
             std::collections::BTreeMap::new(),
@@ -1013,11 +1071,7 @@ mod tests {
             });
 
             for round in 0..5_000 {
-                let root = if round % 2 == 0 {
-                    "/srv/first"
-                } else {
-                    "/srv/second"
-                };
+                let root = if round % 2 == 0 { "first" } else { "second" };
                 let _ = state.replace(Reloaded::from_sites(
                     Arc::new(named_sites(root)),
                     Some(8080),
@@ -1033,9 +1087,9 @@ mod tests {
             !seen.is_empty(),
             "the sampler never ran, so it observed nothing"
         );
+        let (first, second) = (site_root("first"), site_root("second"));
         assert!(
-            seen.iter()
-                .all(|root| root == Path::new("/srv/first") || root == Path::new("/srv/second")),
+            seen.iter().all(|root| *root == first || *root == second),
             "a sample resolved to a root no generation named"
         );
     }
@@ -1062,13 +1116,13 @@ mod tests {
         );
 
         let first = Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(before),
             std::collections::BTreeMap::new(),
         );
         let second = Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(after),
             std::collections::BTreeMap::new(),
@@ -1107,7 +1161,7 @@ mod tests {
         let mut grants = GrpcGrantsMap::new();
         grants.insert("app".to_string(), GrpcGrants::any());
         let state = Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(grants),
             std::collections::BTreeMap::new(),

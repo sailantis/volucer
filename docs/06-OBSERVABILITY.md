@@ -16,11 +16,11 @@ format = "combined"               # or "json"
 request_id_header = "X-Request-Id"
 ```
 
-| Key                 | Type   | Default          | What it does                                            |
-| ------------------- | ------ | ---------------- | ------------------------------------------------------- |
+| Key                 | Type   | Default          | What it does                                              |
+| ------------------- | ------ | ---------------- | --------------------------------------------------------- |
 | `path`              | path   | **required**     | Where the log is written. `-` means the process's stdout. |
-| `format`            | string | `"combined"`     | `"combined"` or `"json"`.                               |
-| `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from.                  |
+| `format`            | string | `"combined"`     | `"combined"` or `"json"`.                                 |
+| `request_id_header` | string | `"X-Request-Id"` | The header to adopt a request id from.                    |
 
 Volucer does not create the parent directory. If it does not exist or cannot be opened,
 startup reports the problem once and the server continues without writing the access log.
@@ -42,8 +42,8 @@ or `kubectl logs` shows the access log beside the diagnostics (which go to stder
 consequences worth knowing:
 
 - **There is nothing to rotate.** A stream has no path, so a rotation cannot detach it and
-  `SIGHUP` does not reopen it — the runtime's own driver rotates what it captured. `volucer
-  check` says so rather than printing the usual `logrotate` instruction.
+  `SIGHUP` does not reopen it — the runtime's own driver rotates what it captured.
+  `volucer check` says so rather than printing the usual `logrotate` instruction.
 - **Volucer writes through the handle it already has**, not a second one on `/dev/stdout`. The
   difference matters: a second handle would keep writing into a renamed inode after a rotation,
   which is exactly the failure the reopen exists to prevent.
@@ -181,33 +181,79 @@ One policy applies process-wide to both front ends; it does not vary by route or
 ## Error pages
 
 By default an error this server generates — a `502` from a dead backend, a `504` from a timeout, a
-`429` from the rate limit, a `404` from the router — is a single line of plain text. Write a page per
-status when a deployment should send something better:
+`429` from the rate limit, a `404` from the router or from a missing static file — is a single line
+of plain text. Write a page per status when a deployment should send something better:
 
 ```toml
 [server.error_pages]
 "404" = "pages/404.html"
 "502" = "pages/502.html"
 "429" = "pages/busy.html"
+"4xx" = "pages/client-error.html"   # any 4xx not named above
+"default" = "pages/error.html"      # anything else this server generates
 ```
 
-Paths resolve against the configuration file's directory, like every other path in the file. Only
-`400`–`599` are accepted: a `2xx` or `3xx` page could never be reached, and accepting one is how an
-operator concludes the feature does not work rather than that the code is wrong.
+Paths resolve against the configuration file's directory, like every other path in the file — not
+against the document root, and the page does **not** need to be reachable by a request. It only has
+to be readable by the process.
+
+Three key spellings, consulted in this order: an exact code, then a class (`"4xx"`, `"5xx"`), then
+`"default"`. Only `400`–`599` are accepted: a `2xx` or `3xx` page could never be reached, and
+accepting one is how an operator concludes the feature does not work rather than that the code is
+wrong. A key is matched regardless of case and surrounding spaces, so `"4XX"`, `"DEFAULT"` and
+`" 502 "` name the same pages as `"4xx"`, `"default"` and `"502"`.
 
 **Only the body is replaced, never the status.** A page for `502` is sent with `502` and
-`Cache-Control: no-store`, so a client can still tell what happened and a cache will not keep it. If
-the page cannot be read — deleted after `check` passed, or pointed at a directory — the plain-text
-body is sent instead and the reason is logged at `warn`: the status is the answer and the body is
-decoration, so a missing page must not turn a `502` into a `500`.
+`Cache-Control: no-store`, so a client can still tell what happened and a cache will not keep it. The
+same header is on the _unconfigured_ `403` and `404` the static layer answers, and on every other
+error this server generates — including the ones the FastCGI front end reports behind nginx: a `404`
+with no caching directive is heuristically cacheable, so a URL that misses once would keep missing
+for a client long after the file is deployed.
+
+**The page's own extension decides its `Content-Type`.** `.html` and `.htm` are
+`text/html; charset=utf-8`, `.json` is `application/json`, `.txt` is `text/plain; charset=utf-8` and
+`.xml` is `application/xml`. Anything else — including a page with no extension — keeps the HTML
+default, so an existing page is unchanged.
+
+If the page cannot be read — deleted after `check` passed, or pointed at a directory — the plain-text
+body is sent instead, with the status preserved and the reason logged at `warn`: the status is the
+answer and the body is decoration, so a missing page must not turn a `404` into a `500` or into an
+empty response. The status's own headers survive that fallback, so a `429` whose page is missing
+still carries `Retry-After` and `no-store`.
+
+A page is written byte for byte, whatever it is encoded in: a `.xml` page declaring a single-byte
+encoding arrives intact, not re-encoded.
+
+### Per site
+
+A site can state the pages it wants to differ and inherit every other one:
+
+```toml
+[server.error_pages]
+"404" = "pages/404.html"
+"502" = "pages/502.html"
+
+[sites.shop.error_pages]
+"404" = "shop/404.html"
+```
+
+The overlay is merged per key, and the merge happens before the class and `default` keys expand — so
+a deployment's exact `"404"` still wins over a site that only broadened with `"4xx"`. See
+[Routing and Sites](03-ROUTING-AND-SITES.md#what-a-site-inherits).
 
 Two things are deliberately **not** affected:
 
 - **A backend's own error response.** A `404` a PHP application produces is the application's page;
-  this server does not rewrite it. These pages cover the statuses *this server* generates.
+  this server does not rewrite it. These pages cover the statuses _this server_ generates.
 - **gRPC.** A failed call reports its outcome in the trailer section, so there is no body to replace.
 
-`volucer check` lists every configured code with the path it resolved, and marks a missing file.
+`volucer check` lists every configured table per site with the path it resolved, expands the wildcard
+keys to the statuses they answer, and marks a missing file.
+
+The FastCGI front end honours the same tables, so a deployment behind nginx answers a `404` or a
+`403` or a `502` with the page it configured rather than with a `volucer:` line. A status nginx
+answers itself — a request it refused or a `404` it produced from its own configuration — never
+reaches this server, so `error_page` in `nginx.conf` is still the right place for those.
 
 ## The worker-control routes
 
@@ -339,12 +385,12 @@ records.
 What a backend is handed is decided by `[server].trace_context`, which has the same four
 values as nginx's `otel_trace_context`:
 
-| Value | Reads the client's `traceparent` | Writes Volucer's for the backend |
-|---|---|---|
-| `ignore` | no | no |
-| `extract` | yes | no — **the default** |
-| `inject` | no | yes |
-| `propagate` | yes | yes |
+| Value       | Reads the client's `traceparent` | Writes Volucer's for the backend |
+| ----------- | -------------------------------- | -------------------------------- |
+| `ignore`    | no                               | no                               |
+| `extract`   | yes                              | no — **the default**             |
+| `inject`    | no                               | yes                              |
+| `propagate` | yes                              | yes                              |
 
 ```toml
 [server]
@@ -355,7 +401,7 @@ Under `extract`, the default, a client's header reaches the backend unchanged. T
 this server has always done, and it means a backend's spans are **siblings** of Volucer's
 span: both name the caller as their parent.
 
-Under `propagate`, the backend is handed *Volucer's* context instead, so its spans are
+Under `propagate`, the backend is handed _Volucer's_ context instead, so its spans are
 **children** of Volucer's span and a trace view shows one request rather than two branches
 hanging from it. This is nginx's `otel_trace_context propagate`, and it is the value to set
 when the backend produces its own spans.
@@ -364,12 +410,12 @@ The replacement applies to every backend kind:
 
 - a worker sees `HTTP_TRACEPARENT` in the CGI environment it rebuilds from the request;
 - an `upstream` origin receives the header on the request it is proxied;
-- a FastCGI backend — including the FastCGI *listener*, behind nginx — is dispatched with
+- a FastCGI backend — including the FastCGI _listener_, behind nginx — is dispatched with
   the `PARAMS` entry replaced rather than appended to. Replacing matters: two
   `HTTP_TRACEPARENT` entries would leave the parent decided by whichever one the application
   reads first.
 
-`ignore` does not *strip* the header. A `traceparent` is an ordinary request header, and
+`ignore` does not _strip_ the header. A `traceparent` is an ordinary request header, and
 Volucer relays the environment it was given; `ignore` only means this server neither reads
 the trace nor writes one.
 
@@ -420,14 +466,14 @@ queue from consuming process memory during a collector outage.
 ## Sampling
 
 `[telemetry].sample` decides which traces leave the process. It is the cost control that
-`trace_context` is not: `trace_context` says what a *backend* is handed and works with no
+`trace_context` is not: `trace_context` says what a _backend_ is handed and works with no
 `[telemetry]` table at all, while `sample` says what this server sends to its collector.
 
-| Value | What is exported |
-|---|---|
+| Value                              | What is exported                                                                                                                                            |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `"parent_based"` — **the default** | The traces an upstream service already decided to record, **and** a request that arrived with no `traceparent` at all. OTel's `ParentBased(root=AlwaysOn)`. |
-| `"always"` | Every trace, whatever the caller's flag said. |
-| `"ratio"` | The fraction given by `sample_ratio`, chosen deterministically from the trace id. |
+| `"always"`                         | Every trace, whatever the caller's flag said.                                                                                                               |
+| `"ratio"`                          | The fraction given by `sample_ratio`, chosen deterministically from the trace id.                                                                           |
 
 The two halves of the default are worth separating, because only one is obvious:
 
@@ -435,7 +481,7 @@ The two halves of the default are worth separating, because only one is obvious:
   budget on this request, and a proxy that flipped the bit would make every downstream span
   appear regardless. nginx spells this policy `otel_trace $otel_parent_sampled`.
 - **A request with no `traceparent` is recorded.** It has no parent to defer to — it is a
-  *root* — and treating its absent flag as `-00` would leave a standalone deployment, with
+  _root_ — and treating its absent flag as `-00` would leave a standalone deployment, with
   nothing in front of it, exporting nothing at all while `[telemetry]` looked configured.
 
 The decision is applied in one place and read twice: it becomes the `sampled` bit on the
@@ -457,7 +503,7 @@ process state — so every hop applying the same fraction agrees about the same 
 arithmetic follows the W3C consistent-probability rule that OpenTelemetry's `ProbabilitySampler`
 uses: the randomness is the seven rightmost bytes of the trace id, and a trace is kept when that
 value is at or above a threshold derived from the fraction. Lowering the fraction therefore only
-ever *removes* traces, so a backend may sample more generously than the front-end without
+ever _removes_ traces, so a backend may sample more generously than the front-end without
 losing anything the front-end kept.
 
 `0.0` and `1.0` are exact — no traces and all traces — and the smallest accepted non-zero value

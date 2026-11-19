@@ -28,6 +28,15 @@ impl Config {
                 )));
             }
 
+            if let Some(pages) = &site.error_pages {
+                // Checked here rather than only at render time, for the reason the server's table
+                // is: a page that cannot be reached is a site answering a bare status where its
+                // file said otherwise.
+                if let Err(reason) = pages.validate(&format!("sites.{name}.error_pages")) {
+                    return Err(Error::Config(reason));
+                }
+            }
+
             for host in &site.hosts {
                 validate_host_pattern(host, &format!("sites.{name}.hosts"))?;
                 let key = host.trim().to_ascii_lowercase();

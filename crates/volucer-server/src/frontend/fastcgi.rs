@@ -380,7 +380,35 @@ pub fn write_error<W: Write>(
     message: &str,
     reason: ServerErrorKind,
 ) -> Result<()> {
-    write_error_with(writer, request_id, message, reason, None)
+    write_error_with(writer, request_id, message, reason, None, None)
+}
+
+/// [`write_error`] with the deployment's page for the status this failure means.
+///
+/// The page replaces the body and nothing else: the `Status:` line still comes from `reason`, so an
+/// operator's `502` page is answered as a `502`. That split is the same one the HTTP path makes, and
+/// it is why the page is a parameter rather than something the caller assembles — the status and the
+/// body would otherwise be two decisions that could disagree.
+pub fn write_error_page<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    message: &str,
+    reason: ServerErrorKind,
+    retry_after_secs: Option<u64>,
+    page: Option<Page<'_>>,
+) -> Result<()> {
+    write_error_with(writer, request_id, message, reason, retry_after_secs, page)
+}
+
+/// A page a deployment wrote for an error status, already read and typed.
+///
+/// Borrowed rather than owned because the writer only ever copies it into a record, and the caller
+/// has already had to hold the bytes to know their length. `content_type` comes from
+/// [`volucer_core::config::error_page_content_type`], so both front ends type one page alike.
+#[derive(Debug, Clone, Copy)]
+pub struct Page<'a> {
+    pub body: &'a [u8],
+    pub content_type: &'a str,
 }
 
 /// A refusal that tells the client when to come back.
@@ -400,6 +428,7 @@ pub fn write_rate_limited<W: Write>(
         message,
         ServerErrorKind::RateLimited,
         Some(retry_after_secs.max(1)),
+        None,
     )
 }
 
@@ -416,6 +445,28 @@ pub fn write_forbidden<W: Write>(writer: &mut W, request_id: u16, message: &str)
         message,
         ServerErrorKind::AddressDenied,
         None,
+        None,
+    )
+}
+
+/// [`write_forbidden`] with the deployment's page for `403`.
+///
+/// The refusal is `[server.access]`'s, so there is no body to preserve and the page is the whole
+/// answer — but it still travels with the reason rather than beside it, so the status and the body
+/// cannot be chosen by two callers that disagree.
+pub fn write_forbidden_page<W: Write>(
+    writer: &mut W,
+    request_id: u16,
+    message: &str,
+    page: Option<Page<'_>>,
+) -> Result<()> {
+    write_error_with(
+        writer,
+        request_id,
+        message,
+        ServerErrorKind::AddressDenied,
+        None,
+        page,
     )
 }
 
@@ -488,26 +539,37 @@ fn write_error_with<W: Write>(
     message: &str,
     reason: ServerErrorKind,
     retry_after_secs: Option<u64>,
+    page: Option<Page<'_>>,
 ) -> Result<()> {
-    // `no-store` on both of the refuse-with-a-status kinds, and it is not decoration: a shared
-    // cache that stored a 429 or a 413 would serve it to every other client of the same URL, which
-    // turns one caller's problem into everybody's. RoadRunner sets it for the same reason.
-    let extra = match (&reason, retry_after_secs) {
-        (ServerErrorKind::RateLimited, Some(seconds)) => {
-            format!("Cache-Control: no-store\r\nRetry-After: {seconds}\r\n")
-        }
-        (
-            ServerErrorKind::BodyTooLarge
-            | ServerErrorKind::RateLimited
-            | ServerErrorKind::AddressDenied,
-            _,
-        ) => "Cache-Control: no-store\r\n".to_string(),
-        _ => String::new(),
-    };
-    let body = format!(
-        "Status: {}\r\nContent-Type: text/plain; charset=utf-8\r\n{extra}\r\nvolucer: {message}\r\n",
-        reason.status_line()
+    // `no-store` on **every** generated error, which is the rule the HTTP path already applies in
+    // `plain_error_page`: a 502 or a 403 is as cacheable-looking as a 429, and a shared cache that
+    // kept one would serve this deployment's failure to every other client of the same URL. It is
+    // unconditional rather than per-kind because the reason a 4xx was excluded before was that
+    // nothing had looked at it — the two front-ends now say the same thing about the same status.
+    //
+    // `Retry-After` still belongs to the rate limit alone: only that kind has a number to give.
+    let mut extra = String::from("Cache-Control: no-store\r\n");
+    if let (ServerErrorKind::RateLimited, Some(seconds)) = (&reason, retry_after_secs) {
+        extra.push_str(&format!("Retry-After: {seconds}\r\n"));
+    }
+    // **A configured page replaces the body and nothing else.** The `Status:` line still comes from
+    // `reason`, so a page written for a `502` is answered as a `502` — the same split the HTTP path
+    // makes, and the reason the two are not assembled by the caller.
+    let header_block = format!(
+        "Status: {}\r\nContent-Type: {}\r\n{extra}\r\n",
+        reason.status_line(),
+        page.map_or("text/plain; charset=utf-8", |page| page.content_type),
     );
+    // **The body is appended as bytes, never formatted into the header `String`.** A page is a file
+    // an operator wrote and is not obliged to be UTF-8 — an XML page declaring a single-byte encoding
+    // is a legitimate one — and a `String::from_utf8_lossy` round trip would replace every byte it
+    // did not recognise, sending a document that is neither the page nor valid XML. The HTTP path
+    // writes the same bytes unchanged, and the two must agree.
+    let mut body = header_block.into_bytes();
+    match page {
+        Some(page) => body.extend_from_slice(page.body),
+        None => body.extend_from_slice(format!("volucer: {message}\r\n").as_bytes()),
+    }
 
     // A failed request also gets one assembled write, and its END_REQUEST carries the
     // *reason's* protocol status rather than `RequestComplete` — that is what tells nginx
@@ -518,7 +580,9 @@ fn write_error_with<W: Write>(
         protocol_status: reason.protocol_status(),
     };
     write_assembled(writer, |out| {
-        record::append_records(out, RecordType::Stdout, request_id, body.as_bytes(), true);
+        // One `STDOUT` record holding the header block and the body: the shape nginx has always been
+        // given here, so a page written for a status cannot arrive as anything else.
+        record::append_records(out, RecordType::Stdout, request_id, &body, true);
         record::append_records(
             out,
             RecordType::Stderr,
@@ -1016,6 +1080,118 @@ mod tests {
         let text = String::from_utf8_lossy(&stdout.content);
         assert!(text.contains("Cache-Control: no-store"), "{text}");
         assert!(!text.contains("Retry-After"), "{text}");
+    }
+
+    /// **Every** generated error says `no-store`, not only the two that were thought of first.
+    ///
+    /// A `502` or a `403` is as easy for a shared cache to keep as a `429`, and the HTTP path has
+    /// always sent `no-store` for both — `plain_error_page` sets it unconditionally. Two front ends
+    /// answering the same status with two caching directives is the drift this test pins against.
+    #[test]
+    fn every_generated_error_says_no_store() {
+        for reason in [
+            ServerErrorKind::Backend,
+            ServerErrorKind::Overloaded,
+            ServerErrorKind::NoMultiplexing,
+            ServerErrorKind::BodyTooLarge,
+            ServerErrorKind::RateLimited,
+            ServerErrorKind::AddressDenied,
+        ] {
+            let mut wire = Vec::new();
+            write_error(&mut wire, 1, "refused", reason).unwrap();
+            let mut cursor = wire.as_slice();
+            let stdout = next_non_empty(&mut cursor).unwrap();
+            let text = String::from_utf8_lossy(&stdout.content);
+            assert!(
+                text.contains("Cache-Control: no-store"),
+                "{reason:?} must not be cacheable: {text}"
+            );
+        }
+    }
+
+    /// **A configured page is written byte for byte**, whatever it is encoded in.
+    ///
+    /// A page is a file an operator wrote, and an XML one declaring a single-byte encoding is a
+    /// legitimate page. Formatting it through a `String` would replace every byte that is not UTF-8
+    /// with `U+FFFD` and send a document that is neither the page nor valid XML — while the HTTP path
+    /// writes the same bytes unchanged.
+    #[test]
+    fn a_configured_page_is_written_as_bytes_rather_than_lossy_text() {
+        // Not valid UTF-8 on purpose: `0xE9` is `é` in ISO-8859-1 and an invalid lead byte in UTF-8.
+        let page: &[u8] = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><error>caf\xE9</error>";
+        let mut wire = Vec::new();
+        write_error_page(
+            &mut wire,
+            1,
+            "worker died",
+            ServerErrorKind::Backend,
+            None,
+            Some(crate::frontend::fastcgi::Page {
+                body: page,
+                content_type: "application/xml",
+            }),
+        )
+        .unwrap();
+
+        let mut cursor = wire.as_slice();
+        let stdout = next_non_empty(&mut cursor).unwrap();
+        let text = String::from_utf8_lossy(&stdout.content);
+        assert!(text.contains("Status: 502 Bad Gateway"), "{text}");
+        assert!(text.contains("Content-Type: application/xml"), "{text}");
+        assert!(text.contains("Cache-Control: no-store"), "{text}");
+        // The body is in this same record, unaltered: the replacement character is exactly the
+        // corruption this pins against.
+        let body = stdout.content.split_at(stdout.content.len() - page.len()).1;
+        assert_eq!(body, page, "the page must be written byte for byte");
+    }
+
+    /// An empty page is a legitimate file, and its answer must not lose the header block.
+    #[test]
+    fn an_empty_configured_page_still_answers_with_its_status() {
+        let mut wire = Vec::new();
+        write_error_page(
+            &mut wire,
+            1,
+            "refused",
+            ServerErrorKind::AddressDenied,
+            None,
+            Some(crate::frontend::fastcgi::Page {
+                body: b"",
+                content_type: "text/html; charset=utf-8",
+            }),
+        )
+        .unwrap();
+
+        let mut cursor = wire.as_slice();
+        let header = next_non_empty(&mut cursor).unwrap();
+        let text = String::from_utf8_lossy(&header.content);
+        assert!(text.contains("Status: 403 Forbidden"), "{text}");
+        assert!(text.contains("Cache-Control: no-store"), "{text}");
+    }
+
+    #[test]
+    fn a_bodiless_error_page_still_writes_a_stderr_record_for_the_reason() {
+        // The reason still reaches nginx's error log even when the body is the operator's page: a
+        // 502 an operator is reading about has to say *why*, and the page cannot.
+        let mut wire = Vec::new();
+        write_error_page(
+            &mut wire,
+            1,
+            "worker died",
+            ServerErrorKind::Backend,
+            None,
+            Some(crate::frontend::fastcgi::Page {
+                body: b"",
+                content_type: "text/html; charset=utf-8",
+            }),
+        )
+        .unwrap();
+
+        let mut cursor = wire.as_slice();
+        let _ = next_non_empty(&mut cursor).unwrap();
+        let stderr = next_non_empty(&mut cursor).unwrap();
+        assert_eq!(stderr.record_type(), RecordType::Stderr);
+        assert_eq!(stderr.content, b"worker died");
     }
 
     #[test]

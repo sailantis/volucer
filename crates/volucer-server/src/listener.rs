@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use volucer_core::sites::Sites;
 use volucer_observe::access_log::Record;
 use volucer_observe::{Observability, RequestContext};
-use volucer_watch::{Registry, SharedState};
+use volucer_watch::{Registry, Reloaded, SharedState, Swappable};
 
 use crate::dispatch::Dispatcher;
 use crate::error::{Result, ServerError};
@@ -124,9 +124,19 @@ pub struct FastCgiListener {
     /// The process's one registry, so this listener is reachable by a reload.
     ///
     /// Held rather than derived from `sites` because a reload has to rebuild the *derived* state of
-    /// every front-end, and this listener has none of its own — it resolves per request. Keeping
-    /// the registry here is what lets `serve` hold one place that a trigger applies through.
+    /// every front-end, and this listener resolves its site per request. Keeping the registry here
+    /// is what lets `serve` hold one place that a trigger applies through.
     registry: Arc<Registry>,
+    /// This listener's snapshot, so a reload reaches the tables it derived rather than only the
+    /// site table itself.
+    ///
+    /// **Its own `Swappable` rather than a shared one**, for the reason the HTTP listener has one:
+    /// the snapshot carries the error pages, and a page chosen for a request must come from the
+    /// same generation the site did. Registered with the registry, so a `SIGHUP` moves it exactly
+    /// like the HTTP front-ends' — before this, the only per-generation table this front-end had
+    /// was the site table itself, which is why `[server.error_pages]` was silently inert behind
+    /// nginx.
+    state: Arc<Swappable<Reloaded>>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -193,12 +203,28 @@ impl FastCgiListener {
     ) -> Result<Self> {
         let listener = bind(address)?;
         listener.set_nonblocking(true).map_err(ServerError::Io)?;
+        // This listener's snapshot, built before it is registered so the first request already has
+        // one — and registered here rather than by a builder, because a reload has to reach it the
+        // same way it reaches an HTTP listener's. The pages start empty: `with_error_pages`
+        // installs them through `replace`, which every registration already points at.
+        let state = Arc::new(Swappable::new(Reloaded::from_sites(
+            registry.shared().sites(),
+            None,
+            dispatcher.grpc_grants(),
+            std::collections::BTreeMap::new(),
+        )));
+        registry.register(volucer_watch::RegisteredFrontEnd::new(
+            Arc::clone(&state),
+            listener.local_addr().map(|address| address.port()),
+        ));
+
         Ok(FastCgiListener {
             address: address.to_string(),
             listener,
             dispatcher,
             sites: registry.shared().clone(),
             registry,
+            state,
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
             limits,
@@ -239,6 +265,33 @@ impl FastCgiListener {
     #[must_use]
     pub fn with_access(mut self, access: Arc<volucer_watch::AccessCell>) -> Self {
         self.access = Some(access);
+        self
+    }
+
+    /// The same listener with the deployment's error pages.
+    ///
+    /// The tables `serve` resolved, per site and already expanded — so a `404` this front-end
+    /// answers carries the page the deployment wrote for it, instead of the `volucer: …` line that
+    /// was the only thing an nginx deployment could ever produce. Builder-shaped for the reason the
+    /// other two are: a listener a test binds has no pages, and must keep compiling without saying
+    /// so.
+    #[must_use]
+    pub fn with_error_pages(
+        self,
+        pages: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<u16, std::path::PathBuf>,
+        >,
+    ) -> Self {
+        // Rebuilt from the live site table through the same constructor a reload uses, so the
+        // first generation and every later one resolve a site and its pages identically.
+        let next = Reloaded::from_sites(
+            self.registry.shared().sites(),
+            None,
+            self.dispatcher.grpc_grants(),
+            pages,
+        );
+        let _previous = self.state.replace(next);
         self
     }
 
@@ -308,7 +361,7 @@ impl FastCgiListener {
                         continue;
                     }
                     let dispatcher = Arc::clone(&self.dispatcher);
-                    let sites = self.sites.clone();
+                    let state = Arc::clone(&self.state);
                     let stats = Arc::clone(&self.stats);
                     let shutdown = Arc::clone(&self.shutdown);
                     let limits = self.limits;
@@ -317,7 +370,7 @@ impl FastCgiListener {
                     let access = self.access.clone();
                     let shared = Shared {
                         dispatcher,
-                        sites,
+                        state,
                         stats,
                         shutdown,
                         observe,
@@ -638,6 +691,39 @@ fn server_error_status(err: &ServerError) -> u16 {
     }
 }
 
+/// A configured page for a status, read and typed, or `None` when there is none to use.
+///
+/// Read per response rather than cached, like the HTTP path's: an operator fixes a broken page and
+/// the next request uses it. A page that cannot be read is reported and then ignored — a `502`
+/// whose page was deleted must still be a `502`, and the plain-text body is the fallback rather
+/// than a second failure on the path that reports the first.
+///
+/// Returns the bytes rather than a borrowed [`fastcgi::Page`] because the reader owns them; the
+/// caller turns this into a `Page` at the one point it writes the answer.
+fn error_page_for(
+    pages: &std::collections::BTreeMap<u16, std::path::PathBuf>,
+    status: u16,
+) -> Option<(Vec<u8>, &'static str)> {
+    let page = pages.get(&status)?;
+    match std::fs::read(page) {
+        Ok(body) => Some((body, volucer_core::config::error_page_content_type(page))),
+        Err(err) => {
+            tracing::warn!(
+                status,
+                page = %page.display(),
+                %err,
+                "an error page could not be read; the plain-text body is sent instead"
+            );
+            None
+        }
+    }
+}
+
+/// The borrowed [`fastcgi::Page`] an [`error_page_for`] result describes.
+fn as_page<'a>(page: Option<&'a (Vec<u8>, &'static str)>) -> Option<fastcgi::Page<'a>> {
+    page.map(|(body, content_type)| fastcgi::Page { body, content_type })
+}
+
 /// Write one access-log record for a request that arrived over FastCGI.
 ///
 /// A free function rather than a method: it needs the request environment, the context and the
@@ -738,7 +824,12 @@ fn record_fastcgi(
 /// together.
 struct Shared {
     dispatcher: Arc<Dispatcher>,
-    sites: SharedState,
+    /// The generation this connection resolves each request against.
+    ///
+    /// The snapshot rather than the bare site table, because a request needs more than the table:
+    /// its error pages travel in the same value, and taking them from anywhere else would let a
+    /// reload land between "which site" and "which page".
+    state: Arc<Swappable<Reloaded>>,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
     observe: Arc<volucer_observe::Observability>,
@@ -754,7 +845,7 @@ fn serve_connection(
 ) -> Result<()> {
     let Shared {
         dispatcher,
-        sites,
+        state,
         stats,
         shutdown,
         observe,
@@ -870,7 +961,7 @@ fn serve_connection(
         // that arrives after a reload very often arrives on a connection accepted before it, and a
         // per-connection snapshot would serve the old configuration for the life of that
         // connection. That is what this line was written to fix, and the test pins it.
-        let snapshot = sites.sites();
+        let snapshot = state.load();
         // The local address a FastCGI request arrived on, for a site's `addresses` binding.
         //
         // **`SERVER_ADDR`, which nginx sets from `$server_addr` in its own `fastcgi_params`**, is the
@@ -887,6 +978,10 @@ fn serve_connection(
             .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok());
         let site =
             snapshot.resolve_request(host.as_deref(), local, volucer_core::SiteProtocol::Fastcgi);
+        // This site's pages for this generation. Borrowed from the snapshot rather than looked up at
+        // each failure, so a page and the site it belongs to cannot come from two generations — the
+        // same rule the HTTP path follows.
+        let pages = site.error_pages;
         // **Identity is resolved per request, here, on the request path.** nginx keeps its upstream
         // alive, so the next request very often arrives on a connection accepted long before it; a
         // per-connection id would give two requests the same id, which is worse than no id at all
@@ -924,7 +1019,13 @@ fn serve_connection(
                         if observe.is_active() {
                             record_fastcgi(&observe, &context, &request, 403, 0, started.elapsed());
                         }
-                        fastcgi::write_forbidden(stream.get_mut(), request_id, &reason)?;
+                        let page = error_page_for(pages, 403);
+                        fastcgi::write_forbidden_page(
+                            stream.get_mut(),
+                            request_id,
+                            &reason,
+                            as_page(page.as_ref()),
+                        )?;
                         if !keep_conn {
                             return Ok(());
                         }
@@ -1030,7 +1131,7 @@ fn serve_connection(
         // granted nothing — which is the whole of the rule: an application that is not granted
         // anything is not told where the socket is.
         let selected = dispatcher
-            .backend_for_routes(&site.routes, &request)
+            .backend_for_routes(&site.site.routes, &request)
             .to_string();
 
         // **A redirect answers before anything is dispatched**, and it is answered here rather than
@@ -1042,7 +1143,7 @@ fn serve_connection(
         // same thing it does on the HTTP path — nginx's `fastcgi_params` sets it from `$request_uri`,
         // which is the raw request line's target rather than a decoded path.
         if let Some((redirect, prefix)) = volucer_core::config::select_route(
-            &site.routes,
+            &site.site.routes,
             host.as_deref(),
             param(request.params.as_slice(), b"REQUEST_URI")
                 .and_then(|uri| uri.split('?').next())
@@ -1175,7 +1276,7 @@ fn serve_connection(
                         started.elapsed(),
                     );
                 }
-                fastcgi::write_error(
+                fastcgi::write_error_page(
                     stream.get_mut(),
                     request_id,
                     &err.to_string(),
@@ -1183,6 +1284,8 @@ fn serve_connection(
                         ServerError::BodyTooLarge { .. } => ServerErrorKind::BodyTooLarge,
                         _ => ServerErrorKind::Backend,
                     },
+                    None,
+                    as_page(error_page_for(pages, server_error_status(&err)).as_ref()),
                 )?;
             }
         }

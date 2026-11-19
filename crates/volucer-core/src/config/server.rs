@@ -151,10 +151,11 @@ pub struct ServerConfig {
     /// this server answers, which is the only way a page for a status the front-end did not itself
     /// produce can ever be reached.
     ///
-    /// **Only the bodies of `text/html` responses are replaced.** A `403` on a gRPC call, a `429` on
-    /// a JSON API and a `404` on a `HEAD` are all cases where the body is either not HTML or not
-    /// sent at all, and swapping a page in would break the client that asked. See
-    /// [`ErrorPages::body_for`].
+    /// **The response's status is never changed**, and the page replaces the body of an error this
+    /// server generated — never a backend's own error response, which is the application's page. A
+    /// `404` a PHP application produces is passed through untouched. The `Content-Type` comes from
+    /// the page's own extension, so a `.json` page can answer a JSON API; a page with no recognised
+    /// extension keeps the HTML default.
     #[serde(default)]
     pub error_pages: ErrorPages,
 
@@ -614,31 +615,199 @@ pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
 
 /// The largest request body a backend will be handed, when configuration says nothing.
 ///
-/// The bodies this server sends for an error status, by code.
+/// One key in an error-page table.
 ///
-/// A newtype over a `BTreeMap<u16, PathBuf>` rather than a bare map, so the two rules that make a
-/// page safe — the code has to be a *client* or server error, and the path is resolved against the
-/// configuration's directory — live with the type rather than at each lookup.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, transparent)]
+/// Three spellings, and the order they are consulted in is the whole rule: an **exact** code, then
+/// the **class** it falls in (`"4xx"`, `"5xx"`), then `"default"`. A class exists because the pages
+/// an operator writes are usually one shape per family, and writing five near-identical entries to
+/// say "every client error looks like this" is how a table drifts out of date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PageKey {
+    /// One status, e.g. `"404"`.
+    Exact(u16),
+    /// A family, e.g. `"4xx"`.
+    Class(u8),
+    /// Every error status with no better answer.
+    Default,
+}
+
+impl PageKey {
+    /// The key a written string names, or a message saying why it names none.
+    ///
+    /// Case-insensitive in the class and `default` spellings so `"4XX"` is the same key as `"4xx"`,
+    /// which matters because a TOML key is written by hand and neither spelling looks wrong.
+    pub fn parse(key: &str) -> std::result::Result<Self, String> {
+        let trimmed = key.trim();
+        if trimmed.eq_ignore_ascii_case("default") {
+            return Ok(PageKey::Default);
+        }
+        // `4xx`, `5xx`: one digit that is an error class, then the wildcard suffix.
+        if let Some(class) = trimmed
+            .strip_suffix("xx")
+            .or_else(|| trimmed.strip_suffix("XX"))
+            .or_else(|| trimmed.strip_suffix("Xx"))
+            .or_else(|| trimmed.strip_suffix("xX"))
+        {
+            let parsed = class
+                .parse::<u8>()
+                .ok()
+                .filter(|class| (4..=5).contains(class));
+            return match (parsed, trimmed.len()) {
+                (Some(class), 3) => Ok(PageKey::Class(class)),
+                (Some(_), _) => Err(format!(
+                    "{key:?} is a class of more than one digit; write \"4xx\" or \"5xx\""
+                )),
+                (None, _) => Err(format!(
+                    "{key:?} is not an error class; only \"4xx\" and \"5xx\" name a family of error \
+                     statuses"
+                )),
+            };
+        }
+        match trimmed.parse::<u16>() {
+            // A 2xx or 3xx page would be a page nothing could ever reach, and accepting one is how
+            // an operator concludes the feature does not work rather than that the code is wrong.
+            Ok(status) if (400..=599).contains(&status) => Ok(PageKey::Exact(status)),
+            Ok(status) => Err(format!(
+                "{key:?} names {status}, which is not an error status; only 400 to 599 are ever \
+                 generated as an error"
+            )),
+            Err(_) => Err(format!(
+                "{key:?} is not a status code; write it quoted, e.g. \"502\" = \"pages/502.html\", \
+                 or a class such as \"4xx\""
+            )),
+        }
+    }
+
+    /// The key as it is written in configuration, for `check` and for diagnostics.
+    #[must_use]
+    pub fn as_str(self) -> String {
+        match self {
+            PageKey::Exact(status) => status.to_string(),
+            PageKey::Class(class) => format!("{class}xx"),
+            PageKey::Default => "default".to_string(),
+        }
+    }
+}
+
+/// The bodies this server sends for an error status, by key.
+///
+/// A newtype over a `BTreeMap<String, PathBuf>` rather than a bare map, so the three rules that make
+/// a page safe — the key names an error, the path is resolved against the configuration's directory,
+/// and the lookup order is exact-then-class-then-default — live with the type rather than at each
+/// lookup.
+///
+/// # Inheritance
+///
+/// A site's table is an *overlay*, not a replacement: it states the keys it changes and inherits
+/// every other key from `[server.error_pages]`. Merging happens on keys, before the wildcard
+/// expansion, so a server `"404"` still wins over a site that only broadened with `"4xx"` — the more
+/// specific answer an operator would predict from the two files they wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorPages {
-    /// The page per status code, e.g. `502 = "pages/502.html"`.
+    /// The page per key, e.g. `"502" = "pages/502.html"` or `"4xx" = "pages/not-found.html"`.
     ///
     /// A TOML key must be a string, so the codes are written as strings: `"502" = "…"`. Parsed
     /// strictly, because `[server.error_pages.502]` is not a table and a file that wrote a table
     /// would otherwise be read as no pages at all.
+    ///
+    /// Every key that names an error is stored in the **canonical** spelling [`PageKey::as_str`]
+    /// produces, which is what makes the hand-written spellings [`PageKey::parse`] accepts —
+    /// `"4XX"`, `"DEFAULT"`, `" 404 "` — pages that are actually served rather than keys that
+    /// validate and then never match. See [`canonicalize_keys`].
     pages: std::collections::BTreeMap<String, PathBuf>,
 }
 
+/// Deserialised through the canonical spelling, so a key that validates is a key that is found.
+///
+/// Written by hand rather than derived because the normalisation has to happen *between* the TOML
+/// and the map: a `#[serde(transparent)]` newtype would keep whatever spelling the operator typed,
+/// and [`ErrorPages::page`] probes for the canonical one.
+impl<'de> Deserialize<'de> for ErrorPages {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let pages = std::collections::BTreeMap::<String, PathBuf>::deserialize(deserializer)?;
+        Ok(ErrorPages {
+            pages: canonicalize_keys(pages),
+        })
+    }
+}
+
+impl Serialize for ErrorPages {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.pages.serialize(serializer)
+    }
+}
+
+/// Every key that names an error rewritten to the spelling the lookup uses.
+///
+/// [`PageKey::parse`] deliberately accepts `"4XX"`, `"DEFAULT"` and `" 404 "` — a hand-written key
+/// whose only mistake is case or spacing still names one unambiguous page — but [`ErrorPages::page`]
+/// is a map probe for the *canonical* spelling. Rewriting on the way in is what keeps those two
+/// halves agreeing; without it an accepted spelling validates and then silently serves nothing.
+///
+/// A key that names no error is left **exactly as written**, so [`ErrorPages::validate`] can quote
+/// the operator's own string back to them rather than a normalised one they never typed.
+fn canonicalize_keys(
+    pages: std::collections::BTreeMap<String, PathBuf>,
+) -> std::collections::BTreeMap<String, PathBuf> {
+    pages
+        .into_iter()
+        .map(|(key, page)| match PageKey::parse(&key) {
+            Ok(parsed) => (parsed.as_str(), page),
+            Err(_) => (key, page),
+        })
+        .collect()
+}
+
 impl ErrorPages {
-    /// The resolved page for a status, if the deployment wrote one.
+    /// The page for a status, following exact → class → default.
     ///
     /// `resolve` is applied here rather than at load time because the path is relative to the
     /// configuration's directory, which only the caller knows — the same rule every other path in
     /// the file follows.
     #[must_use]
     pub fn page(&self, status: u16) -> Option<&Path> {
-        self.pages.get(&status.to_string()).map(PathBuf::as_path)
+        let class = (status / 100) as u8;
+        for key in [
+            PageKey::Exact(status),
+            PageKey::Class(class),
+            PageKey::Default,
+        ] {
+            if let Some(page) = self.pages.get(&key.as_str()) {
+                return Some(page.as_path());
+            }
+        }
+        None
+    }
+
+    /// Every key the table states, in the order a report reads best: exact codes first, then classes,
+    /// then `default`.
+    #[must_use]
+    pub fn keys(&self) -> Vec<PageKey> {
+        let mut parsed: Vec<PageKey> = self
+            .pages
+            .keys()
+            .filter_map(|key| PageKey::parse(key).ok())
+            .collect();
+        parsed.sort();
+        parsed
+    }
+
+    /// The exact status codes the table names, for the diagnostics that print a code per line.
+    #[must_use]
+    pub fn codes(&self) -> Vec<u16> {
+        self.keys()
+            .into_iter()
+            .filter_map(|key| match key {
+                PageKey::Exact(status) => Some(status),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether the table is empty, which is the case an operator did not configure it at all.
@@ -647,32 +816,128 @@ impl ErrorPages {
         self.pages.is_empty()
     }
 
-    /// The codes that have a page, sorted, for `check` to report.
+    /// This table with another's keys laid over it, per key.
+    ///
+    /// The shape every per-site setting in this file follows (`static_files`, `compression`,
+    /// `hsts`): a site states what it changes, and a key it does not name keeps the deployment's.
     #[must_use]
-    pub fn codes(&self) -> Vec<u16> {
-        self.pages
-            .keys()
-            .filter_map(|code| code.parse().ok())
-            .collect()
+    pub fn overlaid_with(&self, overrides: &ErrorPageOverrides) -> ErrorPages {
+        let mut merged = self.clone();
+        for (key, page) in &overrides.pages {
+            merged.pages.insert(key.clone(), page.clone());
+        }
+        merged
     }
 
-    /// Refuse a key that is not a status code, and a code that cannot be an error status.
-    pub fn validate(&self) -> std::result::Result<(), String> {
-        for code in self.pages.keys() {
-            let Ok(status) = code.parse::<u16>() else {
+    /// Refuse a key that does not name an error, naming the table the key was written in.
+    pub fn validate(&self, where_: &str) -> std::result::Result<(), String> {
+        for key in self.pages.keys() {
+            PageKey::parse(key).map_err(|reason| format!("{where_} has the key {reason}"))?;
+            if self.pages[key].as_os_str().is_empty() {
                 return Err(format!(
-                    "server.error_pages has the key {code:?}, which is not a status code; write                      it quoted, e.g. \"502\" = \"pages/502.html\""
-                ));
-            };
-            // A 2xx or 3xx page would be a page nothing could ever reach, and accepting one is how
-            // an operator concludes the feature does not work rather than that the code is wrong.
-            if !(400..=599).contains(&status) {
-                return Err(format!(
-                    "server.error_pages names {status}, which is not an error status; only 400 to                      599 are ever generated as an error"
+                    "{where_} names an empty path for {key:?}; give a file, or remove the key"
                 ));
             }
         }
         Ok(())
+    }
+
+    /// This table with every key expanded to the statuses it answers, and each path resolved.
+    ///
+    /// The request path's shape: one `BTreeMap<u16, _>` lookup with no wildcard arithmetic, which is
+    /// what lets `Reloaded` answer "which page" without re-deriving a class or a default per
+    /// request. Expanding walks 400–599, and only when something was configured at all.
+    ///
+    /// `base` is the directory a relative page resolves against — the configuration file's, the same
+    /// rule every other path in the file follows.
+    #[must_use]
+    pub fn expanded(&self, base: &Path) -> std::collections::BTreeMap<u16, PathBuf> {
+        if self.pages.is_empty() {
+            return std::collections::BTreeMap::new();
+        }
+        let mut resolved = std::collections::BTreeMap::new();
+        for status in 400..=599u16 {
+            if let Some(page) = self.page(status) {
+                resolved.insert(status, base.join(page));
+            }
+        }
+        resolved
+    }
+}
+
+/// A site's overrides for `[server.error_pages]`.
+///
+/// The same keys as the deployment's table, merged per key rather than replacing it — see
+/// [`ErrorPages::overlaid_with`]. Absent inherits the whole table, so the ordinary one-site
+/// deployment never writes this at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErrorPageOverrides {
+    /// Canonicalised on the way in, for the reason [`ErrorPages`]'s map is: a site writing `"4XX"`
+    /// has to land on the key its own overlay merge and the request-path lookup probe for.
+    pages: std::collections::BTreeMap<String, PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for ErrorPageOverrides {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let pages = std::collections::BTreeMap::<String, PathBuf>::deserialize(deserializer)?;
+        Ok(ErrorPageOverrides {
+            pages: canonicalize_keys(pages),
+        })
+    }
+}
+
+impl Serialize for ErrorPageOverrides {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.pages.serialize(serializer)
+    }
+}
+
+impl ErrorPageOverrides {
+    /// This table laid over the deployment's.
+    #[must_use]
+    pub fn apply(&self, base: &ErrorPages) -> ErrorPages {
+        base.overlaid_with(self)
+    }
+
+    /// Refuse a key that does not name an error, naming the site it was written in.
+    pub fn validate(&self, where_: &str) -> std::result::Result<(), String> {
+        ErrorPages {
+            pages: self.pages.clone(),
+        }
+        .validate(where_)
+    }
+}
+
+/// The `Content-Type` a configured error page's own extension implies.
+///
+/// A page is chosen by *status*, not by media type, so the extension is the only signal there is —
+/// and it is a better one than a second configuration key would be, because the file an operator
+/// wrote already says what it is. An extension with no entry keeps the HTML default, which is what
+/// every page written before this was typed by extension got.
+///
+/// Shared by both front ends: the HTTP path and nginx's `Status:` line must not type the same page
+/// differently, and a second table would drift.
+#[must_use]
+pub fn error_page_content_type(page: &std::path::Path) -> &'static str {
+    match page
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("xml") => "application/xml",
+        // A page with no extension — `pages/404` rather than `pages/404.html` — keeps the HTML
+        // default, so nothing that worked before this existed changes meaning.
+        _ => "text/html; charset=utf-8",
     }
 }
 

@@ -35,6 +35,13 @@ backend = "fpm"
 | `policy` | Selects `"all"`, `"backend"`, or `"static"` behavior. Defaults to `"all"`. |
 | `backend` | Selects the backend for matching requests. Required unless `policy = "static"`. |
 
+`[server]` is the default, unnamed site. Its `default_backend` is the fallback when no route
+selects a backend, including when a matching `policy = "static"` route leaves backend selection
+to the fallback. Routes can still select other backends, so the default site can use multiple
+backends. If there is only one backend, `default_backend` may be omitted and Volucer uses that
+backend; with multiple backends, it is required. `volucer check` reports the inferred default
+or names the backends when one must be specified. The value is a backend name, not a kind.
+
 ### Which route wins
 
 The most specific matching route wins. Specificity is determined by these rules, in
@@ -252,13 +259,26 @@ remaining settings.
 
 `static_files` inherits per key. For example, a site can set `precompressed` and inherit
 the server's `cache_control`. The same per-key behavior applies to `compression`, `acme`,
-and `hsts`.
+`hsts` and `error_pages`.
+
+`error_pages` is an **overlay**: a site states the codes it wants to differ and inherits every
+other page from `[server.error_pages]`. The merge happens before the wildcard keys expand, so a
+deployment's `"404"` still wins over a site that only broadened with `"4xx"` — the more specific
+key is the one that survives.
+
+```toml
+[server.error_pages]
+"404" = "pages/404.html"
+
+[sites.shop.error_pages]
+"404" = "shop/404.html"
+```
 
 A site's `routes` replaces `[server.routes]`; the two route lists are not merged. Once a
 site defines routes, it does not inherit any routes from `[server]`.
 
-`default_backend` also inherits from `[server]`. It handles requests not assigned a
-backend by a `policy = "static"` route.
+`default_backend` inherits from `[server]` unless the site sets its own. It handles requests
+not assigned a backend by a `policy = "static"` route.
 
 `redirect_to_https` is inherited as well. A site bound to an internal address may be
 intended to serve cleartext, so it can disable a redirect inherited from `[server]`. See

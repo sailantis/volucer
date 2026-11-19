@@ -19,8 +19,7 @@ Choose a backend for each route:
 All routes use the same listener. For example, one Volucer process can serve `/api` with
 a worker and `/admin` through FastCGI.
 
-**FastCGI is a protocol, not a PHP feature.** Volucer can attach to an existing FastCGI
-pool with the `external` backend, or start and supervise a compatible server with
+Volucer can attach to an existing FastCGI pool with the `external` backend, or start and supervise a compatible server with
 `spawn_cgi`. This includes `php-fpm`, `php-cgi`, and FastCGI applications built with
 WSGI, Rack, or Go.
 
@@ -221,26 +220,18 @@ socket:
 http = "127.0.0.1:8080"
 document_root = "./public"
 
-[backends.app]
+[backends.fpm]
 kind = "external"
 socket = "unix:/run/php/php8.3-fpm.sock"
 ```
 
-The configuration has three important parts:
+The configuration has two important parts:
 
-- **`[server]`** configures the listener, document root, and default backend.
-- **`[backends.app]`** defines how the application is reached. Here, `external` connects to
-  a PHP-FPM process that is already running.
-- **`default_backend`** selects the backend for requests that do not match a route. It
-  belongs under `[server]` because that table also represents the default, unnamed site.
-  A `[sites.<name>]` table can override it for a particular host, along with settings such
-  as `document_root`. It may be omitted when there is exactly one backend, which is then used
-  — `volucer check` says so rather than leaving you to notice the key is gone. With two or
-  more backends it is required, and the error names them.
+- **`[server]`** configures the listener and document root.
+- **`[backends.fpm]`** defines how the application is reached. Here, `external` connects to a PHP-FPM process that is already running.
 
-  It names a backend, never a kind: `default_backend = "worker"` means the backend called
-  `worker`, because a backend may legitimately be named after a kind and one key should not
-  mean two things.
+Because this configuration defines just one backend, Volucer uses it by default. `volucer check`
+reports this so the choice is explicit.
 
 This is a complete FastCGI setup: Volucer serves requests to PHP-FPM without requiring
 nginx in front. The same `external` backend can connect to any FastCGI server; change the
@@ -274,20 +265,20 @@ With the example configuration above, the application is available at
 
 `volucer serve` accepts these options:
 
-| Option                                    | Effect                                                                                                                |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Option                                    | Effect                                                                                                                        |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `-c`, `--config <PATH>`                   | The configuration file. Defaults to `VOLUCER_CONFIG`, then `volucer.toml`, then `.volucer.toml`, and is optional — see below. |
-| `-o`, `--override <KEY=VALUE>`            | Set one key, in `dot.notation`. Repeatable.                                                                           |
-| `--listen <ADDR>`                         | Shorthand for `-o server.http=<ADDR>`.                                                                                |
-| `--fastcgi <ADDR>`                        | Shorthand for `-o server.fastcgi=<ADDR>`.                                                                             |
-| `--document-root <PATH>`, `--root <PATH>` | Override `server.document_root`.                                                                                      |
-| `--front-controller <NAME>`               | Override `server.front_controller`. Set it to an empty string to serve only real files.                               |
-| `--php-cgi [<PATH>]`                      | Serve a `php-cgi` pool as the default backend — see below.                                                            |
-| `--worker <COMMAND>`                      | Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`.                                     |
-| `--fcgi <COMMAND>`                        | Serve any FastCGI server as the default backend, e.g. `--fcgi "python fcgi_app.py --bind {address}"`.                 |
-| `--workers <N>`                           | How many slots the chosen backend starts. Requires one of the three flags above.                                      |
-| `--concurrency <N>`                       | How many requests one `--fcgi` slot serves at once. `--fcgi` only. `--capacity` is the old spelling and still parses. |
-| `--max-connections <N>`                   | Maximum concurrent client connections. Defaults to `512`.                                                             |
+| `-o`, `--override <KEY=VALUE>`            | Set one key, in `dot.notation`. Repeatable.                                                                                   |
+| `--listen <ADDR>`                         | Shorthand for `-o server.http=<ADDR>`.                                                                                        |
+| `--fastcgi <ADDR>`                        | Shorthand for `-o server.fastcgi=<ADDR>`.                                                                                     |
+| `--document-root <PATH>`, `--root <PATH>` | Override `server.document_root`.                                                                                              |
+| `--front-controller <NAME>`               | Override `server.front_controller`. Set it to an empty string to serve only real files.                                       |
+| `--php-cgi [<PATH>]`                      | Serve a `php-cgi` pool as the default backend — see below.                                                                    |
+| `--worker <COMMAND>`                      | Serve a resident worker as the default backend, e.g. `--worker "php worker.php"`.                                             |
+| `--fcgi <COMMAND>`                        | Serve any FastCGI server as the default backend, e.g. `--fcgi "python fcgi_app.py --bind {address}"`.                         |
+| `--workers <N>`                           | How many slots the chosen backend starts. Requires one of the three flags above.                                              |
+| `--concurrency <N>`                       | How many requests one `--fcgi` slot serves at once. `--fcgi` only. `--capacity` is the old spelling and still parses.         |
+| `--max-connections <N>`                   | Maximum concurrent client connections. Defaults to `512`.                                                                     |
 
 Command-line options override values in the configuration file. Use them to supply
 deployment-specific settings without maintaining a separate file for each environment.

@@ -395,6 +395,14 @@ fn measure(path: &Path, revalidating: bool) -> Option<(Option<File>, std::fs::Me
         return metadata.is_file().then_some((Some(file), metadata));
     }
 
+    // The parameter stays in the signature on both platforms because the callers
+    // compute it unconditionally, but only the Windows branch above reads it. On
+    // Unix this is the whole story, and an unread binding under `-D warnings` is an
+    // error rather than a hint — which is how this compiled everywhere except the
+    // one platform CI builds on.
+    #[cfg(not(windows))]
+    let _ = revalidating;
+
     // One `stat`, and the handle is left to the body. `is_dir()` and `is_file()`
     // each stat on their own, so asking both would be two round trips to learn one
     // fact; the metadata answers both and is what the answer is built from.
@@ -754,9 +762,16 @@ fn precondition_failed(headers: &HeaderMap) -> StaticResponse {
         .expect("headers are valid")
 }
 
-/// A status with no headers and no body.
+/// A refusal with no body.
+///
+/// **`no-store` is set here rather than left to the caller**, and it is the one header a refusal
+/// must never omit: a `404` with no caching directive is *heuristically cacheable* — RFC 9111 §4.2.2
+/// lets a cache keep it for any freshness it can guess — so a URL that 404s once can keep 404ing
+/// for a client long after the file is deployed. The error-page renderer sets the same header on the
+/// answers it builds, which is what keeps the two paths indistinguishable to a cache.
 fn status_only(status: StatusCode) -> StaticResponse {
     build(status)
+        .header(CACHE_CONTROL, "no-store")
         .body(body_of(Bytes::new()))
         .expect("a status alone is a valid response")
 }

@@ -9,11 +9,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[server.error_pages]` works per site, per class, and behind nginx.** A site states only the
+  pages it wants to differ, and inherits every other key from the deployment's table — the merge
+  happens before wildcards expand, so a server `"404"` still wins over a site that only broadened
+  with `"4xx"`. Keys accept a class (`"4xx"`, `"5xx"`) and `"default"`, so one page can answer a
+  family instead of five near-identical files. A configured page is typed by its own extension
+  (`.html`, `.json`, `.txt`, `.xml`), which is what makes this usable for an API site. The FastCGI
+  front end honours the same tables, so a deployment behind nginx no longer answers a `404`, a `403`
+  or a `502` with a `volucer:` line, and the HTTP/3 body-too-large refusal goes through the same
+  renderer as every other error. See [Error pages](docs/06-OBSERVABILITY.md#error-pages).
 - **`examples/docker/`: two complete, CI-verified image recipes.** `Dockerfile.ubuntu` (294 MB)
   and `Dockerfile.alpine` (98 MB) build a `worker`-ready image with PHP 8.5, Composer and the
   published binary. `verify.sh` starts the image, waits for its health check, and serves a real
   request, so a package renamed upstream or a `COPY` whose source moved fails a pull request
   rather than a user's first `docker run`. A new `Examples` job in `ci.yml` runs it against both.
+
+### Fixed
+
+- **A site's relative `document_root` is absolutised.** It never was, despite the field's own
+  documentation: the command line absolutised the default site's root and stopped there. A site
+  writing `document_root = "shop"` therefore handed a relative path to `SCRIPT_FILENAME`, and
+  because `php-cgi` `chdir()`s into the directory of the script it executed, the second request
+  onwards answered `No input file specified` — the exact failure the default site's rule exists to
+  prevent.
+- **The static layer's `403` and `404` carry `Cache-Control: no-store`.** They carried no caching
+  directive at all, so a refusal was _heuristically cacheable_: a URL that missed once could keep
+  missing for a client long after the file was deployed.
+- **A configured error page that cannot be read answers with plain text rather than an empty
+  body.** The static layer's substitution sent a bare status with no body, which a client cannot
+  tell from a truncated response; it now falls back to the same page the other error path sends,
+  with the status preserved.
+- **Error-page keys are normalised on load.** Validation accepted variants such as `"4XX"`,
+  `"DEFAULT"` and `" 502 "`, but lookup used canonical keys, so these entries never matched.
+  Normalisation now applies to both `[server.error_pages]` and site overlays.
+- **Plain-text error fallbacks preserve status headers.** When a configured `429` page is missing,
+  the fallback now keeps `Retry-After` and `Cache-Control: no-store`, preventing premature retries
+  against an empty bucket.
+- **The FastCGI front end sends `Cache-Control: no-store` for every error it generates.** It was
+  set only for the `413` and the `429`, so a `403` or a `502` behind nginx was heuristically
+  cacheable while the same status over HTTP was not.
+- **A configured page is written byte for byte over FastCGI.** Formatting the body into a `String`
+  replaced every non-UTF-8 byte with `U+FFFD`, corrupting an XML page in a single-byte encoding —
+  which the HTTP path served intact.
+- **An error page comes from the generation its site was resolved from.** The site name was taken
+  from the request's snapshot but the page from whatever `SIGHUP` had installed since, so a reload
+  in between could pair one generation's site with another's table, or lose the page entirely if
+  the site had been removed.
 
 ### Changed
 
@@ -63,11 +104,11 @@ This is the release the published benchmark pins: the numbers in
 `volucer-competition` are produced by this tag, so the table describes the artifact
 `cargo install` gives you rather than a working tree near it.
 
-Read *Changed* before upgrading. Two defaults flipped and one public field is gone.
+Read _Changed_ before upgrading. Two defaults flipped and one public field is gone.
 
 ### Added
 
-- **`measure_wait`, opt-in slot-contention reporting.** A `worker` or `attach` backend now collects how long each request waited for a slot only when asked to, and the shutdown summary says `wait not measured` when it did not. See *Changed* below for why the default flipped.
+- **`measure_wait`, opt-in slot-contention reporting.** A `worker` or `attach` backend now collects how long each request waited for a slot only when asked to, and the shutdown summary says `wait not measured` when it did not. See _Changed_ below for why the default flipped.
 
 ### Performance
 
