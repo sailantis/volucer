@@ -942,14 +942,33 @@ mod tests {
     }
 
     /// A site table whose site and root are both named, so a sample can tell them apart.
+    ///
+    /// The root goes through [`site_root`] rather than being used verbatim, because a *named*
+    /// site's root is absolutised when the table is built and `"/srv/first"` is a relative path on
+    /// Windows. A caller that asserted on the name as written would be asserting on something the
+    /// table never holds.
     fn named_sites(root: &str) -> Sites {
+        let root = site_root(root);
         let text = format!(
             "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {root:?}\n\n\
              [sites.app]\nhosts = [\"app.test\"]\ndocument_root = {root:?}\n",
             root = root
         );
         let config = Config::from_toml(&text).expect("config parses");
-        Sites::from_config(&config, Path::new(root))
+        Sites::from_config(&config, Path::new(&root))
+    }
+
+    /// The path a named site's root resolves to, spelled per platform.
+    ///
+    /// `/srv/first` is absolute on unix and relative on Windows, and only an absolute root keeps
+    /// its spelling. Written as a helper rather than repeated at each assertion so the platform
+    /// difference lives in one place.
+    fn site_root(name: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!("C:/srv/{name}"))
+        } else {
+            std::path::PathBuf::from(format!("/srv/{name}"))
+        }
     }
 
     /// The sampling technique used by the concurrency test **would** catch a split generation.
@@ -968,9 +987,9 @@ mod tests {
     /// static layer, moved one after another.
     #[test]
     fn three_separate_swaps_be_observed_mid_generation() {
-        let table = Swappable::new(named_sites("/srv/first"));
-        let routings = Swappable::new(Path::new("/srv/first").to_path_buf());
-        let statics = Swappable::new(Path::new("/srv/first").to_path_buf());
+        let table = Swappable::new(named_sites("first"));
+        let routings = Swappable::new(site_root("first"));
+        let statics = Swappable::new(site_root("first"));
 
         let observed_a_mixture = std::sync::atomic::AtomicBool::new(false);
         let stop = AtomicBool::new(false);
@@ -992,11 +1011,7 @@ mod tests {
             for round in 0..20_000 {
                 // Alternating, so a reader that only ever samples one direction cannot look clean
                 // by accident.
-                let to = if round % 2 == 0 {
-                    "/srv/second"
-                } else {
-                    "/srv/first"
-                };
+                let to = if round % 2 == 0 { "second" } else { "first" };
                 // A yield between the three writes, which is what makes a mixture observable
                 // rather than a matter of luck: the reader's loop is pure atomic loads, so it gets
                 // in between them every time. Without the yields this test is a race that would
@@ -1004,9 +1019,9 @@ mod tests {
                 // a control.
                 let _ = table.replace(named_sites(to));
                 std::thread::yield_now();
-                let _ = routings.replace(Path::new(to).to_path_buf());
+                let _ = routings.replace(site_root(to));
                 std::thread::yield_now();
-                let _ = statics.replace(Path::new(to).to_path_buf());
+                let _ = statics.replace(site_root(to));
             }
             stop.store(true, Ordering::Relaxed);
             reader.join().expect("the reader thread panicked");
@@ -1028,7 +1043,7 @@ mod tests {
     #[test]
     fn one_swap_never_yields_a_partial_generation() {
         let state = Swappable::new(Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(GrpcGrantsMap::new()),
             std::collections::BTreeMap::new(),
@@ -1056,11 +1071,7 @@ mod tests {
             });
 
             for round in 0..5_000 {
-                let root = if round % 2 == 0 {
-                    "/srv/first"
-                } else {
-                    "/srv/second"
-                };
+                let root = if round % 2 == 0 { "first" } else { "second" };
                 let _ = state.replace(Reloaded::from_sites(
                     Arc::new(named_sites(root)),
                     Some(8080),
@@ -1076,9 +1087,9 @@ mod tests {
             !seen.is_empty(),
             "the sampler never ran, so it observed nothing"
         );
+        let (first, second) = (site_root("first"), site_root("second"));
         assert!(
-            seen.iter()
-                .all(|root| root == Path::new("/srv/first") || root == Path::new("/srv/second")),
+            seen.iter().all(|root| *root == first || *root == second),
             "a sample resolved to a root no generation named"
         );
     }
@@ -1105,13 +1116,13 @@ mod tests {
         );
 
         let first = Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(before),
             std::collections::BTreeMap::new(),
         );
         let second = Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(after),
             std::collections::BTreeMap::new(),
@@ -1150,7 +1161,7 @@ mod tests {
         let mut grants = GrpcGrantsMap::new();
         grants.insert("app".to_string(), GrpcGrants::any());
         let state = Reloaded::from_sites(
-            Arc::new(named_sites("/srv/first")),
+            Arc::new(named_sites("first")),
             Some(8080),
             Arc::new(grants),
             std::collections::BTreeMap::new(),

@@ -790,7 +790,16 @@ document_root = "/srv/api"
 /// never passes through that path, which is the gap this pins.
 #[test]
 fn a_relative_site_document_root_is_absolutised() {
-    let text = r#"
+    // Spelled per platform, because the second half of this test is about a root that is *left
+    // alone*, and `/srv/absolute` is a relative path to a Windows build — it would be joined to
+    // the working directory like `shop` and the test would be asserting the opposite of its name.
+    let absolute_root = if cfg!(windows) {
+        "C:/srv/absolute"
+    } else {
+        "/srv/absolute"
+    };
+    let text = format!(
+        r#"
 [server]
 http = "127.0.0.1:8080"
 document_root = "/srv/default"
@@ -801,9 +810,10 @@ document_root = "shop"
 
 [sites.absolute]
 hosts = ["absolute.test"]
-document_root = "/srv/absolute"
-"#;
-    let config = Config::from_toml(text).expect("parses");
+document_root = {absolute_root:?}
+"#
+    );
+    let config = Config::from_toml(&text).expect("parses");
     config.validate().expect("valid");
     let sites = crate::sites::Sites::from_config(&config, std::path::Path::new("/srv/default"));
 
@@ -815,7 +825,7 @@ document_root = "/srv/absolute"
     );
     assert_eq!(
         sites.named()["absolute"].document_root,
-        std::path::PathBuf::from("/srv/absolute"),
+        std::path::PathBuf::from(absolute_root),
         "and an absolute one is left exactly as written"
     );
 }
