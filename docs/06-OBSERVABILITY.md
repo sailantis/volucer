@@ -42,8 +42,8 @@ or `kubectl logs` shows the access log beside the diagnostics (which go to stder
 consequences worth knowing:
 
 - **There is nothing to rotate.** A stream has no path, so a rotation cannot detach it and
-  `SIGHUP` does not reopen it — the runtime's own driver rotates what it captured. `volucer
-check` says so rather than printing the usual `logrotate` instruction.
+  `SIGHUP` does not reopen it — the runtime's own driver rotates what it captured.
+  `volucer check` says so rather than printing the usual `logrotate` instruction.
 - **Volucer writes through the handle it already has**, not a second one on `/dev/stdout`. The
   difference matters: a second handle would keep writing into a renamed inode after a rotation,
   which is exactly the failure the reopen exists to prevent.
